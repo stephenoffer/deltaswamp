@@ -5,8 +5,13 @@
 //! extension to coexist in one process with the `deltalake` wheel, which links
 //! its own (forked) build of the kernel.
 
+mod changes;
 mod commit;
 mod error;
+mod files;
+mod functions;
+mod partition;
+mod predicate;
 mod runtime;
 mod scan;
 mod snapshot;
@@ -27,6 +32,24 @@ use snapshot::{create_table, PySnapshot};
 /// same string, so a kernel bump fails loudly at three layers rather than
 /// silently changing behaviour.
 pub const KERNEL_VERSION: &str = "0.28.0";
+
+/// Capabilities this build provides, by stable name.
+///
+/// Python gates each feature on this list rather than on `hasattr`, so a stale
+/// extension (built before a feature landed) refuses cleanly instead of
+/// failing with an `AttributeError` or, worse, a changed signature.
+pub const FEATURES: &[&str] = &[
+    "predicate_skipping",
+    "timestamp_travel",
+    "table_changes",
+    "files",
+    "metadata_json",
+    "commit_raw",
+    "partitioned_append",
+    "uc_create_table_request",
+    "checkpoint",
+    "file_restricted_scan",
+];
 
 #[pyfunction]
 fn kernel_version() -> &'static str {
@@ -51,6 +74,7 @@ fn runtime_is_multithreaded() -> bool {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("KERNEL_VERSION", KERNEL_VERSION)?;
+    m.add("FEATURES", FEATURES.to_vec())?;
     m.add_class::<PySnapshot>()?;
     m.add_class::<UcCommitConfig>()?;
     m.add(
@@ -63,6 +87,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("RetryableError", m.py().get_type::<RetryableError>())?;
     m.add_function(wrap_pyfunction!(create_table, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_version, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_is_multithreaded, m)?)?;

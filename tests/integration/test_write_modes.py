@@ -298,13 +298,17 @@ class TestKernelOverwrite:
         KernelEngine().overwrite(plain.resolved, pa.table({"id": [9], "city": ["quito"]}))
         assert len(plain.history()) == before + 1
 
-    def test_predicate_is_refused_rather_than_ignored(self, plain: Any) -> None:
+    def test_predicate_overwrite_rewrites_only_matching_rows(self, plain: Any) -> None:
+        """A predicate overwrite on the kernel is a whole-table rewrite: rows
+        matching the predicate are replaced, every other row survives."""
+        from deltalake import DeltaTable
         from deltaswamp.engine.kernel import KernelEngine
 
-        with pytest.raises(UnreachableTableError, match="cannot scope"):
-            KernelEngine().overwrite(
-                plain.resolved, pa.table({"id": [9], "city": ["q"]}), predicate="id = 1"
-            )
+        KernelEngine().overwrite(
+            plain.resolved, pa.table({"id": [9], "city": ["q"]}), predicate="id = 1"
+        )
+        got = DeltaTable(plain.location).to_pyarrow_table().to_pylist()
+        assert {r["id"] for r in got} == {2, 9}
 
     def test_kernel_txn_and_commit_metadata(self, plain: Any) -> None:
         from deltaswamp.engine.kernel import KernelEngine

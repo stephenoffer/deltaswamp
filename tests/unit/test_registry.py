@@ -11,6 +11,7 @@ from typing import ClassVar
 
 import pytest
 from deltaswamp.catalog.registry import (
+    BUILTIN_CATALOGS,
     ENTRY_POINT_GROUP,
     available_catalogs,
     catalog_for_uri,
@@ -23,12 +24,42 @@ class TestEntryPoints:
     def test_group_name(self) -> None:
         assert ENTRY_POINT_GROUP == "deltaswamp.catalogs"
 
-    @pytest.mark.parametrize("name", ["databricks", "unity", "hive", "glue", "filesystem"])
+    @pytest.mark.parametrize(
+        "name", ["databricks", "unity", "hive", "glue", "filesystem", "sharing"]
+    )
     def test_every_builtin_catalog_is_registered(self, name: str) -> None:
-        """Fails if the distribution metadata was not installed correctly."""
         assert name in available_catalogs()
 
-    @pytest.mark.parametrize("name", ["databricks", "unity", "hive", "glue", "filesystem"])
+    def test_builtins_resolve_without_entry_point_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The built-in catalogs must not depend on the entry-point index.
+
+        A source checkout, a vendored copy, a zipapp and several freezers all
+        lose that metadata. Losing it used to unregister every catalog and make
+        the library unusable, so this pins the fallback down.
+        """
+        from deltaswamp.catalog import registry
+
+        monkeypatch.setattr(registry, "entry_points", lambda **_: ())
+        assert set(available_catalogs()) == set(BUILTIN_CATALOGS)
+        for name in BUILTIN_CATALOGS:
+            assert isinstance(load_catalog_class(name), type)
+
+    def test_builtins_match_the_declared_entry_points(self) -> None:
+        """BUILTIN_CATALOGS and pyproject.toml must not drift apart."""
+        import tomllib
+        from pathlib import Path
+
+        pyproject = Path(__file__).parents[2] / "pyproject.toml"
+        declared = tomllib.loads(pyproject.read_text())["project"]["entry-points"][
+            ENTRY_POINT_GROUP
+        ]
+        assert declared == BUILTIN_CATALOGS
+
+    @pytest.mark.parametrize(
+        "name", ["databricks", "unity", "hive", "glue", "filesystem", "sharing"]
+    )
     def test_every_registered_catalog_loads(self, name: str) -> None:
         cls = load_catalog_class(name)
         assert isinstance(cls, type)

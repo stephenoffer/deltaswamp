@@ -147,3 +147,35 @@ class CredentialProvider(Protocol):
         that still looks valid, which happens when clocks disagree.
         """
         ...
+
+
+class StaticCredentialProvider:
+    """Serves one already-vended credential, for a single short operation.
+
+    Used where the catalog vends a credential for a *path* rather than a table
+    -- creating an external table, or reading a log before registering it --
+    so there is no table identity to re-vend against. It is deliberately not
+    refreshable: past `expires_at` it raises rather than handing out a dead
+    credential that fails later with a storage 403.
+    """
+
+    def __init__(self, credentials: Credentials) -> None:
+        self._credentials = credentials
+
+    @property
+    def table_id(self) -> str | None:
+        return self._credentials.table_id
+
+    def credentials(self, operation: Operation = Operation.READ) -> Credentials:
+        if self._credentials.is_expired:
+            raise CredentialError(
+                "the path credential has expired, and a path credential cannot be re-vended "
+                "from here; retry the operation to obtain a fresh one"
+            )
+        return self._credentials
+
+    def invalidate(self) -> None:
+        """Nothing to refresh; the next call re-checks expiry."""
+
+    def __repr__(self) -> str:
+        return f"StaticCredentialProvider({self._credentials!r})"

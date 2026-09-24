@@ -26,7 +26,9 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.11
-      - run: uv pip install --system pytest mypy ruff
+      # Pinned deliberately: unpinned, an upstream ruff/mypy release turns CI
+      # red with no change here. Keep in step with .pre-commit-config.yaml.
+      - run: uv pip install --system pytest 'mypy==2.3.1' 'ruff==0.14.2'
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
@@ -92,7 +94,7 @@ jobs:
           import deltaswamp as ds
           ds.check_native()
           from deltaswamp.catalog.registry import available_catalogs
-          assert set(available_catalogs()) == {'databricks','filesystem','glue','hive','unity'}
+          assert set(available_catalogs()) == {'databricks','filesystem','glue','hive','sharing','unity'}
           import importlib.resources as r
           assert (r.files('deltaswamp') / 'py.typed').is_file()
           assert (r.files('deltaswamp') / '_native.pyi').is_file()

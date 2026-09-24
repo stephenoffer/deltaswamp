@@ -15,18 +15,36 @@ touching the Delta log, because several decisions cannot be made afterwards:
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from ..capability import TableFeature, feature_from_wire
 from ..credentials import CredentialProvider
 from ..identity import TableRef
 
+if TYPE_CHECKING:  # pragma: no cover
+    from ..credentials import Credentials
+    from ..governance import (
+        ColumnLineage,
+        FunctionSummary,
+        Grant,
+        Lineage,
+        StagingTable,
+        TableInfo,
+        TableSummary,
+        Volume,
+        VolumeSummary,
+    )
+
 __all__ = [
     "Catalog",
+    "GovernedCatalog",
     "LogTailEntry",
+    "NamespaceCatalog",
     "ResolvedTable",
+    "TableLifecycleCatalog",
     "TableType",
 ]
 
@@ -109,6 +127,14 @@ class ResolvedTable:
 
     credential_provider: CredentialProvider | None = None
 
+    #: The catalog's Iceberg REST endpoint, when it has one. Set for Iceberg
+    #: tables and UniForm tables, and consumed by the Iceberg engine.
+    iceberg_rest_uri: str | None = None
+    #: A Delta Sharing profile (a path, URL or JSON document). Set only for
+    #: tables reached through a share, whose files are served as presigned URLs
+    #: and are not addressable by a storage location at all.
+    sharing_profile: str | None = field(default=None, repr=False)
+
     @property
     def features(self) -> frozenset[str]:
         return self.reader_features | self.writer_features
@@ -161,6 +187,11 @@ class ResolvedTable:
         """
         fmt = (self.data_source_format or "").upper()
         return fmt in ("", "DELTA", "DELTA_UNIFORM_ICEBERG", "DELTA_UNIFORM_HUDI")
+
+    @property
+    def is_shared(self) -> bool:
+        """Reached through Delta Sharing rather than by storage location."""
+        return self.sharing_profile is not None
 
     @property
     def is_iceberg(self) -> bool:
@@ -240,3 +271,171 @@ class Catalog(Protocol):
         lookups, and per-table credential vending has no batch endpoint.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Optional catalog capabilities. A catalog implements these in addition to
+# `Catalog`; check with isinstance. A catalog may satisfy a protocol and still
+# raise NotImplementedError from a method its server lacks -- it then lists the
+# method name in an `unsupported_operations` frozenset attribute, so a caller
+# can report support without making the call.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class GovernedCatalog(Protocol):
+    """Unity Catalog governance: metadata, permissions, tags, lineage, constraints.
+
+    `target` in the permission methods is a `TableRef` for a table, or a dotted
+    name for another securable, whose kind `securable_type` names ("TABLE",
+    "SCHEMA", "CATALOG", "VOLUME", "FUNCTION"). Privileges use the underscore
+    spelling, e.g. "EXTERNAL_USE_SCHEMA".
+    """
+
+    def table_info(self, ref: TableRef) -> TableInfo: ...
+
+    def grants(
+        self,
+        target: TableRef | str,
+        principal: str | None = None,
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]: ...
+
+    def effective_grants(
+        self,
+        target: TableRef | str,
+        principal: str | None = None,
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]: ...
+
+    def grant(
+        self,
+        target: TableRef | str,
+        principal: str,
+        privileges: Iterable[str],
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]: ...
+
+    def revoke(
+        self,
+        target: TableRef | str,
+        principal: str,
+        privileges: Iterable[str],
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]: ...
+
+    def tags(self, ref: TableRef, column: str | None = None) -> dict[str, str]: ...
+
+    def set_tags(
+        self, ref: TableRef, tags: Mapping[str, str], column: str | None = None
+    ) -> None: ...
+
+    def unset_tags(self, ref: TableRef, keys: Iterable[str], column: str | None = None) -> None: ...
+
+    def set_owner(self, ref: TableRef, principal: str) -> None: ...
+
+    def lineage(self, ref: TableRef, direction: str = "both") -> Lineage: ...
+
+    def column_lineage(
+        self, ref: TableRef, column: str, direction: str = "both"
+    ) -> ColumnLineage: ...
+
+    def add_primary_key(
+        self, ref: TableRef, name: str, columns: Iterable[str], *, rely: bool = False
+    ) -> None: ...
+
+    def add_foreign_key(
+        self,
+        ref: TableRef,
+        name: str,
+        columns: Iterable[str],
+        parent_ref: TableRef,
+        parent_columns: Iterable[str],
+        *,
+        rely: bool = False,
+    ) -> None: ...
+
+    def drop_table_constraint(self, ref: TableRef, name: str, *, cascade: bool = False) -> None: ...
+
+
+@runtime_checkable
+class NamespaceCatalog(Protocol):
+    """Creating and dropping catalogs, schemas and volumes, and searching them."""
+
+    def create_catalog(
+        self, name: str, comment: str | None = None, storage_root: str | None = None
+    ) -> None: ...
+
+    def drop_catalog(self, name: str, force: bool = False) -> None: ...
+
+    def create_schema(
+        self,
+        catalog: str,
+        name: str,
+        comment: str | None = None,
+        storage_root: str | None = None,
+    ) -> None: ...
+
+    def drop_schema(self, catalog: str, name: str, force: bool = False) -> None: ...
+
+    def table_exists(self, ref: TableRef) -> bool: ...
+
+    def search_tables(
+        self,
+        catalog: str,
+        schema_pattern: str | None = None,
+        table_pattern: str | None = None,
+    ) -> list[TableSummary]: ...
+
+    def list_functions(self, catalog: str, schema: str) -> list[FunctionSummary]: ...
+
+    def list_volumes(self, catalog: str, schema: str) -> list[VolumeSummary]: ...
+
+    def create_volume(
+        self,
+        catalog: str,
+        schema: str,
+        name: str,
+        volume_type: str = "MANAGED",
+        storage_location: str | None = None,
+        comment: str | None = None,
+    ) -> VolumeSummary: ...
+
+    def drop_volume(self, catalog: str, schema: str, name: str) -> None: ...
+
+    def volume(self, ref: TableRef | str) -> Volume: ...
+
+
+@runtime_checkable
+class TableLifecycleCatalog(Protocol):
+    """Bringing a table into existence in the catalog.
+
+    External: write the Delta log with `path_credentials(location,
+    "PATH_CREATE_TABLE")`, then `register_table`. Managed (catalog-managed):
+    `create_staging_table`, write version 0 at its location with its storage
+    options and required properties, then `finalize_managed_table` with the
+    UC Delta API CreateTableRequest body.
+    """
+
+    def register_table(
+        self,
+        ref: TableRef,
+        location: str,
+        *,
+        columns_schema_json: str | Mapping[str, Any] | None = None,
+        partition_columns: Iterable[str] | None = None,
+        properties: Mapping[str, str] | None = None,
+        comment: str | None = None,
+    ) -> ResolvedTable: ...
+
+    def path_credentials(self, url: str, operation: str = "PATH_READ") -> Credentials: ...
+
+    def create_staging_table(self, ref: TableRef) -> StagingTable: ...
+
+    def finalize_managed_table(
+        self, ref: TableRef, request_body: Mapping[str, Any]
+    ) -> ResolvedTable: ...

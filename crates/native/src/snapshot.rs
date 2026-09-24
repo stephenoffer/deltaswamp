@@ -11,15 +11,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::snapshot::{Snapshot, SnapshotRef};
-use delta_kernel::{Engine, LogPath};
-use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
+use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
+use delta_kernel::{Engine, LogPath, Version};
 use pyo3::prelude::*;
-use pyo3_arrow::{PyRecordBatchReader, PySchema};
+use pyo3_arrow::{PyRecordBatchReader, PySchema, PyTable};
 use url::Url;
 
 use crate::commit::{self, SharedEngine, UcCommitConfig};
 use crate::error::{NativeError, Result};
+use crate::files;
+use crate::predicate::parse_predicate;
 use crate::runtime;
 use crate::scan::KernelBatchReader;
 use crate::store;
@@ -42,7 +44,7 @@ pub struct PySnapshot {
 impl PySnapshot {
     /// Normalise a table root: kernel requires a trailing slash and rejects
     /// paths without one, with an error that is hard to act on.
-    fn table_root_url(table_root: &str) -> Result<Url> {
+    pub(crate) fn table_root_url(table_root: &str) -> Result<Url> {
         let normalised = if table_root.ends_with('/') {
             table_root.to_string()
         } else {
@@ -81,6 +83,70 @@ impl PySnapshot {
             })
             .collect()
     }
+
+    /// Build one snapshot. The catalog inputs are re-applied on every build so
+    /// a timestamp lookup and the final build see the same ratified tail.
+    fn build(
+        engine: &SharedEngine,
+        url: &Url,
+        version: Option<Version>,
+        log_tail: Option<&[LogTailEntry]>,
+        max_catalog_version: Option<Version>,
+    ) -> Result<SnapshotRef> {
+        let mut builder = Snapshot::builder_for(url.as_str());
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+        if let Some(entries) = log_tail {
+            builder = builder.with_log_tail(Self::build_log_tail(url, entries.to_vec())?);
+        }
+        if let Some(v) = max_catalog_version {
+            builder = builder.with_max_catalog_version(v);
+        }
+        Ok(runtime::block_on(async {
+            builder.build(engine.as_ref() as &dyn Engine)
+        })?)
+    }
+
+    /// Resolve the latest recreatable version as of `timestamp_ms`.
+    ///
+    /// The history search needs a snapshot to bound it, and on a catalog-managed
+    /// table only the catalog's tail says what "latest" is -- so resolve the
+    /// latest snapshot with the tail first, search, then rebuild at the found
+    /// version with the same tail.
+    fn resolve_as_of(
+        engine: &SharedEngine,
+        url: &Url,
+        timestamp_ms: i64,
+        log_tail: Option<&[LogTailEntry]>,
+        max_catalog_version: Option<Version>,
+    ) -> Result<SnapshotRef> {
+        let latest = Self::build(engine, url, None, log_tail, max_catalog_version)?;
+        let found = latest_version_as_of(
+            &latest,
+            engine.as_ref() as &dyn Engine,
+            timestamp_ms,
+            HistoryCommitType::Recreatable,
+        )
+        .map_err(|e| match e {
+            delta_kernel::Error::LogHistory(inner) => NativeError::Invalid(format!(
+                "no version of {url} can be reconstructed as of timestamp {timestamp_ms} ms \
+                 ({inner}). The timestamp is before the earliest recreatable commit (version 0 \
+                 or the oldest retained checkpoint); choose a later timestamp."
+            )),
+            other => NativeError::from(other),
+        })?;
+        if found.version == latest.version() {
+            return Ok(latest);
+        }
+        Self::build(
+            engine,
+            url,
+            Some(found.version),
+            log_tail,
+            max_catalog_version,
+        )
+    }
 }
 
 #[pymethods]
@@ -96,6 +162,7 @@ impl PySnapshot {
         version = None,
         log_tail = None,
         max_catalog_version = None,
+        timestamp_ms = None,
     ))]
     fn resolve(
         py: Python<'_>,
@@ -104,28 +171,25 @@ impl PySnapshot {
         version: Option<u64>,
         log_tail: Option<Vec<LogTailEntry>>,
         max_catalog_version: Option<u64>,
+        timestamp_ms: Option<i64>,
     ) -> PyResult<Self> {
+        if version.is_some() && timestamp_ms.is_some() {
+            return Err(
+                NativeError::Invalid("pass version or timestamp_ms, not both".to_string()).into(),
+            );
+        }
         let url = Self::table_root_url(table_root)?;
         let options = options.unwrap_or_default();
 
         // Log resolution does real I/O, so release the GIL for it.
         let (inner, engine) = py.detach(|| -> Result<(SnapshotRef, SharedEngine)> {
             let object_store = store::build_store(&url, &options)?;
-            let engine: SharedEngine = Arc::new(DefaultEngine::builder(object_store).build());
-
-            let mut builder = Snapshot::builder_for(url.as_str());
-            if let Some(v) = version {
-                builder = builder.at_version(v);
-            }
-            if let Some(entries) = log_tail {
-                builder = builder.with_log_tail(Self::build_log_tail(&url, entries)?);
-            }
-            if let Some(v) = max_catalog_version {
-                builder = builder.with_max_catalog_version(v);
-            }
-
-            let snapshot =
-                runtime::block_on(async { builder.build(engine.as_ref() as &dyn Engine) })?;
+            let engine = commit::new_engine(object_store);
+            let tail = log_tail.as_deref();
+            let snapshot = match timestamp_ms {
+                Some(ts) => Self::resolve_as_of(&engine, &url, ts, tail, max_catalog_version)?,
+                None => Self::build(&engine, &url, version, tail, max_catalog_version)?,
+            };
             Ok((snapshot, engine))
         })?;
 
@@ -206,22 +270,122 @@ impl PySnapshot {
     ///
     /// Deletion vectors are applied by kernel and row order is preserved; see
     /// `crate::scan` for why that ordering matters.
-    #[pyo3(signature = (columns = None))]
-    fn scan(&self, py: Python<'_>, columns: Option<Vec<String>>) -> PyResult<PyRecordBatchReader> {
+    ///
+    /// `predicate` (JSON, see `crate::predicate`) only skips files; rows that
+    /// do not match can still come back and the caller must filter them.
+    ///
+    /// `files` restricts the read to data files whose log path (the `path`
+    /// column of `files()`: relative, URL-encoded, as stored) is listed.
+    /// Unlisted files are dropped before any I/O; unknown paths are ignored;
+    /// `[]` gives an empty stream. Output is otherwise identical to the full
+    /// scan, so the union of scans over a partition of `files()` equals it.
+    #[pyo3(signature = (columns = None, predicate = None, files = None))]
+    fn scan(
+        &self,
+        py: Python<'_>,
+        columns: Option<Vec<String>>,
+        predicate: Option<String>,
+        files: Option<Vec<String>>,
+    ) -> PyResult<PyRecordBatchReader> {
         let reader = py.detach(|| -> Result<KernelBatchReader> {
-            let mut builder = self.inner.clone().scan_builder();
+            let full = self.inner.schema();
+            let predicate = parse_predicate(predicate.as_deref(), full.as_ref())?;
+            let mut builder = self
+                .inner
+                .clone()
+                .scan_builder()
+                .with_predicate(predicate.map(Arc::new));
 
             if let Some(columns) = columns {
-                let full = self.inner.schema();
                 let projected = full.project(&columns)?;
                 builder = builder.with_schema(projected);
             }
 
             let scan = builder.build()?;
-            KernelBatchReader::try_new(&scan, self.engine.clone() as Arc<dyn Engine>)
+            let engine = self.engine.clone() as Arc<dyn Engine>;
+            match files {
+                Some(files) => KernelBatchReader::try_new_restricted(
+                    &scan,
+                    engine,
+                    files.into_iter().collect(),
+                ),
+                None => KernelBatchReader::try_new(&scan, engine),
+            }
         })?;
 
         Ok(PyRecordBatchReader::new(Box::new(reader)))
+    }
+
+    /// One row per live data file, after predicate-based file skipping.
+    ///
+    /// Columns: `path` (as stored in the log -- usually relative to the table
+    /// root, URL-encoded), `size`, `modification_time`, `partition_values`
+    /// (map, keyed by *physical* name under column mapping), `stats` (raw JSON),
+    /// `deletion_vector` (JSON descriptor or null) and `num_records`.
+    #[pyo3(signature = (predicate = None))]
+    fn files(&self, py: Python<'_>, predicate: Option<String>) -> PyResult<PyTable> {
+        let batch = py.detach(|| -> Result<arrow::array::RecordBatch> {
+            let predicate = parse_predicate(predicate.as_deref(), self.inner.schema().as_ref())?;
+            files::list_files(self.inner.clone(), self.engine.as_ref(), predicate)
+        })?;
+        let schema = batch.schema();
+        PyTable::try_new(vec![batch], schema)
+    }
+
+    /// The current `metaData` action, as Delta-protocol JSON.
+    fn metadata_json(&self) -> PyResult<String> {
+        serde_json::to_string(self.inner.table_configuration().metadata())
+            .map_err(|e| NativeError::Invalid(format!("could not serialise metadata: {e}")).into())
+    }
+
+    /// The current `protocol` action, as Delta-protocol JSON.
+    ///
+    /// Feature lists appear only when the versions call for them (reader 3,
+    /// writer 7); the kernel serialiser omits them otherwise.
+    fn protocol_json(&self) -> PyResult<String> {
+        serde_json::to_string(self.inner.table_configuration().protocol())
+            .map_err(|e| NativeError::Invalid(format!("could not serialise protocol: {e}")).into())
+    }
+
+    /// The configuration string of `domain`, or None if it has no live entry.
+    ///
+    /// System domains (`delta.clustering`, `delta.rowTracking`, ...) are
+    /// readable too; the public kernel accessor refuses them, so this goes
+    /// through the internal one.
+    fn domain_metadata(&self, py: Python<'_>, domain: &str) -> PyResult<Option<String>> {
+        let value = py.detach(|| {
+            self.inner
+                .get_domain_metadata_internal(domain, self.engine.as_ref())
+                .map_err(NativeError::from)
+        })?;
+        Ok(value)
+    }
+
+    /// This snapshot's commit timestamp in milliseconds: the in-commit
+    /// timestamp when ICT is enabled, else the commit file's modification time.
+    fn timestamp(&self, py: Python<'_>) -> PyResult<i64> {
+        let ts = py.detach(|| {
+            self.inner
+                .get_timestamp(self.engine.as_ref())
+                .map_err(NativeError::from)
+        })?;
+        Ok(ts)
+    }
+
+    /// Write a checkpoint at this snapshot's version.
+    ///
+    /// Returns True if a checkpoint was written, False if one already existed.
+    /// On a catalog-managed table every commit up to this version must be
+    /// published first; the kernel refuses otherwise, because a checkpoint over
+    /// unpublished commits would leave a gap in the log for older readers.
+    fn checkpoint(&self, py: Python<'_>) -> PyResult<bool> {
+        let written = py.detach(|| -> Result<bool> {
+            // Called directly, not inside runtime::block_on: the engine's
+            // executor does its own bridging (see commit::SharedEngine).
+            let (result, _) = self.inner.checkpoint(self.engine.as_ref(), None)?;
+            Ok(matches!(result, CheckpointWriteResult::Written))
+        })?;
+        Ok(written)
     }
 
     /// Append Arrow data and commit it as one transaction.
@@ -328,7 +492,7 @@ pub fn create_table(
 
     let version = py.detach(|| -> Result<u64> {
         let object_store = store::build_store(&url, &options.unwrap_or_default())?;
-        let engine: SharedEngine = Arc::new(DefaultEngine::builder(object_store).build());
+        let engine = commit::new_engine(object_store);
         commit::create_table(
             url.as_str(),
             arrow_schema,

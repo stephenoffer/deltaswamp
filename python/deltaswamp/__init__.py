@@ -25,6 +25,7 @@ from .errors import (
     UnreachableTableError,
 )
 from .identity import RefKind, TableRef, parse_ref
+from .predicate import PredicateError
 from .router import Router
 from .table import Connection, Table, connect
 
@@ -53,6 +54,7 @@ __all__ = [
     "IgnoredPropertyWarning",
     "InvalidReferenceError",
     "Operation",
+    "PredicateError",
     "PreflightError",
     "PropertyNotSupportedError",
     "RefKind",

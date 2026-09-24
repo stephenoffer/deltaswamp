@@ -17,10 +17,30 @@ comes from the UC Delta API below.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import dataclasses
+import functools
+import urllib.parse
+from collections.abc import Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, TypeVar
 
+from ..credentials.base import Credentials, Operation
 from ..credentials.databricks import DatabricksCredentialProvider
-from ..errors import InvalidReferenceError, PreflightError
+from ..errors import DeltaSwampError, InvalidReferenceError, PreflightError
+from ..governance import (
+    ColumnLineage,
+    FunctionSummary,
+    Grant,
+    Lineage,
+    StagingTable,
+    TableInfo,
+    TableSummary,
+    Volume,
+    VolumeSummary,
+    create_table_body,
+    delta_schema_to_columns,
+    normalize_privilege,
+    path_operation,
+)
 from ..identity import RefKind, TableRef
 from .base import LogTailEntry, ResolvedTable, TableType
 
@@ -42,11 +62,106 @@ UC_DELTA_API_BASE = "/api/2.1/unity-catalog/delta/v1"
 CAP_EXTERNAL_READ = "HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT"
 CAP_EXTERNAL_WRITE = "HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT"
 
+LINEAGE_API = "/api/2.0/lineage-tracking"
+_JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
+
+_T = TypeVar("_T")
+
+# What each governance call needs, named in the error when it is denied. A bare
+# 403 from Unity Catalog does not say, and guessing wastes an admin round trip.
+_NEEDS = {
+    "read": "Reading table metadata needs USE_CATALOG, USE_SCHEMA and SELECT or ownership.",
+    "grants": "Reading grants needs USE_CATALOG and USE_SCHEMA on the parents; another "
+    "principal's grants may need ownership or MANAGE.",
+    "grant": "Changing grants needs ownership of the securable or MANAGE on it, plus "
+    "USE_CATALOG and USE_SCHEMA on its parents.",
+    "tags": "Setting tags needs APPLY_TAG on the table plus USE_SCHEMA and USE_CATALOG; "
+    "governed tags also need ASSIGN on the tag policy.",
+    "owner": "Transferring ownership needs current ownership or MANAGE.",
+    "lineage": "Lineage needs BROWSE or SELECT on the table and shows only entities the "
+    "caller can see.",
+    "constraint": "Constraints need ownership of the table (and of the parent table for a "
+    "foreign key), plus USE_CATALOG and USE_SCHEMA.",
+    "catalog": "Creating a catalog needs CREATE_CATALOG on the metastore; dropping one "
+    "needs ownership.",
+    "schema": "Creating a schema needs CREATE_SCHEMA and USE_CATALOG; dropping one needs "
+    "ownership.",
+    "volume": "Creating a volume needs CREATE_VOLUME, USE_SCHEMA and USE_CATALOG (an "
+    "external volume also CREATE_EXTERNAL_VOLUME on the external location); reading and "
+    "writing files needs READ_VOLUME / WRITE_VOLUME.",
+    "register": "Registering an external table needs EXTERNAL_USE_SCHEMA on the schema "
+    "(granted explicitly: ownership and ALL_PRIVILEGES do not imply it), CREATE_TABLE and "
+    "USE_SCHEMA on the schema, USE_CATALOG, and CREATE_EXTERNAL_TABLE plus "
+    "EXTERNAL_USE_LOCATION on the external location.",
+    "path": "Path credentials need EXTERNAL_USE_LOCATION on the external location covering "
+    "the path, plus READ_FILES, WRITE_FILES or CREATE_EXTERNAL_TABLE for the operation, "
+    "and external data access enabled on the metastore.",
+    "staging": "Creating a managed table needs CREATE_TABLE, USE_SCHEMA and "
+    "EXTERNAL_USE_SCHEMA on the schema and USE_CATALOG; creation of catalog-managed "
+    "tables by external clients is gated on a workspace preview.",
+}
+
+
+def _dotted(ref: TableRef) -> str:
+    """The unquoted three-part name the REST API takes. Backticks are SQL-only."""
+    if ref.kind is not RefKind.CATALOG or not (ref.catalog and ref.schema and ref.table):
+        raise InvalidReferenceError(f"{ref} is not a catalog.schema.table reference")
+    return f"{ref.catalog}.{ref.schema}.{ref.table}"
+
+
+def _segment(part: str) -> str:
+    return urllib.parse.quote(part, safe="")
+
+
+def _securable_name(target: TableRef | str) -> str:
+    return _dotted(target) if isinstance(target, TableRef) else str(target)
+
+
+def _three_part(name: TableRef | str, what: str) -> tuple[str, str, str]:
+    full = _dotted(name) if isinstance(name, TableRef) else name
+    parts = full.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise InvalidReferenceError(f"a {what} is named catalog.schema.name, not {full!r}")
+    return parts[0], parts[1], parts[2]
+
+
+class _RawPrivilege:
+    """A privilege name this SDK's enum does not know yet.
+
+    The SDK serialises privileges with ``.value``, so this is all it needs;
+    refusing an unknown name would make every new privilege ungrantable until
+    the SDK caught up.
+    """
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+def _sdk_privileges(privileges: Iterable[str]) -> list[Any]:
+    from databricks.sdk.service.catalog import Privilege
+
+    out: list[Any] = []
+    for p in privileges:
+        name = normalize_privilege(p)
+        try:
+            out.append(Privilege(name))
+        except ValueError:
+            out.append(_RawPrivilege(name))
+    if not out:
+        raise InvalidReferenceError("grant/revoke needs at least one privilege")
+    return out
+
 
 class DatabricksUnityCatalog:
-    """Resolves tables in a Databricks-hosted Unity Catalog metastore."""
+    """Resolves tables in a Databricks-hosted Unity Catalog metastore.
+
+    Also implements the optional `GovernedCatalog`, `NamespaceCatalog` and
+    `TableLifecycleCatalog` protocols from `catalog.base`.
+    """
 
     name = "databricks"
+    #: Every governance method works here; see OSSUnityCatalog for the contrast.
+    unsupported_operations: frozenset[str] = frozenset()
 
     @classmethod
     def from_uri(cls, uri: str | None, **kwargs: Any) -> DatabricksUnityCatalog:
@@ -161,6 +276,19 @@ class DatabricksUnityCatalog:
 
         # A catalog-managed table is unreadable without the catalog's commit
         # tail, so fetch it as part of resolution rather than lazily.
+        # Every Unity Catalog table is reachable through the catalog's Iceberg
+        # REST endpoint when it has Iceberg metadata (managed Iceberg, foreign
+        # Iceberg, UniForm); the Iceberg engine decides whether it applies.
+        import dataclasses as _dc
+
+        from ..engine.iceberg import iceberg_rest_uri
+
+        host = getattr(getattr(self.workspace, "config", None), "host", None) or self._host
+        if host:
+            resolved = _dc.replace(
+                resolved, iceberg_rest_uri=iceberg_rest_uri(host, databricks=True)
+            )
+
         if resolved.is_catalog_managed:
             resolved = self._with_catalog_commits(resolved)
 
@@ -207,27 +335,73 @@ class DatabricksUnityCatalog:
 
     def _missing_privileges(self, ref: TableRef) -> str:
         """Name the privileges the principal actually holds, when we can read them."""
-        try:
-            effective = self.workspace.grants.get_effective(
-                securable_type="TABLE", full_name=ref.full_name
-            )
-            held = sorted(
-                {
-                    str(getattr(p, "privilege", p))
-                    for assignment in (getattr(effective, "privilege_assignments", None) or [])
-                    for p in (getattr(assignment, "privileges", None) or [])
-                }
-            )
-        except Exception:
+        held = self._held_privileges("TABLE", _dotted(ref))
+        if held is None:
             return (
                 "Reading a table's files needs SELECT, plus EXTERNAL USE SCHEMA on the "
                 "schema (which only the catalog owner can grant) and external data "
                 "access enabled on the metastore."
             )
-        missing = [p for p in ("SELECT", "EXTERNAL USE SCHEMA") if p not in held]
+        missing = [p for p in ("SELECT", "EXTERNAL_USE_SCHEMA") if p not in held]
         if missing:
             return f"Effective privileges are {held or 'none'}; missing {', '.join(missing)}."
         return f"Effective privileges are {held}, so the block is likely metastore-level."
+
+    def _held_privileges(self, securable_type: str, full_name: str) -> list[str] | None:
+        """Effective privileges visible on a securable, or None when unreadable.
+
+        Normalised to the underscore spelling: the SDK returns `Privilege` enums,
+        whose `str()` is ``"Privilege.SELECT"`` and never matches a bare name.
+        """
+        try:
+            effective = self.workspace.grants.get_effective(
+                securable_type=securable_type, full_name=full_name
+            )
+        except Exception:
+            return None
+        return sorted(
+            {
+                normalize_privilege(getattr(p, "privilege", p))
+                for assignment in (getattr(effective, "privilege_assignments", None) or [])
+                for p in (getattr(assignment, "privileges", None) or [])
+            }
+        )
+
+    def _error(
+        self,
+        exc: Exception,
+        action: str,
+        full_name: str,
+        *,
+        securable_type: str = "TABLE",
+        needs: str = "",
+    ) -> Exception:
+        """Classify a failed governance call, naming what it needs when denied."""
+        text = str(exc)
+        kind = type(exc).__name__
+        if (
+            kind in ("NotFound", "ResourceDoesNotExist")
+            or "404" in text
+            or "does not exist" in text.lower()
+        ):
+            return InvalidReferenceError(
+                f"cannot {action}: {full_name} does not exist in Unity Catalog, or is not "
+                f"visible to this principal. Underlying error: {exc}"
+            )
+        if (
+            kind in ("PermissionDenied", "Unauthenticated")
+            or "403" in text
+            or ("permission" in text.lower())
+        ):
+            held = self._held_privileges(securable_type, full_name)
+            seen = (
+                "" if held is None else f"Effective privileges on {full_name}: {held or 'none'}. "
+            )
+            return PreflightError(
+                f"cannot {action}: access to {full_name} was denied. {needs} {seen}"
+                f"Underlying error: {exc}".replace("  ", " ")
+            )
+        return PreflightError(f"cannot {action} ({full_name}): {exc}")
 
     def _with_catalog_commits(self, resolved: ResolvedTable) -> ResolvedTable:
         """Attach the ratified commit tail and the max trustworthy version."""
@@ -398,3 +572,632 @@ class DatabricksUnityCatalog:
         except Exception as exc:
             problems.append(f"could not read metastore settings: {exc}")
         return problems
+
+    # =============================================================== governance
+
+    def _call(
+        self,
+        action: str,
+        full_name: str,
+        needs: str,
+        fn: Callable[[], _T],
+        *,
+        securable_type: str = "TABLE",
+    ) -> _T:
+        try:
+            return fn()
+        except DeltaSwampError:
+            raise
+        except Exception as exc:
+            raise self._error(
+                exc, action, full_name, securable_type=securable_type, needs=_NEEDS[needs]
+            ) from exc
+
+    def table_info(self, ref: TableRef) -> TableInfo:
+        """Everything Unity Catalog records about a table, as plain data."""
+        name = _dotted(ref)
+
+        def fetch() -> Any:
+            try:
+                return self.workspace.tables.get(
+                    full_name=name,
+                    include_browse=True,
+                    include_delta_metadata=True,
+                    include_manifest_capabilities=True,
+                )
+            except TypeError:  # an older SDK without the include_* flags
+                return self.workspace.tables.get(full_name=name)
+
+        return TableInfo.from_api(self._call("read table metadata", name, "read", fetch))
+
+    # ------------------------------------------------------------ permissions
+
+    def _grant_pages(
+        self, method: Any, securable_type: str, full_name: str, principal: str | None
+    ) -> list[Grant]:
+        out: list[Grant] = []
+        token: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {"securable_type": securable_type, "full_name": full_name}
+            if principal:
+                kwargs["principal"] = principal
+            if token:
+                kwargs["page_token"] = token
+            response = method(**kwargs)
+            out.extend(Grant.list_from_api(response))
+            token = getattr(response, "next_page_token", None)
+            if not token:
+                return out
+
+    def grants(
+        self,
+        target: TableRef | str,
+        principal: str | None = None,
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]:
+        """Privileges granted directly on a securable (not inherited ones)."""
+        kind, name = securable_type.upper(), _securable_name(target)
+        return self._call(
+            "read grants",
+            name,
+            "grants",
+            lambda: self._grant_pages(self.workspace.grants.get, kind, name, principal),
+            securable_type=kind,
+        )
+
+    def effective_grants(
+        self,
+        target: TableRef | str,
+        principal: str | None = None,
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]:
+        """Privileges in force, including those inherited from catalog and schema."""
+        kind, name = securable_type.upper(), _securable_name(target)
+        return self._call(
+            "read effective grants",
+            name,
+            "grants",
+            lambda: self._grant_pages(self.workspace.grants.get_effective, kind, name, principal),
+            securable_type=kind,
+        )
+
+    def _change_grants(
+        self,
+        target: TableRef | str,
+        principal: str,
+        privileges: Iterable[str],
+        securable_type: str,
+        *,
+        add: bool,
+    ) -> list[Grant]:
+        from databricks.sdk.service.catalog import PermissionsChange
+
+        kind, name = securable_type.upper(), _securable_name(target)
+        sdk = _sdk_privileges(privileges)
+        change = (
+            PermissionsChange(principal=principal, add=sdk)
+            if add
+            else PermissionsChange(principal=principal, remove=sdk)
+        )
+        response = self._call(
+            "grant privileges" if add else "revoke privileges",
+            name,
+            "grant",
+            lambda: self.workspace.grants.update(
+                securable_type=kind, full_name=name, changes=[change]
+            ),
+            securable_type=kind,
+        )
+        return Grant.list_from_api(response)
+
+    def grant(
+        self,
+        target: TableRef | str,
+        principal: str,
+        privileges: Iterable[str],
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]:
+        """Grant privileges; returns the securable's grants afterwards."""
+        return self._change_grants(target, principal, privileges, securable_type, add=True)
+
+    def revoke(
+        self,
+        target: TableRef | str,
+        principal: str,
+        privileges: Iterable[str],
+        *,
+        securable_type: str = "TABLE",
+    ) -> list[Grant]:
+        """Revoke privileges; returns the securable's grants afterwards."""
+        return self._change_grants(target, principal, privileges, securable_type, add=False)
+
+    # ------------------------------------------------------------------- tags
+
+    @staticmethod
+    def _tag_entity(ref: TableRef, column: str | None) -> tuple[str, str]:
+        name = _dotted(ref)
+        return ("columns", f"{name}.{column}") if column else ("tables", name)
+
+    def tags(self, ref: TableRef, column: str | None = None) -> dict[str, str]:
+        """Tags on a table, or on one of its columns. Key-only tags map to ""."""
+        entity_type, entity_name = self._tag_entity(ref, column)
+        assignments = self._call(
+            "read tags",
+            entity_name,
+            "tags",
+            lambda: list(
+                self.workspace.entity_tag_assignments.list(
+                    entity_type=entity_type, entity_name=entity_name
+                )
+            ),
+        )
+        return {str(a.tag_key): str(a.tag_value or "") for a in assignments}
+
+    def set_tags(self, ref: TableRef, tags: Mapping[str, str], column: str | None = None) -> None:
+        """Set tags, creating new keys and updating existing ones."""
+        from databricks.sdk.service.catalog import EntityTagAssignment
+
+        entity_type, entity_name = self._tag_entity(ref, column)
+        existing = self.tags(ref, column)
+        api = self.workspace.entity_tag_assignments
+        for key, value in tags.items():
+            assignment = EntityTagAssignment(
+                entity_name=entity_name,
+                tag_key=key,
+                entity_type=entity_type,
+                tag_value=value or None,
+            )
+            call: Callable[[], Any] = (
+                functools.partial(
+                    api.update,
+                    entity_type=entity_type,
+                    entity_name=entity_name,
+                    tag_key=key,
+                    tag_assignment=assignment,
+                    update_mask="tag_value",
+                )
+                if key in existing
+                else functools.partial(api.create, tag_assignment=assignment)
+            )
+            self._call("set tags", entity_name, "tags", call)
+
+    def unset_tags(self, ref: TableRef, keys: Iterable[str], column: str | None = None) -> None:
+        entity_type, entity_name = self._tag_entity(ref, column)
+        api = self.workspace.entity_tag_assignments
+        for key in keys:
+            self._call(
+                "unset tags",
+                entity_name,
+                "tags",
+                functools.partial(
+                    api.delete, entity_type=entity_type, entity_name=entity_name, tag_key=key
+                ),
+            )
+
+    # -------------------------------------------------------- owner & lineage
+
+    def set_owner(self, ref: TableRef, principal: str) -> None:
+        name = _dotted(ref)
+        self._call(
+            "change the owner",
+            name,
+            "owner",
+            lambda: self.workspace.tables.update(full_name=name, owner=principal),
+        )
+
+    def lineage(self, ref: TableRef, direction: str = "both") -> Lineage:
+        """Upstream and downstream tables, plus notebooks, jobs and queries."""
+        name = _dotted(ref)
+        body = self._call(
+            "read lineage",
+            name,
+            "lineage",
+            lambda: self.workspace.api_client.do(
+                "GET",
+                f"{LINEAGE_API}/table-lineage",
+                query={"table_name": name, "include_entity_lineage": True},
+                headers={"Accept": "application/json"},
+            ),
+        )
+        return Lineage.from_api(name, body or {}, direction)
+
+    def column_lineage(self, ref: TableRef, column: str, direction: str = "both") -> ColumnLineage:
+        name = _dotted(ref)
+        body = self._call(
+            "read column lineage",
+            name,
+            "lineage",
+            lambda: self.workspace.api_client.do(
+                "GET",
+                f"{LINEAGE_API}/column-lineage",
+                query={"table_name": name, "column_name": column},
+                headers={"Accept": "application/json"},
+            ),
+        )
+        return ColumnLineage.from_api(name, column, body or {}, direction)
+
+    # ------------------------------------------------------------ constraints
+
+    def add_primary_key(
+        self, ref: TableRef, name: str, columns: Iterable[str], *, rely: bool = False
+    ) -> None:
+        """Add an informational (unenforced) primary key."""
+        from databricks.sdk.service.catalog import PrimaryKeyConstraint, TableConstraint
+
+        full = _dotted(ref)
+        constraint = TableConstraint(
+            primary_key_constraint=PrimaryKeyConstraint(
+                name=name, child_columns=list(columns), rely=rely
+            )
+        )
+        self._call(
+            "add a primary key",
+            full,
+            "constraint",
+            lambda: self.workspace.table_constraints.create(
+                full_name_arg=full, constraint=constraint
+            ),
+        )
+
+    def add_foreign_key(
+        self,
+        ref: TableRef,
+        name: str,
+        columns: Iterable[str],
+        parent_ref: TableRef,
+        parent_columns: Iterable[str],
+        *,
+        rely: bool = False,
+    ) -> None:
+        """Add an informational (unenforced) foreign key."""
+        from databricks.sdk.service.catalog import ForeignKeyConstraint, TableConstraint
+
+        full = _dotted(ref)
+        child, parent = list(columns), list(parent_columns)
+        if len(child) != len(parent):
+            raise InvalidReferenceError(
+                f"a foreign key pairs columns one to one; got {child} -> {parent}"
+            )
+        constraint = TableConstraint(
+            foreign_key_constraint=ForeignKeyConstraint(
+                name=name,
+                child_columns=child,
+                parent_table=_dotted(parent_ref),
+                parent_columns=parent,
+                rely=rely,
+            )
+        )
+        self._call(
+            "add a foreign key",
+            full,
+            "constraint",
+            lambda: self.workspace.table_constraints.create(
+                full_name_arg=full, constraint=constraint
+            ),
+        )
+
+    def drop_table_constraint(self, ref: TableRef, name: str, *, cascade: bool = False) -> None:
+        full = _dotted(ref)
+        self._call(
+            "drop a constraint",
+            full,
+            "constraint",
+            lambda: self.workspace.table_constraints.delete(
+                full_name=full, constraint_name=name, cascade=cascade
+            ),
+        )
+
+    # ============================================================= namespaces
+
+    def create_catalog(
+        self, name: str, comment: str | None = None, storage_root: str | None = None
+    ) -> None:
+        self._call(
+            "create a catalog",
+            name,
+            "catalog",
+            lambda: self.workspace.catalogs.create(
+                name=name, comment=comment, storage_root=storage_root
+            ),
+            securable_type="METASTORE",
+        )
+
+    def drop_catalog(self, name: str, force: bool = False) -> None:
+        self._call(
+            "drop a catalog",
+            name,
+            "catalog",
+            lambda: self.workspace.catalogs.delete(name=name, force=force),
+            securable_type="CATALOG",
+        )
+
+    def create_schema(
+        self,
+        catalog: str,
+        name: str,
+        comment: str | None = None,
+        storage_root: str | None = None,
+    ) -> None:
+        self._call(
+            "create a schema",
+            f"{catalog}.{name}",
+            "schema",
+            lambda: self.workspace.schemas.create(
+                name=name, catalog_name=catalog, comment=comment, storage_root=storage_root
+            ),
+            securable_type="CATALOG",
+        )
+
+    def drop_schema(self, catalog: str, name: str, force: bool = False) -> None:
+        full = f"{catalog}.{name}"
+        self._call(
+            "drop a schema",
+            full,
+            "schema",
+            lambda: self.workspace.schemas.delete(full_name=full, force=force),
+            securable_type="SCHEMA",
+        )
+        self._manifest_cache.pop((catalog, name), None)
+
+    def table_exists(self, ref: TableRef) -> bool:
+        name = _dotted(ref)
+        try:
+            response = self.workspace.tables.exists(full_name=name)
+        except Exception as exc:
+            error = self._error(exc, "check existence", name, needs=_NEEDS["read"])
+            if isinstance(error, InvalidReferenceError):
+                return False  # the parent schema or catalog is missing
+            raise error from exc
+        return bool(getattr(response, "table_exists", False))
+
+    def search_tables(
+        self,
+        catalog: str,
+        schema_pattern: str | None = None,
+        table_pattern: str | None = None,
+    ) -> list[TableSummary]:
+        """Tables in a catalog matching SQL LIKE patterns (``%`` and ``_``).
+
+        One paginated call for the whole catalog, carrying the capability
+        manifest, rather than a get per table.
+        """
+        return self._call(
+            "search tables",
+            catalog,
+            "read",
+            lambda: [
+                TableSummary.from_api(t)
+                for t in self.workspace.tables.list_summaries(
+                    catalog_name=catalog,
+                    schema_name_pattern=schema_pattern,
+                    table_name_pattern=table_pattern,
+                    include_manifest_capabilities=True,
+                )
+            ],
+            securable_type="CATALOG",
+        )
+
+    def list_functions(self, catalog: str, schema: str) -> list[FunctionSummary]:
+        return self._call(
+            "list functions",
+            f"{catalog}.{schema}",
+            "read",
+            lambda: [
+                FunctionSummary.from_api(f)
+                for f in self.workspace.functions.list(catalog_name=catalog, schema_name=schema)
+            ],
+            securable_type="SCHEMA",
+        )
+
+    def list_volumes(self, catalog: str, schema: str) -> list[VolumeSummary]:
+        return self._call(
+            "list volumes",
+            f"{catalog}.{schema}",
+            "volume",
+            lambda: [
+                VolumeSummary.from_api(v)
+                for v in self.workspace.volumes.list(catalog_name=catalog, schema_name=schema)
+            ],
+            securable_type="SCHEMA",
+        )
+
+    def create_volume(
+        self,
+        catalog: str,
+        schema: str,
+        name: str,
+        volume_type: str = "MANAGED",
+        storage_location: str | None = None,
+        comment: str | None = None,
+    ) -> VolumeSummary:
+        from databricks.sdk.service.catalog import VolumeType
+
+        kind = VolumeType(volume_type.upper())
+        if kind is VolumeType.EXTERNAL and not storage_location:
+            raise InvalidReferenceError("an EXTERNAL volume needs a storage_location")
+        info = self._call(
+            "create a volume",
+            f"{catalog}.{schema}.{name}",
+            "volume",
+            lambda: self.workspace.volumes.create(
+                catalog_name=catalog,
+                schema_name=schema,
+                name=name,
+                volume_type=kind,
+                comment=comment,
+                storage_location=storage_location,
+            ),
+            securable_type="SCHEMA",
+        )
+        return VolumeSummary.from_api(info)
+
+    def drop_volume(self, catalog: str, schema: str, name: str) -> None:
+        full = f"{catalog}.{schema}.{name}"
+        self._call(
+            "drop a volume",
+            full,
+            "volume",
+            lambda: self.workspace.volumes.delete(name=full),
+            securable_type="VOLUME",
+        )
+
+    def volume(self, ref: TableRef | str) -> Volume:
+        """Files in a volume, through the Files API at ``/Volumes/c/s/v``."""
+        full = ".".join(_three_part(ref, "volume"))
+
+        def classify(exc: Exception, action: str) -> Exception:
+            return self._error(exc, action, full, securable_type="VOLUME", needs=_NEEDS["volume"])
+
+        return Volume(full, self.workspace.files, on_error=classify)
+
+    # ============================================================== lifecycle
+
+    def register_table(
+        self,
+        ref: TableRef,
+        location: str,
+        *,
+        columns_schema_json: str | Mapping[str, Any] | None = None,
+        partition_columns: Iterable[str] | None = None,
+        properties: Mapping[str, str] | None = None,
+        comment: str | None = None,
+    ) -> ResolvedTable:
+        """Register an existing Delta log at `location` as an EXTERNAL table.
+
+        Write the log first (see `path_credentials`); the catalog records what
+        it is told and does not read the log to check. Returns the table
+        resolved afresh, so its id and credential provider are the catalog's.
+        """
+        from databricks.sdk.service.catalog import ColumnInfo, DataSourceFormat
+        from databricks.sdk.service.catalog import TableType as SdkTableType
+
+        name = _dotted(ref)
+        assert ref.catalog and ref.schema and ref.table
+        partitions = list(partition_columns or ())
+        if partitions and columns_schema_json is None:
+            raise InvalidReferenceError(
+                "partition columns are recorded on the column list, so registering a "
+                "partitioned table needs columns_schema_json"
+            )
+        columns = (
+            delta_schema_to_columns(columns_schema_json, partitions)
+            if columns_schema_json is not None
+            else None
+        )
+
+        def create() -> Any:
+            if comment is None:
+                return self.workspace.tables.create(
+                    name=ref.table,
+                    catalog_name=ref.catalog,
+                    schema_name=ref.schema,
+                    table_type=SdkTableType.EXTERNAL,
+                    data_source_format=DataSourceFormat.DELTA,
+                    storage_location=location,
+                    columns=[ColumnInfo.from_dict(c) for c in columns] if columns else None,
+                    properties=dict(properties) if properties else None,
+                )
+            # The SDK's create has no comment parameter, though the REST body
+            # shares the TableInfo shape that carries one.
+            body: dict[str, Any] = {
+                "name": ref.table,
+                "catalog_name": ref.catalog,
+                "schema_name": ref.schema,
+                "table_type": "EXTERNAL",
+                "data_source_format": "DELTA",
+                "storage_location": location,
+                "comment": comment,
+            }
+            if columns:
+                body["columns"] = columns
+            if properties:
+                body["properties"] = dict(properties)
+            return self.workspace.api_client.do(
+                "POST", "/api/2.1/unity-catalog/tables", body=body, headers=_JSON_HEADERS
+            )
+
+        self._call("register an external table", name, "register", create)
+        self._manifest_cache.pop((ref.catalog, ref.schema), None)
+        return self.resolve(ref)
+
+    def path_credentials(self, url: str, operation: str = "PATH_READ") -> Credentials:
+        """Short-lived storage credentials for a path under an external location.
+
+        ``PATH_CREATE_TABLE`` is the one to write a new external table's log
+        before `register_table`: it is the only operation that works where no
+        table is registered yet.
+        """
+        from databricks.sdk.service.catalog import PathOperation
+
+        op = path_operation(operation)
+        response = self._call(
+            f"vend {op} credentials",
+            url,
+            "path",
+            lambda: self.workspace.temporary_path_credentials.generate_temporary_path_credentials(
+                url=url, operation=PathOperation(op)
+            ),
+            securable_type="EXTERNAL_LOCATION",
+        )
+        # Same response shape as table vending; reuse its parsing, including
+        # the explicit Azure endpoint.
+        parser = DatabricksCredentialProvider(table_id="", table_url=url)
+        creds = parser._to_credentials(
+            response, Operation.READ if op == "PATH_READ" else Operation.READ_WRITE
+        )
+        return dataclasses.replace(creds, table_id=None, scope_prefix=creds.url or url)
+
+    def _delta_api_tables_path(self, ref: TableRef, leaf: str) -> str:
+        assert ref.catalog and ref.schema
+        return (
+            f"{UC_DELTA_API_BASE}/catalogs/{_segment(ref.catalog)}"
+            f"/schemas/{_segment(ref.schema)}/{leaf}"
+        )
+
+    def create_staging_table(self, ref: TableRef) -> StagingTable:
+        """Reserve a managed table: its id, location and write credentials.
+
+        Nothing is visible in the catalog until `finalize_managed_table`.
+        """
+        name = _dotted(ref)
+        body = self._call(
+            "create a staging table",
+            name,
+            "staging",
+            lambda: self.workspace.api_client.do(
+                "POST",
+                self._delta_api_tables_path(ref, "staging-tables"),
+                body={"name": ref.table},
+                headers=_JSON_HEADERS,
+            ),
+            securable_type="SCHEMA",
+        )
+        return StagingTable.from_api(name, body or {})
+
+    def finalize_managed_table(
+        self, ref: TableRef, request_body: Mapping[str, Any]
+    ) -> ResolvedTable:
+        """Register a staged table after its version 0 is written.
+
+        `request_body` is the UC Delta API CreateTableRequest (kebab-case).
+        """
+        name = _dotted(ref)
+        body = create_table_body(ref, request_body)
+        self._call(
+            "finalize a managed table",
+            name,
+            "staging",
+            lambda: self.workspace.api_client.do(
+                "POST",
+                self._delta_api_tables_path(ref, "tables"),
+                body=body,
+                headers=_JSON_HEADERS,
+            ),
+            securable_type="SCHEMA",
+        )
+        assert ref.catalog and ref.schema
+        self._manifest_cache.pop((ref.catalog, ref.schema), None)
+        return self.resolve(ref)

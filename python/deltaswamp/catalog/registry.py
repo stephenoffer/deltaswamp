@@ -28,6 +28,7 @@ from ..errors import InvalidReferenceError
 from .base import Catalog
 
 __all__ = [
+    "BUILTIN_CATALOGS",
     "ENTRY_POINT_GROUP",
     "available_catalogs",
     "catalog_for_uri",
@@ -36,6 +37,26 @@ __all__ = [
 ]
 
 ENTRY_POINT_GROUP = "deltaswamp.catalogs"
+
+#: The first-party catalogs, as dotted paths.
+#:
+#: These ship inside this package, so they are resolved without consulting
+#: installed distribution metadata. Entry points are the *extension* mechanism,
+#: not the way deltaswamp finds its own modules: a source checkout, a vendored
+#: copy, a zipapp and several freezers (PyInstaller, py2app) all lose entry-point
+#: metadata, and losing it used to leave every built-in catalog unregistered and
+#: the library unusable. Entry points are layered on top of this map, so a third
+#: party can still register a new name -- or deliberately shadow a built-in one.
+#:
+#: `tests/unit/test_registry.py` asserts this agrees with pyproject.toml.
+BUILTIN_CATALOGS: dict[str, str] = {
+    "databricks": "deltaswamp.catalog.databricks:DatabricksUnityCatalog",
+    "unity": "deltaswamp.catalog.ossuc:OSSUnityCatalog",
+    "hive": "deltaswamp.catalog.hms:HiveMetastoreCatalog",
+    "glue": "deltaswamp.catalog.glue:GlueCatalog",
+    "filesystem": "deltaswamp.catalog.filesystem:FilesystemCatalog",
+    "sharing": "deltaswamp.catalog.sharing:SharingCatalog",
+}
 
 #: Connection-URI scheme -> registered catalog name. `None` means "no URI given",
 #: which we take to mean Databricks, since that needs no endpoint.
@@ -48,12 +69,22 @@ scheme_to_catalog: dict[str | None, str] = {
     "hive": "hive",
     "glue": "glue",
     "file": "filesystem",
+    # Delta Sharing: `sharing:///path/config.share`, or an endpoint plus token=.
+    "sharing": "sharing",
+    "sharing+https": "sharing",
+    "sharing+http": "sharing",
 }
 
 
 def available_catalogs() -> dict[str, str]:
-    """Registered catalog names mapped to the object they load."""
-    return {ep.name: ep.value for ep in entry_points(group=ENTRY_POINT_GROUP)}
+    """Registered catalog names mapped to the object they load.
+
+    Built-ins first, then entry points, so an installed plugin can shadow a
+    built-in name and an absent entry-point index costs nothing.
+    """
+    found = dict(BUILTIN_CATALOGS)
+    found.update({ep.name: ep.value for ep in entry_points(group=ENTRY_POINT_GROUP)})
+    return found
 
 
 def load_catalog_class(name: str) -> type:
@@ -72,13 +103,20 @@ def load_catalog_class(name: str) -> type:
                 )
             return loaded
 
+    # Only after the entry points, so a plugin registering an existing name
+    # still wins; before the dotted path, so a name never falls through to an
+    # accidental import.
+    builtin = BUILTIN_CATALOGS.get(name)
+    if builtin is not None:
+        return _import_dotted(builtin)
+
     if ":" in name or "." in name:
         return _import_dotted(name)
 
     known = sorted(available_catalogs())
     raise InvalidReferenceError(
         f"no catalog named {name!r} is registered. Known catalogs: "
-        f"{', '.join(known) if known else '(none -- is deltaswamp installed?)'}. "
+        f"{', '.join(known)}. "
         "A dotted module:Class path is also accepted."
     )
 

@@ -29,15 +29,20 @@ dependencies = [
 
 [project.optional-dependencies]
 ray = ["ray[data]>=2.58.0"]
-sql = ["databricks-sql-connector>=4.5.0"]   # opt-in fallback engine
+sql = ["pyarrow>=17"]   # the warehouse fallback speaks the Statement Execution API via databricks-sdk
 hms = ["pymetastore>=0.4.0"]
 glue = ["boto3>=1.35"]
 iceberg = ["pyiceberg>=0.12.0"]             # managed Iceberg via the UC IRC endpoint
-sharing = ["delta-sharing>=1.4.2"]
-ossuc = ["unitycatalog-client>=0.6.0"]
+sharing = ["delta-sharing>=1.4.1"]
 pyarrow = ["pyarrow>=17"]
 pandas = ["pandas>=2"]
 polars = ["polars>=1.39"]
+duckdb = ["duckdb>=1.1", "pyarrow>=17"]     # to_duckdb, Connection.sql
+daft = ["daft>=0.4"]
+all = [
+    "pyarrow>=17", "pandas>=2", "polars>=1.39", "duckdb>=1.1",
+    "pyiceberg>=0.12.0", "delta-sharing>=1.4.1", "boto3>=1.35", "pymetastore>=0.4.0",
+]
 # NOTE: databricks-connect is deliberately absent. It pins requires-python
 # ==3.12.* and conflicts with pyspark; it must never enter the dependency set.
 dev = [
@@ -59,6 +64,7 @@ unity = "deltaswamp.catalog.ossuc:OSSUnityCatalog"
 hive = "deltaswamp.catalog.hms:HiveMetastoreCatalog"
 glue = "deltaswamp.catalog.glue:GlueCatalog"
 filesystem = "deltaswamp.catalog.filesystem:FilesystemCatalog"
+sharing = "deltaswamp.catalog.sharing:SharingCatalog"
 
 [tool.maturin]
 python-source = "python"
@@ -80,7 +86,7 @@ warn_unreachable = true
 files = ["python/deltaswamp", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["deltalake.*", "databricks.*", "pyarrow.*", "ray.*", "pymetastore.*", "polars.*", "boto3.*", "pyiceberg.*"]
+module = ["deltalake.*", "databricks.*", "pyarrow.*", "ray.*", "pymetastore.*", "polars.*", "boto3.*", "pyiceberg.*", "delta_sharing.*", "duckdb.*", "daft.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

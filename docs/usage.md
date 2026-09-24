@@ -7,10 +7,15 @@ Everything the public API does, with the limits stated where they exist.
 - [Opening a table](#opening-a-table)
 - [Reading](#reading)
 - [Writing](#writing)
+- [Creating and registering tables](#creating-and-registering-tables)
 - [Changing rows](#changing-rows)
+- [Schema, properties and features](#schema-properties-and-features)
 - [Maintenance](#maintenance)
-- [Schema and table features](#schema-and-table-features)
 - [Metadata](#metadata)
+- [Governance](#governance)
+- [Delta Sharing](#delta-sharing)
+- [Iceberg](#iceberg)
+- [Handing off to other engines](#handing-off-to-other-engines)
 - [Asking what is possible](#asking-what-is-possible)
 - [Errors](#errors)
 - [Credentials](#credentials)
@@ -29,20 +34,21 @@ optional even though Arrow is the native currency.
 
 | Extra | Adds | You need it for |
 |---|---|---|
-| `pyarrow` | pyarrow | `to_arrow`, `to_pandas`, `to_pyarrow_dataset` |
+| `pyarrow` | pyarrow | `to_arrow`, predicates on the kernel path, the SQL fallback |
 | `pandas` | pandas | `to_pandas` |
-| `polars` | Polars | `to_polars` |
-| `sql` | `databricks-sql-connector` | the SQL warehouse fallback |
+| `polars` | Polars | `to_polars`, `Connection.sql(engine="polars")` |
+| `duckdb` | DuckDB | `to_duckdb`, `Connection.sql` |
+| `daft` | Daft | `to_daft` |
+| `ray` | Ray Data | `to_ray_dataset` |
+| `sql` | pyarrow | the SQL warehouse fallback (the warehouse itself is reached through `databricks-sdk`) |
+| `iceberg` | PyIceberg | Iceberg tables through Unity Catalog's Iceberg REST endpoint |
+| `sharing` | `delta-sharing` | Delta Sharing |
 | `hms` | `pymetastore` | Hive Metastore catalogs |
 | `glue` | boto3 | AWS Glue catalogs |
-| `ossuc` | `unitycatalog-client` | open-source Unity Catalog |
-| `iceberg` | PyIceberg | managed Iceberg tables |
-| `sharing` | `delta-sharing` | Delta Sharing |
-| `ray` | Ray Data | `to_ray_dataset` |
+| `all` | all of the above except Ray and Daft | |
 
-`pip install 'deltaswamp[pyarrow,sql]'` combines them. Note the absence of
-`databricks-connect`: it pins `requires-python == 3.12.*` and conflicts with
-pyspark, so it is deliberately not reachable from any extra here.
+`databricks-connect` is deliberately not reachable from any extra: it pins
+`requires-python == 3.12.*` and conflicts with pyspark.
 
 ## Connecting
 
@@ -71,6 +77,7 @@ conn = ds.connect("uc://http://localhost:8080")  # open-source Unity Catalog
 conn = ds.connect("hms://thrift://metastore:9083")  # Hive Metastore
 conn = ds.connect("glue://")  # AWS Glue, ambient region
 conn = ds.connect("glue://123456789012")  # a specific Glue catalog id
+conn = ds.connect("sharing:///path/to/config.share")  # a Delta Sharing profile
 ```
 
 Useful keyword arguments:
@@ -78,7 +85,8 @@ Useful keyword arguments:
 | Argument | Effect |
 |---|---|
 | `allow_sql_fallback=True` | permits routing through a SQL warehouse; off by default |
-| `warehouse_id="..."` | which warehouse the fallback uses |
+| `warehouse_id="..."` | which warehouse the fallback uses; chosen automatically when omitted |
+| `staging_volume="cat.schema.vol"` | lets the warehouse serve writes and MERGE, staging data in that volume |
 | `storage_options={...}` | extra object-store settings, merged under vended credentials |
 | `default_catalog`, `default_schema` | let you write `conn.table("orders")` |
 | `catalog=MyCatalog()` | supply a catalog object directly and skip URI dispatch |
@@ -102,14 +110,13 @@ t = conn.open_table("s3://bucket/tables/orders")  # straight to storage
 Names may be backtick-quoted, so a dot inside an identifier works:
 ``conn.table("main.`my.schema`.orders")`` is three parts, not four.
 
-These reference forms all resolve:
-
 | Form | Goes to |
 |---|---|
 | `catalog.schema.table` | the connection's catalog |
 | `uc://catalog.schema.table` | Unity Catalog |
 | `hms://host:9083/db/table` | Hive Metastore |
 | `glue://db.table`, `glue://<id>/db.table` | Glue |
+| `share.schema.table` on a sharing connection | Delta Sharing |
 | `s3://`, `gs://`, `abfss://`, `file://`, `/local/path` | storage directly |
 
 `dbfs:/` and `/mnt/...` paths parse and are then refused with an explanation.
@@ -125,41 +132,52 @@ without this library depending on any of them.
 ```python
 stream = t.scan()
 stream = t.scan(columns=["id", "amount"])
-stream = t.scan(predicate="amount > 100")  # delta-rs engine only
+stream = t.scan(predicate="amount > 100 AND region IN ('eu', 'us')")
 stream = t.scan(version=3)
-stream = t.scan(timestamp="2026-01-01T00:00:00Z")  # delta-rs engine only
+stream = t.scan(timestamp="2026-01-01T00:00:00Z")
 ```
+
+Predicates and timestamp travel work on every engine, including the kernel, so
+they work on catalog-managed tables too. On the kernel path a predicate is used
+twice. It is handed to the kernel to skip files by their statistics, and then
+applied exactly to the rows. Both uses come from one parse, so they cannot
+disagree. The predicate language is the boolean subset of Spark SQL:
+comparisons, `AND`/`OR`/`NOT`, `IN`, `BETWEEN`, `LIKE`, `IS [NOT] NULL`, `<=>`,
+nested columns (`addr.zip`) and typed literals (`DATE '2026-01-01'`).
+Arithmetic and function calls are refused with a message; delta-rs and the
+warehouse accept full SQL.
+
+Timestamps honour in-commit timestamps where a table has them, and a timestamp
+earlier than the oldest reconstructable version is refused rather than
+silently clamped.
 
 Convenience wrappers sit on top:
 
 ```python
 t.to_arrow()  # pyarrow.Table
 t.to_pandas()
-t.to_polars()
+t.to_polars()  # or to_polars(lazy=True)
 t.to_pyarrow_dataset()
 t.head(10)
-t.count()
+t.count()  # exact; count(predicate="...") too
+t.files()  # live data files with sizes, partition values and statistics
 ```
 
-Predicates and timestamp travel currently route through delta-rs. Ask for either
-on a table only the kernel can open and you get a refusal naming the reason
-instead of a silent full scan. Version-based travel works on both engines.
-
-Change feeds come from `cdf()`:
+Change feeds come from `cdf()`, by version or by timestamp:
 
 ```python
 for batch in t.cdf(starting_version=5, ending_version=9):
     ...
+t.cdf(starting_timestamp="2026-09-01T00:00:00Z", predicate="region = 'eu'")
 ```
 
-Two guards fire before any CDF read. A table without
-`delta.enableChangeDataFeed` gets a refusal, because enabling it is not
-retroactive and the range you asked for was never recorded. Column mapping earns
-one too, since CDF does not support it. A third guard catches the case where
-`delta.deletedFileRetentionDuration` is shorter than
-`delta.logRetentionDuration`, which lets data files be vacuumed while their
-commits survive; the read would otherwise die on a missing file deep in the
-reader.
+delta-rs serves CDF on tables it can open and the kernel serves the others.
+A catalog-managed table's feed needs the warehouse, since the kernel's change
+feed cannot take the catalog's commit tail. Guards fire before any read.
+A table without `delta.enableChangeDataFeed` is refused, because enabling it is
+not retroactive. A table whose `delta.deletedFileRetentionDuration` is shorter
+than its `delta.logRetentionDuration` is refused too, because files could be
+vacuumed while their commits survive.
 
 ## Writing
 
@@ -167,41 +185,57 @@ reader.
 t.append(df)  # anything Arrow-shaped
 t.overwrite(df)
 t.overwrite(df, predicate="region = 'eu'")  # replaceWhere
+t.overwrite(df, partition_overwrite="dynamic")  # replace the partitions in df
+t.append(df, schema_mode="merge")  # widen the schema to fit
+t.replace(df)  # new contents and schema (RTAS)
+t.append(df, txn=("nightly-load", batch_id))  # idempotent
 ```
 
 `df` can be a pyarrow Table or RecordBatchReader, a Polars DataFrame, a pandas
 DataFrame, or anything else exporting the Arrow PyCapsule interface.
 
-Extra keyword arguments pass through to the engine, so delta-rs options such as
-`partition_by=` and `schema_mode="merge"` work on `append`.
+Catalog-managed tables append through the kernel, which commits via the
+catalog. Partitioned tables are handled: rows are split by partition value and
+written to their own partitions. `conn.write_table(name, df, mode=...)` adds
+Spark's save modes (`error`, `ignore`, `append`, `overwrite`), creating the
+table when it is absent.
 
-Creating a table:
+## Creating and registering tables
 
 ```python
 import pyarrow as pa
 
 schema = pa.schema([("id", pa.int64()), ("city", pa.string())])
-t = conn.create_table("s3://bucket/tables/new", schema)
-t = conn.create_table("main.sales.new", schema, location="s3://bucket/tables/new")
+
+t = conn.create_table("s3://bucket/tables/new", schema)  # a path
+t = conn.create_table("main.sales.new", schema)  # managed, catalog-managed
+t = conn.create_table("main.sales.ext", schema, location="s3://bucket/ext")  # external
+t = conn.create_table("main.sales.c", schema, cluster_by=["city"], comment="...")
+t = conn.register_table("main.sales.old", "s3://bucket/existing-delta-table")
 ```
 
-A catalog name without `location=` will not go through. Creating a *managed* table means
-asking the catalog to allocate storage through its staging-table API and then
-finalising through its create-table API, and that flow is not built yet. The
-error says so instead of writing something into a location nobody asked for.
+A managed table goes through the catalog's staging-table flow. The catalog
+allocates the id and the storage, deltaswamp writes version 0 there with the
+id and protocol the catalog requires, and the catalog then finalises the
+registration. An external table is written with path credentials the catalog
+vends for creating tables, then registered, so the catalog and the log agree.
+`register_table` takes the schema, partitioning and properties from the log.
+
+Both catalog shapes need Unity Catalog (Databricks or open source). On any
+other catalog they are refused, because writing a log alone would leave it
+orphaned while the call appeared to succeed.
+
+`properties=` accepts nearly the whole Delta property surface, including
+`delta.feature.*` signals, row tracking and in-commit timestamps. When delta-rs
+would reject a property, the create falls through to the kernel.
 
 ## Changing rows
 
 ```python
 t.delete("id = 42")
 t.delete()  # every row
-t.update({"status": "'archived'"}, predicate="age > 365")
-t.merge(source, predicate="target.id = source.id")
-```
-
-`merge` returns delta-rs's `TableMerger`, so the clause API is theirs:
-
-```python
+t.update({"status": "'archived'"}, predicate="age > 365")  # SQL expressions
+t.update(new_values={"status": "archived"}, predicate="age > 365")  # plain values
 (
     t.merge(source, "t.id = s.id", source_alias="s", target_alias="t")
     .when_matched_update_all()
@@ -210,68 +244,104 @@ t.merge(source, predicate="target.id = source.id")
 )
 ```
 
-All three are copy-on-write on delta-rs, which rewrites whole Parquet files
-rather than emitting deletion vectors. On a large table that is real write
-amplification, and worth knowing before you run a narrow `DELETE` against
-billions of rows.
+`merge` returns a builder with delta-rs's clause API, whichever engine serves
+it. When the warehouse serves it, the builder generates one `MERGE INTO`
+statement, with the source staged in a volume.
+
+On delta-rs all three are copy-on-write: whole Parquet files are rewritten
+rather than deletion vectors emitted. On a table only the kernel can write,
+which includes catalog-managed tables, `delete`, `update` and predicate
+overwrites are served by rewriting the whole table in one commit against the
+snapshot that was read. A concurrent writer makes the commit conflict rather
+than be lost. This is bounded by `KernelEngine.rewrite_max_bytes` (1 GiB by
+default); larger tables go to the warehouse. It is refused on row-tracked
+tables, whose row ids the kernel cannot preserve. On this path `update` takes
+plain values, or SQL that is a literal or a column name.
+
+## Schema, properties and features
+
+```python
+t.add_column(pa.schema([("region", pa.string())]))  # or {"region": "string"}
+t.set_properties({"delta.enableChangeDataFeed": "true"})
+t.unset_properties(["owner.team"])
+t.add_feature("deletionVectors")
+t.add_constraint({"id_positive": "id > 0"})
+t.drop_constraint("id_positive")
+t.set_comment("orders, one row per line item")
+t.set_column_comment("city", "shipping city")
+t.set_not_null("id")  # checks existing rows first
+t.drop_not_null("id")
+t.alter_column_type("qty", "bigint")  # widening; needs delta.enableTypeWidening
+t.cluster_by(["city"])  # liquid clustering keys; None clears them
+t.rename_column("city", "town")  # needs column mapping
+t.drop_column("region")  # needs column mapping
+```
+
+delta-rs serves what it can. Everything else on a path table is a
+metadata-only commit that deltaswamp writes itself. That covers renames and
+drops under column mapping, type widening, SET NOT NULL, clustering keys, the
+properties delta-rs rejects on ALTER, and any change to a table delta-rs cannot
+write, such as a liquid-clustered one. The change is computed from the table's
+current protocol and metadata, and it raises the protocol when a value implies
+a feature. It is committed as a put-if-absent of the next log file, so a
+concurrent writer causes a recompute rather than an overwrite.
+
+Enable column mapping first to rename or drop:
+`t.set_properties({"delta.columnMapping.mode": "name"})`. The existing Parquet
+column names become the physical names, so no data is rewritten.
+
+These are refused with the reason, because they need more than a metadata
+commit:
+
+- enabling row tracking on an existing table (needs a backfill)
+- UniForm / Iceberg compatibility (needs Iceberg metadata generated)
+- changing column mapping other than none -> name
+- a catalog-managed table's metadata, which the catalog refuses from external
+  writers after version 0
+
+Databricks-only operations need the SQL fallback:
+
+```python
+t.drop_feature("deletionVectors", truncate_history=True)
+t.reorg(purge=True)
+t.clone("main.sales.orders_copy", shallow=True)
+t.analyze(delta_statistics=True)
+t.sync_iceberg()  # regenerate UniForm metadata
+t.refresh()  # a materialized view or streaming table
+t.cluster_by("auto")
+```
 
 ## Maintenance
 
 ```python
 t.optimize()  # bin-packing compaction
-t.z_order(["customer_id"])
-t.vacuum(retention_hours=168, dry_run=True)
+t.optimize(zorder_by=["customer_id"])  # or t.z_order([...])
+t.optimize(full=True)  # OPTIMIZE FULL; warehouse
+t.vacuum(retention_hours=168)  # a dry run by default
+t.vacuum(retention_hours=168, dry_run=False, lite=True)
 t.restore(3)  # or a datetime
 t.repair()  # FSCK
-```
-
-All of these run through delta-rs; the kernel implements none of them. Three
-refuse instead of misbehaving. `vacuum` on a shallow clone stops early, because
-the clone borrows the source's files and vacuuming it risks deleting data the
-source still owns. `restore` on a table with deletion vectors stops too, because
-delta-rs reports success and leaves the rows deleted, so the table reads wrong
-afterward. Databricks forbids `OPTIMIZE`, `VACUUM` and `ANALYZE` on UC managed
-tables from every external client, so those route to SQL or fail.
-
-## Schema and table features
-
-```python
-from deltalake import Schema
-import pyarrow as pa
-
-field = Schema.from_arrow(pa.schema([("region", pa.string())])).fields[0]
-t.add_column([field])
-t.set_properties({"delta.deletedFileRetentionDuration": "interval 30 days"})
-t.add_feature("deletionVectors")
-t.add_constraint({"id_positive": "id > 0"})
-```
-
-These run through delta-rs. Four more exist only in Databricks, so they need the
-SQL fallback and refuse without it: `drop_column`, `rename_column`,
-`drop_feature` and `reorg`.
-
-```python
-t.drop_column("region")
-t.rename_column("city", "town")
-t.drop_feature("deletionVectors", truncate_history=True)
-t.reorg(purge=True)
-t.clone("main.sales.orders_copy", shallow=True)
-```
-
-Log upkeep:
-
-```python
-t.checkpoint()  # write a checkpoint
-t.compact_logs()  # aggregate commits; a no-op on a single-commit table
+t.checkpoint()
+t.compact_logs()
+t.cleanup_metadata()  # delete logs past delta.logRetentionDuration
 t.generate()  # symlink manifests, for Presto and Athena
 t.publish()  # staged catalog commits -> _delta_log
+conn.convert_to_delta("s3://bucket/parquet-dir")
 ```
 
-Converting an existing Parquet directory in place:
+`vacuum` defaults to a dry run because the real thing deletes files. `lite=True`
+considers only files the log records as removed. Three operations refuse rather
+than misbehave:
 
-```python
-t = conn.convert_to_delta("s3://bucket/parquet-dir")
-```
+- `vacuum` on a shallow clone, which borrows the source's files.
+- `restore` through delta-rs on a table with deletion vectors, where delta-rs
+  reports success and leaves the rows deleted.
+- OPTIMIZE and VACUUM on UC managed tables. Databricks forbids them from
+  external clients, so they route to the warehouse.
+
+Checkpoints work on catalog-managed tables. The kernel publishes staged commits
+first, since it checkpoints only published versions. Commits made here also
+checkpoint on their own at the table's `delta.checkpointInterval`.
 
 ## Metadata
 
@@ -285,18 +355,94 @@ t.history(limit=10)
 t.version
 t.location
 t.table_type  # MANAGED, EXTERNAL, VIEW, ...
-t.securable_kind  # the finer-grained UC discriminator
 t.is_catalog_managed
 ```
 
-Metadata reflects the table as of the last call. Any write or ALTER through this
-object refreshes it, so `properties()` after `set_properties()` shows the new
-value rather than the old one.
+Metadata reflects the table as of the last call, and any write or ALTER through
+this object refreshes it. `features()` returns names exactly as the log holds
+them, including ones this release does not recognise, because an unknown
+writer-only feature must not block a read.
 
-`features()` returns names exactly as the log holds them, including ones this
-release does not recognize. That is deliberate: an unknown writer-only feature
-must not block a read, or the first table adopting something new becomes
-unreadable.
+## Governance
+
+On Unity Catalog:
+
+```python
+info = t.info()  # owner, comment, columns, row filter, masks, predictive optimization
+t.grants(); t.effective_grants()
+t.grant("analysts", ["SELECT"]); t.revoke("analysts", "SELECT")
+t.tags(); t.set_tags({"pii": "true"}, column="email"); t.unset_tags(["pii"])
+t.set_owner("data-platform")
+t.lineage(); t.column_lineage("amount")
+t.add_primary_key("pk", ["id"]); t.add_foreign_key("fk", ["cust"], "main.sales.customers", ["id"])
+t.drop_key_constraint("fk")
+t.set_row_filter("main.sec.only_eu", ["region"])  # warehouse
+t.set_column_mask("email", "main.sec.mask_email")  # warehouse
+
+conn.create_catalog("sandbox"); conn.create_schema("sandbox.scratch")
+conn.grant("sandbox.scratch", "analysts", ["USE_SCHEMA"])
+conn.search_tables("main", table_pattern="ord%")
+conn.list_volumes("main.raw"); conn.list_functions("main.udfs")
+vol = conn.volume("main.raw.landing")
+vol.write("drop/2026-09-24.csv", data); vol.read("drop/2026-09-24.csv"); vol.list("drop")
+conn.undrop_table("main.sales.orders")  # warehouse
+```
+
+Open-source Unity Catalog lacks tags, lineage, key constraints, ownership
+changes and the Files API. Those calls come back as refusals that name the
+gap. Other catalogs have no governance API, and say so.
+
+## Delta Sharing
+
+```python
+conn = ds.connect("sharing:///path/to/config.share")
+conn.list_catalogs()  # shares
+t = conn.table("share.schema.table")
+t.to_arrow(predicate="year = 2026")
+t.scan(version=12)
+t.cdf(starting_version=10)  # when the provider shares history
+```
+
+Shared files are read with pyarrow, keeping Delta's types. Tables with
+deletion vectors or column mapping use the client's delta-format path.
+Predicates are sent as hints and then applied exactly. Shares are read-only,
+and writes are refused with that reason.
+
+## Iceberg
+
+Iceberg tables in Unity Catalog (managed or foreign) are served through the
+catalog's Iceberg REST endpoint with PyIceberg: reads, time travel by snapshot
+id or timestamp, history, appends, and overwrites by predicate. UniForm Delta
+tables can also be read as Iceberg, but the Delta path remains the default for
+them. External writes to UniForm tables are refused, because they would leave
+the Iceberg metadata stale; `t.sync_iceberg()` regenerates it on Databricks.
+
+## Handing off to other engines
+
+```python
+t.to_duckdb(name="orders")  # a DuckDB relation, optionally a view
+t.to_polars(lazy=True)
+t.to_ray_dataset()  # parallel: a Ray Data datasource over a scan plan
+t.to_daft()
+
+plan = t.plan_scan(columns=["id"], predicate="day >= '2026-09-01'")
+for group in plan.partitions(8):  # byte-balanced; pickle and ship each
+    part = plan.read(group)  # on a worker: same version, own credentials
+
+for version, batch in t.changes(start, poll_interval=30):  # a CDF stream
+    ...
+
+conn.sql(
+    "SELECT o.region, sum(o.amount) FROM o JOIN c ON o.cust = c.id GROUP BY 1",
+    tables={"o": "main.sales.orders", "c": "glue://crm.customers"},
+)
+conn.sql("SELECT * FROM system.access.audit LIMIT 10", engine="warehouse")
+```
+
+Each hand-off reads through this library, so it works on tables the target
+engine's own Delta reader cannot open. `Connection.sql` runs on DuckDB by
+default (or `engine="polars"`), and can join tables from different catalogs.
+`engine="warehouse"` sends the query to Databricks as it stands.
 
 ## Asking what is possible
 
@@ -312,14 +458,11 @@ Capability(ok=False, engine=None,
 >>> t.can("scan")
 Capability(ok=True, engine=Engine.KERNEL, ...)
 
->>> if t.can("merge"):
-...     t.merge(source, "t.id = s.id")
+>>> t.can("create", properties={"delta.enableRowTracking": "true"})
 ```
 
-`Capability` is truthy when `ok`, so it reads naturally in a condition. Every
-refusal carries a reason, and a remedy whenever one exists. Checking first is
-cheaper than catching, since the verdict comes from catalog metadata and the
-protocol, not from attempting the work.
+`Capability` is truthy when `ok`. Every refusal carries a reason, and a remedy
+whenever one exists.
 
 ## Errors
 
@@ -330,28 +473,17 @@ All inherit from `DeltaSwampError`.
 | `InvalidReferenceError` | the reference could not be parsed or resolved |
 | `UnreachableTableError` | no available engine can serve the request |
 | `FallbackRequiredError` | only the SQL fallback could serve it, and it is off |
+| `PropertyNotSupportedError` | a property the chosen engine cannot handle |
 | `CredentialError` | vending or refresh failed |
 | `PreflightError` | a workspace prerequisite is not satisfied |
 | `CommitConflictError` | another writer took that version first |
 | `BackfillRequiredError` | the catalog wants staged commits published |
 | `CorruptTableError` | on-disk state failed a correctness check |
+| `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
 
-The last two are separate on purpose. A conflict means re-read the snapshot,
-recompute, then stage again at the next version. A backfill demand is
-backpressure, not a rate limit: retrying it with exponential backoff and no
-publish will wedge the table.
-
-```python
-from deltaswamp import BackfillRequiredError, CommitConflictError
-
-try:
-    t.append(df)
-except CommitConflictError:
-    t = conn.table(name)  # fresh snapshot, then redo the work
-    t.append(df)
-except BackfillRequiredError:
-    ...  # publish staged commits, do not just retry
-```
+A conflict means re-read the snapshot, recompute, then stage again at the next
+version. A backfill demand is backpressure, not a rate limit: retrying it with
+exponential backoff and no publish will wedge the table.
 
 ## Credentials
 
@@ -364,81 +496,62 @@ vended storage credential carries its own `expiration_time` and has to be
 re-vended. Databricks publishes no TTL for it, so that field is the only
 authority and nothing here assumes an hour.
 
-Re-vending happens between operations, not during one. Each call resolves a
-fresh snapshot and mints credentials if the cached ones are near expiry, so a
-long-lived `Table` keeps working. A *single* scan that streams for longer than
-the credential's lifetime can still fail, because the kernel builds its object
-store once when the snapshot opens. Split very long reads, or retry them.
+Re-vending happens between operations, not during one. A *single* scan that
+streams for longer than the credential's lifetime can still fail, because the
+kernel builds its object store once when the snapshot opens.
 
 ```python
 creds = t.credentials()  # or credentials(write=True)
 creds.expires_at  # epoch seconds, or None
-creds.expires_within(300)  # True if it dies within five minutes
-creds.cloud  # Cloud.AWS, AZURE, GCP, R2
+creds.expires_within(300)
 creds.redacted()  # safe to log
 ```
 
-`repr` never renders secret material, so a credential in a traceback leaks
-nothing.
-
-Credential *providers* are picklable; credentials are not, by design. A provider
-holds configuration and mints on demand, so shipping one to a distributed worker
-sends no secret and the worker re-vends when its own copy expires. Sending a
-credential instead would put a token in task payloads and logs and freeze it at
-submission time.
-
-Two cloud-specific notes. Azure user-delegation SAS is scoped to a *path*, so
-credentials are keyed by table identity, not by bucket. Sharing one
-across sibling tables in a container produces `403 AuthenticationFailed`. Azure
-also always gets an explicit endpoint, because account-name inference happens to
-work on `*.blob.core.windows.net` and silently breaks Azurite, private-link DNS
-and the sovereign clouds.
+Credential *providers* are picklable; credentials are not. A distributed
+worker receives configuration and re-vends when its own copy expires. Azure
+user-delegation SAS is scoped to a path, so credentials are keyed by table, and
+Azure always gets an explicit endpoint.
 
 ## SQL fallback
 
-Some operations have no open-source implementation at all: `DROP FEATURE`,
-`REORG`, `CLONE`, column rename and drop. Views, materialized views and
-row-filtered tables are likewise unreachable by direct storage access. A
-Databricks SQL warehouse can serve all of it, because the work happens
-server-side.
-
-It is off by default:
+Views, materialized views, row-filtered tables, and the Databricks-only
+operations (`DROP FEATURE`, `REORG`, `CLONE`, `ANALYZE`, `CLUSTER BY AUTO`,
+`OPTIMIZE FULL`, `UNDROP`, row filters and masks) are served by a Databricks SQL
+warehouse, since the work happens server-side. It is off by default:
 
 ```python
-conn = ds.connect(allow_sql_fallback=True, warehouse_id="abc123")
+conn = ds.connect(
+    allow_sql_fallback=True,
+    warehouse_id="abc123",  # optional: a running warehouse is chosen otherwise
+    staging_volume="main.default.staging",  # optional: enables writes and MERGE
+)
 ```
 
-Rerouting a scan through a warehouse changes latency, egress and DBU cost by
-orders of magnitude. A silent reroute would turn that cliff into a mystery, so
-you opt in, and a `SqlFallbackWarning` fires whenever the fallback actually runs.
+Statements run through the Statement Execution API in `databricks-sdk`, with
+results fetched as Arrow. Values are sent as statement parameters and
+identifiers are quoted. `predicate` and `updates` strings are SQL expressions
+by contract. Writes stage Parquet in the volume, load it with `read_files`, and
+delete it afterwards.
+
+Rerouting through a warehouse changes latency and cost by orders of magnitude,
+so you opt in, and a `SqlFallbackWarning` names the warehouse whenever the
+fallback runs.
 
 ## Known limits
 
-Read [conformance.md](conformance.md) for the full matrix. The gaps worth
-knowing before you start:
+See [conformance.md](conformance.md) for the full matrix and
+[ecosystem-audit.md](ecosystem-audit.md) for how each Databricks and ecosystem
+feature is reached.
 
-Catalog-managed tables can be read, appended to and fully overwritten. What they
-cannot do is partial replacement: `DELETE`, `UPDATE`, `MERGE` and a predicate
-overwrite all need deletion vectors, and `Transaction::update_deletion_vectors`
-does not exist in delta-kernel 0.28, so there is nothing to build on. Those route
-to the SQL fallback.
-
-They also cannot be checkpointed here. Binding the kernel's checkpoint writer
-deadlocks against the default engine's executor, and delta-rs cannot open the
-table, so the log grows unbounded. Run a checkpoint from Databricks periodically.
-
-Creating a *managed* table is still refused: it needs the catalog to allocate
-storage through its staging-table API, which cannot be verified without a live
-catalog.
-Distributed scan planning has its seams in place but no Ray integration yet.
-Kernel-side appends handle unpartitioned tables only, which matters solely for
-catalog-managed tables, since path-based ones route to delta-rs anyway.
-
-A `Table` captures catalog-managed commit state when it resolves, so it will not
-see later commits, including its own. Re-open it to pick them up. Credential
-re-vending happens between operations and not inside a single streaming read.
-
-On the Databricks side, external write to UC managed Delta is Public Preview,
-and external access to catalog-commit tables is Beta behind a workspace preview
-an admin must enable. `preflight()` failing on a fresh workspace is the expected
-first result, not a bug.
+- Deletion vectors cannot be authored: delta-kernel 0.28 has no
+  `update_deletion_vectors`. DML on kernel-only tables is therefore a bounded
+  whole-table rewrite. MERGE on those tables needs the warehouse.
+- The change feed of a catalog-managed table needs the warehouse.
+- Distributed planning is kernel-only; tables served by other engines are read
+  on the driver. Following changes needs a change feed (`Table.changes()`).
+- A `Table` captures catalog-managed commit state when it resolves, so it will
+  not see later commits made elsewhere. Re-open it to pick them up.
+- On the Databricks side, external writes to UC managed Delta are Public
+  Preview, and external access to catalog-commit tables is Beta behind a
+  workspace preview an admin must enable. `preflight()` failing on a fresh
+  workspace is the expected first result, not a bug.

@@ -135,49 +135,68 @@ class TestCreate:
         table.append(pa.table({"id": [1], "city": ["oslo"]}))
         assert table.count() == 1
 
-    def test_managed_create_is_refused_with_a_remedy(self, conn: Any) -> None:
-        """Creating a managed table means asking the catalog to allocate storage
-        and finalising through its API. Until that lands, say so rather than
-        creating something in the wrong place."""
+    def test_catalog_create_without_a_lifecycle_catalog_is_refused(self, conn: Any) -> None:
+        """A catalog name needs a catalog that can register it; writing only a
+        log would orphan it while appearing to succeed."""
         from deltaswamp.errors import UnreachableTableError
 
         conn.default_catalog, conn.default_schema = "main", "sales"
         schema = pa.schema([("id", pa.int64())])
-        with pytest.raises(UnreachableTableError, match="staging-table API"):
+        with pytest.raises(UnreachableTableError, match="orphaned"):
             conn.create_table("main.sales.newthing", schema)
 
 
 class TestRequestShapeRouting:
-    """A predicate or timestamp narrows which engines can serve a scan.
+    """Predicates and timestamps now reach the kernel.
 
-    The kernel takes kernel `Predicate` objects rather than SQL strings, so a
-    predicate scan has to reach delta-rs. Routing on the operation alone would
-    hand it to the kernel, which then raises mid-call.
+    The kernel skips files with a structured predicate and never drops a row,
+    so the exact filter is applied afterwards. These check the kernel's answer
+    against delta-rs, which evaluates the same SQL with DataFusion.
     """
 
     def test_plain_scan_uses_kernel(self, conn: Any, path: str) -> None:
         assert conn.open_table(path).can(Operation.SCAN).engine is Engine.KERNEL
 
-    def test_predicate_scan_reaches_deltars(self, conn: Any, path: str) -> None:
-        got = conn.open_table(path).scan(predicate="id > 1")
-        assert pa.table(got).num_rows == 2
-
-    def test_timestamp_travel_reaches_deltars(self, conn: Any, path: str) -> None:
-        from deltaswamp.engine.deltars import DeltaRsEngine
-        from deltaswamp.engine.kernel import KernelEngine
-
-        assert DeltaRsEngine.supports_timestamp_travel is True
-        assert KernelEngine.supports_timestamp_travel is False
-
-    def test_router_reports_the_missing_shape(self, conn: Any, path: str) -> None:
-        from deltaswamp.capability import Operation as Op
-
+    def test_predicate_scan_uses_kernel(self, conn: Any, path: str) -> None:
         table = conn.open_table(path)
         capability = conn.router.capability(
-            Op.SCAN, table.resolved, needs=frozenset({"predicates"})
+            Operation.SCAN, table.resolved, needs=frozenset({"predicates"})
         )
-        assert capability.ok
-        assert capability.engine is Engine.DELTARS
+        assert capability.engine is Engine.KERNEL
+
+    @pytest.mark.parametrize(
+        "predicate",
+        ["id > 1", "city = 'lima' OR id = 1", "NOT (id = 2)", "city LIKE '%o'", "id IN (1, 3)"],
+    )
+    def test_kernel_and_deltars_agree(self, conn: Any, path: str, predicate: str) -> None:
+        from deltalake import DeltaTable
+
+        ours = pa.table(conn.open_table(path).scan(predicate=predicate)).to_pylist()
+        theirs = pa.table(DeltaTable(path).scan(predicate=predicate)).to_pylist()
+        key = lambda row: row["id"]  # noqa: E731
+        assert sorted(ours, key=key) == sorted(theirs, key=key)
+
+    def test_projection_excludes_predicate_only_columns(self, conn: Any, path: str) -> None:
+        got = pa.table(conn.open_table(path).scan(columns=["city"], predicate="id > 1"))
+        assert got.column_names == ["city"]
+        assert sorted(got.column("city").to_pylist()) == ["cairo", "lima"]
+
+    def test_timestamp_travel_on_the_kernel(self, conn: Any, path: str) -> None:
+        import datetime as dt
+        import time
+
+        table = conn.open_table(path)
+        time.sleep(0.01)
+        between = dt.datetime.now(dt.UTC)
+        time.sleep(0.01)
+        table.append(pa.table({"id": [4], "city": ["kyiv"]}))
+        assert table.can(Operation.TIME_TRAVEL).engine is Engine.KERNEL
+        assert pa.table(table.scan(timestamp=between.isoformat())).num_rows == 3
+        assert pa.table(table.scan()).num_rows == 4
+
+    def test_timestamp_before_history_is_named(self, conn: Any, path: str) -> None:
+        with pytest.raises(ds.UnreachableTableError, match="recreatable"):
+            conn.open_table(path).scan(timestamp="2000-01-01T00:00:00Z")
 
 
 class TestOptionalDependencyErrors:

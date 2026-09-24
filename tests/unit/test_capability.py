@@ -180,15 +180,23 @@ class TestDatabricksOnlyOperations:
     @pytest.mark.parametrize(
         "op",
         [
-            Operation.DROP_COLUMN,
-            Operation.RENAME_COLUMN,
             Operation.DROP_FEATURE,
             Operation.REORG,
             Operation.CLONE,
+            Operation.ANALYZE,
+            Operation.SYNC_ICEBERG,
+            Operation.REFRESH,
         ],
     )
     def test_expected_members(self, op: Operation) -> None:
         assert op in DATABRICKS_ONLY_OPERATIONS
+
+    @pytest.mark.parametrize("op", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN])
+    def test_column_mapping_ddl_has_a_direct_path(self, op: Operation) -> None:
+        """Rename and drop are metadata-only under column mapping, which the
+        kernel path writes itself, so they are no longer Databricks-only."""
+        assert op not in DATABRICKS_ONLY_OPERATIONS
+        assert Engine.KERNEL in OPERATION_ENGINES[op].engines
 
     def test_no_read_operation_is_databricks_only(self) -> None:
         """Every read must have at least one direct-to-storage path."""
@@ -225,6 +233,17 @@ class TestDocsMatchTheMatrices:
         ]
         missing = [op.value for op in write_ops if f"`{op.value}`" not in text]
         assert not missing, f"undocumented write operations: {sorted(missing)}"
+
+    def test_every_operation_has_a_routing_row(self) -> None:
+        text = self._conformance()
+        missing = [op.value for op in Operation if f"| `{op.value}` |" not in text]
+        assert not missing, f"operations missing from conformance.md: {missing}"
+
+    def test_routing_rows_match_the_matrix(self) -> None:
+        text = self._conformance()
+        for op in Operation:
+            engines = ", ".join(e.value for e in OPERATION_ENGINES[op].engines) or "*(none)*"
+            assert f"| `{op.value}` | {engines} |" in text, op.value
 
     def test_the_crash_property_is_called_out(self) -> None:
         """delta.minReaderVersion panics, and a reader must not miss that."""

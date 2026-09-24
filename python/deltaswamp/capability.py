@@ -22,6 +22,7 @@ __all__ = [
     "FEATURE_SIGNAL_PREFIX",
     "FEATURE_SUPPORT",
     "KERNEL_CREATE_FEATURES",
+    "METADATA_OPERATIONS",
     "PROPERTY_SUPPORT",
     "Capability",
     "Engine",
@@ -77,6 +78,7 @@ class Operation(StrEnum):
     INCREMENTAL = "incremental"
     HISTORY = "history"
     DETAIL = "detail"
+    FILES = "files"
     # --- write
     APPEND = "append"
     OVERWRITE = "overwrite"
@@ -95,6 +97,14 @@ class Operation(StrEnum):
     ADD_FEATURE = "add_feature"
     DROP_FEATURE = "drop_feature"
     ADD_CONSTRAINT = "add_constraint"
+    DROP_CONSTRAINT = "drop_constraint"
+    UNSET_PROPERTIES = "unset_properties"
+    SET_COMMENT = "set_comment"
+    SET_COLUMN_COMMENT = "set_column_comment"
+    ALTER_COLUMN_TYPE = "alter_column_type"
+    SET_NOT_NULL = "set_not_null"
+    DROP_NOT_NULL = "drop_not_null"
+    CLUSTER_BY = "cluster_by"
     # --- maintenance
     OPTIMIZE = "optimize"
     ZORDER = "zorder"
@@ -108,6 +118,10 @@ class Operation(StrEnum):
     CLONE = "clone"
     CONVERT = "convert"
     GENERATE = "generate"
+    CLEANUP_METADATA = "cleanup_metadata"
+    ANALYZE = "analyze"
+    SYNC_ICEBERG = "sync_iceberg"
+    REFRESH = "refresh"
 
 
 class TableFeature(StrEnum):
@@ -531,106 +545,180 @@ _K, _D, _S, _I, _SH = Engine.KERNEL, Engine.DELTARS, Engine.SQL, Engine.ICEBERG,
 
 # Engines listed in preference order. The SQL entry is only reachable when the
 # connection opted into fallback; the router enforces that, not this table.
+#
+# ICEBERG and SHARING serve only tables that are theirs -- Iceberg tables behind
+# a catalog's Iceberg REST endpoint, and tables reached through a Delta Sharing
+# profile -- and refuse everything else, so their position in a chain only
+# matters for tables more than one engine could serve.
 OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
     [
         # --- read: kernel first, because it reads through writer-only features
         _op(
             Operation.SCAN,
-            (_K, _D, _S),
+            (_K, _D, _SH, _I, _S),
             "kernel reads through writer-only features delta-rs rejects",
         ),
         _op(
             Operation.TIME_TRAVEL,
-            (_K, _D, _S),
+            (_K, _D, _SH, _I, _S),
             "history_manager handles the ICT-enablement boundary",
         ),
         _op(
             Operation.CDF,
-            (_D, _S),
-            "kernel has two CDF modes (ChangeDataFeed and RowTracking) but our binding "
-            "exposes neither yet, so delta-rs serves this",
+            (_D, _K, _SH, _S),
+            "delta-rs serves path tables it can open; the kernel's TableChanges takes the "
+            "ones it cannot. Catalog-managed tables have no CDF outside Databricks",
         ),
         _op(
             Operation.INCREMENTAL,
             (),
-            "kernel has incremental_scan but our binding does not expose it yet, and "
-            "delta-rs has no equivalent; nothing can serve this today",
+            "reading only the files added since a version needs the kernel's "
+            "incremental_scan, which is not bound yet; Table.changes() follows the change "
+            "data feed instead",
         ),
         _op(
             Operation.HISTORY,
-            (_D, _S),
+            (_D, _I, _S),
             "kernel exposes no history() API, only commit_range primitives",
         ),
         _op(
             Operation.DETAIL,
-            (_K, _D, _S),
+            (_K, _D, _SH, _I, _S),
             "kernel CRC path gives O(1) stats with zero I/O when a .crc exists",
+        ),
+        _op(
+            Operation.FILES,
+            (_D, _K),
+            "delta-rs lists add actions with stats; the kernel lists the files of tables "
+            "delta-rs cannot open",
         ),
         # --- write
         _op(
             Operation.APPEND,
-            (_D, _K),
+            (_D, _K, _I, _S),
             "delta-rs for path and external tables; it refuses catalog-managed tables, "
-            "which then fall through to kernel and UCCommitter. No SQL row: a warehouse "
-            "cannot bulk-load without staging files and COPY INTO",
+            "which then fall through to kernel and UCCommitter. The warehouse loads "
+            "through a staging volume when neither can",
         ),
         _op(
             Operation.CREATE,
             (_D, _K),
             "delta-rs creates path and external tables; the kernel takes over when the "
-            "properties or clustering exceed what delta-rs accepts. A catalog-managed create needs "
-            "the catalog to allocate storage first",
+            "properties or clustering exceed what delta-rs accepts, and for managed "
+            "tables, whose storage the catalog allocates through its staging-table API",
         ),
-        _op(Operation.OVERWRITE, (_D,), "kernel has no REPLACE TABLE"),
-        _op(Operation.REPLACE_WHERE, (_D,), "kernel has no replaceWhere"),
-        _op(Operation.MERGE_SCHEMA, (_D,), "kernel has no mergeSchema on the write path"),
+        _op(
+            Operation.OVERWRITE,
+            (_D, _K, _I, _S),
+            "delta-rs first; the kernel replaces a catalog-managed table in one commit",
+        ),
+        _op(
+            Operation.REPLACE_WHERE,
+            (_D, _I, _S, _K),
+            "delta-rs, PyIceberg for Iceberg tables, the warehouse; last, the kernel "
+            "rewrites the whole table in one commit, bounded in size",
+        ),
+        _op(
+            Operation.MERGE_SCHEMA,
+            (_D, _S),
+            "kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH "
+            "SCHEMA EVOLUTION",
+        ),
         # --- dml: delta-rs (copy-on-write) or kernel + our own DV authoring
         _op(
             Operation.DELETE,
-            (_D, _S),
-            "kernel has no DELETE by predicate, and DV authoring is not built, so "
-            "catalog-managed tables need the SQL fallback",
+            (_D, _S, _K),
+            "delta-rs copy-on-write, then the warehouse; last, a whole-table rewrite "
+            "through the kernel, since kernel 0.28 cannot author deletion vectors",
         ),
-        _op(Operation.UPDATE, (_D, _S), "kernel has no expression-driven UPDATE"),
+        _op(
+            Operation.UPDATE,
+            (_D, _S, _K),
+            "delta-rs, then the warehouse; last, a whole-table rewrite through the kernel "
+            "with literal or column assignments",
+        ),
         _op(
             Operation.MERGE,
-            (_D,),
-            "kernel has no MERGE at all, and a warehouse MERGE would need the source "
-            "staged server-side first",
-        ),
-        # --- ddl
-        _op(
-            Operation.ADD_COLUMN,
             (_D, _S),
-            "kernel can add a top-level nullable column but our binding does not "
-            "expose alter_table yet",
+            "kernel has no MERGE at all; the warehouse merges from a source staged in a volume",
         ),
-        _op(Operation.SET_PROPERTIES, (_D, _S), "kernel sets properties at CREATE only"),
-        _op(Operation.ADD_FEATURE, (_D, _S), "kernel enables features at CREATE only"),
+        # --- ddl. The kernel rows are metadata-only commits this library writes
+        # itself, for path tables delta-rs cannot alter or cannot express.
+        _op(
+            Operation.ADD_COLUMN, (_D, _K, _S), "delta-rs first; kernel for tables it cannot write"
+        ),
+        _op(
+            Operation.SET_PROPERTIES,
+            (_D, _K, _S),
+            "delta-rs rejects most of the property surface on ALTER; the kernel path "
+            "accepts what it can validate",
+        ),
+        _op(Operation.UNSET_PROPERTIES, (_K, _S), "delta-rs has no way to remove a property"),
+        _op(Operation.ADD_FEATURE, (_D, _K, _S), "delta-rs first; kernel for the rest"),
         _op(
             Operation.ADD_CONSTRAINT,
             (_D, _S),
-            "kernel marks checkConstraints NotSupported for writes",
+            "kernel marks checkConstraints NotSupported for writes, and adding one means "
+            "validating every existing row",
         ),
-        _op(Operation.DROP_COLUMN, (_S,), "Databricks-only; neither OSS engine implements it"),
+        _op(Operation.DROP_CONSTRAINT, (_D, _K, _S), "a metadata-only change"),
         _op(
-            Operation.RENAME_COLUMN, (_S,), "Databricks-only; kernel defers renames to future work"
+            Operation.SET_COMMENT,
+            (_D, _K, _S),
+            "the table description in the Metadata action",
+        ),
+        _op(
+            Operation.SET_COLUMN_COMMENT,
+            (_D, _K, _S),
+            "a 'comment' entry in the column's field metadata",
+        ),
+        _op(
+            Operation.ALTER_COLUMN_TYPE,
+            (_K, _S),
+            "type widening: metadata-only under the typeWidening feature; delta-rs "
+            "cannot read such a table at all",
+        ),
+        _op(
+            Operation.SET_NOT_NULL,
+            (_K, _S),
+            "needs every existing row checked for nulls before the commit",
+        ),
+        _op(Operation.DROP_NOT_NULL, (_D, _K, _S), "a metadata-only change"),
+        _op(
+            Operation.CLUSTER_BY,
+            (_K, _S),
+            "the delta.clustering domain; delta-rs has no domain metadata support",
+        ),
+        _op(
+            Operation.DROP_COLUMN,
+            (_K, _S),
+            "metadata-only under column mapping, which the kernel path writes; delta-rs "
+            "has no DROP COLUMN",
+        ),
+        _op(
+            Operation.RENAME_COLUMN,
+            (_K, _S),
+            "metadata-only under column mapping, which the kernel path writes; delta-rs "
+            "has no RENAME COLUMN",
         ),
         _op(Operation.DROP_FEATURE, (_S,), "Databricks-only (DROP FEATURE ... TRUNCATE HISTORY)"),
         # --- maintenance
-        _op(Operation.OPTIMIZE, (_D,), "kernel has no OPTIMIZE"),
-        _op(Operation.ZORDER, (_D,), "kernel has no Z-ORDER"),
-        _op(Operation.VACUUM, (_D,), "kernel has no VACUUM"),
-        _op(Operation.RESTORE, (_D,), "kernel has no RESTORE"),
-        _op(Operation.REPAIR, (_D,), "kernel has no FSCK"),
+        _op(
+            Operation.OPTIMIZE,
+            (_D, _S),
+            "kernel has no OPTIMIZE; the warehouse runs it on managed and clustered tables",
+        ),
+        _op(Operation.ZORDER, (_D, _S), "kernel has no Z-ORDER"),
+        _op(Operation.VACUUM, (_D, _S), "kernel has no VACUUM"),
+        _op(Operation.RESTORE, (_D, _S), "kernel has no RESTORE"),
+        _op(Operation.REPAIR, (_D, _S), "kernel has no FSCK"),
         _op(Operation.CONVERT, (_D,), "kernel has no CONVERT TO DELTA"),
         _op(Operation.GENERATE, (_D,), "kernel has no manifest generation"),
         _op(
             Operation.CHECKPOINT,
-            (_D,),
-            "delta-rs writes checkpoints; kernel's Snapshot::checkpoint deadlocks "
-            "against the default engine's executor, so it stays unbound and "
-            "catalog-managed tables cannot be checkpointed here",
+            (_D, _K),
+            "delta-rs for tables it can open; the kernel for the rest, including "
+            "catalog-managed tables, which it publishes first",
         ),
         _op(
             Operation.LOG_COMPACTION,
@@ -638,10 +726,31 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             "kernel's log_compaction_writer is a no-op stub (kernel#2337)",
         ),
         _op(
+            Operation.CLEANUP_METADATA,
+            (_D,),
+            "delta-rs removes log files older than delta.logRetentionDuration",
+        ),
+        _op(
             Operation.PUBLISH, (_K,), "Snapshot::publish; only kernel implements staged->published"
         ),
         _op(Operation.REORG, (_S,), "Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM)"),
         _op(Operation.CLONE, (_S,), "Databricks-only (shallow and deep CLONE)"),
+        _op(
+            Operation.ANALYZE,
+            (_S,),
+            "Databricks-only (ANALYZE TABLE ... COMPUTE [DELTA] STATISTICS)",
+        ),
+        _op(
+            Operation.SYNC_ICEBERG,
+            (_S,),
+            "Databricks-only (MSCK REPAIR TABLE ... SYNC METADATA regenerates UniForm "
+            "Iceberg metadata)",
+        ),
+        _op(
+            Operation.REFRESH,
+            (_S,),
+            "Databricks-only (REFRESH of a materialized view or streaming table)",
+        ),
     ]
 )
 
@@ -661,6 +770,7 @@ ENGINE_METHODS: dict[Operation, str] = {
     Operation.INCREMENTAL: "incremental",
     Operation.HISTORY: "history",
     Operation.DETAIL: "detail",
+    Operation.FILES: "files",
     Operation.APPEND: "append",
     Operation.OVERWRITE: "overwrite",
     Operation.REPLACE_WHERE: "overwrite",
@@ -673,9 +783,17 @@ ENGINE_METHODS: dict[Operation, str] = {
     Operation.DROP_COLUMN: "drop_column",
     Operation.RENAME_COLUMN: "rename_column",
     Operation.SET_PROPERTIES: "set_properties",
+    Operation.UNSET_PROPERTIES: "unset_properties",
     Operation.ADD_FEATURE: "add_feature",
     Operation.DROP_FEATURE: "drop_feature",
     Operation.ADD_CONSTRAINT: "add_constraint",
+    Operation.DROP_CONSTRAINT: "drop_constraint",
+    Operation.SET_COMMENT: "set_comment",
+    Operation.SET_COLUMN_COMMENT: "set_column_comment",
+    Operation.ALTER_COLUMN_TYPE: "alter_column_type",
+    Operation.SET_NOT_NULL: "set_not_null",
+    Operation.DROP_NOT_NULL: "drop_not_null",
+    Operation.CLUSTER_BY: "cluster_by",
     Operation.OPTIMIZE: "optimize",
     Operation.ZORDER: "zorder",
     Operation.VACUUM: "vacuum",
@@ -683,11 +801,15 @@ ENGINE_METHODS: dict[Operation, str] = {
     Operation.REPAIR: "repair",
     Operation.CHECKPOINT: "checkpoint",
     Operation.LOG_COMPACTION: "compact_logs",
+    Operation.CLEANUP_METADATA: "cleanup_metadata",
     Operation.PUBLISH: "publish",
     Operation.REORG: "reorg",
     Operation.CLONE: "clone",
     Operation.CONVERT: "convert",
     Operation.GENERATE: "generate",
+    Operation.ANALYZE: "analyze",
+    Operation.SYNC_ICEBERG: "sync_iceberg_metadata",
+    Operation.REFRESH: "refresh",
 }
 
 READ_OPERATIONS: frozenset[Operation] = frozenset(
@@ -698,6 +820,27 @@ READ_OPERATIONS: frozenset[Operation] = frozenset(
         Operation.INCREMENTAL,
         Operation.HISTORY,
         Operation.DETAIL,
+        Operation.FILES,
+    }
+)
+
+#: Operations that change only the table's metadata, never its data files.
+#: The kernel engine serves these for path tables by writing the commit itself.
+METADATA_OPERATIONS: frozenset[Operation] = frozenset(
+    {
+        Operation.ADD_COLUMN,
+        Operation.DROP_COLUMN,
+        Operation.RENAME_COLUMN,
+        Operation.SET_PROPERTIES,
+        Operation.UNSET_PROPERTIES,
+        Operation.ADD_FEATURE,
+        Operation.DROP_CONSTRAINT,
+        Operation.SET_COMMENT,
+        Operation.SET_COLUMN_COMMENT,
+        Operation.ALTER_COLUMN_TYPE,
+        Operation.SET_NOT_NULL,
+        Operation.DROP_NOT_NULL,
+        Operation.CLUSTER_BY,
     }
 )
 

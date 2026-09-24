@@ -86,21 +86,23 @@ class TestPartitionGuard:
     def test_unpartitioned_table_reports_none(self, path: str) -> None:
         assert _snapshot(path).partition_columns == []
 
-    def test_engine_refuses_partitioned_append(self, tmp_path: Any) -> None:
-        """Writing a partitioned table through the unpartitioned write context
-        would put every row in the root with no partition values -- wrong data
-        rather than an error, so it must be refused up front."""
-        from deltalake import write_deltalake
+    def test_engine_appends_to_a_partitioned_table(self, tmp_path: Any) -> None:
+        """Rows must land in their partition with the right values, which an
+        independent reader (delta-rs) confirms -- the failure mode here is wrong
+        data, not an error."""
+        from deltalake import DeltaTable, write_deltalake
         from deltaswamp.catalog import ResolvedTable
         from deltaswamp.engine.kernel import KernelEngine
-        from deltaswamp.errors import UnreachableTableError
         from deltaswamp.identity import parse_ref
 
         p = str(tmp_path / "part")
         write_deltalake(p, pa.table({"id": [1], "region": ["eu"]}), partition_by=["region"])
-        table = ResolvedTable(ref=parse_ref(p), location=p)
-        with pytest.raises(UnreachableTableError, match="partitioned by region"):
-            KernelEngine().append(table, pa.table({"id": [2], "region": ["us"]}))
+        table = ResolvedTable(ref=parse_ref(p), location=p, partition_columns=("region",))
+        KernelEngine().append(table, pa.table({"id": [2, 3], "region": ["us", None]}))
+        got = DeltaTable(p).to_pyarrow_table().sort_by("id").to_pydict()
+        assert got == {"id": [1, 2, 3], "region": ["eu", "us", None]}
+        partitions = {tuple(sorted(d.items())) for d in DeltaTable(p).partitions()}
+        assert (("region", "us"),) in partitions
 
 
 class TestPublish:

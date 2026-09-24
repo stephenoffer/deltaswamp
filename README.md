@@ -71,23 +71,55 @@ pip install 'deltaswamp[pyarrow,polars,sql]'   # extras as needed
 [Usage guide](docs/usage.md) covers the whole API.
 [Architecture](docs/architecture.md) covers how it works and why.
 [Conformance matrix](docs/conformance.md) covers exactly which features and
-operations go where. [Testing](docs/testing.md) covers the three test tiers,
+operations go where. [Ecosystem audit](docs/ecosystem-audit.md) compares it
+with Databricks and the rest of the Delta ecosystem. [Testing](docs/testing.md) covers the three test tiers,
 including the live Databricks suite. [Contributing](CONTRIBUTING.md) has the
 development setup, and [the changelog](CHANGELOG.md) lists what works today and
 what does not.
 
+## What it covers
+
+- **Every table shape.** UC managed (including catalog-managed), UC external,
+  Iceberg in UC, Delta Sharing, Hive Metastore, Glue and plain paths. Managed
+  tables can be created and external ones registered, not just opened.
+- **Reads** with projection, SQL predicates, time travel by version or
+  timestamp, change data feed and file listing. All of these work on tables
+  only the kernel can open.
+- **Writes and DML.** Append, overwrite, replaceWhere, dynamic partition
+  overwrite, schema merge, idempotent writes, DELETE, UPDATE and MERGE.
+- **ALTER TABLE**, including what delta-rs cannot do: rename and drop columns
+  under column mapping, type widening, SET NOT NULL, clustering keys, and the
+  properties delta-rs rejects. These are written as metadata-only commits.
+- **Maintenance.** OPTIMIZE, Z-ORDER, VACUUM (standard and LITE), RESTORE, FSCK,
+  checkpoints (catalog-managed tables included), log cleanup, and staged-commit
+  publishing.
+- **Governance on Unity Catalog.** Grants, tags, ownership, lineage, key
+  constraints, catalogs, schemas, volumes and files. Row filters and masks go
+  through the warehouse.
+- **Distributed reads**: `plan_scan()` gives a picklable per-file plan, and
+  `to_ray_dataset()` reads it in parallel on Ray.
+- **Hand-offs** to DuckDB, Polars and Daft, and cross-catalog SQL via
+  `conn.sql(...)`.
+
+Databricks-only operations (DROP FEATURE, REORG, CLONE, ANALYZE, OPTIMIZE FULL,
+CLUSTER BY AUTO, UNDROP, materialized-view refresh) run on a SQL warehouse when
+you opt in. [The ecosystem audit](docs/ecosystem-audit.md) maps every Databricks
+and open-source Delta/UC feature to the route that reaches it, and names the
+blocker for the few that none does.
+
 ## Status
 
-Reads, writes, commits and routing work and are covered by tests. Three things
-are not built, and each is refused with a reason rather than half-done: creating
-managed tables, registering external tables in Unity Catalog, and distributed
-scan planning.
+Alpha. Everything above is covered by tests against real on-disk tables, a
+Unity Catalog server that speaks the real `/delta/v1` protocol, and a Delta
+Sharing server; a live Databricks suite runs with a PAT.
 
-Two more are blocked upstream rather than merely unwritten. Deletion vectors
-cannot be authored, because `Transaction::update_deletion_vectors` is absent from
-delta-kernel 0.28, so `DELETE`, `UPDATE` and `MERGE` on a catalog-managed table
-route to the SQL fallback. And catalog-managed tables cannot be checkpointed,
-because the kernel's checkpoint writer deadlocks when bound through PyO3.
+What is not possible yet, and why:
+
+- **Deletion vectors cannot be authored.** `Transaction::update_deletion_vectors`
+  is absent from delta-kernel 0.28. DML on tables only the kernel can write is
+  a bounded whole-table rewrite, and MERGE on those needs the warehouse.
+- **Incremental reads without a change feed** are not built;
+  `Table.changes()` follows tables that have one.
 
 ## Development
 

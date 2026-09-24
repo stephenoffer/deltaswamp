@@ -22,9 +22,10 @@ use std::sync::Arc;
 
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::transaction::{CommitResult, Transaction};
-use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
 use pyo3::prelude::*;
 use unity_catalog_delta_rest_client::TableIdentifier;
@@ -32,9 +33,34 @@ use unity_catalog_delta_rest_client::TableIdentifier;
 use unity_catalog_delta_rest_client::{ClientConfig, UCUpdateTableRestClient};
 
 use crate::error::{NativeError, Result};
+use crate::partition;
 use crate::runtime;
 
-pub type SharedEngine = Arc<DefaultEngine<TokioBackgroundExecutor>>;
+/// The engine every binding uses.
+///
+/// Built on [`TokioMultiThreadExecutor`] over our shared runtime, NOT the
+/// default `TokioBackgroundExecutor`. The background executor runs every
+/// kernel I/O future on one current-thread runtime in one thread. Checkpointing
+/// hands `write_parquet_file` an iterator that itself does log I/O, and pulls
+/// it from *inside* the future running on that thread: the nested
+/// `block_on` enqueues a second future on the same single thread and then
+/// blocks it waiting for the result, so it deadlocks every time, on or off our
+/// runtime. The multi-thread executor bridges a nested `block_on` with
+/// `block_in_place` and another worker picks the inner future up. The kernel
+/// documents this requirement on `Snapshot::checkpoint`.
+pub type SharedEngine = Arc<DefaultEngine<TokioMultiThreadExecutor>>;
+
+/// Build a [`SharedEngine`] over `store`, sharing the process runtime.
+pub fn new_engine(store: Arc<DynObjectStore>) -> SharedEngine {
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        runtime::runtime().handle().clone(),
+    ));
+    Arc::new(
+        DefaultEngine::builder(store)
+            .with_task_executor(executor)
+            .build(),
+    )
+}
 
 /// How to reach Unity Catalog in order to have a commit ratified.
 // `from_py_object` is explicit because this class is passed *into* Rust as an
@@ -150,6 +176,11 @@ pub fn write(
     // Clone before the transaction consumes it; the overwrite path needs to
     // scan the same snapshot to learn which files to remove.
     let scan_source = snapshot.clone();
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
+    let table_schema = snapshot.schema();
     let mut transaction = snapshot.transaction(committer, engine.as_ref())?;
     if let Some(info) = engine_info {
         transaction = transaction.with_engine_info(info);
@@ -175,16 +206,34 @@ pub fn write(
 
     let mut txn = transaction;
     let write_state = txn.write_state()?;
-    let write_context = write_state.unpartitioned_write_context()?;
 
-    for batch in batches {
-        let data = ArrowEngineData::new(batch);
-        let metadata =
-            runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
-        txn.add_files(metadata);
+    if partition_columns.is_empty() {
+        let write_context = write_state.unpartitioned_write_context()?;
+        for batch in batches {
+            let data = ArrowEngineData::new(batch);
+            let metadata =
+                runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+            txn.add_files(metadata);
+        }
+    } else {
+        // One write context per distinct partition tuple; see crate::partition.
+        for batch in batches {
+            for group in
+                partition::split_by_partition(&batch, &partition_columns, table_schema.as_ref())?
+            {
+                let write_context = write_state.partitioned_write_context(group.values)?;
+                let data = ArrowEngineData::new(group.data);
+                let metadata =
+                    runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+                txn.add_files(metadata);
+            }
+        }
     }
 
-    match txn.commit(engine.as_ref()) {
+    // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
+    // with block_in_place, so the commit must run inside the shared
+    // multi-threaded runtime rather than on a bare Python thread.
+    match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
         Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
         Ok(CommitResult::ConflictedTransaction(conflicted)) => {
             let version = conflicted.conflict_version();
@@ -287,7 +336,10 @@ pub fn create_table(
         .build(engine.as_ref(), committer)
         .map_err(|e| classify_commit_error(&e.to_string()))?;
 
-    match txn.commit(engine.as_ref()) {
+    // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
+    // with block_in_place, so the commit must run inside the shared
+    // multi-threaded runtime rather than on a bare Python thread.
+    match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
         Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
         Ok(CommitResult::ConflictedTransaction(_)) => Err(NativeError::CommitConflict(
             "another writer created this table first".to_string(),
@@ -318,4 +370,137 @@ pub fn publish(
         runtime::block_on(async { snapshot.publish(engine.as_ref(), committer.as_ref()) })
             .map_err(|e| classify_commit_error(&e.to_string()))?;
     Ok(published.version())
+}
+
+/// Atomically write `actions` as commit `version`, verbatim.
+///
+/// For metadata-only commits authored in Python (property changes, protocol
+/// upgrades, domain metadata) that the kernel transaction API cannot express.
+/// The commit is a put-if-absent of `_delta_log/<version>.json`: if the file
+/// already exists another writer won, and the caller must re-read and
+/// recompute -- exactly the contract `FileSystemCommitter` gives.
+///
+/// Path-based tables only. A catalog-managed table's commits must be ratified
+/// by the catalog; writing one here would fork the table's history.
+pub fn commit_raw(
+    table_root: &url::Url,
+    options: &std::collections::HashMap<String, String>,
+    version: u64,
+    actions: &[String],
+) -> Result<u64> {
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::{PutMode, PutOptions, PutPayload};
+
+    let body = raw_commit_body(actions)?;
+    let store = crate::store::build_store(table_root, options)?;
+    let root =
+        Path::from_url_path(table_root.path()).map_err(delta_kernel::object_store::Error::from)?;
+    let location = root.join("_delta_log").join(format!("{version:020}.json"));
+
+    let result = runtime::block_on(async {
+        store
+            .put_opts(
+                &location,
+                PutPayload::from(body.into_bytes()),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+    });
+    match result {
+        Ok(_) => Ok(version),
+        Err(delta_kernel::object_store::Error::AlreadyExists { .. }) => {
+            Err(NativeError::CommitConflict(format!(
+                "version {version} already exists at {table_root}: another writer committed \
+                 it first. Re-read the snapshot, recompute the actions against the new \
+                 state, and commit at the next version."
+            )))
+        }
+        Err(delta_kernel::object_store::Error::NotImplemented { .. }) => {
+            Err(NativeError::Invalid(format!(
+                "the object store for {table_root} cannot do an atomic put-if-absent, so a \
+                 raw commit could silently overwrite another writer's. On S3 do not set \
+                 aws_conditional_put=disabled (the default, etag, sends If-None-Match)."
+            )))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Validate and join raw actions into a newline-delimited commit body.
+///
+/// Each action must be one JSON object with exactly one key (the action name),
+/// on one line: a newline inside an action would split it into two log lines
+/// and corrupt the commit for every reader.
+fn raw_commit_body(actions: &[String]) -> Result<String> {
+    if actions.is_empty() {
+        return Err(NativeError::Invalid(
+            "a commit needs at least one action".to_string(),
+        ));
+    }
+    let mut body = String::new();
+    for (i, action) in actions.iter().enumerate() {
+        let action = action.trim();
+        if action.contains(['\n', '\r']) {
+            return Err(NativeError::Invalid(format!(
+                "action {i} spans several lines; each action must be single-line JSON"
+            )));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(action)
+            .map_err(|e| NativeError::Invalid(format!("action {i} is not valid JSON: {e}")))?;
+        match parsed.as_object() {
+            Some(obj) if obj.len() == 1 => {}
+            _ => {
+                return Err(NativeError::Invalid(format!(
+                    "action {i} must be a JSON object with exactly one key naming the action, \
+                     e.g. {{\"commitInfo\": {{...}}}}"
+                )))
+            }
+        }
+        body.push_str(action);
+        body.push('\n');
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod raw_commit_tests {
+    use super::*;
+
+    #[test]
+    fn body_is_newline_delimited_and_terminated() {
+        let body = raw_commit_body(&[
+            r#"{"commitInfo":{"a":1}}"#.to_string(),
+            r#" {"protocol":{"minReaderVersion":1,"minWriterVersion":2}} "#.to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            body,
+            "{\"commitInfo\":{\"a\":1}}\n{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n"
+        );
+    }
+
+    #[test]
+    fn malformed_actions_are_refused() {
+        assert!(raw_commit_body(&[]).is_err());
+        assert!(raw_commit_body(&["not json".to_string()]).is_err());
+        assert!(raw_commit_body(&[r#"{"a":1,"b":2}"#.to_string()]).is_err());
+        assert!(raw_commit_body(&["{\"a\":\n1}".to_string()]).is_err());
+        assert!(raw_commit_body(&["[1]".to_string()]).is_err());
+    }
+
+    #[test]
+    fn put_if_absent_conflicts_on_an_existing_version() {
+        let dir = std::env::temp_dir().join(format!("ds-raw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = url::Url::from_directory_path(&dir).unwrap();
+        let opts = std::collections::HashMap::new();
+        let actions = [r#"{"commitInfo":{}}"#.to_string()];
+        assert_eq!(commit_raw(&url, &opts, 3, &actions).unwrap(), 3);
+        let written =
+            std::fs::read_to_string(dir.join("_delta_log/00000000000000000003.json")).unwrap();
+        assert_eq!(written, "{\"commitInfo\":{}}\n");
+        let err = commit_raw(&url, &opts, 3, &actions).unwrap_err();
+        assert!(matches!(err, NativeError::CommitConflict(_)), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

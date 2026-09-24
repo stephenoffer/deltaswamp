@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from .capability import (
     DATABRICKS_ONLY_OPERATIONS,
+    METADATA_OPERATIONS,
     OPERATION_ENGINES,
     READ_OPERATIONS,
     Capability,
@@ -33,18 +34,11 @@ from .errors import FallbackRequiredError, UnreachableTableError
 __all__ = ["Router"]
 
 #: Operations UCCommitter refuses on a catalog-managed table past version 0.
-_CATALOG_MANAGED_ALTER_OPS: frozenset[Operation] = frozenset(
-    {
-        Operation.SET_PROPERTIES,
-        Operation.ADD_FEATURE,
-        Operation.DROP_FEATURE,
-        Operation.ADD_COLUMN,
-        Operation.DROP_COLUMN,
-        Operation.RENAME_COLUMN,
-        Operation.ADD_CONSTRAINT,
-        Operation.MERGE_SCHEMA,
-    }
-)
+_CATALOG_MANAGED_ALTER_OPS: frozenset[Operation] = METADATA_OPERATIONS | {
+    Operation.DROP_FEATURE,
+    Operation.ADD_CONSTRAINT,
+    Operation.MERGE_SCHEMA,
+}
 
 
 @dataclass
@@ -71,6 +65,14 @@ class Router:
         blocked = self._catalog_level_block(operation, table)
         if blocked is not None:
             return blocked
+
+        # A shared table has exactly one way in, so its engine's verdict is the
+        # whole answer -- including "shares are read-only" for a write, which is
+        # more useful than every other engine reporting it has no location.
+        sharing = self.engines.get(EngineKind.SHARING)
+        if table.is_shared and sharing is not None:
+            verdict: Capability = sharing.supports(operation, table, **shape)  # type: ignore[attr-defined]
+            return verdict
 
         reasons: list[str] = []
         routing = OPERATION_ENGINES.get(operation)
@@ -149,21 +151,39 @@ class Router:
         # refusing on table_type first would contradict the manifest.
         manifest_says_readable = table.external_read_supported is True
 
+        # A shared table is served by the Delta Sharing engine or not at all:
+        # its files are presigned URLs, so nothing else has a way in.
+        if table.is_shared:
+            if EngineKind.SHARING in self.engines:
+                return None
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table is reached through Delta Sharing, and the sharing engine "
+                "is not available",
+                remedy="pip install 'deltaswamp[sharing]'",
+            )
+
         # A non-Delta table has no Delta log to read, whatever else is true.
         if not table.is_delta:
             fmt = table.data_source_format or "unknown"
             if table.is_iceberg:
+                if EngineKind.ICEBERG in self.engines and table.iceberg_rest_uri:
+                    return None  # the Iceberg engine serves it through the catalog.
                 return Capability(
                     operation,
                     ok=False,
                     reason=(
-                        f"the table is Iceberg ({fmt}), not Delta. Neither engine here "
-                        "reads Iceberg"
+                        f"the table is Iceberg ({fmt}), not Delta, and no Iceberg engine is "
+                        "available for it"
+                        + (
+                            ""
+                            if table.iceberg_rest_uri
+                            else " (its catalog advertises no Iceberg REST endpoint)"
+                        )
                     ),
-                    remedy=(
-                        "read it through the Unity Catalog Iceberg REST endpoint at "
-                        "/api/2.1/unity-catalog/iceberg-rest with PyIceberg"
-                    ),
+                    remedy="pip install 'deltaswamp[iceberg]' to read it through the catalog's "
+                    "Iceberg REST endpoint with PyIceberg",
                 )
             return Capability(
                 operation,

@@ -34,30 +34,116 @@ First working version.
   secret.
 - GCS bearer tokens. delta-rs routes the vended OAuth token into
   `google_application_credentials`, which `object_store` reads as a file path.
-- Conformance matrices as tested data: 34 table features, 33 operations, 30 table
+- Conformance matrices as tested data: 34 table features, 46 operations, 30 table
   properties. `docs/conformance.md` is asserted against them.
 - A live Databricks suite authenticated with a personal access token, and
   `tests/fake_uc.py`, a Unity Catalog server speaking the real `/delta/v1`
   protocol so the catalog-managed path is testable without an account.
 
+### Added in the ecosystem pass
+
+See `docs/ecosystem-audit.md` for the feature-by-feature comparison with
+Databricks and the rest of the Delta ecosystem that drove this.
+
+- **Managed-table creation and external-table registration** on Unity Catalog
+  (Databricks and open source). A managed create runs the staging-table flow:
+  the catalog allocates the id and storage, version 0 is written with that id,
+  and the catalog finalises. `Connection.register_table` registers an existing
+  log. Both used to be refused.
+- **Metadata-only ALTER commits** written by this library for path tables.
+  They cover what delta-rs cannot do: RENAME/DROP COLUMN under column mapping,
+  enabling column mapping, type widening, SET NOT NULL (checked against the
+  data), CLUSTER BY, UNSET TBLPROPERTIES, and the properties delta-rs rejects,
+  with the protocol raised as values require. Committed as put-if-absent and
+  recomputed on conflict.
+- **Kernel predicates and timestamp travel.** One parsed SQL predicate drives
+  both file skipping in the kernel and an exact row filter, so
+  `scan(predicate=...)` and `scan(timestamp=...)` work on catalog-managed tables.
+- **Kernel change data feed, file listing, partitioned appends and
+  checkpoints.** The "deadlock" was the default engine's single-threaded
+  executor waiting on itself; engines now use the multi-threaded executor, and
+  catalog-managed tables can be checkpointed (after publishing).
+- **DML on catalog-managed tables without Databricks**: DELETE, UPDATE and
+  replaceWhere as a bounded whole-table rewrite through the kernel.
+- **Delta Sharing** as a catalog and an engine (`sharing://profile`): reads,
+  time travel, CDF and listing, via the `delta-sharing` client.
+- **Iceberg** tables in Unity Catalog through its Iceberg REST endpoint with
+  PyIceberg: reads, time travel, history, appends and overwrites.
+- **The SQL fallback, rewritten** on the Statement Execution API in
+  `databricks-sdk`, so the connector is no longer needed. Results come back as
+  Arrow, values are parameterized, and a warehouse is chosen automatically. It
+  serves every Databricks-only operation (ANALYZE, OPTIMIZE FULL, CLUSTER BY
+  AUTO, REFRESH, SYNC METADATA, UNDROP, row filters and masks) and, with a
+  staging volume, appends, overwrites and MERGE.
+- **Governance**: `Table.info/grants/grant/revoke/tags/set_tags/set_owner/
+  lineage/column_lineage/add_primary_key/add_foreign_key`, and
+  `Connection.create_catalog/create_schema/volume/search_tables/list_functions`.
+- **delta-rs surface completed**: drop constraint, table and column comments,
+  DROP NOT NULL, log cleanup, file listing, CDF by timestamp with predicates,
+  commit metadata on DML, VACUUM LITE, Z-ORDER through `optimize(zorder_by=)`.
+- **Distributed reads**: `Table.plan_scan()` returns a picklable plan of
+  per-file splits pinned to one version, and `to_ray_dataset()` reads it in
+  parallel through a Ray Data datasource. The native file-restricted scan keeps
+  deletion vectors, column mapping and partition values exact per split, on
+  catalog-managed tables too.
+- **Following changes**: `Table.changes(version, poll_interval=...)` yields one
+  batch per committed version from the change feed.
+- **Hand-offs**: `to_duckdb`, `to_polars(lazy=True)`, `to_ray_dataset`,
+  `to_daft`, and `Connection.sql` for cross-catalog SQL on DuckDB or Polars.
+
+### Fixed
+
+- Catalog-managed appends never reached the catalog: the UC commit ran outside
+  the Tokio runtime its committer requires.
+- `OVERWRITE` never routed to the kernel, so a catalog-managed table could not
+  be overwritten despite the kernel implementing it.
+- Properties read back stale after an ALTER: re-enrichment let the previous read
+  override the log.
+- A privilege check compared `str(Privilege.X)` against the SQL spelling and
+  never matched, so 403s named the wrong missing privilege.
+- The SQL fallback interpolated property values and update keys into SQL.
+- Built-in catalogs no longer depend on installed entry-point metadata. Without
+  it, `available_catalogs()` was empty and every `connect()` failed with "no
+  catalog named 'databricks' is registered", which is what a source checkout, a
+  vendored copy, a zipapp or a freezer produces. Entry points still take
+  precedence, so a plugin can shadow a built-in name.
+- CI could not pass as written: the lint and `python ${{ matrix.python }}` jobs
+  ran the unit tests with neither the package nor its dependencies installed,
+  and two test modules imported `pyarrow` and `databricks-sdk` at module scope,
+  so collection failed outright. The package's own modules were already free of
+  eager third-party imports; the tests now match.
+- The packaging assertion in CI never learned about the `sharing` catalog added
+  to `pyproject.toml`, so the native job failed on a correct build.
+- `ruff` and `mypy` were installed unpinned in CI, so an upstream release turned
+  the build red with no change here. Both are pinned to the versions
+  `.pre-commit-config.yaml` already used.
+- Type errors under `mypy --strict`: `mode` and `partition_strategy` reached
+  delta-rs as `str` where it declares `Literal`, and `write_deltalake` is
+  overloaded on `mode` such that only the overwrite signature accepts a
+  predicate.
+
+### Changed
+
+- `vacuum()` defaults to Delta's standard (full) VACUUM on every engine;
+  `lite=True` asks for the log-only variant. It was delta-rs's lite mode before.
+- The `sql` extra no longer installs `databricks-sql-connector`, and the unused
+  `ossuc` extra is gone. New extras: `duckdb`, `daft`, `all`.
+
 ### Known limits
 
 - **There is no way to author deletion vectors.** `Transaction::update_deletion_vectors`
-  is absent from delta-kernel 0.28, so there is no commit hook to build on.
-  `DELETE`, `UPDATE`, `MERGE` and predicate overwrites on a catalog-managed table
-  route to the SQL fallback.
-- **Checkpointing a catalog-managed table is impossible.** `Snapshot::checkpoint`
-  deadlocks when bound through PyO3, on and off the shared runtime, against the
-  default engine's background executor; delta-rs cannot open the table to do it
-  instead. Their logs grow without bound. Checkpoint from Databricks periodically.
-- Creating a *managed* table is refused: it needs the catalog to allocate storage
-  through its staging-table API, and that flow needs a live catalog to verify.
-- Registering an external table in Unity Catalog is refused rather than
-  half-done. Writing the Delta log without calling `tables.create` would leave an
-  orphaned log while appearing to succeed.
-- Distributed scan planning is not implemented. `plan_scan` and `execute_scan`
-  raise; the seams (serializable splits, picklable providers) are in place.
+  is absent from delta-kernel 0.28. DML on kernel-only tables is a whole-table
+  rewrite bounded by `KernelEngine.rewrite_max_bytes`, refused on row-tracked
+  tables; MERGE on those tables needs the SQL fallback.
+- The change feed of a catalog-managed table needs the SQL fallback; the
+  kernel's TableChanges takes no catalog commit tail.
+- Incremental reads without a change feed (the kernel's `incremental_scan`)
+  are not bound; `Table.changes()` needs CDF.
 - Idempotent writes are enforced by this library, not by an engine. delta-rs
   records the transaction identifier and appends the same one again, so the last
   committed version is checked before writing. A concurrent writer can still
   commit in between.
+- Parts of the SQL fallback and governance have been verified against fakes,
+  not a live workspace: statement parameters inside `TIMESTAMP AS OF` and
+  `table_changes()`, `INSERT ... BY NAME` / `WITH SCHEMA EVOLUTION`, the lineage
+  response shape, and the Databricks staging-table response.

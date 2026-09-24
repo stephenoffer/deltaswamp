@@ -196,7 +196,7 @@ class TestCatalogCreateDoesNotOrphan:
     """
 
     def test_catalog_name_with_location_is_refused(self) -> None:
-        import pyarrow as pa
+        pa = pytest.importorskip("pyarrow")
         from deltaswamp.catalog.filesystem import FilesystemCatalog
         from deltaswamp.errors import UnreachableTableError
         from deltaswamp.table import Connection
@@ -210,24 +210,28 @@ class TestCatalogCreateDoesNotOrphan:
             )
 
     def test_catalog_name_without_location_is_refused(self) -> None:
-        import pyarrow as pa
+        pa = pytest.importorskip("pyarrow")
         from deltaswamp.catalog.filesystem import FilesystemCatalog
         from deltaswamp.errors import UnreachableTableError
         from deltaswamp.table import Connection
 
         conn = Connection(catalog=FilesystemCatalog(), router=router())
-        with pytest.raises(UnreachableTableError, match="staging-table API"):
+        with pytest.raises(UnreachableTableError, match="cannot register"):
             conn.create_table("main.sales.orders", pa.schema([("id", pa.int64())]))
 
 
 class TestUnityCatalogPreflight:
     """Refusals decidable from Unity Catalog metadata, in the right order."""
 
-    def test_iceberg_tables_point_at_the_iceberg_rest_endpoint(self) -> None:
+    def test_iceberg_tables_without_an_engine_name_the_extra(self) -> None:
         got = router().capability(Operation.SCAN, table(data_source_format="ICEBERG"))
         assert not got.ok
         assert "Iceberg" in got.reason
-        assert "iceberg-rest" in got.remedy
+        assert "deltaswamp[iceberg]" in got.remedy
+
+    def test_iceberg_tables_without_a_rest_endpoint_say_so(self) -> None:
+        got = router().capability(Operation.SCAN, table(data_source_format="ICEBERG"))
+        assert "no Iceberg REST endpoint" in got.reason
 
     @pytest.mark.parametrize("fmt", ["PARQUET", "CSV", "JSON", "AVRO", "ORC"])
     def test_non_delta_formats_are_refused(self, fmt: str) -> None:

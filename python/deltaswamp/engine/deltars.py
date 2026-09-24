@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 from ..capability import (
     FEATURE_SUPPORT,
@@ -270,14 +270,30 @@ class DeltaRsEngine:
         *,
         starting_version: int | None = None,
         ending_version: int | None = None,
+        starting_timestamp: str | None = None,
+        ending_timestamp: str | None = None,
         columns: list[str] | None = None,
+        predicate: str | None = None,
+        allow_out_of_range: bool = False,
     ) -> Any:
         self._guard_cdf(table)
         return self._open(table).load_cdf(
             starting_version=starting_version if starting_version is not None else 0,
             ending_version=ending_version,
+            starting_timestamp=starting_timestamp,
+            ending_timestamp=ending_timestamp,
             columns=columns,
+            predicate=predicate,
+            allow_out_of_range=allow_out_of_range,
         )
+
+    def files(self, table: ResolvedTable, *, version: int | None = None) -> Any:
+        """One row per live data file: path, size, partition values, stats.
+
+        Flattened, so partition values and column statistics are ordinary
+        columns (`partition.<col>`, `min.<col>`, `max.<col>`, `null_count.<col>`).
+        """
+        return self._open(table, version=version).get_add_actions(flatten=True)
 
     @staticmethod
     def _guard_cdf(table: ResolvedTable) -> None:
@@ -404,7 +420,7 @@ class DeltaRsEngine:
         table: ResolvedTable,
         data: Any,
         *,
-        mode: str,
+        mode: Literal["append", "overwrite"],
         schema_mode: str | None = None,
         predicate: str | None = None,
         partition_by: list[str] | None = None,
@@ -428,18 +444,21 @@ class DeltaRsEngine:
                 "call set_properties() separately, or pass properties at create",
             )
 
-        write_deltalake(
-            table.location,
-            data,
-            mode=mode,
-            schema_mode=schema_mode,
-            predicate=predicate,
-            partition_by=partition_by,
-            target_file_size=target_file_size,
-            writer_properties=writer_properties,
-            commit_properties=_commit_properties(commit_metadata, txn, max_commit_retries),
-            storage_options=self._storage_options(table, write=True) or None,
-        )
+        # delta-rs overloads write_deltalake on `mode`: only the overwrite
+        # signature accepts `predicate`, so the two are called separately rather
+        # than passing a union that matches neither.
+        common: dict[str, Any] = {
+            "schema_mode": schema_mode,
+            "partition_by": partition_by,
+            "target_file_size": target_file_size,
+            "writer_properties": writer_properties,
+            "commit_properties": _commit_properties(commit_metadata, txn, max_commit_retries),
+            "storage_options": self._storage_options(table, write=True) or None,
+        }
+        if mode == "overwrite":
+            write_deltalake(table.location, data, mode="overwrite", predicate=predicate, **common)
+        else:
+            write_deltalake(table.location, data, mode="append", **common)
 
     def txn_version(self, table: ResolvedTable, app_id: str) -> int | None:
         """The last version committed under `app_id`, or None.
@@ -456,7 +475,7 @@ class DeltaRsEngine:
         schema: Any,
         *,
         partition_by: list[str] | None = None,
-        mode: str = "error",
+        mode: Literal["error", "append", "overwrite", "ignore"] = "error",
         properties: dict[str, str] | None = None,
         name: str | None = None,
         description: str | None = None,
@@ -487,8 +506,19 @@ class DeltaRsEngine:
                 storage_options=self._storage_options(table, write=True) or None,
             )
 
-    def delete(self, table: ResolvedTable, predicate: str | None = None) -> dict[str, Any]:
-        result: dict[str, Any] = self._open(table, write=True).delete(predicate)
+    def delete(
+        self,
+        table: ResolvedTable,
+        predicate: str | None = None,
+        *,
+        commit_metadata: dict[str, Any] | None = None,
+        writer_properties: Any = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._open(table, write=True).delete(
+            predicate,
+            writer_properties=writer_properties,
+            commit_properties=_commit_properties(commit_metadata, None, None),
+        )
         return result
 
     def update(
@@ -496,34 +526,92 @@ class DeltaRsEngine:
         table: ResolvedTable,
         *,
         updates: dict[str, str] | None = None,
+        new_values: dict[str, Any] | None = None,
         predicate: str | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+        writer_properties: Any = None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = self._open(table, write=True).update(
-            updates=updates, predicate=predicate
+            updates=updates,
+            new_values=new_values,
+            predicate=predicate,
+            writer_properties=writer_properties,
+            commit_properties=_commit_properties(commit_metadata, None, None),
         )
         return result
 
-    def merge(self, table: ResolvedTable, source: Any, predicate: str, **kwargs: Any) -> Any:
+    def merge(
+        self,
+        table: ResolvedTable,
+        source: Any,
+        predicate: str,
+        *,
+        commit_metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if commit_metadata is not None:
+            kwargs["commit_properties"] = _commit_properties(commit_metadata, None, None)
         return self._open(table, write=True).merge(source, predicate, **kwargs)
 
     # ------------------------------------------------------------ maintenance
 
-    def optimize(self, table: ResolvedTable, **kwargs: Any) -> dict[str, Any]:
-        result: dict[str, Any] = self._open(table, write=True).optimize.compact(**kwargs)
+    def optimize(
+        self,
+        table: ResolvedTable,
+        *,
+        zorder_by: list[str] | None = None,
+        full: bool = False,
+        predicate: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if predicate is not None:
+            raise UnreachableTableError(
+                "optimize with a SQL predicate",
+                "delta-rs scopes OPTIMIZE by partition filters, not by a SQL predicate",
+                "pass partition_filters=[('col', '=', 'value')] instead",
+            )
+        if full:
+            raise UnreachableTableError(
+                "OPTIMIZE ... FULL",
+                "a full reclustering rewrite is a liquid-clustering operation, and delta-rs "
+                "cannot write liquid-clustered tables",
+            )
+        dt = self._open(table, write=True)
+        if zorder_by:
+            result: dict[str, Any] = dt.optimize.z_order(zorder_by, **kwargs)
+        else:
+            result = dt.optimize.compact(**kwargs)
         return result
 
     def zorder(self, table: ResolvedTable, columns: list[str], **kwargs: Any) -> dict[str, Any]:
         result: dict[str, Any] = self._open(table, write=True).optimize.z_order(columns, **kwargs)
         return result
 
-    def vacuum(self, table: ResolvedTable, **kwargs: Any) -> list[str]:
+    def vacuum(
+        self,
+        table: ResolvedTable,
+        *,
+        retention_hours: int | None = None,
+        dry_run: bool = True,
+        lite: bool = False,
+        **kwargs: Any,
+    ) -> list[str]:
+        """VACUUM. `lite=True` only considers files the log says were removed.
+
+        delta-rs calls the two modes `full=True` (Delta's standard VACUUM,
+        which also lists storage for unreferenced files) and `full=False`
+        (Databricks' VACUUM LITE). The default here is the standard one, so the
+        same call means the same thing on every engine.
+        """
         if table.is_shallow_clone:
             raise UnreachableTableError(
                 "vacuum",
                 "the table is a shallow clone and borrows the source table's files; "
                 "vacuuming it risks deleting data the source still owns",
             )
-        result: list[str] = self._open(table, write=True).vacuum(**kwargs)
+        result: list[str] = self._open(table, write=True).vacuum(
+            retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
+        )
         return result
 
     def restore(self, table: ResolvedTable, target: Any, **kwargs: Any) -> dict[str, Any]:
@@ -564,6 +652,28 @@ class DeltaRsEngine:
     ) -> None:
         self._open(table, write=True).alter.add_constraint(constraints, **kwargs)
 
+    def drop_constraint(self, table: ResolvedTable, name: str, *, if_exists: bool = False) -> None:
+        self._open(table, write=True).alter.drop_constraint(name, raise_if_not_exists=not if_exists)
+
+    def set_comment(self, table: ResolvedTable, comment: str | None) -> None:
+        self._open(table, write=True).alter.set_table_description(comment or "")
+
+    def set_column_comment(self, table: ResolvedTable, column: str, comment: str | None) -> None:
+        if "." in column:
+            raise UnreachableTableError(
+                f"comment on nested column {column!r} with delta-rs",
+                "delta-rs sets field metadata on top-level columns only",
+            )
+        self._open(table, write=True).alter.set_column_metadata(column, {"comment": comment or ""})
+
+    def drop_not_null(self, table: ResolvedTable, column: str) -> None:
+        """DROP NOT NULL. A no-op on a column that is already nullable, as in Spark."""
+        try:
+            self._open(table, write=True).alter.drop_column_not_null(column)
+        except Exception as exc:
+            if "already nullable" not in str(exc):
+                raise
+
     # ----------------------------------------------------------- log upkeep
 
     def checkpoint(self, table: ResolvedTable) -> None:
@@ -581,6 +691,14 @@ class DeltaRsEngine:
             return None
         return dt.compact_logs(first, last)
 
+    def cleanup_metadata(self, table: ResolvedTable) -> None:
+        """Delete log files older than `delta.logRetentionDuration`.
+
+        Log entries past retention are what keep old versions time-travelable,
+        so this is the step that makes them unreachable.
+        """
+        self._open(table, write=True).cleanup_metadata()
+
     def generate(self, table: ResolvedTable) -> None:
         """Write symlink manifests for engines that read them (Presto, Athena)."""
         self._open(table, write=True).generate()
@@ -590,7 +708,7 @@ class DeltaRsEngine:
         location: str,
         *,
         partition_by: Any = None,
-        partition_strategy: str = "hive",
+        partition_strategy: Literal["hive", "directory"] = "hive",
         **kwargs: Any,
     ) -> None:
         """Turn a directory of Parquet into a Delta table in place."""

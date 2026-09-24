@@ -33,13 +33,24 @@ The job is to collapse that into one object without lying about what it can do.
 ```
 identity.py      parse a reference   ->  TableRef
 catalog/         resolve a TableRef  ->  ResolvedTable  (+ credential provider)
+                 databricks | unity (OSS) | hive | glue | sharing | filesystem
+governance.py    what Unity Catalog says about a table: grants, tags, lineage
 credentials/     mint short-lived, per-table credentials
 capability.py    the conformance matrix, as data
 router.py        (table, operation)  ->  engine, or a refusal with a reason
-engine/          kernel | deltars | sql            do the actual work
+engine/          kernel | deltars | sql | sharing | iceberg   do the actual work
+engine/metadata  metadata-only commits written by this library
+predicate.py     one SQL predicate -> kernel file skipping + exact row filter
 _native          Rust: delta-kernel-rs through PyO3
 table.py         Connection and Table              the only public surface
 ```
+
+Each engine wraps a library that already does its job well: delta-kernel-rs,
+delta-rs, the Databricks Statement Execution API, the `delta-sharing` client,
+PyIceberg. deltaswamp's own code sits in the gaps between them. That covers
+routing, credential lifetimes, the kernel binding, metadata commits, predicate
+evaluation for the kernel, the staging flows that let a warehouse write, and
+Unity Catalog's managed-table creation.
 
 A read flows down and back up: `conn.table("main.sales.orders")` parses the
 name, asks the catalog to resolve it, and returns a `Table`. The first operation
@@ -107,9 +118,20 @@ defines, and takes the first that says yes. An engine never raises for an
 unsupported combination. It returns a `Capability` carrying the reason. When
 nothing can serve the request, the router raises with every reason it collected.
 
-The SQL warehouse sits last in most chains and is skipped unless the connection
-opted in. `DROP FEATURE`, `REORG`, `CLONE` and column rename reach it alone,
-because no open-source engine implements them at all.
+The SQL warehouse sits late in most chains and is skipped unless the
+connection opted in. `DROP FEATURE`, `REORG`, `CLONE`, `ANALYZE`, `REFRESH` and
+UniForm metadata sync reach it alone, because no open-source engine implements
+them at all.
+
+A request's shape narrows the candidates too. A predicate, a timestamp, a schema
+merge, `OPTIMIZE FULL` or `CLUSTER BY AUTO` each names a `supports_<shape>`
+flag. An engine without the flag is skipped before it can accept the call and
+fail halfway.
+
+Two kinds of table have exactly one way in. A table reached through a Delta
+Sharing profile is served by the sharing engine, whose verdict is final. An
+Iceberg table is served by the Iceberg engine through the catalog's Iceberg
+REST endpoint.
 
 `capabilities()` runs the same logic over every operation without performing
 any, which is what makes checking cheaper than catching.
@@ -157,16 +179,32 @@ shared Rust types. That is what lets this extension coexist in one process with
 the `deltalake` wheel, which links its own separate build of the kernel.
 
 What it exposes: snapshot resolution with the catalog's log tail and maximum
-ratified version, scans that return an Arrow stream, protocol and property
-accessors, partition columns, appends committed through either
-`FileSystemCommitter` or `UCCommitter`, and publishing staged commits.
+ratified version (at a version or a timestamp), scans that return an Arrow
+stream with predicate-based file skipping, file listing, the raw protocol,
+metadata and domain metadata, the change data feed, appends and overwrites
+(partitioned or not) committed through either `FileSystemCommitter` or
+`UCCommitter`, publishing staged commits, checkpoints, an atomic put-if-absent
+commit of raw actions for metadata-only changes, and the helpers of Unity
+Catalog's managed-table creation.
 
-Four constraints from the kernel's own source shape the code:
+Five constraints from the kernel's own source shape the code:
 
-The runtime must be multi-threaded. `UCCommitter` bridges its async catalog
-calls with `block_in_place`, which panics outright on a current-thread runtime,
-so the extension owns one shared multi-threaded runtime and a test asserts the
-invariant holds in the built wheel.
+The runtime must be multi-threaded, and so must the engine's executor.
+`UCCommitter` bridges its async catalog calls with `block_in_place`, which
+panics outright on a current-thread runtime and needs a Tokio handle in scope.
+So commits run inside the shared runtime. The default engine's
+`TokioBackgroundExecutor` runs all I/O on one current-thread runtime, and the
+checkpoint writer pulls log reads from inside a future on that same thread, so
+it deadlocks every time. Every engine here is built on `TokioMultiThreadExecutor`
+over the shared runtime instead, which turns the nested wait into
+`block_in_place` on another worker. That is what makes checkpointing a
+catalog-managed table possible.
+
+Predicates only skip files. The kernel turns Parquet row filtering off so that
+row positions, and so deletion vectors, stay valid. The exact filter is applied
+in Python from the same parse (`predicate.py`). A predicate the kernel cannot
+express is weakened safely: a conjunct is dropped only at positive polarity,
+never beneath a NOT.
 
 `UCCommitter` rejects protocol, metadata and clustering changes at version 1 and
 above. Schema evolution on a catalog-managed table has to go through the
@@ -204,9 +242,21 @@ Writes to Iceberg-reads tables are refused. They would require
 `MSCK REPAIR TABLE ... SYNC METADATA` afterward, which only Databricks can run,
 so writing anyway leaves the Iceberg view silently stale.
 
-Partitioned tables are refused on the kernel append path. That writer builds one
-unpartitioned write context, so it would put every row in the table root with no
-partition values.
+Partitioned appends on the kernel path split each batch by partition value in
+Rust and write each group through its own partitioned write context. A single
+unpartitioned context would put every row in the table root with no partition
+values, which reads back as wrong data rather than an error.
+
+Metadata-only commits are put-if-absent. The change is a pure function of the
+protocol and metadata it was computed from, so losing the race means
+recomputing against the new state, never overwriting the winner. `commitInfo`
+comes first and carries a strictly increasing in-commit timestamp where the
+table uses them.
+
+A copy-on-write rewrite commits against the snapshot it read. Kernel DELETE,
+UPDATE and replaceWhere read, transform and commit through one snapshot, so a
+concurrent writer produces a conflict (a 409 from the catalog, or a lost put),
+never a silently dropped commit.
 
 Unknown feature names never raise. The kernel tolerates unknown writer-only
 features when reading and so must this library, or the first table to adopt
@@ -218,6 +268,15 @@ Catalogs are discovered through the `deltaswamp.catalogs` entry-point group, so
 a third party can ship `deltaswamp-gravitino` out of tree and have it work with
 no change here. A dotted `module:Class` path is accepted too, for a class that
 is not installed as a distribution.
+
+Entry points are the extension mechanism, not how deltaswamp finds its own
+modules. The six built-in catalogs are listed in `BUILTIN_CATALOGS` and resolve
+without consulting installed metadata, because a source checkout, a vendored
+copy, a zipapp and several freezers all lose that metadata, and losing it used
+to leave every catalog unregistered and the library unusable. Lookups consult
+entry points first, so a plugin can still shadow a built-in name deliberately;
+the built-in map is the fallback, and a test asserts it agrees with
+`pyproject.toml`.
 
 The contract is one classmethod plus the `Catalog` protocol:
 
@@ -255,31 +314,35 @@ v0.28.0 tag, so the code is identical and only the source differs.
 
 ## Deliberately not built
 
-Creating managed tables needs the catalog to allocate storage through its
-staging-table API and then finalise through its create-table API. Until that
-exists, the attempt is refused with an explanation, instead of writing to a location
-nobody chose.
-
 Deletion-vector authoring is blocked upstream, not merely unbuilt.
 `Transaction::update_deletion_vectors` and `ack_row_tracking_preservation` are
-both absent from delta-kernel 0.28, so there is no commit hook to author bitmaps
-against. Until a kernel release adds them, `DELETE`, `UPDATE`, `MERGE` and
-predicate overwrites on a catalog-managed table route to the SQL fallback.
+both absent from delta-kernel 0.28. So DML on tables only the kernel can write
+is a whole-table rewrite bounded by `KernelEngine.rewrite_max_bytes`. It is
+refused on row-tracked tables, and MERGE on such tables needs the warehouse.
 
-Catalog-managed tables also cannot be checkpointed. `Snapshot::checkpoint`
-deadlocks when bound through PyO3 -- on and off the shared runtime -- against
-the default engine's background executor, and delta-rs cannot open the table to
-do it instead. The log therefore grows without bound, which is stated in the
-usage guide because it has operational consequences.
+The change feed of a catalog-managed table: the kernel's `TableChanges` lists
+the log itself and takes no catalog commit tail, so it would miss unpublished
+commits.
 
-Distributed scan planning has its seams in place. Planning and execution are
-already separate calls and credential providers already travel to workers, but
-the kernel's split-planning surface is not exposed yet, so `plan_scan` and
-`execute_scan` raise.
+Incremental reads over the kernel's `incremental_scan`, i.e. reading only the
+files added since a version without a change feed. `Table.changes()` follows
+the change data feed instead.
 
-Credential refresh inside a single long read, as above.
+Distributed planning is built for the kernel engine only. delta-rs, sharing,
+Iceberg and the warehouse read on the driver. A plan is a list of per-file
+splits pinned to one snapshot version. A worker re-resolves that version and
+reads only its files through a file-restricted kernel scan, which applies
+deletion vectors, column mapping and partition values exactly as the full scan
+does.
+
+Credential refresh inside a single long read.
 
 Catalog-managed state is captured once at resolution. `log_tail` and
 `max_catalog_version` come from the catalog when the table is resolved, so a
-long-lived `Table` will not see commits made after that point, including its
-own. Re-open the table to pick them up.
+long-lived `Table` will not see commits made after that point by other writers.
+Re-open the table to pick them up.
+
+Server-side Databricks behaviour stays server-side: predictive optimization,
+auto compaction, row-level concurrency, UniForm metadata generation.
+[ecosystem-audit.md](ecosystem-audit.md) maps each of these to the route that
+reaches it.

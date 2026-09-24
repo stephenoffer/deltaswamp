@@ -15,7 +15,7 @@ that names the source it came from, so anyone can re-check it.
 | Table | Contents |
 |---|---|
 | `FEATURE_SUPPORT` | all 34 table features x {kernel, delta-rs} x {read, write} |
-| `OPERATION_ENGINES` | all 33 operations -> engines in preference order |
+| `OPERATION_ENGINES` | all 46 operations -> engines in preference order |
 | `FEATURE_DEPENDENCIES` / `FEATURE_CONFLICTS` | what kernel enforces before a write |
 
 ## Facts worth re-reading before you change routing
@@ -51,9 +51,9 @@ deduplicates, and save modes come from `Connection.write_table`.
 
 | Mode | API | Engine | Note |
 |---|---|---|---|
-| append | `t.append(data)` | delta-rs, kernel | kernel handles unpartitioned tables only |
-| full overwrite | `t.overwrite(data)` | delta-rs | catalog-managed tables cannot be overwritten here |
-| replaceWhere | `t.overwrite(data, predicate=...)` | delta-rs | |
+| append | `t.append(data)` | delta-rs, kernel, iceberg, sql | the warehouse stages data in a volume |
+| full overwrite | `t.overwrite(data)` | delta-rs, kernel | the kernel replaces a catalog-managed table in one commit |
+| replaceWhere | `t.overwrite(data, predicate=...)` | delta-rs, iceberg, sql, kernel | kernel: a bounded whole-table rewrite |
 | dynamic partition overwrite | `t.overwrite(data, partition_overwrite='dynamic')` | delta-rs | emulated; predicate built from the partition values in `data` |
 | schema merge | `t.append(data, schema_mode='merge')` | delta-rs | routes as MERGE_SCHEMA, not APPEND |
 | schema overwrite / RTAS | `t.replace(data)` | delta-rs | |
@@ -61,20 +61,64 @@ deduplicates, and save modes come from `Connection.write_table`.
 | save modes | `conn.write_table(name, data, mode=...)` | both | `error`, `ignore`, `append`, `overwrite` |
 | idempotent write | `t.append(data, txn=(app_id, version))` | enforced here | neither engine deduplicates; verified against delta-rs 1.6.5 |
 | commit metadata | `t.append(data, commit_metadata={...})` | delta-rs | shows up in `history()` |
-| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | delta-rs | copy-on-write; catalog-managed tables need the SQL fallback |
+| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | delta-rs, sql, kernel | copy-on-write on delta-rs; the kernel rewrites the whole table (bounded) for tables only it can write; MERGE on those needs the warehouse |
 
-### Where each operation routes
+## Where every operation routes
 
-| Operation | Engines, in order |
-|---|---|
-| `append` | deltars, kernel |
-| `overwrite` | deltars |
-| `replace_where` | deltars |
-| `merge_schema` | deltars |
-| `create` | deltars, kernel |
-| `delete` | deltars, sql |
-| `update` | deltars, sql |
-| `merge` | deltars |
+Generated from `OPERATION_ENGINES`; `tests/unit/test_capability.py` fails if an
+operation is missing here. `sql` is reachable only with
+`allow_sql_fallback=True`. `sharing` and `iceberg` serve only tables that are
+theirs, so their place in a chain matters only for tables two engines could
+serve.
+
+| Operation | Engines, in order | Why |
+|---|---|---|
+| `scan` | kernel, deltars, sharing, iceberg, sql | kernel reads through writer-only features delta-rs rejects |
+| `time_travel` | kernel, deltars, sharing, iceberg, sql | history_manager handles the ICT-enablement boundary |
+| `cdf` | deltars, kernel, sharing, sql | delta-rs serves path tables it can open; the kernel's TableChanges takes the ones it cannot. Catalog-managed tables have no CDF outside Databricks |
+| `incremental` | *(none)* | reading only the files added since a version needs the kernel's incremental_scan, which is not bound yet; Table.changes() follows the change data feed instead |
+| `history` | deltars, iceberg, sql | kernel exposes no history() API, only commit_range primitives |
+| `detail` | kernel, deltars, sharing, iceberg, sql | kernel CRC path gives O(1) stats with zero I/O when a .crc exists |
+| `files` | deltars, kernel | delta-rs lists add actions with stats; the kernel lists the files of tables delta-rs cannot open |
+| `append` | deltars, kernel, iceberg, sql | delta-rs for path and external tables; it refuses catalog-managed tables, which then fall through to kernel and UCCommitter. The warehouse loads through a staging volume when neither can |
+| `overwrite` | deltars, kernel, iceberg, sql | delta-rs first; the kernel replaces a catalog-managed table in one commit |
+| `replace_where` | deltars, iceberg, sql, kernel | delta-rs, PyIceberg for Iceberg tables, the warehouse; last, the kernel rewrites the whole table in one commit, bounded in size |
+| `create` | deltars, kernel | delta-rs creates path and external tables; the kernel takes over when the properties or clustering exceed what delta-rs accepts, and for managed tables, whose storage the catalog allocates through its staging-table API |
+| `merge_schema` | deltars, sql | kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH SCHEMA EVOLUTION |
+| `delete` | deltars, sql, kernel | delta-rs copy-on-write, then the warehouse; last, a whole-table rewrite through the kernel, since kernel 0.28 cannot author deletion vectors |
+| `update` | deltars, sql, kernel | delta-rs, then the warehouse; last, a whole-table rewrite through the kernel with literal or column assignments |
+| `merge` | deltars, sql | kernel has no MERGE at all; the warehouse merges from a source staged in a volume |
+| `add_column` | deltars, kernel, sql | delta-rs first; kernel for tables it cannot write |
+| `drop_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no DROP COLUMN |
+| `rename_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no RENAME COLUMN |
+| `set_properties` | deltars, kernel, sql | delta-rs rejects most of the property surface on ALTER; the kernel path accepts what it can validate |
+| `add_feature` | deltars, kernel, sql | delta-rs first; kernel for the rest |
+| `drop_feature` | sql | Databricks-only (DROP FEATURE ... TRUNCATE HISTORY) |
+| `add_constraint` | deltars, sql | kernel marks checkConstraints NotSupported for writes, and adding one means validating every existing row |
+| `drop_constraint` | deltars, kernel, sql | a metadata-only change |
+| `unset_properties` | kernel, sql | delta-rs has no way to remove a property |
+| `set_comment` | deltars, kernel, sql | the table description in the Metadata action |
+| `set_column_comment` | deltars, kernel, sql | a 'comment' entry in the column's field metadata |
+| `alter_column_type` | kernel, sql | type widening: metadata-only under the typeWidening feature; delta-rs cannot read such a table at all |
+| `set_not_null` | kernel, sql | needs every existing row checked for nulls before the commit |
+| `drop_not_null` | deltars, kernel, sql | a metadata-only change |
+| `cluster_by` | kernel, sql | the delta.clustering domain; delta-rs has no domain metadata support |
+| `optimize` | deltars, sql | kernel has no OPTIMIZE; the warehouse runs it on managed and clustered tables |
+| `zorder` | deltars, sql | kernel has no Z-ORDER |
+| `vacuum` | deltars, sql | kernel has no VACUUM |
+| `restore` | deltars, sql | kernel has no RESTORE |
+| `repair` | deltars, sql | kernel has no FSCK |
+| `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first |
+| `log_compaction` | deltars | kernel's log_compaction_writer is a no-op stub (kernel#2337) |
+| `publish` | kernel | Snapshot::publish; only kernel implements staged->published |
+| `reorg` | sql | Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM) |
+| `clone` | sql | Databricks-only (shallow and deep CLONE) |
+| `convert` | deltars | kernel has no CONVERT TO DELTA |
+| `generate` | deltars | kernel has no manifest generation |
+| `cleanup_metadata` | deltars | delta-rs removes log files older than delta.logRetentionDuration |
+| `analyze` | sql | Databricks-only (ANALYZE TABLE ... COMPUTE [DELTA] STATISTICS) |
+| `sync_iceberg` | sql | Databricks-only (MSCK REPAIR TABLE ... SYNC METADATA regenerates UniForm Iceberg metadata) |
+| `refresh` | sql | Databricks-only (REFRESH of a materialized view or streaming table) |
 
 ## Table properties
 

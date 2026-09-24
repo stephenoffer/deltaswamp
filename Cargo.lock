@@ -705,6 +705,7 @@ dependencies = [
  "pyo3",
  "pyo3-arrow",
  "roaring",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
