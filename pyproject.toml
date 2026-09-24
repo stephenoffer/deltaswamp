@@ -1,0 +1,94 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "deltaswamp"
+version = "0.1.0"
+description = "One Python connector for every Delta table: Unity Catalog managed and external, Hive Metastore, Glue, and plain object storage."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Stephen Offer" }]
+keywords = ["delta", "delta-lake", "unity-catalog", "databricks", "lakehouse", "arrow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+]
+
+# Core stays deliberately small. Arrow crosses our boundary via the PyCapsule
+# interface, so pyarrow is NOT required -- Polars/DuckDB/pandas can consume a
+# scan without it.
+dependencies = [
+    "deltalake>=1.6.5",     # the DML / maintenance engine
+    "databricks-sdk>=0.141.0",  # unified Databricks auth; do not reimplement
+]
+
+[project.optional-dependencies]
+ray = ["ray[data]>=2.58.0"]
+sql = ["databricks-sql-connector>=4.5.0"]   # opt-in fallback engine
+hms = ["pymetastore>=0.4.0"]
+glue = ["boto3>=1.35"]
+iceberg = ["pyiceberg>=0.12.0"]             # managed Iceberg via the UC IRC endpoint
+sharing = ["delta-sharing>=1.4.2"]
+ossuc = ["unitycatalog-client>=0.6.0"]
+pyarrow = ["pyarrow>=17"]
+pandas = ["pandas>=2"]
+polars = ["polars>=1.39"]
+# NOTE: databricks-connect is deliberately absent. It pins requires-python
+# ==3.12.* and conflicts with pyspark; it must never enter the dependency set.
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "mypy>=1.11",
+    "ruff>=0.8",
+    "testcontainers>=4.8",
+]
+
+[project.urls]
+Repository = "https://github.com/stephenoffer/deltaswamp"
+
+# Third parties can ship out-of-tree catalogs (deltaswamp-mycatalog) by
+# registering here. Config also accepts a dotted path as an escape hatch.
+[project.entry-points."deltaswamp.catalogs"]
+databricks = "deltaswamp.catalog.databricks:DatabricksUnityCatalog"
+unity = "deltaswamp.catalog.ossuc:OSSUnityCatalog"
+hive = "deltaswamp.catalog.hms:HiveMetastoreCatalog"
+glue = "deltaswamp.catalog.glue:GlueCatalog"
+filesystem = "deltaswamp.catalog.filesystem:FilesystemCatalog"
+
+[tool.maturin]
+python-source = "python"
+module-name = "deltaswamp._native"
+manifest-path = "crates/native/Cargo.toml"
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["python/deltaswamp", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["deltalake.*", "databricks.*", "pyarrow.*", "ray.*", "pymetastore.*", "polars.*", "boto3.*", "pyiceberg.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Lets pure-Python tests run without compiling the Rust extension first.
+pythonpath = ["python"]
+markers = [
+    "databricks: requires a live Databricks workspace (set DELTASWAMP_TEST_DATABRICKS=1)",
+    "ossuc: requires an OSS Unity Catalog container",
+    "minio: requires a MinIO container",
+]

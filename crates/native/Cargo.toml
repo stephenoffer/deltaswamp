@@ -1,0 +1,30 @@
+[package]
+name = "deltaswamp-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PyO3 bindings over delta-kernel-rs for the deltaswamp connector"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+delta_kernel.workspace = true
+delta_kernel_default_engine.workspace = true
+arrow.workspace = true
+pyo3.workspace = true
+pyo3-arrow.workspace = true
+roaring.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# The Unity Catalog kernel crates (git-only; see workspace Cargo.toml).
+delta-kernel-unity-catalog.workspace = true
+unity-catalog-delta-client-api.workspace = true
+unity-catalog-delta-rest-client.workspace = true

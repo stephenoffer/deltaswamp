@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" rx="96" fill="#10170F"/><g transform="translate(88 70) scale(1.0)"><g fill="#44581C">
+  <path d="M150 290 C148 318 154 334 160 334 C167 334 170 318 168 290 Z"/>
+  <path d="M240 330 C238 362 246 392 254 392 C262 392 266 362 262 330 Z"/>
+  <path d="M300 320 C299 342 305 358 310 358 C316 358 318 342 318 320 Z"/>
+  <circle cx="254" cy="382" r="3" fill="#B5CF4E" opacity=".7"/>
+</g>
+<defs>
+  <clipPath id="sa"><path d="M-20 175 C50 153 110 153 175 175 S290 195 370 165 V400 H-20 Z"/></clipPath>
+  <clipPath id="ma"><path transform="scale(10)" fill-rule="evenodd" clip-rule="evenodd" d="M34.5593 28.0928L18.5379 0.699785C18.1796 0.0873153 17.2944 0.0873153 16.9362 0.699785L3.32066 23.9789C3.08139 24.3884 3.51327 24.8612 3.94251 24.6599C4.11877 24.577 4.3222 24.4935 4.5456 24.4103L4.54103 24.4195C4.54103 24.4195 4.91303 24.2752 5.54161 24.0761C6.2344 23.8633 6.99355 23.6618 7.68081 23.4915C9.60383 23.0476 12.1237 22.6862 14.3959 23.0635C16.487 23.4105 17.9432 23.971 19.0039 24.5219C19.4902 24.7749 19.9494 24.14 19.5563 23.7579C18.0356 22.28 15.6956 20.496 12.1364 19.7484C11.9806 19.7157 11.9025 19.5399 11.983 19.4024L17.3433 10.2374C17.5195 9.93637 17.9545 9.93637 18.1308 10.2374L28.368 27.7408C28.5837 28.1094 28.4028 28.5803 27.9979 28.7159C27.1957 28.984 26.2374 29.1846 25.1647 29.1846C24.4823 29.1846 23.7957 29.104 23.1075 28.9441C23.1075 28.9441 21.1236 28.631 18.472 27.049C15.8204 25.4672 10.7078 23.4492 4.97098 26.7162C2.52664 28.2869 0.897952 30.4352 0.0397244 31.784C-0.0946967 31.9951 0.137354 32.2469 0.358103 32.1291C2.32921 31.0761 7.64378 28.5892 12.4327 29.4832C15.2791 30.0144 18.5319 32.1632 21.9133 33.3954C27.5071 35.4682 32.9912 31.9954 33.003 31.9879C33.5827 31.6049 33.9232 31.3137 33.9812 31.2632L34.0512 31.2021C34.945 30.422 35.1583 29.1168 34.5593 28.0928Z"/></clipPath>
+  <linearGradient id="swa" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#7E9C2C"/><stop offset=".5" stop-color="#4A5E1E"/><stop offset="1" stop-color="#262E10"/>
+  </linearGradient>
+  <filter id="mka" x="0" y="0" width="100%" height="100%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.03 0.05" numOctaves="4" seed="6"/>
+    <feColorMatrix type="matrix" values="0 0 0 0 .18  0 0 0 0 .26  0 0 0 0 .07  0 0 0 1.8 -.6"/>
+  </filter>
+  <filter id="goa"><feTurbulence type="turbulence" baseFrequency="0.05" numOctaves="2" seed="6"/>
+    <feDisplacementMap in="SourceGraphic" scale="12"/></filter>
+</defs>
+<g clip-path="url(#ma)">
+  <rect x="-20" y="-20" width="400" height="400" fill="#00ADD4"/>
+  <path d="M-20 175 C50 153 110 153 175 175 S290 195 370 165 V400 H-20 Z" fill="url(#swa)"/>
+  <g clip-path="url(#sa)"><g filter="url(#goa)">
+    <ellipse cx="90" cy="250" rx="60" ry="16" fill="#6E5B28" opacity=".6"/>
+    <ellipse cx="270" cy="300" rx="70" ry="18" fill="#2E3A12" opacity=".7"/>
+    <ellipse cx="170" cy="310" rx="60" ry="14" fill="#8FA83A" opacity=".45"/>
+    <ellipse cx="300" cy="240" rx="40" ry="12" fill="#5E4C20" opacity=".55"/>
+  </g><rect x="-20" y="145" width="400" height="260" filter="url(#mka)"/></g>
+  <path d="M-20 175 C50 153 110 153 175 175 S290 195 370 165" fill="none" stroke="#B5CF4E" stroke-width="7" stroke-linecap="round"/>
+  <path d="M-20 175 C50 153 110 153 175 175 S290 195 370 165" transform="translate(0 9)" fill="none" stroke="#33421A" stroke-width="3" opacity=".7"/>
+  <circle cx="88" cy="215" r="5" fill="none" stroke="#CFE483" stroke-width="2" opacity=".8"/><circle cx="100" cy="200" r="3" fill="none" stroke="#CFE483" stroke-width="2" opacity=".8"/><circle cx="250" cy="230" r="5" fill="none" stroke="#CFE483" stroke-width="2" opacity=".8"/><circle cx="262" cy="215" r="3" fill="none" stroke="#CFE483" stroke-width="2" opacity=".8"/><circle cx="305" cy="275" r="4" fill="none" stroke="#CFE483" stroke-width="2" opacity=".8"/><circle cx="150" cy="300" r="4" fill="none" stroke="#CFE483" stroke-width="2" opacity=".8"/><circle cx="60" cy="315" r="3" fill="none" stroke="#CFE483" stroke-width="2" opacity=".8"/>
+</g>
+</g></svg>

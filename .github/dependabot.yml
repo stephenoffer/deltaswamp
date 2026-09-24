@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # delta_kernel is pinned exactly and asserted against a Rust constant and a
+    # Python constant. Bumping it is a deliberate act that needs the CHANGELOG
+    # read and the cross-engine tests re-run, so Dependabot stays out of it.
+    ignore:
+      - dependency-name: delta_kernel
+      - dependency-name: delta_kernel_default_engine
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

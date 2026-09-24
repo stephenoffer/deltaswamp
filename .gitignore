@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------- secrets
+# Listed first because it matters most: the live test suite authenticates with
+# a Databricks personal access token, and a PAT is a long-lived bearer
+# credential. Nothing that could hold one goes near a commit.
+.env
+.env.*
+!.env.example
+.envrc
+.databrickscfg
+*.pem
+*.key
+!**/src/**/*.key
+credentials.json
+secrets.json
+token.txt
+*.token
+.aws/
+.databricks/
+
+# ------------------------------------------------------------------ Rust
+/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock IS committed: the kernel is pinned exactly and CI builds --locked,
+# so the lockfile is part of the contract rather than a build artifact.
+
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*$py.class
+# Compiled extensions. maturin drops these into python/deltaswamp/ on an
+# editable install: .so on Linux and macOS, .pyd on Windows, .dylib if a build
+# is configured that way.
+*.so
+*.pyd
+*.dylib
+*.dll
+.Python
+build/
+dist/
+wheelhouse/
+*.egg-info/
+.eggs/
+*.whl
+*.tar.gz
+
+# Environments
+.venv/
+venv/
+ENV/
+.python-version
+
+# uv: this is a library, so the lockfile is not committed. Remove this line if
+# you would rather pin the development environment.
+uv.lock
+
+# ---------------------------------------------------------------- tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+report.xml
+.benchmarks/
+
+# ------------------------------------------------------------ editors / OS
+.DS_Store
+.AppleDouble
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.ipynb_checkpoints/
+
+# ----------------------------------------------------------------- scratch
+scratch/
+scratchpad/
+tmp/
+*.log

@@ -1,0 +1,6 @@
+# Pinned so a contributor's toolchain cannot be older than the kernel's MSRV.
+# delta-kernel 0.28 declares rust-version = "1.88" (its README still says 1.85;
+# the manifest is the binding one).
+[toolchain]
+channel = "1.88"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,67 @@
+[workspace]
+members = ["crates/native"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/stephenoffer/deltaswamp"
+
+[workspace.dependencies]
+# Delta kernel. Pinned exactly: every 0.x minor has carried breaking changes on a
+# ~3-week cadence, so a caret range would silently break the build.
+#
+# NOTE: these resolve to the git source via [patch.crates-io] below, NOT to
+# crates.io. That is forced, not a preference -- see the patch section.
+delta_kernel = { version = "=0.28.0", features = ["arrow-59", "internal-api"] }
+delta_kernel_default_engine = { version = "=0.28.0", features = ["arrow-59", "rustls"] }
+
+# The Unity Catalog kernel crates are NOT published to crates.io (in-tree only).
+# They must be git deps. Pinned to the v0.28.0 tag commit so they match the
+# crates.io kernel above exactly -- do not bump one without the other.
+delta-kernel-unity-catalog = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "b77d6518b2ae76bcb8796256666ad0de3f7f654b" }
+unity-catalog-delta-client-api = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "b77d6518b2ae76bcb8796256666ad0de3f7f654b" }
+unity-catalog-delta-rest-client = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "b77d6518b2ae76bcb8796256666ad0de3f7f654b" }
+
+# arrow 59 is forced by delta_kernel's arrow-59 feature and by pyo3-arrow 0.19.
+arrow = "59"
+arrow-array = "59"
+arrow-schema = "59"
+
+# object_store is pinned to 0.13.x by delta_kernel 0.28. Note this means
+# GoogleConfigKey::BearerToken (added in object_store 0.14) is NOT available;
+# GCS bearer tokens go through a custom CredentialProvider instead.
+object_store = "0.13.2"
+
+# `extension-module` is NOT enabled here: it tells PyO3 not to link libpython,
+# which is correct for the wheel but breaks `cargo test`'s test binary. maturin
+# adds it for the cdylib build via [tool.maturin] features.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+pyo3-arrow = "0.19"
+
+# Same roaring version delta_kernel itself depends on, so deletion-vector
+# bitmaps we author share the kernel's types.
+roaring = "0.11.2"
+
+tokio = { version = "1.47", features = ["rt-multi-thread", "sync", "macros"] }
+url = "2"
+uuid = { version = "1.18", features = ["v4"] }
+thiserror = "2"
+tracing = "0.1"
+
+# The Unity Catalog kernel crates are published only inside the delta-kernel-rs
+# repository, and they depend on `delta_kernel` by *path*. Cargo treats a path
+# dependency as a different crate instance from the crates.io one, so mixing them
+# produces two copies of `delta_kernel` and two incompatible `Committer` traits:
+#
+#     the trait bound `UCCommitter<..>: Committer` is not satisfied
+#     note: there are multiple different versions of crate `delta_kernel`
+#
+# Patching crates-io to the same v0.28.0 tag unifies them. The code is byte-identical
+# to the published 0.28.0 -- this changes the *source*, not the version -- but it does
+# mean the kernel effectively comes from git as long as we use the UC crates.
+[patch.crates-io]
+delta_kernel = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "b77d6518b2ae76bcb8796256666ad0de3f7f654b" }
+delta_kernel_default_engine = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "b77d6518b2ae76bcb8796256666ad0de3f7f654b" }

@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail rather than silently resolve a different dependency set.
+  CARGO_NET_RETRY: 3
+
+jobs:
+  # Pure-Python checks need no Rust toolchain, so they gate fastest.
+  lint:
+    name: lint, types, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv pip install --system pytest mypy ruff
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+      # These need no extension: reference parsing, the conformance matrices,
+      # routing decisions, and the test asserting docs match those matrices.
+      - name: Unit tests
+        run: pytest tests/unit -q
+
+  # Proves the abi3 claim: one wheel covers every Python from 3.11 up.
+  python-versions:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv python install ${{ matrix.python }}
+      - run: uv pip install --system --python ${{ matrix.python }} pytest
+      - run: uv run --python ${{ matrix.python }} pytest tests/unit -q
+
+  rust:
+    name: rust ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      # No toolchain action: rust-toolchain.toml is the single source of truth
+      # for the version and components, and rustup honours it.
+      - uses: Swatinem/rust-cache@v2
+      - name: Show the resolved toolchain
+        run: cargo --version && cargo clippy --version
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Includes the tripwire asserting KERNEL_VERSION matches Cargo.lock.
+      - run: cargo test --all --locked
+
+  native:
+    name: native build and integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: uv python install 3.11
+      - name: Build and install the wheel
+        # Installing the real artifact exercises packaging as well, and works
+        # without a virtualenv (which `maturin develop` requires).
+        run: |
+          uv pip install --system maturin pytest pyarrow polars
+          maturin build --out dist --locked
+          uv pip install --system --find-links dist deltaswamp
+      - name: Packaging is intact
+        # A build can succeed while the distribution is wrong: a missing
+        # subpackage, absent entry-point metadata, a stub that did not ship.
+        run: |
+          python -c "
+          import deltaswamp as ds
+          ds.check_native()
+          from deltaswamp.catalog.registry import available_catalogs
+          assert set(available_catalogs()) == {'databricks','filesystem','glue','hive','unity'}
+          import importlib.resources as r
+          assert (r.files('deltaswamp') / 'py.typed').is_file()
+          assert (r.files('deltaswamp') / '_native.pyi').is_file()
+          print('packaging OK', ds.__version__)
+          "
+      - name: Kernel pin agrees across all three places
+        run: |
+          python -c "
+          import re, pathlib, deltaswamp as ds
+          from deltaswamp import _native
+          lock = pathlib.Path('Cargo.lock').read_text()
+          m = re.search(r'name = \"delta_kernel\"\nversion = \"([^\"]+)\"', lock)
+          assert m, 'delta_kernel not in Cargo.lock'
+          assert m.group(1) == _native.KERNEL_VERSION == ds.EXPECTED_KERNEL_VERSION, (
+              f'pin drift: lock={m.group(1)} rust={_native.KERNEL_VERSION} py={ds.EXPECTED_KERNEL_VERSION}'
+          )
+          print('kernel pin', m.group(1))
+          "
+      - name: Full test suite
+        # Live Databricks tests are marked and skipped: they need a workspace and
+        # a token. Everything else runs, including the catalog-managed path,
+        # which is covered by tests/fake_uc.py rather than a real catalog.
+        run: pytest -q -m "not databricks"
+
+  sdist:
+    name: sdist builds from source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv python install 3.11
+      - name: Build the sdist and compile the wheel from it
+        # Catches a source distribution missing a file the build needs.
+        run: |
+          uv pip install --system maturin
+          maturin sdist --out dist
+          uv pip install --system --no-binary deltaswamp dist/*.tar.gz
+          python -c "import deltaswamp; deltaswamp.check_native(); print('sdist OK')"
