@@ -26,7 +26,7 @@ unity-catalog-delta-client-api = { git = "https://github.com/delta-io/delta-kern
 unity-catalog-delta-rest-client = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "b77d6518b2ae76bcb8796256666ad0de3f7f654b" }
 
 # arrow 59 is forced by delta_kernel's arrow-59 feature and by pyo3-arrow 0.19.
-arrow = "59"
+arrow = "60"
 arrow-array = "59"
 arrow-schema = "59"
 
