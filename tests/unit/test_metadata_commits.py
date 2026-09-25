@@ -348,9 +348,14 @@ class TestConstraintsAndClustering:
         assert {"clustering", "domainMetadata"} <= set(change.protocol["writerFeatures"])
 
     def test_cluster_by_none_clears_keys(self) -> None:
-        change = m.cluster_by(state(), None)
+        change = m.cluster_by(state(clustering=[["id"]]), None)
         config = json.loads(change.domains[0]["domainMetadata"]["configuration"])
         assert config == {"clusteringColumns": []}
+
+    def test_cluster_by_none_on_an_unclustered_table_adds_no_features(self) -> None:
+        change = m.cluster_by(state(), None)
+        assert change.domains == []
+        assert change.protocol is None
 
     def test_partitioned_tables_cannot_be_clustered(self) -> None:
         with pytest.raises(UnreachableTableError, match="partitioned or clustered"):

@@ -130,16 +130,30 @@ fn comparison_operands(
             (lt == rt).then(|| (Expression::column(lc), Expression::column(rc)))
         }
         (Some((col, ty)), None) => {
-            let scalar = coerce_literal(right, &ty)?;
+            let scalar = skippable(coerce_literal(right, &ty)?)?;
             Some((Expression::column(col), Expression::literal(scalar)))
         }
         (None, Some((col, ty))) => {
-            let scalar = coerce_literal(left, &ty)?;
+            let scalar = skippable(coerce_literal(left, &ty)?)?;
             Some((Expression::literal(scalar), Expression::column(col)))
         }
         // Two literals (a constant), or an unknown column on either side.
         (None, None) => None,
     }
+}
+
+/// Refuse literals whose comparison kernel's skipping gets wrong.
+///
+/// A float zero: kernel orders `-0.0` below `0.0` when pruning (a file whose
+/// partition value is `-0.0` was skipped for `f = 0.0` and `f >= 0.0`), while
+/// IEEE and the exact row filter treat them as equal, so those rows vanished.
+fn skippable(scalar: Scalar) -> Option<Scalar> {
+    let zero = match &scalar {
+        Scalar::Float(f) => *f == 0.0,
+        Scalar::Double(d) => *d == 0.0,
+        _ => false,
+    };
+    (!zero).then_some(scalar)
 }
 
 /// Resolve `{"column": [...]}` against the schema, case-insensitively.
@@ -198,16 +212,25 @@ fn coerce_literal(node: &Value, target: &PrimitiveType) -> Option<Scalar> {
                 target.parse_scalar(&n.to_string()).ok()
             }
             P::Float => {
+                if let Some(i) = json_integer(n) {
+                    // An integer literal must survive the narrowing exactly;
+                    // going via f64 first would already have rounded 2^53+1.
+                    let narrowed = i as f32;
+                    return (narrowed.is_finite() && narrowed as i128 == i)
+                        .then_some(Scalar::Float(narrowed));
+                }
                 let f = n.as_f64()?;
                 let narrowed = f as f32;
                 // Narrowing that moves the value moves the comparison boundary.
                 (f64::from(narrowed) == f && f.is_finite()).then_some(Scalar::Float(narrowed))
             }
             P::Double => {
-                if let Some(i) = n.as_i64() {
-                    // Integers beyond 2^53 are not exactly representable.
+                if let Some(i) = json_integer(n) {
+                    // Integers beyond 2^53 are not exactly representable. The
+                    // check is in i128: `i64::MAX as f64 as i64` saturates
+                    // back to i64::MAX and would pass a rounded value.
                     let d = i as f64;
-                    (d as i64 == i).then_some(Scalar::Double(d))
+                    (d.is_finite() && d as i128 == i).then_some(Scalar::Double(d))
                 } else {
                     n.as_f64().map(Scalar::Double)
                 }
@@ -225,7 +248,11 @@ fn coerce_literal(node: &Value, target: &PrimitiveType) -> Option<Scalar> {
         Value::String(s) => match target {
             // Never via parse_scalar: it maps "" to NULL, which is a different
             // predicate from `= ''`.
-            P::String => Some(Scalar::String(s.clone())),
+            // Only a literal declared as a string compares as one: a date or
+            // decimal rendered as text ('1.50', '2024-01-02') is compared by
+            // the exact filter after a cast, where it can equal a differently
+            // spelled string ('1.5'), so string-ordering skips would be wrong.
+            P::String => matches!(declared, "string" | "").then(|| Scalar::String(s.clone())),
             P::Boolean | P::Byte | P::Short | P::Integer | P::Long | P::Date | P::Timestamp => {
                 if s.is_empty() {
                     None
@@ -243,6 +270,13 @@ fn coerce_literal(node: &Value, target: &PrimitiveType) -> Option<Scalar> {
         },
         _ => None,
     }
+}
+
+/// A JSON integer (signed or beyond i64::MAX), widened losslessly.
+fn json_integer(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
 }
 
 /// Parse a zone-less timestamp; anything carrying a zone is ambiguous here.
@@ -472,6 +506,51 @@ mod tests {
     fn empty_string_literal_stays_an_empty_string() {
         let p = r#"{"op":"eq","args":[{"column":["name"]},{"literal":"","type":"string"}]}"#;
         assert!(conv(p).unwrap().contains("= ''") || conv(p).unwrap().contains("= \"\""));
+    }
+
+    #[test]
+    fn integer_literals_must_be_exact_in_the_float_column_type() {
+        // i64::MAX rounds to 2^63; `as i64` saturating back hid that.
+        let p = r#"{"op":"lt","args":[{"column":["d"]},{"literal":9223372036854775807,"type":"long"}]}"#;
+        assert_eq!(conv(p), None);
+        let p = r#"{"op":"lt","args":[{"column":["d"]},{"literal":18446744073709551615,"type":"long"}]}"#;
+        assert_eq!(conv(p), None);
+        // 2^53+1 is not a float; via f64 it silently became 2^53.
+        let p =
+            r#"{"op":"lt","args":[{"column":["f"]},{"literal":9007199254740993,"type":"long"}]}"#;
+        assert_eq!(conv(p), None);
+        let p = r#"{"op":"lt","args":[{"column":["f"]},{"literal":16777216,"type":"long"}]}"#;
+        assert!(conv(p).is_some());
+        let p = r#"{"op":"lt","args":[{"column":["d"]},{"literal":42,"type":"long"}]}"#;
+        assert!(conv(p).is_some());
+    }
+
+    #[test]
+    fn float_zero_comparisons_are_not_used_for_skipping() {
+        for lit in ["0.0", "-0.0"] {
+            for col in ["f", "d"] {
+                let p = format!(
+                    r#"{{"op":"ge","args":[{{"column":["{col}"]}},{{"literal":{lit},"type":"double"}}]}}"#
+                );
+                assert_eq!(conv(&p), None, "{p}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_string_literals_against_a_string_column_do_not_skip() {
+        for (lit, ty) in [
+            ("1.50", "decimal"),
+            ("2024-01-02", "date"),
+            ("2024-01-02T00:00:00+00:00", "timestamp"),
+        ] {
+            let p = format!(
+                r#"{{"op":"eq","args":[{{"column":["name"]}},{{"literal":"{lit}","type":"{ty}"}}]}}"#
+            );
+            assert_eq!(conv(&p), None, "{p}");
+        }
+        let p = r#"{"op":"eq","args":[{"column":["name"]},{"literal":"1.50","type":"string"}]}"#;
+        assert!(conv(p).is_some());
     }
 
     #[test]

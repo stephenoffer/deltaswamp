@@ -188,6 +188,16 @@ class KernelEngine:
         if not table.is_delta:
             return Capability(operation, ok=False, reason="the table is not a Delta table")
 
+        # The kernel create writes version 0 only; claiming mode='overwrite'
+        # here and refusing in create() left no engine to fall through to.
+        if operation is Operation.CREATE and shape.get("mode") not in (None, "error", "create"):
+            return Capability(
+                operation,
+                ok=False,
+                reason=f"the kernel create path writes version 0 of a new table only, "
+                f"not mode={shape.get('mode')!r}",
+            )
+
         if table.location is None:
             return Capability(
                 operation,
@@ -262,9 +272,16 @@ class KernelEngine:
                         + ", ".join(sorted(write_blockers))
                     ),
                 )
+            if operation in _WRITE_OPS and operation is not Operation.CREATE:
+                refusal = self._data_write_refusal(operation, table)
+                if refusal is not None:
+                    return refusal
             if (
                 table.partition_columns
-                and operation in (Operation.APPEND, Operation.OVERWRITE)
+                and (
+                    operation in (Operation.APPEND, Operation.OVERWRITE)
+                    or operation in _REWRITE_OPS
+                )
                 and not _native_has("partitioned_append")
             ):
                 # The write path here builds one unpartitioned context, so this
@@ -279,7 +296,7 @@ class KernelEngine:
                     ),
                 )
 
-        if operation is Operation.SCAN and table.is_shallow_clone:
+        if operation in (Operation.SCAN, Operation.TIME_TRAVEL) and table.is_shallow_clone:
             # Its add actions point at the source table's files by absolute path.
             # Kernel resolves those before we see them, so we cannot scope
             # credentials correctly or tell borrowed files from owned ones.
@@ -292,6 +309,17 @@ class KernelEngine:
                     "credential-scoped reliably"
                 ),
                 remedy="read the source table directly, or use Compatibility Mode",
+            )
+
+        if operation is Operation.CDF and table.is_catalog_managed:
+            # cdf() refuses these; claiming them here kept the router from
+            # diverting to an engine that can serve them.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the kernel's TableChanges takes no catalog commit tail, so it would "
+                "miss ratified-but-unpublished commits of a catalog-managed table",
+                remedy="ds.connect(..., allow_sql_fallback=True) reads it with table_changes()",
             )
 
         if operation is Operation.CREATE:
@@ -337,6 +365,22 @@ class KernelEngine:
             raise UnreachableTableError("open", "the table has no storage location", None)
         if version is not None and timestamp is not None:
             raise UnreachableTableError("time travel", "pass a version or a timestamp, not both")
+        if version is not None:
+            # operator.index keeps numpy integers (e.g. from a history frame)
+            # working, as the binding's own integer extraction accepted them.
+            import operator
+
+            try:
+                if isinstance(version, bool):
+                    raise TypeError
+                version = operator.index(version)
+            except TypeError:
+                raise UnreachableTableError(
+                    f"read version {version!r}", "a version is an integer"
+                ) from None
+        if version is not None and version < 0:
+            # The binding takes an unsigned version and raised OverflowError.
+            raise UnreachableTableError(f"read version {version}", "versions start at 0")
 
         # `log_tail` and `max_catalog_version` are what make a catalog-managed
         # table readable; both are meaningless (and omitted) otherwise.
@@ -357,6 +401,12 @@ class KernelEngine:
         except ValueError as exc:
             if "earliest recreatable" in str(exc):
                 raise UnreachableTableError(f"read the table as of {timestamp}", str(exc)) from exc
+            if version is not None and "not the same as the specified end version" in str(exc):
+                raise UnreachableTableError(
+                    f"read version {version}",
+                    f"the table has no such version ({exc})",
+                    "time travel to a committed version, or omit it for the latest",
+                ) from exc
             raise
 
     def scan(
@@ -377,22 +427,7 @@ class KernelEngine:
         caller did not ask for are read and then dropped.
         """
         snapshot = self.snapshot(table, version=version, timestamp=timestamp)
-        if predicate is None:
-            return snapshot.scan(columns=columns)
-
-        from .. import predicate as sqlpred
-
-        node = sqlpred.parse(predicate)
-        read_columns = columns
-        if columns is not None:
-            needed = {path[0] for path in sqlpred.columns_of(node)}
-            lowered = {c.lower() for c in columns}
-            read_columns = list(columns) + sorted(c for c in needed if c.lower() not in lowered)
-        stream = snapshot.scan(columns=read_columns, predicate=sqlpred.to_kernel_json(node))
-        _require_pyarrow("filter rows with a predicate on the kernel path")
-        return sqlpred.filter_stream(
-            stream, node, keep=list(columns) if columns is not None else None
-        )
+        return _planned_read(snapshot, columns, predicate)
 
     def files(
         self,
@@ -430,7 +465,8 @@ class KernelEngine:
         """
         from deltaswamp import _native
 
-        given = {k: v for k, v in unsupported.items() if v not in (None, False)}
+        # `v not in (None, False)` also dropped 0, since 0 == False.
+        given = {k: v for k, v in unsupported.items() if v is not None and v is not False}
         if given:
             raise UnreachableTableError(
                 f"read the change data feed with {', '.join(sorted(given))}",
@@ -443,7 +479,14 @@ class KernelEngine:
                 "commit tail, so it would silently miss unpublished commits",
                 "ds.connect(..., allow_sql_fallback=True) reads it with table_changes()",
             )
-        if table.properties.get("delta.enableChangeDataFeed", "false").lower() != "true":
+        # A path-resolved table carries no properties until it is enriched, so
+        # an absent key means "ask the log", not "disabled".
+        enabled = table.properties.get("delta.enableChangeDataFeed")
+        snapshot = None
+        if enabled is None or columns is not None or predicate:
+            snapshot = self.snapshot(table)
+            enabled = snapshot.table_properties().get("delta.enableChangeDataFeed", enabled)
+        if str(enabled or "false").lower() != "true":
             raise UnreachableTableError(
                 "read the change data feed",
                 "delta.enableChangeDataFeed is not enabled on this table, and enabling "
@@ -453,13 +496,23 @@ class KernelEngine:
             raise UnreachableTableError(
                 "read the change data feed", "pass a starting version or timestamp, not both"
             )
+        if ending_version is not None and ending_timestamp is not None:
+            raise UnreachableTableError(
+                "read the change data feed", "pass an ending version or timestamp, not both"
+            )
         from .. import predicate as sqlpred
 
-        node = sqlpred.parse(predicate) if predicate else None
-        read_columns = columns
-        if columns is not None and node is not None:
-            needed = {path[0] for path in sqlpred.columns_of(node)}
-            read_columns = list(columns) + sorted(needed - set(columns))
+        meta = ["_change_type", "_commit_version", "_commit_timestamp"]
+        node, read_columns, keep = None, columns, None
+        if snapshot is not None and (columns is not None or predicate):
+            node, read_columns, wanted = _read_plan(snapshot, columns, predicate or None)
+            if read_columns is not None:
+                # The feed always carries its metadata columns, so they are
+                # never projected, and each is kept exactly once.
+                wanted = read_columns if wanted is None else wanted
+                keep = [*wanted, *(m for m in meta if m not in wanted)]
+                read_columns = [c for c in read_columns if c not in meta]
+                read_columns = _with_data_column(snapshot, read_columns)
         assert table.location is not None  # supports() refused otherwise
         stream = _native.table_changes(
             table.location,
@@ -475,12 +528,16 @@ class KernelEngine:
                 _timestamp_ms(ending_timestamp) if ending_timestamp is not None else None
             ),
         )
-        if node is None:
-            return stream
-        keep = None
-        if columns is not None:
-            keep = [*columns, "_change_type", "_commit_version", "_commit_timestamp"]
-        return sqlpred.filter_stream(stream, node, keep=keep)
+        if node is not None:
+            stream = sqlpred.filter_stream(stream, node)
+        if keep is not None:
+            import pyarrow as pa
+
+            have = pa.RecordBatchReader.from_stream(stream)
+            if list(have.schema.names) == keep:
+                return have
+            return _project(have, keep)
+        return stream
 
     def checkpoint(self, table: ResolvedTable) -> bool:
         """Write a checkpoint at the latest version. False if one already existed.
@@ -566,6 +623,7 @@ class KernelEngine:
         """Append data and commit. Returns the committed version."""
         # A bare **_ here used to swallow schema_mode, writer_properties and the
         # rest, so they silently did nothing on a catalog-managed table.
+        retries = unsupported.pop("max_commit_retries", None)
         given = {k: v for k, v in unsupported.items() if v is not None}
         if given:
             raise UnreachableTableError(
@@ -574,20 +632,71 @@ class KernelEngine:
                 "the router sends these to delta-rs when the table allows it; a "
                 "catalog-managed table needs the SQL fallback",
             )
-        reader = _as_record_batch_reader(data)
-        snapshot = self.snapshot(table, write=True)
+        from deltaswamp import _native
 
-        version: int = snapshot.append(
-            reader,
-            uc=self._uc_commit_config(table),
-            engine_info=engine_info or f"deltaswamp/{_version()}",
-            operation=operation,
-            overwrite=overwrite,
-            txn=txn,
-            commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-        )
-        self._maybe_checkpoint(table, version)
+        # A blind append commutes with any concurrent commit, so losing the race
+        # means re-staging it on the new snapshot -- which delta-rs does too.
+        # Only re-readable data can be re-staged, an overwrite must surface the
+        # conflict, and a catalog-managed table's tail cannot be refreshed here.
+        if retries is not None and not hasattr(data, "to_reader") and not overwrite:
+            import pyarrow as pa
+
+            data = pa.table(_as_record_batch_reader(data))
+        replayable = hasattr(data, "to_reader") and not overwrite and not table.is_catalog_managed
+        attempts = 1 + max(0, self.append_commit_retries if retries is None else int(retries))
+        attempts = attempts if replayable else 1
+        for attempt in range(attempts):
+            reader = _as_record_batch_reader(data)
+            snapshot = self.snapshot(table, write=True)
+            try:
+                version: int = snapshot.append(
+                    reader,
+                    uc=self._uc_commit_config(table),
+                    engine_info=engine_info or f"deltaswamp/{_version()}",
+                    operation=operation,
+                    overwrite=overwrite,
+                    txn=txn,
+                    commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+                )
+            except _native.CommitConflictError:
+                if attempt + 1 >= attempts or self._txn_won_race(snapshot, table, txn):
+                    # A concurrent commit that recorded this txn (or a later
+                    # one) already wrote this batch: re-staging would append it twice.
+                    raise
+                continue
+            break
+        self._maybe_checkpoint(table, version, snapshot)
         return version
+
+    def _txn_won_race(self, snapshot: Any, table: ResolvedTable, txn: Any) -> bool:
+        if txn is None:
+            return False
+        try:
+            fresh = self.snapshot(table)
+            last = fresh.app_id_version(txn[0]) if hasattr(fresh, "app_id_version") else None
+        except Exception:
+            return True  # cannot tell; surfacing the conflict is the safe answer
+        return last is not None and int(last) >= int(txn[1])
+
+    @property
+    def txn_version(self) -> Any:
+        """`txn_version(table, app_id)`: the last version committed under `app_id`.
+
+        None (not a method) on a build without the binding, so callers that
+        test for the method fall back instead of calling one that cannot work.
+        Without it the append dedup had nothing to ask on tables only the
+        kernel can open, and a replayed txn appended twice.
+        """
+        return self._txn_version if _native_has("app_id_version") else None
+
+    def _txn_version(self, table: ResolvedTable, app_id: str) -> int | None:
+        # The snapshot includes a catalog-managed table's ratified tail, so an
+        # unpublished commit's txn counts too.
+        version = self.snapshot(table).app_id_version(app_id)
+        return None if version is None else int(version)
+
+    #: Re-stagings of a blind append that lost a commit race, by default.
+    append_commit_retries = 5
 
     def create(
         self,
@@ -599,7 +708,8 @@ class KernelEngine:
         mode: str = "error",
         properties: dict[str, str] | None = None,
         engine_info: str | None = None,
-        **_ignored: Any,
+        description: str | None = None,
+        **unsupported: Any,
     ) -> int:
         """Create a table and commit version 0.
 
@@ -617,41 +727,69 @@ class KernelEngine:
                 "the kernel create path writes version 0 of a new table only",
                 "use mode='error', or write through delta-rs for overwrite semantics",
             )
+        # A bare **_ignored used to drop these (a description included) silently.
+        _refuse_options("create", unsupported)
+        if description is not None and table.is_catalog_managed:
+            raise UnreachableTableError(
+                "create a catalog-managed table with a description",
+                "the kernel create takes no description, and a follow-up metadata commit "
+                "on a catalog-managed table would bypass the catalog",
+                "set the comment through the catalog after creating the table",
+            )
 
         version: int = create_table(
             table.location,
             schema,
-            options=self._base_options or None,
+            # Vended credentials too: a catalog create writes version 0 to a
+            # location only they can reach.
+            options=self._options(table, write=True) or None,
             properties=properties or None,
             partition_by=partition_by or None,
             cluster_by=cluster_by or None,
             uc=self._uc_commit_config(table),
             engine_info=engine_info or f"deltaswamp/{_version()}",
         )
+        if description is not None:
+            version = self.set_comment(table, description)
         return version
 
     #: Fallback when the table sets no interval. Matches Delta's own default.
     default_checkpoint_interval = 10
 
-    def checkpoint_interval(self, table: ResolvedTable) -> int:
-        raw = table.properties.get("delta.checkpointInterval")
+    def checkpoint_interval(
+        self, table: ResolvedTable, properties: dict[str, str] | None = None
+    ) -> int:
+        # `properties` are the snapshot's own: a path-resolved table carries
+        # none, and its interval used to be read as the default.
+        raw = {**table.properties, **(properties or {})}.get("delta.checkpointInterval")
         try:
             interval = int(raw) if raw else self.default_checkpoint_interval
         except ValueError:
             interval = self.default_checkpoint_interval
         return max(interval, 1)
 
-    def _maybe_checkpoint(self, table: ResolvedTable, version: int) -> None:
+    def _maybe_checkpoint(self, table: ResolvedTable, version: int, snapshot: Any = None) -> None:
         """Checkpoint after a commit at the table's checkpoint interval.
 
-        Kernel commits never checkpoint on their own. A catalog-managed table is
-        checkpointed here too (after publishing), since nothing else outside
-        Databricks can; without it the log grows and opening slows.
+        Kernel commits never checkpoint on their own. The checkpoint is written
+        at exactly `version`, the commit just made.
+
+        A catalog-managed table is skipped: the commit just ratified is not in
+        this ResolvedTable's log tail, so publishing from here stops one version
+        short, and the checkpoint used to land on the previous version. A
+        checkpoint cannot cover an unpublished commit, so `checkpoint()` on a
+        freshly resolved table (which publishes first) is the way to take one.
         """
-        if version == 0 or version % self.checkpoint_interval(table) != 0:
+        if version == 0 or table.is_catalog_managed:
             return
         try:
-            self.checkpoint(table)
+            properties = snapshot.table_properties() if snapshot is not None else None
+        except Exception:
+            properties = None
+        if version % self.checkpoint_interval(table, properties) != 0:
+            return
+        try:
+            self.snapshot(table, version=version, write=True).checkpoint()
         except Exception:
             # A checkpoint is an optimization; never fail a commit that worked.
             return
@@ -681,15 +819,38 @@ class KernelEngine:
         if predicate is not None:
             import pyarrow as pa
 
+            # These used to be dropped here: a txn lost its idempotency record
+            # and commit metadata vanished, while the plain overwrite kept both.
+            passthrough = {
+                k: kwargs.pop(k, None) for k in ("txn", "commit_metadata", "engine_info")
+            }
+            _refuse_options("overwrite with a predicate", kwargs)
             incoming = pa.table(_as_record_batch_reader(data))
 
             def replace(current: Any, keep: Any) -> Any:
-                kept = current.filter(keep)
-                return pa.concat_tables(
-                    [kept, incoming.select(kept.column_names).cast(kept.schema)]
-                )
+                import pyarrow.compute as pc
 
-            return int(self._rewrite(table, predicate, replace, operation="WRITE")["version"])
+                from .. import predicate as sqlpred
+
+                kept = current.filter(keep)
+                new = _conform(incoming, kept.schema)
+                # replaceWhere: every new row must satisfy the predicate, as
+                # Databricks (replaceWhere.constraintCheck) and delta-rs enforce.
+                # Accepting others writes rows outside the range being replaced.
+                node = _canonical_node(sqlpred.parse(predicate), new.schema)
+                ok = pc.fill_null(_evaluate(new, sqlpred.to_arrow(node, new.schema)), False)
+                bad = new.num_rows - int(pc.sum(ok).as_py() or 0)
+                if bad:
+                    raise UnreachableTableError(
+                        f"overwrite where {predicate}",
+                        f"{bad} row(s) of the new data do not satisfy the predicate, so "
+                        "writing them would add rows outside the range being replaced",
+                        "filter the data to the predicate first",
+                    )
+                return pa.concat_tables([kept, new])
+
+            result = self._rewrite(table, predicate, replace, operation="WRITE", **passthrough)
+            return int(result["version"])
         return self.append(table, data, operation="WRITE", overwrite=True, **kwargs)
 
     # ------------------------------------------------ copy-on-write rewrites
@@ -725,6 +886,67 @@ class KernelEngine:
             )
         return None
 
+    def _data_write_refusal(self, operation: Operation, table: ResolvedTable) -> Capability | None:
+        """Tables whose data the kernel's transaction refuses to write at commit.
+
+        Each of these used to be claimed and then fail after the data was
+        staged, with no way for the router to divert the call.
+        """
+        writer = table.min_writer_version or 0
+        if 3 <= writer <= 6:
+            # A legacy protocol implies checkConstraints (and, from 4, CDF and
+            # generated columns), which the kernel writer does not support.
+            return Capability(
+                operation,
+                ok=False,
+                reason=f"the table uses the legacy writer protocol version {writer}, which "
+                "implies checkConstraints; the kernel writer does not support it",
+            )
+        append_only = str(table.properties.get("delta.appendOnly", "false")).lower() == "true"
+        if append_only and operation is not Operation.APPEND:
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table is append-only (delta.appendOnly=true), so no commit may "
+                "remove or rewrite its data",
+            )
+        cdf = str(table.properties.get("delta.enableChangeDataFeed", "false")).lower() == "true"
+        if cdf and operation is not Operation.APPEND:
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table has the change data feed enabled, and the kernel cannot "
+                "write the CDC files a commit that removes data must carry",
+            )
+        if (writer == 2 or "invariants" in table.writer_features) and self._has_invariants(table):
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table schema declares column invariants, which the kernel "
+                "writer does not enforce and therefore refuses",
+            )
+        return None
+
+    def _has_invariants(self, table: ResolvedTable) -> bool:
+        import json
+
+        try:
+            schema = json.loads(json.loads(self.snapshot(table).metadata_json())["schemaString"])
+        except Exception:
+            return False  # cannot tell; the commit itself will refuse if so
+
+        def walk(node: Any) -> bool:
+            if isinstance(node, dict):
+                metadata = node.get("metadata")
+                if isinstance(metadata, dict) and "delta.invariants" in metadata:
+                    return True
+                return any(walk(v) for v in node.values())
+            if isinstance(node, list):
+                return any(walk(v) for v in node)
+            return False
+
+        return walk(schema)
+
     def _live_bytes(self, table: ResolvedTable) -> int:
         import pyarrow as pa
 
@@ -738,6 +960,9 @@ class KernelEngine:
         transform: Any,
         *,
         operation: str,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+        engine_info: str | None = None,
     ) -> dict[str, Any]:
         """Copy-on-write through one kernel transaction.
 
@@ -763,7 +988,8 @@ class KernelEngine:
         if predicate is None:
             matched = pa.array([True] * current.num_rows, pa.bool_())
         else:
-            expr = sqlpred.to_arrow(sqlpred.parse(predicate), current.schema)
+            node = _canonical_node(sqlpred.parse(predicate), current.schema)
+            expr = sqlpred.to_arrow(node, current.schema)
             matched = pc.fill_null(_evaluate(current, expr), False)
         keep = pc.invert(matched)
         replacement = transform(current, keep)
@@ -773,11 +999,13 @@ class KernelEngine:
         version = snapshot.append(
             replacement.to_reader(),
             uc=self._uc_commit_config(table),
-            engine_info=f"deltaswamp/{_version()}",
+            engine_info=engine_info or f"deltaswamp/{_version()}",
             operation=operation,
             overwrite=True,
+            txn=txn,
+            commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
         )
-        self._maybe_checkpoint(table, version)
+        self._maybe_checkpoint(table, version, snapshot)
         return {"version": int(version), "num_affected_rows": touched}
 
     def delete(
@@ -821,15 +1049,28 @@ class KernelEngine:
         if not assignments:
             raise UnreachableTableError("update", "no assignments given")
 
+        def column_index(schema: Any, name: str, what: str) -> int:
+            # Delta column names are case-insensitive.
+            index = int(schema.get_field_index(_canonical_path(schema, (name,))[0]))
+            if index < 0:
+                raise UnreachableTableError(what, f"the table has no column {name!r}")
+            return index
+
         def assign(current: Any, keep: Any) -> Any:
             out = current
             for column, value in assignments.items():
-                index = out.schema.get_field_index(column)
-                if index < 0:
-                    raise UnreachableTableError(f"update {column}", "the table has no such column")
+                index = column_index(out.schema, column, f"update {column}")
                 field = out.schema.field(index)
                 if isinstance(value, sqlpred.Column):
-                    source = out.column(".".join(value.path)).cast(field.type)
+                    # SQL reads every right-hand side from the row as it was:
+                    # `SET a = b, b = a` swaps. Reading `out` chained them.
+                    if len(value.path) != 1:
+                        raise UnreachableTableError(
+                            f"update {column}", "assigning from a nested field is not supported"
+                        )
+                    what = f"update {column} from {value.path[0]}"
+                    source_index = column_index(current.schema, value.path[0], what)
+                    source = current.column(source_index).cast(field.type)
                 else:
                     raw = value.value if isinstance(value, sqlpred.Literal) else value
                     source = pa.array([raw] * out.num_rows).cast(field.type)
@@ -1060,7 +1301,10 @@ class KernelEngine:
             import pyarrow as pa
 
             nulls = 0
-            for batch in pa.RecordBatchReader.from_stream(snapshot.scan(columns=[column])):
+            # The metadata change matches names case-insensitively; the
+            # native projection does not, and failed on `ID` for `id`.
+            name = _canonical_path(pa.schema(snapshot.schema()), (column,))[0]
+            for batch in pa.RecordBatchReader.from_stream(snapshot.scan(columns=[name])):
                 nulls += batch.column(0).null_count
             if nulls:
                 raise UnreachableTableError(
@@ -1117,6 +1361,13 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version, timestamp=timestamp)
         skipping = sqlpred.to_kernel_json(sqlpred.parse(predicate)) if predicate else None
         files = pa.table(snapshot.files(predicate=skipping)).to_pylist()
+        # The log keys partition values by *physical* name, which under column
+        # mapping is a `col-<uuid>`; splits report the logical column name.
+        logical = {}
+        for fld in pa.schema(snapshot.schema()):
+            physical = (fld.metadata or {}).get(b"delta.columnMapping.physicalName")
+            if physical is not None:
+                logical[physical.decode()] = fld.name
         splits = []
         for f in files:
             dv = f.get("deletion_vector")
@@ -1137,7 +1388,7 @@ class KernelEngine:
                 ScanSplit(
                     path=f["path"],
                     size=int(f["size"]),
-                    partition_values={k: v for k, v in partition_values.items()},
+                    partition_values={logical.get(k, k): v for k, v in partition_values.items()},
                     deletion_vector=descriptor,
                     commit_version=int(snapshot.version),
                 )
@@ -1158,29 +1409,144 @@ class KernelEngine:
         the kernel exactly as in a full scan; the predicate is applied exactly
         afterwards.
         """
-        from .. import predicate as sqlpred
-
         versions = {s.commit_version for s in splits}
         if len(versions) > 1:
             raise UnreachableTableError(
                 "execute scan splits",
-                f"the splits were planned against different versions ({sorted(versions)})",
+                # key=str: a hand-built split with no version made sorted()
+                # raise TypeError comparing None with an int.
+                f"the splits were planned against different versions ({sorted(versions, key=str)})",
                 "plan once and distribute that plan",
             )
         version = next(iter(versions)) if versions else None
         snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
-        if predicate is None:
-            return snapshot.scan(columns=columns, files=paths)
-        node = sqlpred.parse(predicate)
-        read_columns = columns
-        if columns is not None:
-            needed = {path[0] for path in sqlpred.columns_of(node)}
-            read_columns = list(columns) + sorted(needed - set(columns))
-        stream = snapshot.scan(
-            columns=read_columns, predicate=sqlpred.to_kernel_json(node), files=paths
+        return _planned_read(snapshot, columns, predicate, files=paths)
+
+
+def _canonical_path(schema: Any, path: tuple[str, ...]) -> tuple[str, ...]:
+    """`path` spelled as `schema` spells it. Delta names are case-insensitive.
+
+    The kernel resolves a projection and the exact row filter resolves a
+    column by exact name, so `ID` against a column `id` used to fail on one
+    side and match on the other. Unmatched segments are left as written, for
+    the reader to reject.
+    """
+    import pyarrow as pa
+
+    out: list[str] = []
+    current: Any = schema
+    for name in path:
+        if isinstance(current, pa.Schema):
+            fields = list(current)
+        elif isinstance(current, pa.StructType):
+            fields = [current.field(i) for i in range(current.num_fields)]
+        else:
+            return (*out, *path[len(out) :])
+        match = next((f for f in fields if f.name == name), None) or next(
+            (f for f in fields if f.name.lower() == name.lower()), None
         )
-        return sqlpred.filter_stream(stream, node, keep=list(columns) if columns else None)
+        if match is None:
+            return (*out, *path[len(out) :])
+        out.append(match.name)
+        current = match.type
+    return tuple(out)
+
+
+def _canonical_node(node: Any, schema: Any) -> Any:
+    """`node` with every column reference spelled as `schema` spells it."""
+    import dataclasses
+
+    from .. import predicate as sqlpred
+
+    if isinstance(node, sqlpred.Column):
+        return sqlpred.Column(_canonical_path(schema, node.path))
+    if isinstance(node, sqlpred.Node):
+        return dataclasses.replace(node, args=tuple(_canonical_node(a, schema) for a in node.args))
+    return node
+
+
+def _read_plan(
+    snapshot: Any, columns: list[str] | None, predicate: str | None
+) -> tuple[Any, list[str] | None, list[str] | None]:
+    """`(node, read_columns, keep)` for a projected, filtered read.
+
+    `read_columns` adds what the predicate needs to what was asked for, and is
+    never empty: an empty projection panics inside the native reader, so one
+    column is read and dropped. `keep` is the final projection, or None when
+    the read already is it.
+    """
+    from .. import predicate as sqlpred
+
+    node = sqlpred.parse(predicate) if predicate is not None else None
+    if columns is None and node is None:
+        return None, None, None
+    import pyarrow as pa
+
+    schema = pa.schema(snapshot.schema())
+    if node is not None:
+        node = _canonical_node(node, schema)
+    if columns is None:
+        return node, None, None
+    wanted = list(dict.fromkeys(_canonical_path(schema, (c,))[0] for c in columns))
+    read = list(wanted)
+    if node is not None:
+        for path in sorted(sqlpred.columns_of(node)):
+            if path[0] not in read:
+                read.append(path[0])
+    read = _with_data_column(snapshot, read)
+    return node, read, (wanted if read != wanted else None)
+
+
+def _with_data_column(snapshot: Any, read: list[str]) -> list[str]:
+    """`read`, plus one data-file column when it has none.
+
+    The native reader panics on a projection with no data-file columns --
+    an empty one, or only partition columns -- so one is read and dropped.
+    """
+    partitions = set(snapshot.partition_columns)
+    if read and not set(read) <= partitions:
+        return read
+    data = [n for n in snapshot.schema().names if n not in partitions]
+    return [*read, data[0]] if data else read
+
+
+def _project(stream: Any, keep: list[str]) -> Any:
+    """`stream` narrowed to `keep`, in that order. `[]` keeps row counts only."""
+    import pyarrow as pa
+
+    reader = pa.RecordBatchReader.from_stream(stream)
+    schema = pa.schema([reader.schema.field(name) for name in keep])
+    return pa.RecordBatchReader.from_batches(schema, (b.select(keep) for b in reader))
+
+
+def _planned_read(
+    snapshot: Any,
+    columns: list[str] | None,
+    predicate: str | None,
+    *,
+    files: list[str] | None = None,
+) -> Any:
+    """Scan `snapshot`: files skipped by the predicate, rows filtered exactly."""
+    from .. import predicate as sqlpred
+
+    extra = {} if files is None else {"files": files}
+    if predicate is not None:
+        _require_pyarrow("filter rows with a predicate on the kernel path")
+    elif columns is not None and not columns:
+        _require_pyarrow("read an empty projection on the kernel path")
+    if predicate is None and columns and all(isinstance(c, str) for c in columns):
+        names = set(snapshot.schema().names)
+        data = names - set(snapshot.partition_columns)
+        exact = set(columns) <= names and len(set(columns)) == len(columns)
+        if exact and data & set(columns):
+            return snapshot.scan(columns=columns, **extra)
+    node, read, keep = _read_plan(snapshot, columns, predicate)
+    skipping = sqlpred.to_kernel_json(node) if node is not None else None
+    stream = snapshot.scan(columns=read, predicate=skipping, **extra)
+    if node is not None:
+        stream = sqlpred.filter_stream(stream, node)
+    return stream if keep is None else _project(stream, keep)
 
 
 def _delta_fields(fields: Any) -> list[dict[str, Any]]:
@@ -1194,10 +1560,15 @@ def _delta_fields(fields: Any) -> list[dict[str, Any]]:
     from .metadata import arrow_to_delta_field
 
     if isinstance(fields, dict):
+        # `str(dtype)` used to commit whatever it produced -- `int64` for
+        # pa.int64(), `bigint` as typed -- and a schema holding a type Delta
+        # does not know makes the whole table unreadable.
         return [
-            {"name": name, "type": str(dtype), "nullable": True, "metadata": {}}
+            {"name": name, "type": _delta_type(name, dtype), "nullable": True, "metadata": {}}
             for name, dtype in fields.items()
         ]
+    if not isinstance(fields, (list, tuple)) and isinstance(getattr(fields, "fields", None), list):
+        fields = fields.fields  # a deltalake Schema: its fields, not itself as one
     items = (
         list(fields) if isinstance(fields, (list, tuple)) or hasattr(fields, "names") else [fields]
     )
@@ -1215,6 +1586,70 @@ def _delta_fields(fields: Any) -> list[dict[str, Any]]:
                 "pass pyarrow fields, deltalake Fields, or a {name: type} mapping",
             )
     return out
+
+
+_DELTA_PRIMITIVES = frozenset(
+    {
+        "string",
+        "long",
+        "integer",
+        "short",
+        "byte",
+        "float",
+        "double",
+        "boolean",
+        "binary",
+        "date",
+        "timestamp",
+        "timestamp_ntz",
+    }
+)
+_SQL_ALIASES = {
+    "bigint": "long",
+    "int": "integer",
+    "smallint": "short",
+    "tinyint": "byte",
+    "bool": "boolean",
+    "real": "float",
+    "varchar": "string",
+    "char": "string",
+    "text": "string",
+    "int64": "long",
+    "int32": "integer",
+    "int16": "short",
+    "int8": "byte",
+    "float32": "float",
+    "float64": "double",
+    "utf8": "string",
+    "large_string": "string",
+    "timestampntz": "timestamp_ntz",
+    "date32": "date",
+}
+
+
+def _delta_type(name: str, dtype: Any) -> Any:
+    """A Delta schema type from a `{name: type}` value, or a refusal."""
+    import re
+
+    if isinstance(dtype, dict):
+        return dtype  # already Delta JSON (struct, array, map)
+    if not isinstance(dtype, str):
+        from .metadata import arrow_to_delta_type
+
+        return arrow_to_delta_type(dtype)
+    text = dtype.strip().lower()
+    text = _SQL_ALIASES.get(text, text)
+    decimal = re.fullmatch(r"(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", text)
+    if decimal:
+        return f"decimal({int(decimal.group(1))},{int(decimal.group(2))})"
+    if text in _DELTA_PRIMITIVES:
+        return text
+    raise UnreachableTableError(
+        f"add column {name}",
+        f"{dtype!r} is not a Delta type",
+        "use a Delta primitive (long, integer, string, double, decimal(p,s), ...), "
+        "a pyarrow type, or a Delta JSON type",
+    )
 
 
 def _require_pyarrow(what: str) -> None:
@@ -1250,7 +1685,10 @@ def _timestamp_ms(value: Any) -> int:
     if isinstance(value, dt.datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=dt.UTC)
-        return int(value.timestamp() * 1000)
+        # Exact integer arithmetic: float truncation rounded pre-1970 instants
+        # toward zero, a millisecond late.
+        epoch = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
+        return int((value - epoch) // dt.timedelta(milliseconds=1))
     raise UnreachableTableError(
         f"time travel to {value!r}", "expected a datetime, an ISO-8601 string or epoch millis"
     )
@@ -1265,6 +1703,38 @@ def _evaluate(table: Any, expr: Any) -> Any:
         return pa.array([], pa.bool_())
     result = ds.dataset(table).to_table(columns={"_m": expr}).column("_m")
     return result.combine_chunks() if isinstance(result, pa.ChunkedArray) else result
+
+
+def _conform(data: Any, schema: Any) -> Any:
+    """`data` with `schema`'s columns, names and types, for a rewrite commit.
+
+    Names match case-insensitively; a missing nullable column is null. An
+    extra column, or a missing non-nullable one, is refused: selecting only
+    the table's columns used to drop the extra data without a word.
+    """
+    import pyarrow as pa
+
+    by_lower = {name.lower(): name for name in data.column_names}
+    extra = sorted(set(by_lower) - {f.name.lower() for f in schema})
+    if extra:
+        raise UnreachableTableError(
+            "overwrite with a predicate",
+            f"the data has columns the table does not: {', '.join(extra)}",
+            "drop them, or add them to the table first",
+        )
+    columns = []
+    for field in schema:
+        source = by_lower.get(field.name.lower())
+        if source is None:
+            if not field.nullable:
+                raise UnreachableTableError(
+                    "overwrite with a predicate",
+                    f"the data has no {field.name!r} column, which the table requires",
+                )
+            columns.append(pa.nulls(data.num_rows, field.type))
+        else:
+            columns.append(data.column(source).cast(field.type))
+    return pa.Table.from_arrays(columns, schema=schema)
 
 
 def _refuse_options(what: str, options: dict[str, Any]) -> None:

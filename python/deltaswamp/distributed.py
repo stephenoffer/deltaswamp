@@ -15,7 +15,7 @@ splits, balanced by bytes.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 __all__ = ["DeltaSwampDatasource", "ScanPlan", "balance"]
@@ -43,14 +43,17 @@ class ScanPlan:
         """Read some (default: all) of the planned splits as a pyarrow Table."""
         import pyarrow as pa
 
+        return pa.table(self.stream(splits))
+
+    def stream(self, splits: Iterable[Any] | None = None) -> Any:
+        """Read some (default: all) of the planned splits as an Arrow stream."""
         chosen = list(self.splits if splits is None else splits)
-        stream = self.engine.execute_scan(
+        return self.engine.execute_scan(
             self.table,
             chosen,
             columns=list(self.columns) if self.columns is not None else None,
             predicate=self.predicate,
         )
-        return pa.table(stream)
 
     def partitions(self, n: int) -> list[tuple[Any, ...]]:
         return balance(self.splits, n)
@@ -105,13 +108,39 @@ def DeltaSwampDatasource(plan: ScanPlan) -> Any:
         def estimate_inmemory_data_size(self) -> int | None:
             return self._plan.total_bytes or None
 
-        def get_read_tasks(self, parallelism: int, **_: Any) -> list[Any]:
+        def get_read_tasks(
+            self, parallelism: int, per_task_row_limit: int | None = None, **_: Any
+        ) -> list[Any]:
+            # An empty plan still gets one task, so the dataset has a schema
+            # rather than none at all.
+            groups = self._plan.partitions(parallelism) or [()]
             tasks = []
-            for group in self._plan.partitions(parallelism):
-                plan = self._plan
+            for group in groups:
+                # Each task carries only its own splits: closing over the whole
+                # plan shipped every split to every task.
+                plan = replace(self._plan, splits=tuple(group)) if group else self._plan
 
-                def read(group: tuple[Any, ...] = group, plan: ScanPlan = plan) -> Iterator[Any]:
-                    yield plan.read(group)
+                def read(plan: ScanPlan = plan, empty: bool = not group) -> Iterator[Any]:
+                    import pyarrow as pa
+
+                    # Batch by batch: materialising a whole group first held
+                    # every file of the task in memory at once.
+                    # Through the engine, not a newer ScanPlan method: the plan
+                    # is unpickled against whatever release the worker has.
+                    stream = plan.engine.execute_scan(
+                        plan.table,
+                        [] if empty else list(plan.splits),
+                        columns=list(plan.columns) if plan.columns is not None else None,
+                        predicate=plan.predicate,
+                    )
+                    reader = pa.RecordBatchReader.from_stream(stream)
+                    produced = False
+                    for batch in reader:
+                        if batch.num_rows:
+                            produced = True
+                            yield pa.Table.from_batches([batch], schema=reader.schema)
+                    if not produced:
+                        yield reader.schema.empty_table()
 
                 metadata = BlockMetadata(
                     num_rows=None,
@@ -119,7 +148,12 @@ def DeltaSwampDatasource(plan: ScanPlan) -> Any:
                     exec_stats=None,
                     input_files=tuple(s.path for s in group),
                 )
-                tasks.append(ReadTask(read, metadata))
+                # Ray slices each task's output to the limit a downstream
+                # `limit()` pushed into the read; older Ray has no such argument.
+                limit = (
+                    {} if per_task_row_limit is None else {"per_task_row_limit": per_task_row_limit}
+                )
+                tasks.append(ReadTask(read, metadata, **limit))
             return tasks
 
     return _Datasource(plan)

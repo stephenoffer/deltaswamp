@@ -378,25 +378,28 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
         _row(TableFeature.VARIANT_TYPE_PREVIEW, _RW, _Y, _Y, _Y, _Y),
         _row(TableFeature.VARIANT_SHREDDING, _RW, _Y, _Y, _N, _N),
         _row(TableFeature.VARIANT_SHREDDING_PREVIEW, _RW, _Y, _Y, _N, _N),
+        # Both rows are NO, not PARTIAL: the native crate does not enable the
+        # dev-only cargo features, so the compiled kernel reports these
+        # NotSupported and, being ReaderWriter, refuses to even scan them.
         _row(
             TableFeature.ADAPTIVE_METADATA_PREVIEW,
             _RW,
-            _P,
-            _P,
             _N,
             _N,
-            "kernel gates this behind the adaptive-metadata-in-dev cargo feature; "
-            "not production-ready",
+            _N,
+            _N,
+            "kernel supports this only behind the adaptive-metadata-in-dev cargo "
+            "feature, which this build does not enable",
         ),
         _row(
             TableFeature.GEOSPATIAL,
             _RW,
-            _P,
             _N,
             _N,
             _N,
-            "kernel gates behind geo-type-in-dev; read only, writes error. One feature "
-            "covers both geometry and geography.",
+            _N,
+            "kernel reads it only behind the geo-type-in-dev cargo feature, which this "
+            "build does not enable. One feature covers both geometry and geography.",
         ),
         # --- no kernel variant at all
         _row(
@@ -443,6 +446,8 @@ FEATURE_DEPENDENCIES: dict[TableFeature, frozenset[TableFeature]] = {
     TableFeature.CLUSTERING: frozenset({TableFeature.DOMAIN_METADATA}),
     TableFeature.CATALOG_MANAGED: frozenset({TableFeature.IN_COMMIT_TIMESTAMP}),
     TableFeature.CATALOG_OWNED_PREVIEW: frozenset({TableFeature.IN_COMMIT_TIMESTAMP}),
+    # Kernel's CREATE TABLE adds variantType alongside variantShredding.
+    TableFeature.VARIANT_SHREDDING: frozenset({TableFeature.VARIANT_TYPE}),
     TableFeature.ICEBERG_COMPAT_V1: frozenset({TableFeature.COLUMN_MAPPING}),
     TableFeature.ICEBERG_COMPAT_V2: frozenset({TableFeature.COLUMN_MAPPING}),
     TableFeature.ICEBERG_COMPAT_V3: frozenset(
@@ -481,6 +486,13 @@ FEATURE_CONFLICTS: dict[TableFeature, frozenset[TableFeature]] = {
 }
 
 
+#: Non-canonical wire names kernel parses as a known feature. Older writers
+#: emitted `timestampWithoutTimezone`; kernel reads it as timestampNtz.
+_WIRE_ALIASES: dict[str, TableFeature] = {
+    "timestampWithoutTimezone": TableFeature.TIMESTAMP_NTZ,
+}
+
+
 def feature_from_wire(name: str) -> TableFeature | None:
     """Map an on-the-wire feature name to a known feature, or None if unknown.
 
@@ -491,7 +503,7 @@ def feature_from_wire(name: str) -> TableFeature | None:
     try:
         return TableFeature(name)
     except ValueError:
-        return None
+        return _WIRE_ALIASES.get(name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -810,6 +822,128 @@ ENGINE_METHODS: dict[Operation, str] = {
     Operation.ANALYZE: "analyze",
     Operation.SYNC_ICEBERG: "sync_iceberg_metadata",
     Operation.REFRESH: "refresh",
+}
+
+#: Features an engine's *operation* cannot handle even though the engine reads
+#: and writes the feature in general: the per-feature matrix above is too coarse
+#: for these, and each one used to be claimed and then fail mid-call. Probed
+#: against deltalake 1.6.5 and delta-kernel 0.28.
+#:
+#: * delta-rs OPTIMIZE / Z-ORDER / ADD COLUMN raise "Column mapping is not
+#:   supported for write operation ..." on a column-mapped table.
+#: * the kernel's transaction refuses any commit carrying a remove on a table
+#:   whose row tracking is not suspended ("Remove actions are not yet
+#:   supported"), so a kernel OVERWRITE fails after staging the new data.
+OPERATION_FEATURE_BLOCKERS: dict[tuple[Engine, Operation], frozenset[TableFeature]] = {
+    (Engine.DELTARS, Operation.OPTIMIZE): frozenset({TableFeature.COLUMN_MAPPING}),
+    (Engine.DELTARS, Operation.ZORDER): frozenset({TableFeature.COLUMN_MAPPING}),
+    (Engine.DELTARS, Operation.ADD_COLUMN): frozenset({TableFeature.COLUMN_MAPPING}),
+    (Engine.KERNEL, Operation.OVERWRITE): frozenset({TableFeature.ROW_TRACKING}),
+    # A symlink manifest lists whole Parquet files: readers of one would return
+    # rows a deletion vector removed, and see physical column names. Spark
+    # refuses both; delta-rs writes the manifest regardless.
+    (Engine.DELTARS, Operation.GENERATE): frozenset(
+        {TableFeature.DELETION_VECTORS, TableFeature.COLUMN_MAPPING}
+    ),
+}
+
+#: Operations that remove data, which ``delta.appendOnly=true`` forbids on every
+#: engine. delta-rs accepted them at routing and failed at commit ("includes
+#: Remove action with data change but Delta table is append-only"), so
+#: ``Table.can()`` reported them servable.
+APPEND_ONLY_FORBIDDEN: frozenset[Operation] = frozenset(
+    {
+        Operation.OVERWRITE,
+        Operation.REPLACE_WHERE,
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.RESTORE,
+    }
+)
+
+#: Metadata-only only under column mapping: without it a column's logical name
+#: is its name in every Parquet file. The kernel path refused these only once
+#: called, so ``Table.can("rename_column")`` said yes on every plain table.
+COLUMN_MAPPING_REQUIRED: frozenset[Operation] = frozenset(
+    {Operation.RENAME_COLUMN, Operation.DROP_COLUMN}
+)
+
+#: Data commits that leave a UniForm table's Iceberg metadata behind. Only
+#: Databricks regenerates it (after its own commits, or MSCK REPAIR ... SYNC
+#: METADATA), so delta-rs refuses these on an Iceberg-enabled table and the
+#: kernel refuses its metadata changes -- but a kernel APPEND went through and
+#: the Iceberg view silently went stale.
+UNIFORM_STALE_WRITES: frozenset[Operation] = frozenset(
+    {
+        Operation.APPEND,
+        Operation.OVERWRITE,
+        Operation.REPLACE_WHERE,
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.MERGE,
+        Operation.MERGE_SCHEMA,
+    }
+)
+
+#: Operations the kernel serves by writing to the log without a data commit.
+#: Its checkpoint writer still runs the write-protocol check, so it refuses the
+#: same tables a data write does -- a legacy writer protocol 3-6 ("Feature
+#: 'checkConstraints' is not supported"), column invariants present in the
+#: schema, and any writer feature it cannot write -- but supports() never
+#: checked, so CHECKPOINT was claimed and then failed.
+KERNEL_LOG_WRITE_OPERATIONS: frozenset[Operation] = frozenset({Operation.CHECKPOINT})
+
+#: Features delta-rs may ignore for one operation, because that operation writes
+#: no commit and reads nothing the feature changes. delta-rs refuses to *commit*
+#: to a table carrying a writer feature it lacks, and the per-feature matrix
+#: says so, but these operations never commit:
+#:
+#: * HISTORY reads commitInfo only; delta-rs opens tables with these reader
+#:   features and lists their history correctly.
+#: * a VACUUM *dry run* lists files and deletes none (a real VACUUM commits
+#:   VACUUM START/END, which delta-rs refuses on all of these tables).
+#: * CLEANUP_METADATA deletes expired commit files behind a checkpoint, and
+#:   LOG_COMPACTION writes a compacted file; delta-rs keeps domainMetadata
+#:   actions and the row-tracking fields of add actions in both.
+#:
+#: Features that constrain the *values* a writer produces (identity, generated
+#: and default columns, constraints, invariants) never bind these either.
+_LOG_ONLY_EXEMPT: frozenset[TableFeature] = frozenset(
+    {
+        TableFeature.DOMAIN_METADATA,
+        TableFeature.CLUSTERING,
+        TableFeature.ROW_TRACKING,
+        TableFeature.TYPE_WIDENING,
+        TableFeature.TYPE_WIDENING_PREVIEW,
+        TableFeature.VARIANT_SHREDDING,
+        TableFeature.VARIANT_SHREDDING_PREVIEW,
+        TableFeature.IDENTITY_COLUMNS,
+        TableFeature.GENERATED_COLUMNS,
+        TableFeature.CHECK_CONSTRAINTS,
+        TableFeature.INVARIANTS,
+        TableFeature.ALLOW_COLUMN_DEFAULTS,
+        TableFeature.MATERIALIZE_PARTITION_COLUMNS,
+    }
+)
+DELTARS_OPERATION_EXEMPTIONS: dict[Operation, frozenset[TableFeature]] = {
+    Operation.HISTORY: frozenset(
+        {
+            TableFeature.TYPE_WIDENING,
+            TableFeature.TYPE_WIDENING_PREVIEW,
+            TableFeature.VACUUM_PROTOCOL_CHECK,
+            TableFeature.VARIANT_SHREDDING,
+            TableFeature.VARIANT_SHREDDING_PREVIEW,
+        }
+    ),
+    Operation.CLEANUP_METADATA: _LOG_ONLY_EXEMPT,
+    Operation.LOG_COMPACTION: _LOG_ONLY_EXEMPT | {TableFeature.IN_COMMIT_TIMESTAMP},
+}
+#: Exemptions that hold for a dry run only (VACUUM and REPAIR/FSCK): it lists
+#: what it would remove and commits nothing; the real thing commits.
+DELTARS_DRY_RUN_OPERATIONS: frozenset[Operation] = frozenset({Operation.VACUUM, Operation.REPAIR})
+DELTARS_VACUUM_DRY_RUN_EXEMPT: frozenset[TableFeature] = _LOG_ONLY_EXEMPT | {
+    TableFeature.IN_COMMIT_TIMESTAMP,
+    TableFeature.VACUUM_PROTOCOL_CHECK,
 }
 
 READ_OPERATIONS: frozenset[Operation] = frozenset(

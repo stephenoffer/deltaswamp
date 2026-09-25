@@ -111,7 +111,12 @@ pub fn table_changes(
 
     let predicate = parse_predicate(predicate, changes.schema())?;
     let projected = match columns {
-        Some(mut columns) => {
+        Some(columns) => {
+            let mut columns = if columns.is_empty() {
+                columns
+            } else {
+                crate::scan::resolve_columns(changes.schema(), &columns)?
+            };
             // The change metadata columns are what make a row a *change*;
             // always keep them.
             for c in CDF_COLUMNS {
@@ -119,10 +124,18 @@ pub fn table_changes(
                     columns.push(c.to_string());
                 }
             }
-            Some(changes.schema().project(&columns)?)
+            changes.schema().project(&columns)?
         }
-        None => None,
+        None => Arc::new(changes.schema().clone()),
     };
+    // A projection of partition and change columns only (`columns=["p"]`,
+    // `columns=[]`) leaves the Parquet read schema empty, and kernel's reader
+    // panics on that, killing the shared I/O executor. A row-index column
+    // keeps every read non-empty; it is dropped from the output below.
+    let projected = Some(Arc::new(projected.add_metadata_column(
+        crate::scan::ROW_COUNT_COLUMN,
+        delta_kernel::schema::MetadataColumnSpec::RowIndex,
+    )?));
 
     let scan = Arc::new(changes)
         .scan_builder()
@@ -131,5 +144,6 @@ pub fn table_changes(
         .build()?;
     let schema = scan.logical_schema().clone();
     let iter = scan.execute(engine.clone() as Arc<dyn Engine>)?;
-    KernelBatchReader::from_parts(schema.as_ref(), iter)
+    Ok(KernelBatchReader::from_parts(schema.as_ref(), iter)?
+        .without_column(crate::scan::ROW_COUNT_COLUMN))
 }

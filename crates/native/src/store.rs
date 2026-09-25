@@ -49,17 +49,39 @@ fn is_azure(url: &Url) -> bool {
 }
 
 fn gcs_bearer_token(options: &HashMap<String, String>) -> Option<&str> {
-    GCS_BEARER_KEYS
-        .iter()
-        .find_map(|k| options.get(*k))
-        .map(String::as_str)
-        .filter(|t| !t.is_empty())
+    // Keys are matched case-insensitively, as object_store does, and an empty
+    // value under one alias must not hide a real token under the next.
+    GCS_BEARER_KEYS.iter().find_map(|k| {
+        options
+            .iter()
+            .find(|(key, value)| key.eq_ignore_ascii_case(k) && !value.is_empty())
+            .map(|(_, value)| value.as_str())
+    })
+}
+
+/// True if the options name an Azure endpoint, or ask for the emulator
+/// (which object_store points at Azurite itself). Keys are case-insensitive,
+/// as `parse_url_opts` lowercases them; every alias object_store accepts for
+/// the endpoint counts.
+fn has_azure_endpoint(options: &HashMap<String, String>) -> bool {
+    options.iter().any(|(k, v)| {
+        let k = k.to_ascii_lowercase();
+        let endpoint = matches!(
+            k.as_str(),
+            "azure_storage_endpoint" | "azure_endpoint" | "endpoint"
+        ) && !v.trim().is_empty();
+        let emulator = matches!(k.as_str(), "azure_storage_use_emulator" | "use_emulator")
+            && matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            );
+        endpoint || emulator
+    })
 }
 
 /// Build an object store for `url`, honouring vended credentials.
 pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
-    if is_azure(url) && !options.contains_key("azure_endpoint") && !options.contains_key("endpoint")
-    {
+    if is_azure(url) && !has_azure_endpoint(options) {
         // Refusing here rather than letting a confusing 403 surface later.
         return Err(NativeError::Invalid(format!(
             "Azure URL {url} has no explicit endpoint. Relying on account-name \
@@ -90,6 +112,7 @@ fn build_gcs_with_bearer(
     // Forward everything except our own token keys; object_store would reject
     // them as unknown configuration.
     for (k, v) in options {
+        let k = k.to_ascii_lowercase();
         if GCS_INTERNAL_KEYS.contains(&k.as_str()) {
             continue;
         }
@@ -150,6 +173,36 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_alias_does_not_hide_a_token_under_another() {
+        let o = opts(&[
+            ("google_bearer_token", ""),
+            ("gcp_oauth_token", "ya29.real"),
+        ]);
+        assert_eq!(gcs_bearer_token(&o), Some("ya29.real"));
+        let o = opts(&[("GCP_OAUTH_TOKEN", "ya29.upper")]);
+        assert_eq!(gcs_bearer_token(&o), Some("ya29.upper"));
+    }
+
+    #[test]
+    fn azure_endpoint_aliases_and_the_emulator_are_accepted() {
+        let url = Url::parse("abfss://container@account.dfs.core.windows.net/t/").unwrap();
+        for (k, v) in [
+            (
+                "azure_storage_endpoint",
+                "http://127.0.0.1:10000/devstoreaccount1",
+            ),
+            ("AZURE_ENDPOINT", "https://account.blob.core.windows.net"),
+            ("azure_storage_use_emulator", "true"),
+            ("use_emulator", "true"),
+        ] {
+            assert!(has_azure_endpoint(&opts(&[(k, v)])), "{k}");
+        }
+        assert!(!has_azure_endpoint(&opts(&[("use_emulator", "false")])));
+        assert!(!has_azure_endpoint(&opts(&[("azure_endpoint", "")])));
+        assert!(build_store(&url, &opts(&[("azure_storage_use_emulator", "true")])).is_ok());
+    }
+
+    #[test]
     fn empty_gcs_token_is_not_treated_as_a_credential() {
         let o = opts(&[("gcp_oauth_token", "")]);
         assert_eq!(gcs_bearer_token(&o), None);
@@ -162,6 +215,43 @@ mod tests {
         let url = Url::parse("gs://bucket/table/").unwrap();
         let o = opts(&[("gcp_oauth_token", "ya29.token")]);
         assert!(build_store(&url, &o).is_ok());
+    }
+
+    /// The token must actually reach the wire as `Authorization: Bearer`,
+    /// not just build a store. A one-shot local HTTP server stands in for GCS.
+    #[test]
+    fn gcs_bearer_token_is_sent_on_requests() {
+        use delta_kernel::object_store::{path::Path, ObjectStoreExt};
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            let _ = sock.write_all(
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+            String::from_utf8_lossy(&buf[..n]).to_lowercase()
+        });
+
+        let url = Url::parse("gs://bucket/table/").unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let o = opts(&[
+            ("GOOGLE_BEARER_TOKEN", "ya29.secret"),
+            ("google_base_url", base.as_str()),
+            ("allow_http", "true"),
+        ]);
+        let store = build_store(&url, &o).unwrap();
+        let _ = crate::runtime::block_on(async {
+            store.head(&Path::from("table/_delta_log/x.json")).await
+        });
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("authorization: bearer ya29.secret"),
+            "request did not carry the bearer token:\n{request}"
+        );
     }
 
     #[test]

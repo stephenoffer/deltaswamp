@@ -44,6 +44,7 @@ pub const FEATURES: &[&str] = &[
     "table_changes",
     "files",
     "metadata_json",
+    "app_id_version",
     "commit_raw",
     "partitioned_append",
     "uc_create_table_request",

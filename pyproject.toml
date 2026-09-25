@@ -37,10 +37,13 @@ sharing = ["delta-sharing>=1.4.1"]
 pyarrow = ["pyarrow>=17"]
 pandas = ["pandas>=2"]
 polars = ["polars>=1.39"]
-duckdb = ["duckdb>=1.1", "pyarrow>=17"]     # to_duckdb, Connection.sql
+# pytz: DuckDB imports it to hand TIMESTAMP WITH TIME ZONE values to Python
+# (fetchall/fetchone), and fails "Required module 'pytz' failed to import"
+# on every tz-aware Delta timestamp column without it.
+duckdb = ["duckdb>=1.1", "pyarrow>=17", "pytz"]     # to_duckdb, Connection.sql
 daft = ["daft>=0.4"]
 all = [
-    "pyarrow>=17", "pandas>=2", "polars>=1.39", "duckdb>=1.1",
+    "pyarrow>=17", "pandas>=2", "polars>=1.39", "duckdb>=1.1", "pytz",
     "pyiceberg>=0.12.0", "delta-sharing>=1.4.1", "boto3>=1.35", "pymetastore>=0.4.0",
 ]
 # NOTE: databricks-connect is deliberately absent. It pins requires-python

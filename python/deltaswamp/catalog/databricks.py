@@ -19,14 +19,25 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import threading
+import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from .._sdk import PRODUCT
 from ..credentials.base import Credentials, Operation
-from ..credentials.databricks import DatabricksCredentialProvider
-from ..errors import DeltaSwampError, InvalidReferenceError, PreflightError
+from ..credentials.databricks import (
+    DatabricksCredentialProvider,
+    _config_attributes,
+    _error_kind,
+)
+from ..errors import (
+    DeltaSwampError,
+    InvalidArgumentError,
+    InvalidReferenceError,
+    PreflightError,
+)
 from ..governance import (
     ColumnLineage,
     FunctionSummary,
@@ -64,6 +75,14 @@ CAP_EXTERNAL_READ = "HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT"
 CAP_EXTERNAL_WRITE = "HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT"
 
 LINEAGE_API = "/api/2.0/lineage-tracking"
+
+#: How long a schema listing's capability manifests are trusted. A row filter
+#: or column mask added after the listing withdraws the table from vending, and
+#: a manifest cached for the life of the process kept claiming it was readable.
+MANIFEST_CACHE_TTL_SECONDS = 300.0
+#: After a throttled/unavailable metastore-region lookup, how long to wait
+#: before asking again.
+REGION_RETRY_SECONDS = 60.0
 _JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
 _T = TypeVar("_T")
@@ -110,8 +129,70 @@ def _dotted(ref: TableRef) -> str:
     return f"{ref.catalog}.{ref.schema}.{ref.table}"
 
 
+def _is_sdk_config(obj: Any) -> bool:
+    try:
+        from databricks.sdk.core import Config
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(obj, Config)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Throttling, unavailability or a network failure: worth asking again later."""
+    kind = _error_kind(exc)
+    if kind == "transient":
+        return True
+    names = {c.__name__ for c in type(exc).__mro__}
+    if "DatabricksError" in names:
+        # Every SDK error is an IOError; only a 5xx among them is transient.
+        return kind is None and "InternalError" in names
+    # requests' connection errors and timeouts are IOErrors too.
+    return isinstance(exc, OSError)
+
+
 def _segment(part: str) -> str:
     return urllib.parse.quote(part, safe="")
+
+
+def _url_name(name: str) -> str:
+    """A dotted securable name, escaped for the SDK methods that put it in a URL path.
+
+    The SDK interpolates `full_name` into the request path verbatim. A name
+    carrying ``#``, ``?`` or ``%`` -- all legal in Unity Catalog -- then
+    truncated the path at a fragment or query, or was percent-decoded into a
+    different name, and the lookup 404ed or hit the wrong securable. Dots stay
+    literal: they are the separators the API expects.
+    """
+    return ".".join(_segment(p) for p in name.split("."))
+
+
+def _r2_as_s3(location: str | None) -> str | None:
+    """Rewrite ``r2://bucket@account.r2.cloudflarestorage.com/p`` to ``s3://bucket/p``.
+
+    Unity Catalog records R2 locations under an ``r2://`` scheme that neither
+    object_store nor delta-rs recognises; R2 is S3-compatible, and the vended
+    credential carries the account endpoint.
+    """
+    if not location or not location.lower().startswith("r2://"):
+        return location
+    parsed = urllib.parse.urlparse(location)
+    bucket = parsed.netloc.partition("@")[0]
+    if not bucket:
+        return location
+    return f"s3://{bucket}{parsed.path}"
+
+
+# Table properties by which Databricks advertises a catalog-managed table before
+# the log has been read. Both the GA name and the preview one, and both of the
+# values the protocol allows for a `delta.feature.*` property.
+_CATALOG_MANAGED_PROPERTIES = ("delta.feature.catalogManaged", "delta.feature.catalogOwned-preview")
+
+
+def _advertises_catalog_managed(properties: Mapping[str, str]) -> bool:
+    return any(
+        str(properties.get(key, "")).strip().lower() in ("supported", "enabled")
+        for key in _CATALOG_MANAGED_PROPERTIES
+    )
 
 
 def _securable_name(target: TableRef | str) -> str:
@@ -170,7 +251,17 @@ class DatabricksUnityCatalog:
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         host = kwargs.pop("host", None)
         if uri and uri.startswith("databricks://"):
-            host = host or uri[len("databricks://") :] or None
+            # Only the authority is the host: a trailing path or a query
+            # (``databricks://h/?profile=p``) went into the host verbatim and
+            # the SDK then addressed a host that does not exist.
+            rest = uri[len("databricks://") :]
+            nested = "://" in rest.split("?", 1)[0]
+            parsed = urllib.parse.urlparse(rest if nested else uri)
+            netloc = f"{parsed.scheme}://{parsed.netloc}" if nested else parsed.netloc
+            host = host or (netloc if parsed.netloc else None)
+            query = urllib.parse.parse_qs(parsed.query)
+            if "profile" in query and "profile" not in kwargs:
+                kwargs["profile"] = query["profile"][-1]
         return cls(host=host, **kwargs)
 
     def __init__(
@@ -191,16 +282,52 @@ class DatabricksUnityCatalog:
         # Manifest capabilities are cached per schema: one list call is both
         # cheaper and more reliable than N per-table lookups.
         self._manifest_cache: dict[tuple[str, str], dict[str, frozenset[str]]] = {}
+        self._manifest_cached_at: dict[tuple[str, str], float] = {}
         # The metastore region, fetched at most once. `_region_cached` is
         # separate from `_region` so a workspace that answers None is not
         # re-asked on every resolve.
         self._region: str | None = None
         self._region_cached = False
+        self._region_retry_at = 0.0
+        # Guards lazy client construction and the one-time region lookup, both
+        # reached from concurrent resolves.
+        self._lock = threading.RLock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The lock and the live client cannot travel; a copy rebuilds both.
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        state["_client"] = None
+        # Monotonic timestamps mean nothing in another process: a worker whose
+        # clock started later saw a negative age, so the driver's manifest
+        # cache never expired there (and a region back-off could last for
+        # days). The copy starts with neither.
+        state["_manifest_cache"] = {}
+        state["_manifest_cached_at"] = {}
+        state["_region_retry_at"] = 0.0
+        # A databricks-sdk Config is not picklable (its auth header factory is
+        # a closure), so a catalog built from one could not be shipped at all.
+        # Carry its plain attributes instead, as the credential provider does.
+        config = state.get("_explicit_config")
+        if config is not None:
+            state["_explicit_config"] = None
+            state["_config_kwargs"] = {**_config_attributes(config), **self._config_kwargs}
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ client
 
     @property
     def workspace(self) -> Any:
+        if self._client is not None:
+            return self._client
+        with self._lock:
+            return self._build_workspace()
+
+    def _build_workspace(self) -> Any:
         if self._client is None:
             try:
                 from .._sdk import workspace_client
@@ -233,15 +360,49 @@ class DatabricksUnityCatalog:
         """
         if self._region_cached:
             return self._region
-        self._region_cached = True
-        try:
-            current = self.workspace.metastores.current()
-            if current is not None and current.metastore_id:
-                info = self.workspace.metastores.get(current.metastore_id)
-                self._region = getattr(info, "region", None) or None
-        except Exception:
-            self._region = None
+        with self._lock:
+            # Marked cached only once the lookup has finished: setting the flag
+            # first let a concurrent resolve read the still-unset region and
+            # vend S3 credentials without one.
+            if not self._region_cached:
+                if time.monotonic() < self._region_retry_at:
+                    # Recently throttled: do not re-ask on every resolve (each
+                    # ask may spend minutes inside the SDK's own retries).
+                    return self._region
+                region, definitive = self._lookup_region()
+                self._region = region
+                # A throttled or unavailable workspace is not an answer: caching
+                # its None for the life of the catalog sent every later S3 vend
+                # out without a region (us-east-1), long after the blip.
+                self._region_cached = definitive
+                if not definitive:
+                    self._region_retry_at = time.monotonic() + REGION_RETRY_SECONDS
         return self._region
+
+    def _lookup_region(self) -> tuple[str | None, bool]:
+        """(region, whether the answer may be cached)."""
+        region: str | None = None
+        transient = False
+        # `metastores.summary()` first: any workspace user may call it, while
+        # `metastores.get()` is metastore-admin only -- so for an ordinary
+        # principal the region was never found and every S3 read outside
+        # us-east-1 failed with the Location-less redirect described above.
+        try:
+            summary = self.workspace.metastores.summary()
+            region = getattr(summary, "region", None) or None
+        except Exception as exc:
+            transient = transient or _is_transient(exc)
+            region = None
+        if region is None:
+            try:
+                current = self.workspace.metastores.current()
+                if current is not None and current.metastore_id:
+                    info = self.workspace.metastores.get(current.metastore_id)
+                    region = getattr(info, "region", None) or None
+            except Exception as exc:
+                transient = transient or _is_transient(exc)
+                region = None
+        return region, region is not None or not transient
 
     def _provider_kwargs(self) -> dict[str, Any]:
         kwargs = dict(self._config_kwargs)
@@ -251,8 +412,17 @@ class DatabricksUnityCatalog:
             kwargs["host"] = self._host
         if self._token:
             kwargs["token"] = self._token
-        if self._explicit_config is not None:
-            kwargs["config"] = self._explicit_config
+        config = self._explicit_config
+        if config is None and self._client is not None:
+            # Share the catalog's resolved Config. Without it every table's
+            # provider built its own: a host-metadata request and, for OAuth,
+            # its own token fetch per table -- N tables, N token requests
+            # against a rate-limited endpoint. Pickling still ships attributes.
+            live = getattr(self._client, "config", None)
+            if _is_sdk_config(live):
+                config = live
+        if config is not None:
+            kwargs["config"] = config
         return kwargs
 
     # ----------------------------------------------------------------- resolve
@@ -266,18 +436,24 @@ class DatabricksUnityCatalog:
 
         info = self._get_table(ref)
         capabilities = self._capabilities_for(ref, info)
+        # With no manifest to consult, a row filter or column mask on the table
+        # still decides it: vending refuses such a table outright, so claiming
+        # "unknown" sent the read into a credential error instead of the SQL
+        # fallback or a refusal that names the cause.
+        governed = self._has_row_filter_or_mask(info)
+        read_ok = None if capabilities is None else CAP_EXTERNAL_READ in capabilities
+        write_ok = None if capabilities is None else CAP_EXTERNAL_WRITE in capabilities
+        if capabilities is None and governed:
+            read_ok = write_ok = False
 
-        properties = dict(getattr(info, "properties", None) or {})
         # Databricks also exposes delta runtime properties separately; they carry
         # the delta.* settings that decide routing.
-        runtime = getattr(info, "delta_runtime_properties_kvpairs", None)
-        if runtime is not None:
-            properties.update(getattr(runtime, "delta_runtime_properties", None) or {})
+        properties = self._properties(info)
 
         table_type = self._table_type(info)
         resolved = ResolvedTable(
             ref=ref,
-            location=getattr(info, "storage_location", None),
+            location=_r2_as_s3(getattr(info, "storage_location", None)),
             table_type=table_type,
             data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
             securable_kind=self._securable_kind(info),
@@ -290,22 +466,9 @@ class DatabricksUnityCatalog:
             # exposes no Delta metadata id, so there is nothing to compare.
             etag=getattr(info, "etag", None),
             properties=properties,
-            external_read_supported=(
-                None if capabilities is None else CAP_EXTERNAL_READ in capabilities
-            ),
-            external_write_supported=(
-                None if capabilities is None else CAP_EXTERNAL_WRITE in capabilities
-            ),
-            credential_provider=(
-                DatabricksCredentialProvider(
-                    table_id=info.table_id,
-                    table_url=getattr(info, "storage_location", None),
-                    region=self._metastore_region(),
-                    **self._provider_kwargs(),
-                )
-                if getattr(info, "table_id", None)
-                else None
-            ),
+            external_read_supported=read_ok,
+            external_write_supported=write_ok,
+            credential_provider=self._credential_provider(info),
         )
 
         # A catalog-managed table is unreadable without the catalog's commit
@@ -323,10 +486,37 @@ class DatabricksUnityCatalog:
                 resolved, iceberg_rest_uri=iceberg_rest_uri(host, databricks=True)
             )
 
-        if resolved.is_catalog_managed:
+        if resolved.is_catalog_managed or _advertises_catalog_managed(resolved.properties):
             resolved = self._with_catalog_commits(resolved)
 
         return resolved
+
+    def _credential_provider(self, info: Any) -> DatabricksCredentialProvider | None:
+        table_id = getattr(info, "table_id", None)
+        if not table_id:
+            return None
+        return DatabricksCredentialProvider(
+            table_id=table_id,
+            table_url=getattr(info, "storage_location", None),
+            region=self._metastore_region(),
+            **self._provider_kwargs(),
+        )
+
+    @staticmethod
+    def _has_row_filter_or_mask(info: Any) -> bool:
+        if getattr(info, "row_filter", None) is not None:
+            return True
+        return any(
+            getattr(c, "mask", None) is not None for c in getattr(info, "columns", None) or ()
+        )
+
+    @staticmethod
+    def _properties(info: Any) -> dict[str, str]:
+        properties = dict(getattr(info, "properties", None) or {})
+        runtime = getattr(info, "delta_runtime_properties_kvpairs", None)
+        if runtime is not None:
+            properties.update(getattr(runtime, "delta_runtime_properties", None) or {})
+        return properties
 
     def _get_table(self, ref: TableRef) -> Any:
         """Fetch a table, asking for the manifest in the same round trip.
@@ -338,16 +528,19 @@ class DatabricksUnityCatalog:
         # _dotted, not ref.full_name: full_name is SQL-quoted, and a backtick in
         # the REST path is a literal character, so any table whose name needs
         # quoting (a hyphen, a dot, a space) 404s on an otherwise valid lookup.
-        name = _dotted(ref)
+        name = _url_name(_dotted(ref))
         try:
-            return self.workspace.tables.get(
-                full_name=name,
-                include_manifest_capabilities=True,
-                include_delta_metadata=True,
-            )
-        except TypeError:
-            # An older SDK without these parameters; degrade rather than fail.
-            return self.workspace.tables.get(full_name=name)
+            try:
+                return self.workspace.tables.get(
+                    full_name=name,
+                    include_manifest_capabilities=True,
+                    include_delta_metadata=True,
+                )
+            except TypeError:
+                # An older SDK without these parameters; degrade rather than fail.
+                return self.workspace.tables.get(full_name=name)
+        except DeltaSwampError:
+            raise
         except Exception as exc:
             raise self._classify(exc, ref) from exc
 
@@ -358,13 +551,36 @@ class DatabricksUnityCatalog:
         so we ask `grants.get_effective` and name it.
         """
         text = str(exc)
-        if "404" in text or "does not exist" in text.lower():
+        kind = _error_kind(exc)
+        # The SDK's typed errors decide first. Their messages rarely carry the
+        # status code ("User does not have SELECT on Table ..."), so a text
+        # match alone reported a plain permission denial as "could not
+        # resolve", without naming the missing privilege.
+        if kind == "unauthenticated":
+            return PreflightError(
+                f"could not resolve {ref.full_name}: the Databricks credentials were "
+                "rejected (expired or invalid token, or the wrong workspace host). "
+                f"Underlying error: {exc}"
+            )
+        if kind == "transient":
+            # Text heuristics below would read a throttling message that happens
+            # to say "does not have capacity" as a privilege denial.
+            return PreflightError(
+                f"could not resolve {ref.full_name}: the workspace is throttling or "
+                f"temporarily unavailable; retry later. Underlying error: {exc}"
+            )
+        if kind == "not_found" or (
+            kind is None and ("404" in text or "does not exist" in text.lower())
+        ):
             return InvalidReferenceError(
                 f"{ref.full_name} does not exist in Unity Catalog. If it was recently "
                 "dropped and re-created, re-resolve it: a cached table_id no longer "
                 f"matches. Underlying error: {exc}"
             )
-        if "403" in text or "permission" in text.lower():
+        if kind == "denied" or (
+            kind is None
+            and ("403" in text or "permission" in text.lower() or "does not have" in text.lower())
+        ):
             return PreflightError(
                 f"access to {ref.full_name} was denied. {self._missing_privileges(ref)} "
                 f"Underlying error: {exc}"
@@ -393,7 +609,7 @@ class DatabricksUnityCatalog:
         """
         try:
             effective = self.workspace.grants.get_effective(
-                securable_type=securable_type, full_name=full_name
+                securable_type=securable_type, full_name=_url_name(full_name)
             )
         except Exception:
             return None
@@ -413,10 +629,23 @@ class DatabricksUnityCatalog:
         *,
         securable_type: str = "TABLE",
         needs: str = "",
+        held_on: str | None = None,
     ) -> Exception:
-        """Classify a failed governance call, naming what it needs when denied."""
+        """Classify a failed governance call, naming what it needs when denied.
+
+        `held_on` is the securable whose effective privileges explain a denial,
+        when that is not `full_name` itself -- creating a schema is decided by
+        privileges on its *catalog*, which is what must be looked up.
+        """
         text = str(exc)
         kind = type(exc).__name__
+        typed = _error_kind(exc)
+        if typed == "unauthenticated":
+            return PreflightError(
+                f"cannot {action} ({full_name}): the Databricks credentials were rejected "
+                "(expired or invalid token, or the wrong workspace host). "
+                f"Underlying error: {exc}"
+            )
         # Databricks allowlists which connectors may WRITE through the UC Delta
         # API, by product User-Agent. deltaswamp sets one (see _sdk.py), but an
         # unregistered name is still refused, and the raw 400 reads like a bug
@@ -431,24 +660,35 @@ class DatabricksUnityCatalog:
                 "connector, or use ds.connect(..., allow_sql_fallback=True) to create "
                 f"and write managed tables through a SQL warehouse. Underlying error: {exc}"
             )
-        if (
-            kind in ("NotFound", "ResourceDoesNotExist")
-            or "404" in text
-            or "does not exist" in text.lower()
+        if typed == "transient":
+            return PreflightError(
+                f"cannot {action} ({full_name}): the workspace is throttling or temporarily "
+                f"unavailable; retry later. Underlying error: {exc}"
+            )
+        if typed == "not_found" or (
+            typed is None
+            and (
+                kind in ("NotFound", "ResourceDoesNotExist")
+                or "404" in text
+                or "does not exist" in text.lower()
+            )
         ):
             return InvalidReferenceError(
                 f"cannot {action}: {full_name} does not exist in Unity Catalog, or is not "
                 f"visible to this principal. Underlying error: {exc}"
             )
-        if (
-            kind in ("PermissionDenied", "Unauthenticated")
-            or "403" in text
-            or ("permission" in text.lower())
-        ):
-            held = self._held_privileges(securable_type, full_name)
-            seen = (
-                "" if held is None else f"Effective privileges on {full_name}: {held or 'none'}. "
+        if typed == "denied" or (
+            typed is None
+            and (
+                kind == "PermissionDenied"
+                or "403" in text
+                or "permission" in text.lower()
+                or "does not have" in text.lower()
             )
+        ):
+            target = held_on or full_name
+            held = self._held_privileges(securable_type, target)
+            seen = "" if held is None else f"Effective privileges on {target}: {held or 'none'}. "
             return PreflightError(
                 f"cannot {action}: access to {full_name} was denied. {needs} {seen}"
                 f"Underlying error: {exc}".replace("  ", " ")
@@ -461,10 +701,26 @@ class DatabricksUnityCatalog:
 
         ref = resolved.ref
         assert ref.catalog and ref.schema and ref.table
-        path = f"{UC_DELTA_API_BASE}/catalogs/{ref.catalog}/schemas/{ref.schema}/tables/{ref.table}"
+        # Each segment escaped, as `_delta_api_tables_path` does for the POSTs:
+        # a table named with ``#`` or ``?`` otherwise truncated the path.
+        path = (
+            f"{UC_DELTA_API_BASE}/catalogs/{_segment(ref.catalog)}"
+            f"/schemas/{_segment(ref.schema)}/tables/{_segment(ref.table)}"
+        )
         try:
-            body = self.workspace.api_client.do("GET", path)
+            body = self.workspace.api_client.do("GET", path, headers={"Accept": "application/json"})
         except Exception as exc:
+            # A token that expired, a throttled workspace, or a table dropped
+            # between tables.get and this call were all reported as "gated on a
+            # workspace preview", sending admins after the wrong setting. An
+            # unknown *endpoint* (ENDPOINT_NOT_FOUND, or a bare 404) is the gate,
+            # and a denial may be too, so both keep the preview message.
+            code = str(getattr(exc, "error_code", "") or "").upper()
+            kind = _error_kind(exc)
+            if kind in ("unauthenticated", "transient") or (
+                kind == "not_found" and code and code != "ENDPOINT_NOT_FOUND"
+            ):
+                raise self._classify(exc, ref) from exc
             raise PreflightError(
                 f"could not load catalog commits for {ref.full_name} via the UC Delta API "
                 f"({path}). Catalog-managed tables cannot be opened without the catalog's "
@@ -473,21 +729,35 @@ class DatabricksUnityCatalog:
                 f"that an admin must enable. Underlying error: {exc}"
             ) from exc
 
+        if not isinstance(body, Mapping):
+            raise PreflightError(
+                f"the UC Delta API returned no table description for {ref.full_name} "
+                f"({path}); a catalog-managed table cannot be opened without its commit tail"
+            )
         entries, latest, location = parse_commit_tail(body, resolved.location)
         return dataclasses.replace(
             resolved,
             log_tail=entries,
             max_catalog_version=latest,
-            location=location,
+            location=_r2_as_s3(location),
         )
 
     # ------------------------------------------------------------------ listing
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
         out: list[ResolvedTable] = []
-        for info in self.workspace.tables.list(
-            catalog_name=catalog, schema_name=schema, include_manifest_capabilities=True
-        ):
+        # Materialised under _call so a denial or a missing schema is named like
+        # every other catalog call, not surfaced as a raw SDK exception.
+        infos = self._call(
+            "list tables",
+            f"{catalog}.{schema}",
+            "read",
+            lambda: self._list_table_infos(catalog, schema),
+            securable_type="SCHEMA",
+        )
+        for info in infos:
+            if not getattr(info, "name", None):
+                continue
             ref = TableRef(
                 kind=RefKind.CATALOG,
                 catalog=catalog,
@@ -497,25 +767,61 @@ class DatabricksUnityCatalog:
                 raw=f"{catalog}.{schema}.{info.name}",
             )
             caps = self._manifest_capabilities(info)
+            read_ok = None if caps is None else CAP_EXTERNAL_READ in caps
+            write_ok = None if caps is None else CAP_EXTERNAL_WRITE in caps
+            # As in resolve(): with no manifest, a row filter or column mask
+            # still decides it -- vending refuses such a table outright.
+            if caps is None and self._has_row_filter_or_mask(info):
+                read_ok = write_ok = False
+            # Properties and a credential provider too: without them a listed
+            # table reported itself as not catalog-managed and could not vend
+            # storage credentials, so opening it failed or took the wrong path.
             out.append(
                 ResolvedTable(
                     ref=ref,
-                    location=getattr(info, "storage_location", None),
+                    location=_r2_as_s3(getattr(info, "storage_location", None)),
                     table_type=self._table_type(info),
                     data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
                     securable_kind=self._securable_kind(info),
                     table_id=getattr(info, "table_id", None),
-                    external_read_supported=(None if caps is None else CAP_EXTERNAL_READ in caps),
-                    external_write_supported=(None if caps is None else CAP_EXTERNAL_WRITE in caps),
+                    etag=getattr(info, "etag", None),
+                    properties=self._properties(info),
+                    external_read_supported=read_ok,
+                    external_write_supported=write_ok,
+                    credential_provider=self._credential_provider(info),
                 )
             )
         return out
 
+    def _list_table_infos(self, catalog: str, schema: str) -> list[Any]:
+        try:
+            return list(
+                self.workspace.tables.list(
+                    catalog_name=catalog, schema_name=schema, include_manifest_capabilities=True
+                )
+            )
+        except TypeError:
+            # An older SDK without the parameter: degrade as _get_table does,
+            # rather than failing the listing outright.
+            return list(self.workspace.tables.list(catalog_name=catalog, schema_name=schema))
+
     def list_catalogs(self) -> list[str]:
-        return [c.name for c in self.workspace.catalogs.list() if c.name]
+        return self._call(
+            "list catalogs",
+            "the metastore",
+            "read",
+            lambda: [c.name for c in self.workspace.catalogs.list() if c.name],
+            securable_type="METASTORE",
+        )
 
     def list_schemas(self, catalog: str) -> list[str]:
-        return [s.name for s in self.workspace.schemas.list(catalog_name=catalog) if s.name]
+        return self._call(
+            "list schemas",
+            catalog,
+            "read",
+            lambda: [s.name for s in self.workspace.schemas.list(catalog_name=catalog) if s.name],
+            securable_type="CATALOG",
+        )
 
     def drop_table(self, ref: TableRef) -> None:
         """Drop a table from Unity Catalog.
@@ -524,10 +830,13 @@ class DatabricksUnityCatalog:
         stay where they are, so the data outlives the registration.
         """
         try:
-            # Unquoted: see _get_table_info.
-            self.workspace.tables.delete(full_name=_dotted(ref))
+            # Unquoted for SQL, escaped for the URL path: see _get_table.
+            self.workspace.tables.delete(full_name=_url_name(_dotted(ref)))
         except Exception as exc:
             raise self._classify(exc, ref) from exc
+        finally:
+            if ref.catalog and ref.schema:
+                self._manifest_cache.pop((ref.catalog.lower(), ref.schema.lower()), None)
 
     def _capabilities_for(self, ref: TableRef, info: Any) -> frozenset[str] | None:
         """Capability flags for one table, from its own manifest or the schema's."""
@@ -536,9 +845,19 @@ class DatabricksUnityCatalog:
             return own
 
         assert ref.catalog and ref.schema
-        key = (ref.catalog, ref.schema)
-        if key not in self._manifest_cache:
-            cache: dict[str, frozenset[str]] = {}
+        # Unity Catalog names are case-insensitive and listed in lower case, so
+        # both the cache key and the per-table lookup fold case; `Main.Sales.Orders`
+        # otherwise never matched the listed `orders` and lost its manifest.
+        key = (ref.catalog.lower(), ref.schema.lower())
+        cached_at = self._manifest_cached_at.get(key)
+        # Read once into a local: a concurrent resolve of the same schema may
+        # expire (pop) the entry between a membership test and the lookup,
+        # which raised KeyError out of an otherwise healthy resolve.
+        cache: dict[str, frozenset[str]] | None = self._manifest_cache.get(key)
+        if cached_at is None or time.monotonic() - cached_at > MANIFEST_CACHE_TTL_SECONDS:
+            cache = None
+        if cache is None:
+            cache = {}
             try:
                 for listed in self.workspace.tables.list(
                     catalog_name=ref.catalog,
@@ -546,14 +865,15 @@ class DatabricksUnityCatalog:
                     include_manifest_capabilities=True,
                 ):
                     caps = self._manifest_capabilities(listed)
-                    if caps is not None:
-                        cache[listed.name] = caps
+                    if caps is not None and getattr(listed, "name", None):
+                        cache[str(listed.name).lower()] = caps
             except Exception:
                 # Listing may be denied where a direct get is allowed. Absence of
                 # a manifest is reported as "unknown", never as "unsupported".
                 cache = {}
             self._manifest_cache[key] = cache
-        return self._manifest_cache[key].get(ref.table or "")
+            self._manifest_cached_at[key] = time.monotonic()
+        return cache.get((ref.table or "").lower())
 
     @staticmethod
     def _manifest_capabilities(info: Any) -> frozenset[str] | None:
@@ -563,7 +883,8 @@ class DatabricksUnityCatalog:
         caps = getattr(manifest, "capabilities", None)
         if caps is None:
             return None
-        return frozenset(str(c) for c in caps)
+        # `str()` of an enum member is "Cls.NAME" and never matches a flag.
+        return frozenset(v for v in (DatabricksUnityCatalog._enum_value(c) for c in caps) if v)
 
     @staticmethod
     def _enum_value(value: Any) -> str | None:
@@ -624,6 +945,7 @@ class DatabricksUnityCatalog:
         fn: Callable[[], _T],
         *,
         securable_type: str = "TABLE",
+        held_on: str | None = None,
     ) -> _T:
         try:
             return fn()
@@ -631,7 +953,12 @@ class DatabricksUnityCatalog:
             raise
         except Exception as exc:
             raise self._error(
-                exc, action, full_name, securable_type=securable_type, needs=_NEEDS[needs]
+                exc,
+                action,
+                full_name,
+                securable_type=securable_type,
+                needs=_NEEDS[needs],
+                held_on=held_on,
             ) from exc
 
     def table_info(self, ref: TableRef) -> TableInfo:
@@ -641,13 +968,13 @@ class DatabricksUnityCatalog:
         def fetch() -> Any:
             try:
                 return self.workspace.tables.get(
-                    full_name=name,
+                    full_name=_url_name(name),
                     include_browse=True,
                     include_delta_metadata=True,
                     include_manifest_capabilities=True,
                 )
             except TypeError:  # an older SDK without the include_* flags
-                return self.workspace.tables.get(full_name=name)
+                return self.workspace.tables.get(full_name=_url_name(name))
 
         return TableInfo.from_api(self._call("read table metadata", name, "read", fetch))
 
@@ -659,7 +986,10 @@ class DatabricksUnityCatalog:
         out: list[Grant] = []
         token: str | None = None
         while True:
-            kwargs: dict[str, Any] = {"securable_type": securable_type, "full_name": full_name}
+            kwargs: dict[str, Any] = {
+                "securable_type": securable_type,
+                "full_name": _url_name(full_name),
+            }
             if principal:
                 kwargs["principal"] = principal
             if token:
@@ -727,7 +1057,7 @@ class DatabricksUnityCatalog:
             name,
             "grant",
             lambda: self.workspace.grants.update(
-                securable_type=kind, full_name=name, changes=[change]
+                securable_type=kind, full_name=_url_name(name), changes=[change]
             ),
             securable_type=kind,
         )
@@ -771,7 +1101,7 @@ class DatabricksUnityCatalog:
             "tags",
             lambda: list(
                 self.workspace.entity_tag_assignments.list(
-                    entity_type=entity_type, entity_name=entity_name
+                    entity_type=entity_type, entity_name=_url_name(entity_name)
                 )
             ),
         )
@@ -789,14 +1119,17 @@ class DatabricksUnityCatalog:
                 entity_name=entity_name,
                 tag_key=key,
                 entity_type=entity_type,
-                tag_value=value or None,
+                # Key-only tags are "" (or None); anything else is sent as text --
+                # an int value went over the wire as a JSON number, and 0 was
+                # silently dropped to a key-only tag.
+                tag_value=None if value is None or value == "" else str(value),
             )
             call: Callable[[], Any] = (
                 functools.partial(
                     api.update,
                     entity_type=entity_type,
-                    entity_name=entity_name,
-                    tag_key=key,
+                    entity_name=_url_name(entity_name),
+                    tag_key=_segment(key),
                     tag_assignment=assignment,
                     update_mask="tag_value",
                 )
@@ -809,14 +1142,24 @@ class DatabricksUnityCatalog:
         entity_type, entity_name = self._tag_entity(ref, column)
         api = self.workspace.entity_tag_assignments
         for key in keys:
-            self._call(
-                "unset tags",
-                entity_name,
-                "tags",
-                functools.partial(
-                    api.delete, entity_type=entity_type, entity_name=entity_name, tag_key=key
-                ),
-            )
+            try:
+                self._call(
+                    "unset tags",
+                    entity_name,
+                    "tags",
+                    functools.partial(
+                        api.delete,
+                        entity_type=entity_type,
+                        entity_name=_url_name(entity_name),
+                        tag_key=_segment(key),
+                    ),
+                )
+            except InvalidReferenceError:
+                # A tag that is not set answers 404 too, which surfaced as "the
+                # table does not exist". Unsetting an absent tag is a no-op;
+                # only a genuinely missing table is an error.
+                if not self.table_exists(ref):
+                    raise
 
     # -------------------------------------------------------- owner & lineage
 
@@ -826,7 +1169,7 @@ class DatabricksUnityCatalog:
             "change the owner",
             name,
             "owner",
-            lambda: self.workspace.tables.update(full_name=name, owner=principal),
+            lambda: self.workspace.tables.update(full_name=_url_name(name), owner=principal),
         )
 
     def lineage(self, ref: TableRef, direction: str = "both") -> Lineage:
@@ -927,7 +1270,7 @@ class DatabricksUnityCatalog:
             full,
             "constraint",
             lambda: self.workspace.table_constraints.delete(
-                full_name=full, constraint_name=name, cascade=cascade
+                full_name=_url_name(full), constraint_name=name, cascade=cascade
             ),
         )
 
@@ -951,9 +1294,14 @@ class DatabricksUnityCatalog:
             "drop a catalog",
             name,
             "catalog",
-            lambda: self.workspace.catalogs.delete(name=name, force=force),
+            lambda: self.workspace.catalogs.delete(name=_segment(name), force=force),
             securable_type="CATALOG",
         )
+        # Every schema of a dropped catalog is gone with it; a re-created one
+        # must not inherit their capability manifests.
+        # Snapshot the keys: a concurrent resolve may add one mid-iteration.
+        for key in [k for k in list(self._manifest_cache) if k[0] == name.lower()]:
+            self._manifest_cache.pop(key, None)
 
     def create_schema(
         self,
@@ -970,6 +1318,7 @@ class DatabricksUnityCatalog:
                 name=name, catalog_name=catalog, comment=comment, storage_root=storage_root
             ),
             securable_type="CATALOG",
+            held_on=catalog,
         )
 
     def drop_schema(self, catalog: str, name: str, force: bool = False) -> None:
@@ -978,15 +1327,15 @@ class DatabricksUnityCatalog:
             "drop a schema",
             full,
             "schema",
-            lambda: self.workspace.schemas.delete(full_name=full, force=force),
+            lambda: self.workspace.schemas.delete(full_name=_url_name(full), force=force),
             securable_type="SCHEMA",
         )
-        self._manifest_cache.pop((catalog, name), None)
+        self._manifest_cache.pop((catalog.lower(), name.lower()), None)
 
     def table_exists(self, ref: TableRef) -> bool:
         name = _dotted(ref)
         try:
-            response = self.workspace.tables.exists(full_name=name)
+            response = self.workspace.tables.exists(full_name=_url_name(name))
         except Exception as exc:
             error = self._error(exc, "check existence", name, needs=_NEEDS["read"])
             if isinstance(error, InvalidReferenceError):
@@ -1056,7 +1405,13 @@ class DatabricksUnityCatalog:
     ) -> VolumeSummary:
         from databricks.sdk.service.catalog import VolumeType
 
-        kind = VolumeType(volume_type.upper())
+        try:
+            kind = VolumeType(str(volume_type).upper())
+        except ValueError as exc:
+            raise InvalidArgumentError(
+                f"unknown volume_type {volume_type!r}; expected one of "
+                f"{sorted(t.value for t in VolumeType)}"
+            ) from exc
         if kind is VolumeType.EXTERNAL and not storage_location:
             raise InvalidReferenceError("an EXTERNAL volume needs a storage_location")
         info = self._call(
@@ -1072,6 +1427,7 @@ class DatabricksUnityCatalog:
                 storage_location=storage_location,
             ),
             securable_type="SCHEMA",
+            held_on=f"{catalog}.{schema}",
         )
         return VolumeSummary.from_api(info)
 
@@ -1081,7 +1437,7 @@ class DatabricksUnityCatalog:
             "drop a volume",
             full,
             "volume",
-            lambda: self.workspace.volumes.delete(name=full),
+            lambda: self.workspace.volumes.delete(name=_url_name(full)),
             securable_type="VOLUME",
         )
 
@@ -1160,8 +1516,15 @@ class DatabricksUnityCatalog:
                 "POST", "/api/2.1/unity-catalog/tables", body=body, headers=_JSON_HEADERS
             )
 
-        self._call("register an external table", name, "register", create)
-        self._manifest_cache.pop((ref.catalog, ref.schema), None)
+        self._call(
+            "register an external table",
+            name,
+            "register",
+            create,
+            securable_type="SCHEMA",
+            held_on=f"{ref.catalog}.{ref.schema}",
+        )
+        self._manifest_cache.pop((ref.catalog.lower(), ref.schema.lower()), None)
         return self.resolve(ref)
 
     def path_credentials(self, url: str, operation: str = "PATH_READ") -> Credentials:
@@ -1185,7 +1548,11 @@ class DatabricksUnityCatalog:
         )
         # Same response shape as table vending; reuse its parsing, including
         # the explicit Azure endpoint.
-        parser = DatabricksCredentialProvider(table_id="", table_url=url)
+        # With the metastore region: UC vends S3 path keys without one too, and
+        # a bucket outside us-east-1 then fails on the Location-less redirect.
+        parser = DatabricksCredentialProvider(
+            table_id="", table_url=url, region=self._metastore_region()
+        )
         creds = parser._to_credentials(
             response, Operation.READ if op == "PATH_READ" else Operation.READ_WRITE
         )
@@ -1215,6 +1582,7 @@ class DatabricksUnityCatalog:
                 headers=_JSON_HEADERS,
             ),
             securable_type="SCHEMA",
+            held_on=f"{ref.catalog}.{ref.schema}",
         )
         return StagingTable.from_api(name, body or {})
 
@@ -1238,7 +1606,8 @@ class DatabricksUnityCatalog:
                 headers=_JSON_HEADERS,
             ),
             securable_type="SCHEMA",
+            held_on=f"{ref.catalog}.{ref.schema}",
         )
         assert ref.catalog and ref.schema
-        self._manifest_cache.pop((ref.catalog, ref.schema), None)
+        self._manifest_cache.pop((ref.catalog.lower(), ref.schema.lower()), None)
         return self.resolve(ref)

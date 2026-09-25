@@ -305,10 +305,15 @@ class TestKernelOverwrite:
         from deltaswamp.engine.kernel import KernelEngine
 
         KernelEngine().overwrite(
-            plain.resolved, pa.table({"id": [9], "city": ["q"]}), predicate="id = 1"
+            plain.resolved, pa.table({"id": [1], "city": ["q"]}), predicate="id = 1"
         )
         got = DeltaTable(plain.location).to_pyarrow_table().to_pylist()
-        assert {r["id"] for r in got} == {2, 9}
+        assert {(r["id"], r["city"]) for r in got} == {(1, "q"), (2, "lima")}
+        # A new row outside the predicate is refused, as Databricks does.
+        with pytest.raises(Exception, match="do not satisfy the predicate"):
+            KernelEngine().overwrite(
+                plain.resolved, pa.table({"id": [9], "city": ["z"]}), predicate="id = 1"
+            )
 
     def test_kernel_txn_and_commit_metadata(self, plain: Any) -> None:
         from deltaswamp.engine.kernel import KernelEngine

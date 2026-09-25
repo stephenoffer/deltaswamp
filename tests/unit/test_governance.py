@@ -423,7 +423,7 @@ class TestLiveRegressions:
         )
         creds = provider._to_credentials(response, CredOp.READ)
         assert creds.cloud is Cloud.AZURE
-        assert creds.secrets["azure_endpoint"] == "https://acct.dfs.core.windows.net"
+        assert creds.secrets["azure_endpoint"] == "https://acct.blob.core.windows.net"
         # Azure SAS is path-scoped, so the store registry must key on the path
         # rather than the bucket, or the second table in a container gets the
         # first one's signature and a 403.
@@ -1124,7 +1124,7 @@ class TestPathCredentials:
             )
         )
         creds = dbx.path_credentials(url, "read")
-        assert creds.as_storage_options()["azure_endpoint"] == "https://acct.dfs.core.windows.net"
+        assert creds.as_storage_options()["azure_endpoint"] == "https://acct.blob.core.windows.net"
         assert "SECRET" not in repr(creds)
 
     def test_bad_operation(self, dbx: Any) -> None:
@@ -1234,7 +1234,7 @@ class TestStagingOptions:
         )
         assert azure == {
             "azure_storage_sas_key": "sv=x",
-            "azure_endpoint": "https://acct.dfs.core.windows.net",
+            "azure_endpoint": "https://acct.blob.core.windows.net",
         }
         gcs, expires = staging_storage_options(
             "gs://b/t",

@@ -1,6 +1,6 @@
 //! Error translation from kernel errors into Python exceptions.
 
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyIOError, PyValueError};
 use pyo3::PyErr;
 use thiserror::Error;
 
@@ -58,7 +58,19 @@ impl From<NativeError> for PyErr {
     fn from(err: NativeError) -> PyErr {
         let message = err.to_string();
         match err {
-            NativeError::ObjectStore(_) => PyIOError::new_err(message),
+            // A missing object (e.g. a data file removed by VACUUM) is an
+            // I/O failure, not bad input: callers retrying on OSError, or
+            // telling "not found" apart, need the right class.
+            NativeError::ObjectStore(delta_kernel::object_store::Error::NotFound { .. })
+            | NativeError::Kernel(delta_kernel::Error::FileNotFound(_)) => {
+                PyFileNotFoundError::new_err(message)
+            }
+            NativeError::ObjectStore(_)
+            | NativeError::Kernel(
+                delta_kernel::Error::ObjectStore(_)
+                | delta_kernel::Error::IOError(_)
+                | delta_kernel::Error::Reqwest(_),
+            ) => PyIOError::new_err(message),
             NativeError::CommitConflict(_) => CommitConflictError::new_err(message),
             NativeError::BackfillRequired(_) => BackfillRequiredError::new_err(message),
             NativeError::Retryable(_) => RetryableError::new_err(message),

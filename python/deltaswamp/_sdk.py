@@ -67,4 +67,10 @@ def workspace_client(*, config: Any = None, **kwargs: Any) -> Any:
                 config._product_info = (PRODUCT, sdk_version())
         return WorkspaceClient(config=config)
 
-    return WorkspaceClient(**{**product_kwargs(), **kwargs})
+    # An explicit `product=None` (a caller forwarding optional arguments) must
+    # not erase the stamp: the SDK would send `unknown/0.0.0` and every UC
+    # Delta API call would 400.
+    given = {
+        k: v for k, v in kwargs.items() if not (k in ("product", "product_version") and v is None)
+    }
+    return WorkspaceClient(**{**product_kwargs(), **given})

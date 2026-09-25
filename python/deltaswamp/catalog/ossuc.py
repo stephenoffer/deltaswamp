@@ -11,6 +11,7 @@ Uses stdlib HTTP so the base install needs no extra dependency.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -67,6 +68,7 @@ _UNSUPPORTED = {
 _NEEDS = {
     "read": "Reading needs USE CATALOG and USE SCHEMA on the parents and SELECT or ownership.",
     "grant": "Changing grants needs ownership of the securable.",
+    "drop": "Dropping a table needs ownership of it, plus USE SCHEMA and USE CATALOG.",
     "catalog": "Creating a catalog needs CREATE CATALOG on the metastore.",
     "schema": "Creating a schema needs CREATE SCHEMA and USE CATALOG.",
     "volume": "Creating a volume needs CREATE VOLUME, USE SCHEMA and USE CATALOG.",
@@ -96,6 +98,11 @@ def _like(pattern: str | None) -> re.Pattern[str] | None:
     return re.compile(f"^{body}$", re.IGNORECASE)
 
 
+def _prop(value: Any) -> str:
+    """A table property value as UC stores it: a string, booleans lower-cased."""
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
 def _unsupported(method: str) -> NoReturn:
     raise NotImplementedError(f"{method}: {_UNSUPPORTED[method]}")
 
@@ -115,9 +122,14 @@ def _request(
     *,
     method: str = "GET",
     body: Any = None,
+    timeout: float = 30.0,
 ) -> Any:
     """One JSON request. `body`, when given, is sent as JSON."""
     url = base_url.rstrip("/") + path
+    # Checked before anything is built: urllib would otherwise happily open a
+    # file:// URL, or fail with an unhelpful "unknown url type".
+    if not url.startswith(("http://", "https://")):
+        raise InvalidReferenceError(f"refusing non-HTTP catalog URL {url!r}")
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=data, method=method)
     request.add_header("Accept", "application/json")
@@ -125,61 +137,136 @@ def _request(
         request.add_header("Content-Type", "application/json")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
-    if not url.startswith(("http://", "https://")):
-        raise InvalidReferenceError(f"refusing non-HTTP catalog URL {url!r}")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             text = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:500]
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:  # an HTTPError need not carry a readable body
+            detail = str(exc.reason)
         raise UnityCatalogHTTPError(
             f"{method} {url} failed with HTTP {exc.code}: {detail}", exc.code
         ) from exc
     except urllib.error.URLError as exc:
         raise PreflightError(f"{method} {url} failed: {exc.reason}") from exc
-    return json.loads(text) if text else {}
+    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+        # A read timeout, a reset connection or a truncated body surfaces as
+        # one of these, not URLError, and used to escape as a bare socket error.
+        raise PreflightError(f"{method} {url} failed: {exc!r}") from exc
+    if not text.strip():
+        return {}
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        # A proxy's HTML error page or a truncated body: say what came back
+        # instead of raising a JSONDecodeError with no URL in it.
+        raise PreflightError(
+            f"{method} {url} returned a non-JSON response: {text[:200]!r}"
+        ) from exc
 
 
-def _parse_vended(body: dict[str, Any]) -> Credentials:
-    """Parse a UC temporary-credentials response (table or path)."""
-    url = body.get("url") or ""
-    expiry = body.get("expiration_time") or body.get("expirationTime")
-    expires_at = float(expiry) / 1000.0 if expiry else None
+def _cloud_for(url: str) -> Cloud:
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme in ("s3", "s3a", "s3n"):
+        return Cloud.AWS
+    if scheme in ("abfs", "abfss", "wasb", "wasbs", "az", "adl"):
+        return Cloud.AZURE
+    if scheme in ("gs", "gcs"):
+        return Cloud.GCP
+    if scheme in ("", "file"):
+        return Cloud.LOCAL
+    raise CredentialError(f"cannot tell which cloud {url!r} is on")
 
-    if "aws_temp_credentials" in body:
-        c = body["aws_temp_credentials"]
-        return Credentials(
-            cloud=Cloud.AWS,
-            url=url,
-            expires_at=expires_at,
-            secrets={
-                "aws_access_key_id": c["access_key_id"],
-                "aws_secret_access_key": c["secret_access_key"],
-                "aws_session_token": c["session_token"],
-            },
-            scope_prefix=url or None,
+
+def _parse_vended(
+    body: dict[str, Any],
+    fallback_url: str | None = None,
+    table_id: str | None = None,
+) -> Credentials:
+    """Parse a UC temporary-credentials response (table or path).
+
+    `fallback_url` is the table location, used when the response names no
+    URL: without it the credential had no scope, so every table's credential
+    shared one registry key and an Azure SAS scoped to one table path was
+    reused for another.
+    """
+    if not isinstance(body, Mapping):
+        raise CredentialError(
+            f"OSS Unity Catalog returned a non-object credentials response: {body!r:.200}"
         )
-    if "gcp_oauth_token" in body:
+    url = body.get("url") or fallback_url or ""
+    expiry = body.get("expiration_time") or body.get("expirationTime")
+    try:
+        expires_at = float(expiry) / 1000.0 if expiry else None
+    except (TypeError, ValueError):
+        raise CredentialError(f"unparseable credential expiration_time {expiry!r}") from None
+
+    def block(name: str) -> Mapping[str, Any] | None:
+        # A server serialising every optional block explicitly sends the ones
+        # that do not apply as null; `in` alone then picked a null AWS block
+        # and crashed with a TypeError.
+        value = body.get(name)
+        return value if isinstance(value, Mapping) and value else None
+
+    def need(mapping: Mapping[str, Any], key: str, where: str) -> str:
+        value = mapping.get(key)
+        if not value:
+            raise CredentialError(
+                f"OSS Unity Catalog's {where} block has no {key!r} (fields: {sorted(mapping)})"
+            )
+        return str(value)
+
+    common: dict[str, Any] = {
+        "url": url,
+        "expires_at": expires_at,
+        "scope_prefix": url or None,
+        "table_id": table_id,
+    }
+    if (c := block("aws_temp_credentials")) is not None:
+        secrets = {
+            "aws_access_key_id": need(c, "access_key_id", "aws_temp_credentials"),
+            "aws_secret_access_key": need(c, "secret_access_key", "aws_temp_credentials"),
+        }
+        # Static IAM-user keys legitimately come without a session token.
+        if c.get("session_token"):
+            secrets["aws_session_token"] = str(c["session_token"])
+        return Credentials(cloud=Cloud.AWS, secrets=secrets, **common)
+    if (c := block("gcp_oauth_token")) is not None:
         return Credentials(
             cloud=Cloud.GCP,
-            url=url,
-            expires_at=expires_at,
-            secrets={"google_bearer_token": body["gcp_oauth_token"]["oauth_token"]},
-            scope_prefix=url or None,
+            secrets={"google_bearer_token": need(c, "oauth_token", "gcp_oauth_token")},
+            **common,
         )
-    if "azure_user_delegation_sas" in body:
+    if (c := block("azure_user_delegation_sas")) is not None:
         from ..credentials.databricks import azure_endpoint_for
 
         endpoint = azure_endpoint_for(url)
-        secrets = {"azure_storage_sas_key": body["azure_user_delegation_sas"]["sas_token"]}
+        secrets = {"azure_storage_sas_key": need(c, "sas_token", "azure_user_delegation_sas")}
         if endpoint:
             secrets["azure_endpoint"] = endpoint
+            if endpoint.lower().startswith("http://"):
+                # object_store refuses a plain-http endpoint (Azurite) unless
+                # told to allow it: "URL scheme is not allowed".
+                secrets["azure_allow_http"] = "true"
+        return Credentials(cloud=Cloud.AZURE, secrets=secrets, **common)
+    storage = body.get("storage-credentials") or body.get("storage_credentials")
+    if isinstance(storage, Mapping):
+        storage = [storage]
+    if storage:
+        # The /delta/v1 shape (as staging-tables answers): a list of
+        # {prefix, operation, config, expiration-time-ms}.
+        from ..governance import staging_storage_options
+
+        location = url or str((storage[0] or {}).get("prefix") or "")
+        options, stated = staging_storage_options(location, storage)
         return Credentials(
-            cloud=Cloud.AZURE,
-            url=url,
-            expires_at=expires_at,
-            secrets=secrets,
-            scope_prefix=url or None,
+            cloud=_cloud_for(location),
+            url=location,
+            expires_at=stated if stated is not None else expires_at,
+            secrets=options,
+            scope_prefix=location or None,
+            table_id=table_id,
         )
     raise CredentialError(
         f"OSS Unity Catalog returned no recognised credential block: {sorted(body)}"
@@ -201,8 +288,12 @@ class OSSUnityCredentialProvider:
         ref: TableRef,
         token: str | None = None,
         table_id: str | None = None,
+        location: str | None = None,
     ) -> None:
+        if ref.kind is not RefKind.CATALOG or not (ref.catalog and ref.schema and ref.table):
+            raise InvalidReferenceError(f"{ref} is not a catalog.schema.table reference")
         self._table_id = table_id
+        self._location = location
         self._base_url = base_url
         self._catalog = ref.catalog
         self._schema = ref.schema
@@ -232,12 +323,22 @@ class OSSUnityCredentialProvider:
         self._cache.clear()
 
     def credentials(self, operation: Operation = Operation.READ) -> Credentials:
+        try:
+            # A plain "READ" string used to die on `.value`.
+            operation = Operation(str(getattr(operation, "value", operation)).upper())
+        except ValueError:
+            raise CredentialError(
+                f"credential operation must be READ or READ_WRITE, not {operation!r}"
+            ) from None
         cached = self._cache.get(operation)
         if cached is not None and not cached.expires_within():
             return cached
+        # Percent-encoded: a name with a space, '#', '?' or '/' otherwise
+        # built a different URL (or a different table) entirely.
+        query = urllib.parse.urlencode({"operation": operation.value})
         path = (
-            f"{UC_DELTA_API}/catalogs/{self._catalog}/schemas/{self._schema}"
-            f"/tables/{self._table}/credentials?operation={operation.value}"
+            f"{UC_DELTA_API}/catalogs/{_q(self._catalog or '')}/schemas/{_q(self._schema or '')}"
+            f"/tables/{_q(self._table or '')}/credentials?{query}"
         )
         body = _request(self._base_url, path, self._token)
         creds = self._parse(body)
@@ -245,7 +346,9 @@ class OSSUnityCredentialProvider:
         return creds
 
     def _parse(self, body: dict[str, Any]) -> Credentials:
-        return _parse_vended(body)
+        return _parse_vended(
+            body, fallback_url=getattr(self, "_location", None), table_id=self._table_id
+        )
 
 
 class OSSUnityCatalog:
@@ -258,7 +361,16 @@ class OSSUnityCatalog:
         """Build from ``uc://http://host:8080`` or ``unity://host:8080``."""
         if not uri:
             raise InvalidReferenceError("the unity catalog needs a server URL")
-        base_url = uri.split("://", 1)[1]
+        # "unity://host:8080" -> "host:8080"; a bare "host:8080" (no scheme at
+        # all) used to die with an IndexError.
+        base_url = uri.split("://", 1)[1] if "://" in uri else uri
+        if uri.lower().startswith(("http://", "https://")):
+            # Already the server URL: stripping its scheme and re-adding
+            # "http://" silently downgraded an https server to plain HTTP,
+            # sending the bearer token in the clear.
+            base_url = uri
+        if not base_url.strip("/"):
+            raise InvalidReferenceError(f"the unity catalog URL {uri!r} names no server")
         # Drop kwargs meant for Databricks auth; they are meaningless here.
         for unused in ("profile", "host", "config"):
             kwargs.pop(unused, None)
@@ -273,24 +385,16 @@ class OSSUnityCatalog:
     def resolve(self, ref: TableRef) -> ResolvedTable:
         if ref.kind is not RefKind.CATALOG:
             raise InvalidReferenceError(f"{ref} is a path; use the filesystem catalog")
-        assert ref.catalog and ref.schema and ref.table
-
-        full = urllib.parse.quote(f"{ref.catalog}.{ref.schema}.{ref.table}", safe="")
-        info = _request(self._base_url, f"{UC_API}/tables/{full}", self._token)
-
-        properties = dict(info.get("properties") or {})
-        resolved = ResolvedTable(
-            ref=ref,
-            location=info.get("storage_location"),
-            table_type=self._table_type(info.get("table_type")),
-            data_source_format=info.get("data_source_format"),
-            table_id=info.get("table_id"),
-            properties=properties,
-            credential_provider=OSSUnityCredentialProvider(
-                self._base_url, ref, self._token, info.get("table_id")
-            ),
-            table_uuid=info.get("table_id"),
+        # _dotted, not an assert: under `python -O` the assert vanished and a
+        # two-part name was looked up as "cat.schema.None".
+        name = _dotted(ref)
+        info = self._call(
+            "resolve the table",
+            name,
+            "read",
+            lambda: _request(self._base_url, f"{UC_API}/tables/{_q(name)}", self._token),
         )
+        resolved = self._resolved_from_info(ref, info)
 
         # Every Unity Catalog table is reachable through the catalog's Iceberg
         # REST endpoint when it has Iceberg metadata (managed Iceberg, foreign
@@ -307,11 +411,51 @@ class OSSUnityCatalog:
             resolved = self._with_catalog_commits(resolved, ref)
         return resolved
 
+    def _resolved_from_info(self, ref: TableRef, info: Mapping[str, Any]) -> ResolvedTable:
+        """One table-info response as a ResolvedTable (shared by resolve and list)."""
+        table_id = info.get("table_id")
+        location = info.get("storage_location")
+        return ResolvedTable(
+            ref=ref,
+            location=location,
+            table_type=self._table_type(info.get("table_type")),
+            data_source_format=info.get("data_source_format"),
+            table_id=table_id,
+            # Values stringified: object_store / delta-rs take str -> str only.
+            properties={
+                str(k): str(v) for k, v in (info.get("properties") or {}).items() if v is not None
+            },
+            credential_provider=OSSUnityCredentialProvider(
+                self._base_url, ref, self._token, table_id, location
+            ),
+            table_uuid=table_id,
+        )
+
     def _with_catalog_commits(self, resolved: ResolvedTable, ref: TableRef) -> ResolvedTable:
         import dataclasses
 
-        path = f"{UC_DELTA_API}/catalogs/{ref.catalog}/schemas/{ref.schema}/tables/{ref.table}"
-        body = _request(self._base_url, path, self._token)
+        path = self._delta_tables_path(ref, f"tables/{_q(ref.table or '')}")
+        try:
+            body = self._call(
+                "read the catalog commit tail",
+                _dotted(ref),
+                "read",
+                lambda: _request(self._base_url, path, self._token),
+            )
+        except InvalidReferenceError as exc:
+            # The table was found a moment ago through the tables API, so a
+            # 404 here means the server has no UC Delta API, not that the
+            # table is missing.
+            raise PreflightError(
+                f"{_dotted(ref)} is catalog-managed, but {self._base_url}{UC_DELTA_API} "
+                "did not serve its commit tail; catalog-managed tables need Unity Catalog "
+                f"0.5+ with the Delta API enabled ({exc})"
+            ) from exc
+        if not isinstance(body, Mapping):
+            raise PreflightError(
+                f"the UC Delta API returned a non-object table response for {_dotted(ref)}: "
+                f"{body!r:.200}"
+            )
         entries, latest, location = parse_commit_tail(body, resolved.location)
         return dataclasses.replace(
             resolved,
@@ -321,55 +465,82 @@ class OSSUnityCatalog:
         )
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
-        query = urllib.parse.urlencode({"catalog_name": catalog, "schema_name": schema})
-        body = _request(self._base_url, f"{UC_API}/tables?{query}", self._token)
+        # Paged: the server returns one page (100 by default) plus a
+        # next_page_token, and reading only the first silently dropped the rest.
         out = []
-        for info in body.get("tables", []):
+        # Under _call: a missing schema or a denial is named like every other
+        # catalog call instead of surfacing as a bare HTTP error.
+        infos = self._call(
+            "list tables",
+            f"{catalog}.{schema}",
+            "read",
+            lambda: self._paged(
+                f"{UC_API}/tables", "tables", {"catalog_name": catalog, "schema_name": schema}
+            ),
+        )
+        for info in infos:
+            if not info.get("name"):
+                continue
+            name = str(info["name"])
             ref = TableRef(
                 kind=RefKind.CATALOG,
                 catalog=catalog,
                 schema=schema,
-                table=info["name"],
+                table=name,
                 scheme="uc",
-                raw=f"{catalog}.{schema}.{info['name']}",
+                raw=f"{catalog}.{schema}.{name}",
             )
-            out.append(
-                ResolvedTable(
-                    ref=ref,
-                    location=info.get("storage_location"),
-                    table_type=self._table_type(info.get("table_type")),
-                    data_source_format=info.get("data_source_format"),
-                    table_id=info.get("table_id"),
-                    properties=dict(info.get("properties") or {}),
-                    credential_provider=OSSUnityCredentialProvider(
-                        self._base_url, ref, self._token
-                    ),
-                )
-            )
+            # The table id reaches the provider and table_uuid too; listing used
+            # to drop both, so listed tables skipped the stale-id check.
+            out.append(self._resolved_from_info(ref, info))
         return out
 
     def list_catalogs(self) -> list[str]:
-        body = _request(self._base_url, f"{UC_API}/catalogs", self._token)
-        return [c["name"] for c in body.get("catalogs", []) if c.get("name")]
+        return [
+            str(c["name"])
+            for c in self._call(
+                "list catalogs",
+                "the metastore",
+                "read",
+                lambda: self._paged(f"{UC_API}/catalogs", "catalogs", {}),
+            )
+            if c.get("name")
+        ]
 
     def list_schemas(self, catalog: str) -> list[str]:
-        query = urllib.parse.urlencode({"catalog_name": catalog})
-        body = _request(self._base_url, f"{UC_API}/schemas?{query}", self._token)
-        return [s["name"] for s in body.get("schemas", []) if s.get("name")]
+        return [
+            str(s["name"])
+            for s in self._call(
+                "list schemas",
+                catalog,
+                "read",
+                lambda: self._paged(f"{UC_API}/schemas", "schemas", {"catalog_name": catalog}),
+            )
+            if s.get("name")
+        ]
 
     def drop_table(self, ref: TableRef) -> None:
         # _dotted, not an f-string: it rejects a reference that is not
         # catalog.schema.table. Interpolating directly turned a path reference
         # into a DELETE of a table literally named "None.None.None".
-        full = _q(_dotted(ref))
-        _request(self._base_url, f"{UC_API}/tables/{full}", self._token, method="DELETE")
+        name = _dotted(ref)
+        # Under _call: dropping a missing table is an InvalidReferenceError,
+        # as it is on Databricks, not a raw HTTP 404.
+        self._call(
+            "drop the table",
+            name,
+            "drop",
+            lambda: _request(
+                self._base_url, f"{UC_API}/tables/{_q(name)}", self._token, method="DELETE"
+            ),
+        )
 
     @staticmethod
     def _table_type(raw: str | None) -> TableType | None:
         if not raw:
             return None
         try:
-            return TableType(raw)
+            return TableType(str(raw).upper())
         except ValueError:
             return None
 
@@ -426,9 +597,13 @@ class OSSUnityCatalog:
 
     @staticmethod
     def _permissions_path(target: TableRef | str, securable_type: str) -> tuple[str, str]:
-        name = _dotted(target) if isinstance(target, TableRef) else str(target)
+        name = _dotted(target) if isinstance(target, TableRef) else str(target).strip()
+        if not name:
+            raise InvalidReferenceError("a permissions call needs a securable name")
+        # An SDK SecurableType enum stringifies as "SecurableType.TABLE".
+        kind = str(getattr(securable_type, "value", securable_type)).strip()
         # OSS spells securable types in lower case in the path.
-        return name, f"{UC_API}/permissions/{_q(securable_type.lower())}/{_q(name)}"
+        return name, f"{UC_API}/permissions/{_q(kind.lower())}/{_q(name)}"
 
     @staticmethod
     def _from_wire(body: Any) -> list[Grant]:
@@ -465,8 +640,18 @@ class OSSUnityCatalog:
         *,
         add: bool,
     ) -> list[Grant]:
+        if not principal or not str(principal).strip():
+            raise InvalidReferenceError("grant/revoke needs a principal")
+        # A bare string is one privilege: iterating "SELECT" sent the
+        # privileges "S", "E", "L", "E", "C", "T".
+        if isinstance(privileges, str):
+            privileges = [privileges]
         # OSS spells privileges with spaces: "USE SCHEMA", not "USE_SCHEMA".
-        wire = [normalize_privilege(p).replace("_", " ") for p in privileges]
+        wire = list(
+            dict.fromkeys(
+                normalize_privilege(p).replace("_", " ") for p in privileges if str(p).strip()
+            )
+        )
         if not wire:
             raise InvalidReferenceError("grant/revoke needs at least one privilege")
         name, path = self._permissions_path(target, securable_type)
@@ -610,15 +795,28 @@ class OSSUnityCatalog:
     def _paged(self, path: str, key: str, params: dict[str, str]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         token: str | None = None
+        seen: set[str] = set()
         while True:
             query = dict(params)
             if token:
                 query["page_token"] = token
-            body = self._get(f"{path}?{urllib.parse.urlencode(query)}")
-            out.extend(body.get(key) or [])
-            token = body.get("next_page_token")
+            encoded = urllib.parse.urlencode(query)
+            body = self._get(f"{path}?{encoded}" if encoded else path)
+            if not isinstance(body, Mapping):
+                raise PreflightError(
+                    f"{self._base_url}{path} returned {type(body).__name__}, not a JSON object"
+                )
+            out.extend(dict(item) for item in (body.get(key) or []) if isinstance(item, Mapping))
+            token = body.get("next_page_token") or None
             if not token:
                 return out
+            if token in seen:
+                # A server that hands back the same token forever used to spin
+                # here indefinitely, growing `out` without bound.
+                raise PreflightError(
+                    f"{self._base_url}{path} repeated page token {token!r}; refusing to loop"
+                )
+            seen.add(token)
 
     def search_tables(
         self,
@@ -632,11 +830,25 @@ class OSSUnityCatalog:
         for schema in self.list_schemas(catalog):
             if schemas is not None and not schemas.match(schema):
                 continue
-            for info in self._paged(
-                f"{UC_API}/tables", "tables", {"catalog_name": catalog, "schema_name": schema}
-            ):
+            try:
+                infos = self._paged(
+                    f"{UC_API}/tables", "tables", {"catalog_name": catalog, "schema_name": schema}
+                )
+            except UnityCatalogHTTPError as exc:
+                if exc.status == 404:
+                    # Dropped between listing the schemas and listing its
+                    # tables: it has no tables to report, not a failed search.
+                    continue
+                raise
+            for info in infos:
                 if tables is None or tables.match(str(info.get("name") or "")):
-                    out.append(TableSummary.from_api({"catalog_name": catalog, **info}))
+                    # The listed schema fills in a name the entry leaves out, which
+                    # otherwise came back as "catalog.table".
+                    out.append(
+                        TableSummary.from_api(
+                            {"catalog_name": catalog, "schema_name": schema, **info}
+                        )
+                    )
         return out
 
     def list_functions(self, catalog: str, schema: str) -> list[FunctionSummary]:
@@ -676,9 +888,18 @@ class OSSUnityCatalog:
         storage_location: str | None = None,
         comment: str | None = None,
     ) -> VolumeSummary:
-        kind = volume_type.upper()
+        kind = str(getattr(volume_type, "value", volume_type)).strip().upper()
+        if kind not in ("MANAGED", "EXTERNAL"):
+            raise InvalidReferenceError(
+                f"volume_type must be MANAGED or EXTERNAL, not {volume_type!r}"
+            )
         if kind == "EXTERNAL" and not storage_location:
             raise InvalidReferenceError("an EXTERNAL volume needs a storage_location")
+        if kind == "MANAGED" and storage_location:
+            raise InvalidReferenceError(
+                "a MANAGED volume's location is chosen by the catalog; pass "
+                "volume_type='EXTERNAL' to use storage_location"
+            )
         body: dict[str, Any] = {
             "catalog_name": catalog,
             "schema_name": schema,
@@ -720,6 +941,11 @@ class OSSUnityCatalog:
     ) -> ResolvedTable:
         """Register an existing Delta log at `location` as an EXTERNAL table."""
         name = _dotted(ref)
+        if not location:
+            raise InvalidReferenceError(f"registering {name} needs a storage location")
+        # A bare string is one column, not one column per character.
+        if isinstance(partition_columns, str):
+            partition_columns = [partition_columns]
         partitions = list(partition_columns or ())
         if partitions and columns_schema_json is None:
             raise InvalidReferenceError(
@@ -738,7 +964,9 @@ class OSSUnityCatalog:
                 if columns_schema_json is not None
                 else []
             ),
-            "properties": dict(properties or {}),
+            # UC properties are string -> string; a bool or int was sent as a
+            # JSON literal and rejected (or stored as "True").
+            "properties": {str(k): _prop(v) for k, v in dict(properties or {}).items()},
         }
         if comment is not None:
             body["comment"] = comment
@@ -748,7 +976,7 @@ class OSSUnityCatalog:
             "register",
             lambda: self._send("POST", f"{UC_API}/tables", body),
         )
-        return self.resolve(ref)
+        return self._resolve_after(ref, "registered")
 
     def path_credentials(self, url: str, operation: str = "PATH_READ") -> Credentials:
         op = path_operation(operation)
@@ -760,7 +988,11 @@ class OSSUnityCatalog:
                 "POST", f"{UC_API}/temporary-path-credentials", {"url": url, "operation": op}
             ),
         )
-        body.setdefault("url", url)
+        if not isinstance(body, dict):
+            raise CredentialError(f"unexpected path-credentials response for {url}: {body!r:.200}")
+        # `or`, not setdefault: a present-but-empty url left the credential
+        # with no scope and, on Azure, no endpoint.
+        body["url"] = body.get("url") or url
         return _parse_vended(body)
 
     def _delta_tables_path(self, ref: TableRef, leaf: str) -> str:
@@ -790,4 +1022,20 @@ class OSSUnityCatalog:
             "staging",
             lambda: self._send("POST", self._delta_tables_path(ref, "tables"), body),
         )
-        return self.resolve(ref)
+        return self._resolve_after(ref, "created")
+
+    def _resolve_after(self, ref: TableRef, done: str) -> ResolvedTable:
+        """Resolve a table this catalog has just registered.
+
+        The registration already succeeded, so a failure here must say so: a
+        bare "does not exist" or network error read as if nothing had happened,
+        and retrying the create then failed with "already exists".
+        """
+        try:
+            return self.resolve(ref)
+        except (PreflightError, InvalidReferenceError, CredentialError) as exc:
+            raise PreflightError(
+                f"{_dotted(ref)} was {done} in Unity Catalog, but reading it back failed: "
+                f"{exc}. The table exists; open it again with conn.table({_dotted(ref)!r}) "
+                "rather than repeating the create"
+            ) from exc

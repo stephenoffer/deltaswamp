@@ -267,7 +267,7 @@ class TestReads:
         assert rec.last == f"SELECT * FROM table_changes({_lit(NAME)}, :p0, :p1)"
         assert rec.params == {
             "p0": ("2024-05-01T12:00:00+00:00", "TIMESTAMP"),
-            "p1": ("2024-06-01", "TIMESTAMP"),
+            "p1": ("2024-06-01T00:00:00+00:00", "TIMESTAMP"),
         }
 
     def test_cdf_defaults_to_version_zero(self) -> None:
@@ -467,9 +467,9 @@ class TestMaintenance:
         eng.restore(table(), 4)
         assert rec.last == f"RESTORE TABLE {NAME} TO VERSION AS OF 4"
         eng.restore(table(), "2024-01-01 00:00:00")
-        assert rec.last == f"RESTORE TABLE {NAME} TO TIMESTAMP AS OF '2024-01-01 00:00:00'"
+        assert rec.last == f"RESTORE TABLE {NAME} TO TIMESTAMP AS OF '2024-01-01T00:00:00+00:00'"
         eng.restore(table(), dt.datetime(2024, 1, 2, 3, 4, 5))
-        assert rec.last == f"RESTORE TABLE {NAME} TO TIMESTAMP AS OF '2024-01-02T03:04:05'"
+        assert rec.last == f"RESTORE TABLE {NAME} TO TIMESTAMP AS OF '2024-01-02T03:04:05+00:00'"
 
     def test_repair(self) -> None:
         rows = pa.table({"dataFilePath": ["f1"], "dataFileMissing": [True]})
@@ -596,7 +596,8 @@ class TestStagedWrites:
         assert path.endswith(".parquet")
         assert pq.read_table(io.BytesIO(client.files.uploaded[path])).equals(data)
         assert rec.last == (
-            f"INSERT INTO {NAME} BY NAME SELECT * FROM read_files('{path}', format => 'parquet')"
+            f"INSERT INTO {NAME} BY NAME SELECT `id`, `city` "
+            f"FROM read_files('{path}', format => 'parquet')"
         )
         assert client.files.deleted == [path]
 
@@ -632,7 +633,7 @@ class TestStagedWrites:
     def test_overwrite(self) -> None:
         eng, rec, client = engine()
         eng.overwrite(table(), pa.table({"id": [1]}))
-        assert rec.last.startswith(f"INSERT OVERWRITE {NAME} BY NAME SELECT * FROM read_files(")
+        assert rec.last.startswith(f"INSERT OVERWRITE {NAME} BY NAME SELECT `id` FROM read_files(")
         assert client.files.deleted
 
     def test_replace_where_orders_columns_like_the_table(self) -> None:
@@ -695,7 +696,8 @@ class TestMerge:
         )
         path = _staged_path(client)
         assert rec.last == (
-            f"MERGE INTO {NAME} AS `t` USING (SELECT * FROM read_files('{path}', format => "
+            f"MERGE INTO {NAME} AS `t` USING (SELECT `id`, `v`, `ts` "
+            f"FROM read_files('{path}', format => "
             "'parquet')) AS `s` ON t.id = s.id"
             " WHEN MATCHED AND s.ts > t.ts THEN UPDATE SET `t`.`v` = s.v"
             " WHEN MATCHED THEN UPDATE SET `t`.`id` = `s`.`id`, `t`.`v` = `s`.`v`"

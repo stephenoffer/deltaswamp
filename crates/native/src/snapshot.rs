@@ -45,17 +45,50 @@ impl PySnapshot {
     /// Normalise a table root: kernel requires a trailing slash and rejects
     /// paths without one, with an error that is hard to act on.
     pub(crate) fn table_root_url(table_root: &str) -> Result<Url> {
+        if table_root.trim().is_empty() {
+            return Err(NativeError::Invalid(
+                "the table root is empty; pass a URL or a filesystem path".to_string(),
+            ));
+        }
         let normalised = if table_root.ends_with('/') {
             table_root.to_string()
         } else {
             format!("{table_root}/")
         };
-        Url::parse(&normalised).or_else(|_| {
-            // Bare filesystem paths are a convenience users expect.
-            Url::from_directory_path(&normalised).map_err(|_| {
-                NativeError::Invalid(format!("cannot interpret {table_root:?} as a table root"))
-            })
-        })
+        match Url::parse(&normalised) {
+            // A one-letter "scheme" is a Windows drive (`C:\t`), not a URL.
+            Ok(url) if url.scheme().len() > 1 => {
+                if url.query().is_some() || url.fragment().is_some() {
+                    // `file:///t/a#b` parses as path `/t/a` plus a fragment,
+                    // which silently addresses a different table.
+                    return Err(NativeError::Invalid(format!(
+                        "table root {table_root:?} contains '?' or '#', which a URL reads as \
+                         a query or fragment rather than part of the path; percent-encode \
+                         them (%3F, %23) or pass a filesystem path"
+                    )));
+                }
+                Ok(url)
+            }
+            _ => {
+                // Bare filesystem paths are a convenience users expect,
+                // relative ones included (resolved against the working dir).
+                // `~` is a shell expansion; unexpanded it silently made a
+                // directory literally named "~" under the working directory.
+                let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+                let expanded = match (normalised.strip_prefix("~/"), home) {
+                    (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+                    _ => std::path::PathBuf::from(&normalised),
+                };
+                let path = std::path::absolute(&expanded).map_err(|e| {
+                    NativeError::Invalid(format!(
+                        "cannot interpret {table_root:?} as a table root: {e}"
+                    ))
+                })?;
+                Url::from_directory_path(&path).map_err(|_| {
+                    NativeError::Invalid(format!("cannot interpret {table_root:?} as a table root"))
+                })
+            }
+        }
     }
 
     fn build_log_tail(table_root: &Url, entries: Vec<LogTailEntry>) -> Result<Vec<LogPath>> {
@@ -71,6 +104,31 @@ impl PySnapshot {
                 return Err(NativeError::Invalid(format!(
                     "catalog log tail is not contiguous: version {a} is followed by {b}. \
                      Kernel requires an unbroken run of commits; re-fetch the tail."
+                )));
+            }
+        }
+
+        for (version, filename, ..) in &entries {
+            // Kernel `join`s the name onto `_staged_commits/`, so a path, an
+            // absolute URL or `..` would read a commit from somewhere else
+            // entirely -- another table's log, say.
+            let bare = !filename.is_empty()
+                && filename != "."
+                && filename != ".."
+                && !filename.contains(['/', '\\', '?', '#', ':', '%']);
+            if !bare {
+                return Err(NativeError::Invalid(format!(
+                    "catalog log tail entry for version {version} names {filename:?}; expected \
+                     a bare staged-commit file name such as <version>.<uuid>.json"
+                )));
+            }
+            // The version in the name is the one kernel reads; it must agree
+            // with the one the contiguity check above ran on.
+            let digits: String = filename.chars().take_while(char::is_ascii_digit).collect();
+            if digits.parse::<u64>().ok() != Some(*version) {
+                return Err(NativeError::Invalid(format!(
+                    "catalog log tail entry for version {version} names {filename:?}, whose \
+                     file name is for a different version"
                 )));
             }
         }
@@ -296,21 +354,51 @@ impl PySnapshot {
                 .scan_builder()
                 .with_predicate(predicate.map(Arc::new));
 
-            if let Some(columns) = columns {
-                let projected = full.project(&columns)?;
-                builder = builder.with_schema(projected);
+            let mut schema = match columns {
+                Some(columns) => {
+                    let columns = crate::scan::resolve_columns(full.as_ref(), &columns)?;
+                    full.project(&columns)?
+                }
+                None => full.clone(),
+            };
+            // Reading only partition columns (a projection such as
+            // `columns=["region"]`, or a table with no data columns at all)
+            // leaves the Parquet read schema empty, and kernel's reader then
+            // panics building a zero-field struct -- killing the shared I/O
+            // executor. A row-index column keeps the read non-empty and
+            // carries each file's row count; it is dropped again below.
+            let partition_columns = self
+                .inner
+                .table_configuration()
+                .logical_partition_columns()
+                .to_vec();
+            let only_partitions = schema.num_fields() > 0
+                && schema
+                    .fields()
+                    .all(|f| partition_columns.iter().any(|p| p == f.name()));
+            if only_partitions {
+                schema = Arc::new(schema.add_metadata_column(
+                    crate::scan::ROW_COUNT_COLUMN,
+                    delta_kernel::schema::MetadataColumnSpec::RowIndex,
+                )?);
             }
+            builder = builder.with_schema(schema);
 
             let scan = builder.build()?;
             let engine = self.engine.clone() as Arc<dyn Engine>;
-            match files {
+            let reader = match files {
                 Some(files) => KernelBatchReader::try_new_restricted(
                     &scan,
                     engine,
                     files.into_iter().collect(),
                 ),
                 None => KernelBatchReader::try_new(&scan, engine),
-            }
+            }?;
+            Ok(if only_partitions {
+                reader.without_column(crate::scan::ROW_COUNT_COLUMN)
+            } else {
+                reader
+            })
         })?;
 
         Ok(PyRecordBatchReader::new(Box::new(reader)))
@@ -359,6 +447,20 @@ impl PySnapshot {
                 .map_err(NativeError::from)
         })?;
         Ok(value)
+    }
+
+    /// The last `txn` version recorded for `app_id`, or None if it has none.
+    ///
+    /// This is what makes `txn=(app_id, version)` writes idempotent: a writer
+    /// skips a batch whose version is at or below this. Expired entries
+    /// (`delta.setTransactionRetentionDuration`) read as None, as in Spark.
+    fn app_id_version(&self, py: Python<'_>, app_id: &str) -> PyResult<Option<i64>> {
+        let version = py.detach(|| {
+            self.inner
+                .get_app_id_version(app_id, self.engine.as_ref())
+                .map_err(NativeError::from)
+        })?;
+        Ok(version)
     }
 
     /// This snapshot's commit timestamp in milliseconds: the in-commit
@@ -420,10 +522,12 @@ impl PySnapshot {
         commit_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<u64> {
         let reader = data.into_reader()?;
-        let batches: std::result::Result<Vec<_>, _> = reader.collect();
-        let batches = batches.map_err(NativeError::from)?;
 
         let version = py.detach(|| {
+            // Draining the input is I/O too (it may be a dataset scan), and
+            // holding the GIL for it stalled every other Python thread.
+            let batches: std::result::Result<Vec<_>, _> = reader.collect();
+            let batches = batches.map_err(NativeError::from)?;
             commit::write(
                 self.inner.clone(),
                 self.engine.clone(),
@@ -480,14 +584,21 @@ pub fn create_table(
     // Kernel resolves a local table root through `try_parse_uri`, which requires
     // the directory to exist. Object stores have no such notion, but a local
     // create would otherwise fail before it began.
-    if !table_root.contains("://") || table_root.starts_with("file://") {
-        let path = table_root.strip_prefix("file://").unwrap_or(table_root);
-        std::fs::create_dir_all(path).map_err(|e| {
+    // The directory comes from the parsed URL, so `file://` percent-escapes
+    // (`my%20table`) and `file:/t` forms create the directory kernel will use.
+    let url = PySnapshot::table_root_url(table_root)?;
+    let mut created_dir = None;
+    if url.scheme() == "file" {
+        let path = url.to_file_path().map_err(|_| {
+            NativeError::Invalid(format!("{table_root:?} is not a local filesystem path"))
+        })?;
+        if !path.exists() {
+            created_dir = Some(path.clone());
+        }
+        std::fs::create_dir_all(&path).map_err(|e| {
             NativeError::Invalid(format!("could not create table directory {path:?}: {e}"))
         })?;
     }
-
-    let url = PySnapshot::table_root_url(table_root)?;
     let arrow_schema = schema.into_inner();
 
     let version = py.detach(|| -> Result<u64> {
@@ -503,6 +614,11 @@ pub fn create_table(
             uc,
             engine_info,
         )
-    })?;
-    Ok(version)
+    });
+    if let (Err(_), Some(dir)) = (&version, created_dir) {
+        // Do not leave an empty directory behind for a create that failed
+        // validation; `remove_dir` only succeeds while it is still empty.
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(version?)
 }

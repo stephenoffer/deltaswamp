@@ -71,6 +71,9 @@ class Credentials:
     # table in the same container yields 403 AuthenticationFailed (delta-rs#4425).
     scope_prefix: str | None = None
     table_id: str | None = None
+    # What the credential was vended for, when known. A READ credential handed
+    # to a write only fails later, at the storage layer, with a bare 403.
+    operation: Operation | None = None
 
     def expires_within(self, seconds: float = DEFAULT_REFRESH_MARGIN_SECONDS) -> bool:
         """True if this credential is gone, or will be within `seconds`."""
@@ -96,7 +99,10 @@ class Credentials:
         # Never rely on account-name inference for the Azure endpoint: it
         # silently breaks Azurite, private-link DNS, and sovereign clouds
         # (.chinacloudapi.cn, .usgovcloudapi.net). See ClickHouse#115098.
-        if self.cloud is Cloud.AZURE and "azure_endpoint" not in opts:
+        # object_store accepts the endpoint under any of its aliases (and the
+        # emulator flag stands in for one); insisting on the one spelling
+        # refused credentials that named it `azure_storage_endpoint`.
+        if self.cloud is Cloud.AZURE and not _has_azure_endpoint(opts):
             raise CredentialError(
                 "Azure credentials must carry an explicit azure_endpoint; "
                 "account-name inference breaks Azurite, private-link and "
@@ -114,6 +120,24 @@ class Credentials:
             f"Credentials(cloud={self.cloud.value}, url={self.url!r}, "
             f"expires_at={exp}, keys={sorted(self.secrets)})"
         )
+
+
+_AZURE_ENDPOINT_KEYS = frozenset({"azure_endpoint", "azure_storage_endpoint", "endpoint"})
+
+
+def _has_azure_endpoint(opts: dict[str, str]) -> bool:
+    for key, value in opts.items():
+        k = key.lower()
+        if k in _AZURE_ENDPOINT_KEYS and str(value).strip():
+            return True
+        if k in ("azure_storage_use_emulator", "use_emulator") and str(value).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return True
+    return False
 
 
 @runtime_checkable
@@ -167,6 +191,17 @@ class StaticCredentialProvider:
         return self._credentials.table_id
 
     def credentials(self, operation: Operation = Operation.READ) -> Credentials:
+        # A credential vended for reading cannot serve a write; handing it out
+        # anyway failed much later with an opaque storage 403 mid-commit.
+        if (
+            self._credentials.operation is Operation.READ
+            and str(operation).upper() == Operation.READ_WRITE.value
+        ):
+            raise CredentialError(
+                "this path credential was vended read-only and cannot be used to write; "
+                "request a write-capable path credential (PATH_READ_WRITE or "
+                "PATH_CREATE_TABLE)"
+            )
         if self._credentials.is_expired:
             raise CredentialError(
                 "the path credential has expired, and a path credential cannot be re-vended "

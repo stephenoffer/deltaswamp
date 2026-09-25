@@ -12,9 +12,9 @@ FEATURES: list[str]
 """Capabilities this build provides, by stable name.
 
 One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
-"metadata_json", "commit_raw", "partitioned_append", "uc_create_table_request",
-"checkpoint". Gate on this list, not `hasattr`, so a stale build refuses
-cleanly.
+"metadata_json", "app_id_version", "commit_raw", "partitioned_append",
+"uc_create_table_request", "checkpoint", "file_restricted_scan". Gate on this
+list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -76,7 +76,13 @@ def create_table(
     all of which delta-rs rejects. Clustering is not a property: pass
     `cluster_by`, which sets it through the kernel's data layout.
 
-    `partition_by` and `cluster_by` are mutually exclusive.
+    `partition_by` and `cluster_by` are mutually exclusive, and each may name
+    a column once. The schema needs at least one column. Unsigned integer
+    columns are widened to the next signed type (uint8 -> short, uint16 ->
+    integer, uint32/uint64 -> long) so every value fits; uint64 values above
+    the long range are refused on write. `table_root` may be a URL or a path
+    (relative paths and `~/` are resolved); a URL must not contain an
+    unencoded `?` or `#`.
     """
 
 def table_changes(
@@ -283,6 +289,14 @@ class Snapshot:
         readable too.
         """
 
+    def app_id_version(self, app_id: str) -> int | None:
+        """The last `txn` version recorded for `app_id`, or None if none.
+
+        Pair with `append(txn=(app_id, version))` for idempotent writes: skip
+        a batch whose version is at or below this. Entries past
+        `delta.setTransactionRetentionDuration` read as None.
+        """
+
     def timestamp(self) -> int:
         """This version's commit timestamp in epoch milliseconds.
 
@@ -321,11 +335,18 @@ class Snapshot:
         the partition columns removed; the kernel serialises the values per the
         Delta protocol (NULL -> null / `__HIVE_DEFAULT_PARTITION__` directory,
         dates as YYYY-MM-DD, timestamps in UTC). A partition column that cannot
-        be cast to the table's type is a ValueError.
+        be cast to the table's type without changing a value is a ValueError.
+
+        Columns are matched to the table schema by name (case-insensitively),
+        at every struct level, never by position: a missing nullable column is
+        written as NULL, a missing NOT NULL one or an extra one is a
+        ValueError, and narrower types (int32, ms timestamps, dictionary
+        strings) are cast to the table's type when that is lossless.
 
         `overwrite` removes every file visible in this snapshot in the same
         commit. `txn` is `(app_id, version)` for idempotent writes;
-        `commit_metadata` goes into commitInfo.
+        `commit_metadata` goes into commitInfo, and may not use a key the
+        commitInfo action reserves (`operation`, `timestamp`, `txnId`, ...).
         """
 
     def publish(self, uc: UcCommitConfig | None = None) -> int:

@@ -25,7 +25,7 @@ use arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::engine::arrow_data::EngineDataArrowExt;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::schema::SchemaRef;
@@ -38,9 +38,80 @@ use crate::error::Result;
 pub struct KernelBatchReader {
     schema: ArrowSchemaRef,
     iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+    /// Set once the stream has failed; nothing is read after an error.
+    failed: bool,
 }
 
+/// Map requested column names onto the schema's own spelling.
+///
+/// Delta column names are case-insensitive, and kernel's `project` matches
+/// exactly, so `["ID"]` against a column `id` used to fail with the bare
+/// message "ID". An empty list is refused outright: kernel cannot build a
+/// zero-column batch (it panics, which aborts the process mid-stream).
+pub fn resolve_columns(
+    schema: &delta_kernel::schema::StructType,
+    columns: &[String],
+) -> Result<Vec<String>> {
+    if columns.is_empty() {
+        return Err(crate::error::NativeError::Invalid(
+            "columns=[] selects no columns; pass None to read every column, or name at least one"
+                .to_string(),
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(columns.len());
+    for name in columns {
+        let field = schema.field(name).or_else(|| {
+            let mut matches = schema
+                .fields()
+                .filter(|f| f.name().eq_ignore_ascii_case(name));
+            let first = matches.next();
+            // Ambiguous only if the schema itself differs just by case.
+            first.filter(|_| matches.next().is_none())
+        });
+        let Some(field) = field else {
+            let known: Vec<&str> = schema.fields().map(|f| f.name().as_str()).collect();
+            return Err(crate::error::NativeError::Invalid(format!(
+                "column {name:?} is not in the table schema; columns are {known:?}"
+            )));
+        };
+        if out.iter().any(|c| c == field.name()) {
+            return Err(crate::error::NativeError::Invalid(format!(
+                "column {name:?} is requested more than once"
+            )));
+        }
+        out.push(field.name().clone());
+    }
+    Ok(out)
+}
+
+/// Name of the row-index column added to a partition-columns-only read so
+/// the Parquet read schema is never empty; it never reaches the caller.
+pub const ROW_COUNT_COLUMN: &str = "__deltaswamp_row_index";
+
 impl KernelBatchReader {
+    /// This reader with the top-level column `name` removed from its schema
+    /// and from every batch (row counts are kept).
+    pub fn without_column(mut self, name: &str) -> Self {
+        let Ok(index) = self.schema.index_of(name) else {
+            return self;
+        };
+        let keep: Vec<usize> = (0..self.schema.fields().len())
+            .filter(|i| *i != index)
+            .collect();
+        let Ok(schema) = self.schema.project(&keep) else {
+            return self;
+        };
+        self.schema = Arc::new(schema);
+        let inner = std::mem::replace(&mut self.iter, Box::new(std::iter::empty()));
+        self.iter = Box::new(inner.map(move |item| {
+            let data = item?;
+            let batch = data.try_into_record_batch()?;
+            let batch = batch.project(&keep)?;
+            Ok(Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
+        }));
+        self
+    }
+
     pub fn try_new(scan: &Scan, engine: Arc<dyn Engine>) -> Result<Self> {
         let iter = scan.execute(engine)?;
         Self::from_parts(scan.logical_schema().as_ref(), iter)
@@ -80,6 +151,7 @@ impl KernelBatchReader {
         Ok(Self {
             schema: Arc::new(schema),
             iter: Box::new(iter),
+            failed: false,
         })
     }
 }
@@ -90,10 +162,55 @@ impl Iterator for KernelBatchReader {
     fn next(&mut self) -> Option<Self::Item> {
         // Deliberately a 1:1 pass-through. Do not batch, coalesce, reorder or
         // filter here; see the module docs.
-        self.iter.next().map(|data| {
-            data.try_into_record_batch()
-                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
-        })
+        if self.failed {
+            return None;
+        }
+        // This runs inside the Arrow C stream callback, which cannot unwind:
+        // a kernel panic here would abort the whole Python process. Turn it
+        // into a stream error instead.
+        let iter = &mut self.iter;
+        let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            iter.next().map(|data| {
+                data.try_into_record_batch().map_err(|e| {
+                    // Kept as an I/O error so pyarrow raises OSError (EIO)
+                    // rather than ArrowInvalid: a dropped connection or a
+                    // vacuumed file mid-read is not bad input.
+                    if is_io_error(&e) {
+                        let msg = e.to_string();
+                        ArrowError::IoError(msg.clone(), std::io::Error::other(msg))
+                    } else {
+                        ArrowError::ExternalError(Box::new(e))
+                    }
+                })
+            })
+        }))
+        .unwrap_or_else(|panic| {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Some(Err(ArrowError::ExternalError(
+                format!("the kernel panicked while reading: {msg}").into(),
+            )))
+        });
+        match item {
+            Some(Err(e)) => {
+                self.failed = true;
+                // pyo3-arrow copies the message into a CString with `expect`,
+                // so a NUL byte (e.g. from a path in a corrupt log) would
+                // panic inside the C callback and abort the process.
+                let clean = |m: String| m.replace('\0', "\\0");
+                Some(Err(match e {
+                    ArrowError::IoError(msg, io) => ArrowError::IoError(clean(msg), io),
+                    ArrowError::ExternalError(inner) => {
+                        ArrowError::ExternalError(clean(inner.to_string()).into())
+                    }
+                    other => ArrowError::ExternalError(clean(other.to_string()).into()),
+                }))
+            }
+            other => other,
+        }
     }
 }
 
@@ -101,6 +218,33 @@ impl RecordBatchReader for KernelBatchReader {
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
+}
+
+/// True if `err`, or anything in its source chain, is a storage failure.
+///
+/// The Parquet reader wraps object-store errors in Arrow errors, so the
+/// top-level kernel variant alone does not tell.
+fn is_io_error(err: &Error) -> bool {
+    if matches!(
+        err,
+        Error::ObjectStore(_) | Error::IOError(_) | Error::FileNotFound(_) | Error::Reqwest(_)
+    ) {
+        return true;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(e) = source {
+        if e.is::<delta_kernel::object_store::Error>() || e.is::<std::io::Error>() {
+            return true;
+        }
+        if let Some(ArrowError::ExternalError(inner)) = e.downcast_ref::<ArrowError>() {
+            let inner: &(dyn std::error::Error + 'static) = inner.as_ref();
+            if inner.is::<delta_kernel::object_store::Error>() || inner.is::<std::io::Error>() {
+                return true;
+            }
+        }
+        source = e.source();
+    }
+    false
 }
 
 type DataIter = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
@@ -258,5 +402,77 @@ impl Iterator for RestrictedScan {
             self.finished = true;
         }
         item
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::PySnapshot;
+    use delta_kernel::schema::{DataType, StructField, StructType};
+
+    fn schema() -> StructType {
+        StructType::try_new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("Name", DataType::STRING),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn columns_resolve_case_insensitively_to_the_schema_spelling() {
+        let cols = resolve_columns(&schema(), &["ID".into(), "name".into()]).unwrap();
+        assert_eq!(cols, ["id", "Name"]);
+    }
+
+    #[test]
+    fn empty_unknown_and_duplicate_columns_are_clear_errors() {
+        let err = resolve_columns(&schema(), &[]).unwrap_err();
+        assert!(err.to_string().contains("columns=[]"), "{err}");
+        let err = resolve_columns(&schema(), &["nope".into()]).unwrap_err();
+        assert!(err.to_string().contains("not in the table schema"), "{err}");
+        let err = resolve_columns(&schema(), &["id".into(), "ID".into()]).unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn a_panicking_kernel_iterator_becomes_a_stream_error() {
+        let iter =
+            std::iter::from_fn(|| -> Option<DeltaResult<Box<dyn EngineData>>> { panic!("boom") });
+        let mut reader = KernelBatchReader::from_parts(&schema(), iter).unwrap();
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert!(reader.next().is_none(), "nothing is read after an error");
+    }
+
+    #[test]
+    fn stream_error_messages_carry_no_nul_bytes() {
+        let iter = std::iter::once(Err(Error::generic("bad path a\0b")));
+        let mut reader = KernelBatchReader::from_parts(&schema(), iter).unwrap();
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(!err.to_string().contains('\0'), "{err}");
+    }
+
+    #[test]
+    fn table_roots_parse_paths_and_refuse_fragments() {
+        let url = PySnapshot::table_root_url("/tmp/my table").unwrap();
+        assert_eq!(url.as_str(), "file:///tmp/my%20table/");
+        let url = PySnapshot::table_root_url("rel/t").unwrap();
+        assert!(url.path().ends_with("/rel/t/"), "{url}");
+        assert!(url.scheme() == "file");
+        let err = PySnapshot::table_root_url("file:///tmp/a#b").unwrap_err();
+        assert!(err.to_string().contains("fragment"), "{err}");
+        assert!(PySnapshot::table_root_url("s3://bucket/t?x=1").is_err());
+        assert!(PySnapshot::table_root_url("").is_err());
+        let url = PySnapshot::table_root_url("s3://bucket/t").unwrap();
+        assert_eq!(url.as_str(), "s3://bucket/t/");
+        // A path containing '#' is fine: only a URL reads it as a fragment.
+        let url = PySnapshot::table_root_url("/tmp/a#b").unwrap();
+        assert_eq!(url.path(), "/tmp/a%23b/");
+        if let Some(home) = std::env::var_os("HOME") {
+            let url = PySnapshot::table_root_url("~/t").unwrap();
+            let want = url::Url::from_directory_path(std::path::Path::new(&home).join("t"));
+            assert_eq!(Some(url), want.ok());
+        }
     }
 }

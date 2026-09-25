@@ -16,6 +16,13 @@ class InvalidReferenceError(DeltaSwampError):
     """A table reference could not be parsed or resolved."""
 
 
+class InvalidArgumentError(DeltaSwampError, ValueError):
+    """A call's arguments are malformed or contradict each other.
+
+    A ValueError too, so code that catches the builtin keeps working.
+    """
+
+
 class UnreachableTableError(DeltaSwampError):
     """The table exists but no available engine can serve the request.
 
@@ -31,6 +38,13 @@ class UnreachableTableError(DeltaSwampError):
         if remedy:
             msg += f"\n  remedy: {remedy}"
         super().__init__(msg)
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # The default rebuilds from `args` (the one formatted message), which
+        # this __init__ cannot take: an error raised in a Ray worker or a
+        # multiprocessing child would fail to unpickle on the driver and be
+        # replaced by an unrelated TypeError.
+        return (type(self), (self.operation, self.reason, self.remedy), self.__dict__)
 
 
 class FallbackRequiredError(UnreachableTableError):
@@ -82,6 +96,10 @@ class CommitConflictError(DeltaSwampError):
     def __init__(self, version: int, message: str) -> None:
         self.version = version
         super().__init__(message)
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # See UnreachableTableError.__reduce__.
+        return (type(self), (self.version, str(self)), self.__dict__)
 
 
 class BackfillRequiredError(DeltaSwampError):

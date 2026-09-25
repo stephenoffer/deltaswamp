@@ -298,8 +298,14 @@ class TestCatalogManagedWithoutDatabricks:
 
     def test_replace_where(self, managed: Any) -> None:
         managed.table("main.sales.dml").overwrite(
-            pa.table({"id": [9], "c": ["n"]}), predicate="id IS NULL"
+            pa.table({"id": [9], "c": ["n"]}), predicate="id IS NULL OR id = 9"
         )
+        assert self.rows(managed) == [(1, "a"), (2, "b"), (3, "c"), (9, "n")]
+        # A new row outside the predicate is refused, as Databricks does.
+        with pytest.raises(Exception, match="do not satisfy the predicate"):
+            managed.table("main.sales.dml").overwrite(
+                pa.table({"id": [8], "c": ["m"]}), predicate="id IS NULL"
+            )
         assert self.rows(managed) == [(1, "a"), (2, "b"), (3, "c"), (9, "n")]
 
     def test_checkpoint_publishes_first(self, managed: Any) -> None:

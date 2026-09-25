@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -66,7 +67,12 @@ def _plain(obj: Any) -> dict[str, Any]:
     if callable(as_dict):
         out = as_dict()
         return dict(out) if isinstance(out, Mapping) else {}
-    return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    try:
+        attrs = vars(obj)
+    except TypeError:  # a __slots__ object has no __dict__
+        names = [n for cls in type(obj).__mro__ for n in getattr(cls, "__slots__", ())]
+        attrs = {n: getattr(obj, n) for n in names if hasattr(obj, n)}
+    return {k: v for k, v in attrs.items() if not k.startswith("_")}
 
 
 def _pick(d: Mapping[str, Any], *keys: str) -> Any:
@@ -247,7 +253,9 @@ class TableInfo:
             updated_at=_int(d.get("updated_at")),
             updated_by=d.get("updated_by"),
             columns=columns,
-            properties={str(k): str(v) for k, v in (d.get("properties") or {}).items()},
+            properties={
+                str(k): str(v) for k, v in (d.get("properties") or {}).items() if v is not None
+            },
             runtime_properties=runtime,
             row_filter=row_filter,
             constraints=tuple(
@@ -334,15 +342,18 @@ class Grant:
             groups: dict[tuple[str | None, str | None], list[str]] = {}
             for p in assignment.get("privileges") or []:
                 if isinstance(p, Mapping):  # effective: {privilege, inherited_from_*}
+                    # A privilege-less entry used to become the privilege "NONE".
+                    if p.get("privilege") is None:
+                        continue
                     key = (_str(p.get("inherited_from_type")), p.get("inherited_from_name"))
                     groups.setdefault(key, []).append(normalize_privilege(p.get("privilege")))
-                else:
+                elif p is not None and str(getattr(p, "value", p)).strip():
                     groups.setdefault((None, None), []).append(normalize_privilege(p))
             for (from_type, from_name), privileges in groups.items():
                 out.append(
                     Grant(
                         principal=principal,
-                        privileges=tuple(sorted(privileges)),
+                        privileges=tuple(sorted(set(privileges))),
                         inherited_from_type=from_type,
                         inherited_from_name=from_name,
                     )
@@ -638,8 +649,17 @@ class Volume:
             raise self._on_error(exc, action) from exc
 
     def path(self, path: str = "") -> str:
-        """The absolute ``/Volumes/...`` path for a volume-relative one."""
-        parts = [p for p in path.replace("\\", "/").split("/") if p not in ("", ".")]
+        """The absolute ``/Volumes/...`` path for a volume-relative one.
+
+        An absolute path already inside this volume is accepted as-is, rather
+        than being nested under the root a second time.
+        """
+        path = path.replace("\\", "/")
+        if path.casefold() == self.root.casefold() or path.casefold().startswith(
+            self.root.casefold() + "/"
+        ):
+            path = path[len(self.root) :]
+        parts = [p for p in path.split("/") if p not in ("", ".")]
         if ".." in parts:
             raise InvalidReferenceError(f"{path!r} climbs out of volume {self.full_name}")
         return "/".join([self.root, *parts])
@@ -656,7 +676,13 @@ class Volume:
             full = str(d.get("path") or "")
             out.append(
                 FileEntry(
-                    path=full[len(self.root) :].lstrip("/") if full.startswith(self.root) else full,
+                    # UC lower-cases names, so the server's paths need not
+                    # match the casing the volume was opened with.
+                    path=(
+                        full[len(self.root) :].lstrip("/")
+                        if full.casefold().startswith(self.root.casefold() + "/")
+                        else full
+                    ),
                     name=str(d.get("name") or full.rstrip("/").rsplit("/", 1)[-1]),
                     is_directory=bool(d.get("is_directory")),
                     size=_int(d.get("file_size")),
@@ -670,7 +696,16 @@ class Volume:
 
         def download() -> bytes:
             contents = getattr(self._files.download(file_path=target), "contents", None)
-            return b"" if contents is None else bytes(contents.read())
+            if contents is None:
+                return b""
+            try:
+                return bytes(contents.read())
+            finally:
+                # The SDK hands back a streaming HTTP body; left open it pins
+                # a pooled connection per read.
+                close = getattr(contents, "close", None)
+                if callable(close):
+                    close()
 
         return self._run("read a volume file", download)
 
@@ -778,13 +813,18 @@ def staging_storage_options(
     are dropped rather than passed through, since object_store rejects keys it
     does not know. Azure gets an explicit endpoint, never account inference.
     """
-    creds = list(credentials)
+    # A single credential object (not wrapped in a list) used to iterate as
+    # its keys and crash on str.get.
+    creds = [credentials] if isinstance(credentials, Mapping) else list(credentials)
+    creds = [c for c in creds if isinstance(c, Mapping)]
     if not creds:
         return {}, None
 
     def score(c: Mapping[str, Any]) -> tuple[int, int, int]:
-        prefix = str(c.get("prefix") or "")
-        covers = location.rstrip("/").startswith(prefix.rstrip("/"))
+        prefix = str(c.get("prefix") or "").rstrip("/")
+        loc = location.rstrip("/")
+        # On a path boundary: "s3://b/t" covers "s3://b/t/x", not "s3://b/t2".
+        covers = not prefix or loc == prefix or loc.startswith(prefix + "/")
         return (int(covers), int(c.get("operation") == "READ_WRITE"), len(prefix))
 
     chosen = max(creds, key=score)
@@ -800,6 +840,10 @@ def staging_storage_options(
                 "breaks Azurite, private-link DNS and sovereign clouds"
             )
         options["azure_endpoint"] = endpoint
+        if endpoint.lower().startswith("http://"):
+            # object_store refuses a plain-http endpoint (Azurite) without
+            # this: "URL scheme is not allowed".
+            options["azure_allow_http"] = "true"
     expiry = _pick(chosen, "expiration-time-ms", "expiration_time_ms")
     return options, (float(expiry) / 1000.0 if expiry else None)
 
@@ -824,6 +868,18 @@ _PRIMITIVES = {
 }
 
 
+def _field_name(name: str) -> str:
+    """A struct field name as Spark's type text spells it.
+
+    A name that is not a plain identifier (a space, a colon, a comma, a
+    bracket) is backtick-quoted; unquoted, ``struct<a b:int>`` or
+    ``struct<a:b:int>`` is a different type or no type at all to the reader.
+    """
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return name
+    return "`" + name.replace("`", "``") + "`"
+
+
 def _type_text(dtype: Any) -> str:
     if isinstance(dtype, str):
         if dtype in _PRIMITIVES:
@@ -833,7 +889,9 @@ def _type_text(dtype: Any) -> str:
         raise DeltaSwampError(f"unrecognised Delta type {dtype!r} in the table schema")
     kind = dtype.get("type")
     if kind == "struct":
-        inner = ",".join(f"{f['name']}:{_type_text(f['type'])}" for f in dtype.get("fields", []))
+        inner = ",".join(
+            f"{_field_name(f['name'])}:{_type_text(f['type'])}" for f in dtype.get("fields", [])
+        )
         return f"struct<{inner}>"
     if kind == "array":
         return f"array<{_type_text(dtype['elementType'])}>"
@@ -854,7 +912,12 @@ def delta_schema_to_columns(
     parsed: Mapping[str, Any] = json.loads(schema) if isinstance(schema, str) else schema
     if parsed.get("type") != "struct":
         raise DeltaSwampError("a Delta table schema must be a struct type")
+    # A bare string is one column, not one per character.
+    if isinstance(partition_columns, str):
+        partition_columns = [partition_columns]
     partitions = list(partition_columns)
+    if len(set(partitions)) != len(partitions):
+        raise DeltaSwampError(f"partition columns {partitions} name a column twice")
     names = [f["name"] for f in parsed.get("fields", [])]
     missing = [p for p in partitions if p not in names]
     if missing:

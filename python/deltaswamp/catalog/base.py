@@ -108,7 +108,30 @@ def parse_commit_tail(
     which is every catalog-managed table, the one thing no other Python library
     can open.
     """
-    commits = body.get("commits") or []
+    commits = [c for c in (body.get("commits") or []) if isinstance(c, Mapping)]
+    for c in commits:
+        missing = [
+            what
+            for what, names in (
+                ("version", ("version", "commit-version", "commitVersion")),
+                # Without a file name the kernel is handed an empty path and
+                # fails far from the cause.
+                ("file name", ("file-name", "file_name", "fileName")),
+            )
+            if not str(_first(c, *names) or "").strip() and _first(c, *names) != 0
+        ]
+        if missing:
+            from ..errors import CorruptTableError
+
+            raise CorruptTableError(
+                f"a catalog commit carries no {' or '.join(missing)}: {dict(c)!r:.300}"
+            )
+    # Sorted and de-duplicated: kernel wants the tail ascending and contiguous,
+    # and the API does not promise an order.
+    commits = list(
+        {int(_first(c, "version", "commit-version", "commitVersion")): c for c in commits}.values()
+    )
+    commits.sort(key=lambda c: int(_first(c, "version", "commit-version", "commitVersion")))
     entries = tuple(
         LogTailEntry(
             version=int(_first(c, "version", "commit-version", "commitVersion")),
@@ -131,6 +154,11 @@ def parse_commit_tail(
         for c in commits
     )
     latest = _first(body, "latest-table-version", "latest_table_version", "latestTableVersion")
+    if latest is None and entries:
+        # Commits are published oldest-first, so the newest unpublished one is
+        # the latest ratified version. Leaving it unset made the kernel refuse
+        # the table ("Max catalog version is required").
+        latest = entries[-1].version
     metadata = body.get("metadata") or {}
     location = (
         body.get("location")
@@ -220,8 +248,12 @@ class ResolvedTable:
         return (
             TableFeature.CATALOG_MANAGED.value in self.features
             or TableFeature.CATALOG_OWNED_PREVIEW.value in self.features
-            # Databricks signals it as a table property too.
-            or self.properties.get("delta.feature.catalogManaged") == "supported"
+            # Databricks signals it as a table property too (either spelling).
+            or any(
+                str(self.properties.get(f"delta.feature.{f.value}", "")).lower()
+                in ("supported", "enabled")
+                for f in (TableFeature.CATALOG_MANAGED, TableFeature.CATALOG_OWNED_PREVIEW)
+            )
         )
 
     @property
@@ -283,7 +315,14 @@ class ResolvedTable:
                     TableFeature.ICEBERG_COMPAT_V3.value,
                 )
             )
-            or self.properties.get("delta.universalFormat.enabledFormats", "").find("iceberg") >= 0
+            or "iceberg"
+            in str(self.properties.get("delta.universalFormat.enabledFormats", "")).lower()
+            # The catalog reports the enabling properties before the log has
+            # been read, when the feature lists are still empty.
+            or any(
+                str(self.properties.get(f"delta.enableIcebergCompatV{n}", "")).lower() == "true"
+                for n in (1, 2, 3)
+            )
         )
 
     @property

@@ -139,13 +139,56 @@ impl UcCommitConfig {
 /// backfill demand as a transient error and wedging the table.
 pub fn classify_commit_error(message: &str) -> NativeError {
     let lowered = message.to_lowercase();
-    if lowered.contains("429") || lowered.contains("unbackfilled") {
+    // The UC client renders "HTTP error (status NNN): ...". When a status is
+    // present it is authoritative: a 400 whose text mentions "conflicting
+    // properties" is not a lost race, and retrying it would loop forever.
+    if let Some(status) = http_status(&lowered) {
+        return match status {
+            429 => NativeError::BackfillRequired(message.to_string()),
+            409 => NativeError::CommitConflict(message.to_string()),
+            _ => NativeError::Invalid(message.to_string()),
+        };
+    }
+    // Otherwise look for the codes as whole numbers only: a staged-commit
+    // UUID or a version like `...00429.json` must not read as a status.
+    if has_code(&lowered, "429") || lowered.contains("unbackfilled") {
         return NativeError::BackfillRequired(message.to_string());
     }
-    if lowered.contains("409") || lowered.contains("conflict") {
+    if has_code(&lowered, "409") || lowered.contains("conflict") {
         return NativeError::CommitConflict(message.to_string());
     }
     NativeError::Invalid(message.to_string())
+}
+
+/// The status in an `(status NNN)` fragment, if the message carries one.
+fn http_status(lowered: &str) -> Option<u16> {
+    let rest = &lowered[lowered.find("status ")? + "status ".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    (digits.len() == 3).then(|| digits.parse().ok()).flatten()
+}
+
+/// True if `code` occurs in `text` not adjacent to another alphanumeric.
+fn has_code(text: &str, code: &str) -> bool {
+    text.match_indices(code).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + code.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+/// Classify a kernel commit error, keeping I/O failures as I/O errors.
+///
+/// Flattening an object-store failure to its message made a network error or
+/// a 403 during commit surface as `ValueError`, indistinguishable from bad
+/// input.
+pub fn classify_kernel_commit_error(err: delta_kernel::Error) -> NativeError {
+    match err {
+        delta_kernel::Error::ObjectStore(_)
+        | delta_kernel::Error::IOError(_)
+        | delta_kernel::Error::FileNotFound(_) => NativeError::Kernel(err),
+        other => classify_commit_error(&other.to_string()),
+    }
 }
 
 /// Append or overwrite Arrow batches, committing them as one transaction.
@@ -181,6 +224,11 @@ pub fn write(
         .logical_partition_columns()
         .to_vec();
     let table_schema = snapshot.schema();
+    let batches = batches
+        .iter()
+        .map(|b| partition::conform_to_table(b, table_schema.as_ref(), &partition_columns))
+        .collect::<Result<Vec<_>>>()?;
+    let batches = partition::coalesce(batches)?;
     let mut transaction = snapshot.transaction(committer, engine.as_ref())?;
     if let Some(info) = engine_info {
         transaction = transaction.with_engine_info(info);
@@ -248,7 +296,7 @@ pub fn write(
              so the same transaction may be retried"
                 .to_string(),
         )),
-        Err(err) => Err(classify_commit_error(&err.to_string())),
+        Err(err) => Err(classify_kernel_commit_error(err)),
     }
 }
 
@@ -265,6 +313,28 @@ fn apply_commit_metadata(
 
     let mut keys: Vec<&str> = metadata.keys().map(String::as_str).collect();
     keys.sort_unstable();
+    // Kernel writes these itself and silently drops a caller's value for
+    // them, so a user's "operation" or "timestamp" just vanished.
+    const RESERVED: &[&str] = &[
+        "timestamp",
+        "inCommitTimestamp",
+        "operation",
+        "operationParameters",
+        "operationMetrics",
+        "kernelVersion",
+        "isBlindAppend",
+        "engineInfo",
+        "txnId",
+    ];
+    if let Some(bad) = keys
+        .iter()
+        .find(|k| k.is_empty() || RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k)))
+    {
+        return Err(NativeError::Invalid(format!(
+            "commit_metadata key {bad:?} is empty or reserved by the Delta commitInfo action \
+             (reserved: {RESERVED:?}); use a different key, e.g. userMetadata"
+        )));
+    }
 
     let fields: Vec<Field> = keys
         .iter()
@@ -314,7 +384,33 @@ pub fn create_table(
         ));
     }
 
-    let kernel_schema = Schema::try_from_arrow(schema.as_ref())?;
+    if schema.fields().is_empty() {
+        // Kernel creates it, then refuses every scan of it.
+        return Err(NativeError::Invalid(
+            "a table needs at least one column".to_string(),
+        ));
+    }
+    for columns in [&partition_by, &cluster_by].into_iter().flatten() {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = columns.iter().find(|c| !seen.insert(c.to_lowercase())) {
+            return Err(NativeError::Invalid(format!(
+                "column {dup:?} is listed twice in the table layout"
+            )));
+        }
+    }
+    let widened = arrow::datatypes::Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                f.as_ref()
+                    .clone()
+                    .with_data_type(partition::widen_unsigned(f.data_type()))
+            })
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    );
+    let kernel_schema = Schema::try_from_arrow(&widened)?;
     let info = engine_info.unwrap_or_else(|| "deltaswamp".to_string());
     let mut builder = kernel_create_table(table_root, Arc::new(kernel_schema), info);
 
@@ -334,7 +430,7 @@ pub fn create_table(
 
     let txn = builder
         .build(engine.as_ref(), committer)
-        .map_err(|e| classify_commit_error(&e.to_string()))?;
+        .map_err(classify_kernel_commit_error)?;
 
     // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
     // with block_in_place, so the commit must run inside the shared
@@ -347,7 +443,7 @@ pub fn create_table(
         Ok(CommitResult::RetryableTransaction(_)) => Err(NativeError::Retryable(
             "the create failed with a retryable I/O error".to_string(),
         )),
-        Err(err) => Err(classify_commit_error(&err.to_string())),
+        Err(err) => Err(classify_kernel_commit_error(err)),
     }
 }
 
@@ -368,7 +464,7 @@ pub fn publish(
     };
     let published =
         runtime::block_on(async { snapshot.publish(engine.as_ref(), committer.as_ref()) })
-            .map_err(|e| classify_commit_error(&e.to_string()))?;
+            .map_err(classify_kernel_commit_error)?;
     Ok(published.version())
 }
 
@@ -389,13 +485,37 @@ pub fn commit_raw(
     actions: &[String],
 ) -> Result<u64> {
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::{PutMode, PutOptions, PutPayload};
+    use delta_kernel::object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
     let body = raw_commit_body(actions)?;
     let store = crate::store::build_store(table_root, options)?;
     let root =
         Path::from_url_path(table_root.path()).map_err(delta_kernel::object_store::Error::from)?;
-    let location = root.join("_delta_log").join(format!("{version:020}.json"));
+    let location = root
+        .clone()
+        .join("_delta_log")
+        .join(format!("{version:020}.json"));
+
+    if version > 0 {
+        // Put-if-absent only stops two writers taking the same version; it
+        // does not stop a skipped one. `N.json` without `N-1.json` is a gap
+        // that makes the log unreadable, so require the predecessor.
+        let previous = root
+            .join("_delta_log")
+            .join(format!("{:020}.json", version - 1));
+        match runtime::block_on(async { store.head(&previous).await }) {
+            Ok(_) => {}
+            Err(delta_kernel::object_store::Error::NotFound { .. }) => {
+                return Err(NativeError::Invalid(format!(
+                    "cannot commit version {version} at {table_root}: version {} does not \
+                     exist, so the log would have a gap. Commit at the version after the \
+                     snapshot's.",
+                    version - 1
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     let result = runtime::block_on(async {
         store
@@ -495,12 +615,76 @@ mod raw_commit_tests {
         let url = url::Url::from_directory_path(&dir).unwrap();
         let opts = std::collections::HashMap::new();
         let actions = [r#"{"commitInfo":{}}"#.to_string()];
-        assert_eq!(commit_raw(&url, &opts, 3, &actions).unwrap(), 3);
+        assert_eq!(commit_raw(&url, &opts, 0, &actions).unwrap(), 0);
         let written =
-            std::fs::read_to_string(dir.join("_delta_log/00000000000000000003.json")).unwrap();
+            std::fs::read_to_string(dir.join("_delta_log/00000000000000000000.json")).unwrap();
         assert_eq!(written, "{\"commitInfo\":{}}\n");
-        let err = commit_raw(&url, &opts, 3, &actions).unwrap_err();
+        let err = commit_raw(&url, &opts, 0, &actions).unwrap_err();
         assert!(matches!(err, NativeError::CommitConflict(_)), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_raw_commit_that_would_leave_a_gap_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ds-raw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = url::Url::from_directory_path(&dir).unwrap();
+        let opts = std::collections::HashMap::new();
+        let actions = [r#"{"commitInfo":{}}"#.to_string()];
+        let err = commit_raw(&url, &opts, 3, &actions).unwrap_err();
+        assert!(err.to_string().contains("gap"), "{err}");
+        assert!(!dir.join("_delta_log/00000000000000000003.json").exists());
+        commit_raw(&url, &opts, 0, &actions).unwrap();
+        assert_eq!(commit_raw(&url, &opts, 1, &actions).unwrap(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_codes_are_read_from_the_status_not_from_uuids_or_versions() {
+        // A UUID or zero-padded version containing 429/409 is not a status.
+        let msg = "UC update_table error: HTTP error (status 400): bad staged commit \
+                   _delta_log/_staged_commits/00000000000000000429.a429b-409c.json";
+        assert!(matches!(
+            classify_commit_error(msg),
+            NativeError::Invalid(_)
+        ));
+        let msg = "HTTP error (status 400): conflicting table properties";
+        assert!(matches!(
+            classify_commit_error(msg),
+            NativeError::Invalid(_)
+        ));
+        let msg = "UC update_table error: HTTP error (status 409): version exists";
+        assert!(matches!(
+            classify_commit_error(msg),
+            NativeError::CommitConflict(_)
+        ));
+        let msg = "UC update_table error: HTTP error (status 429): too many";
+        assert!(matches!(
+            classify_commit_error(msg),
+            NativeError::BackfillRequired(_)
+        ));
+        // No status: whole-number codes and keywords still classify.
+        assert!(matches!(
+            classify_commit_error("got 409 back"),
+            NativeError::CommitConflict(_)
+        ));
+        assert!(matches!(
+            classify_commit_error("file 00000000000000000409.json is bad"),
+            NativeError::Invalid(_)
+        ));
+        assert!(matches!(
+            classify_commit_error("max unbackfilled commits reached"),
+            NativeError::BackfillRequired(_)
+        ));
+    }
+
+    #[test]
+    fn io_failures_during_commit_stay_io_errors() {
+        let err =
+            delta_kernel::Error::IOError(std::io::Error::other("connection reset (status 409)"));
+        assert!(matches!(
+            classify_kernel_commit_error(err),
+            NativeError::Kernel(_)
+        ));
     }
 }
