@@ -414,11 +414,13 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             TableFeature.DELETION_VECTORS,
             _RW,
             _Y,
-            _P,
+            _Y,
             _Y,
             _P,
-            "kernel installs connector-authored DV descriptors but computes no bitmaps; "
-            "delta-rs reads and preserves DVs but never emits them (DML is copy-on-write)",
+            "DELETE, UPDATE and replaceWhere on the kernel write deletion vectors as "
+            "Databricks does (bitmaps computed here, committed through the kernel's DV "
+            "update); delta-rs reads and preserves DVs but never emits them (DML is "
+            "copy-on-write)",
             "delta-rs#4512",
         ),
         _row(
@@ -709,8 +711,9 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         _op(
             Operation.REPLACE_WHERE,
             (_D, _I, _S, _K),
-            "delta-rs, PyIceberg for Iceberg tables, the warehouse; last, the kernel "
-            "rewrites the whole table in one commit, bounded in size",
+            "deletion vectors through the kernel when the table enables them; otherwise "
+            "delta-rs, PyIceberg for Iceberg tables, the warehouse, and last a bounded "
+            "whole-table rewrite through the kernel",
         ),
         _op(
             Operation.MERGE_SCHEMA,
@@ -718,23 +721,29 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             "kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH "
             "SCHEMA EVOLUTION",
         ),
-        # --- dml: delta-rs (copy-on-write) or kernel + our own DV authoring
+        # --- dml: delta-rs (copy-on-write) or the kernel with deletion vectors.
+        # On a table with deletion vectors enabled the router asks the kernel
+        # first (router._preference), so DML writes vectors as Databricks does.
         _op(
             Operation.DELETE,
             (_D, _S, _K),
-            "delta-rs copy-on-write, then the warehouse; last, a whole-table rewrite "
-            "through the kernel, since kernel 0.28 cannot author deletion vectors",
+            "deletion vectors through the kernel when the table enables them; otherwise "
+            "delta-rs copy-on-write, then the warehouse, and last a bounded whole-table "
+            "rewrite through the kernel",
         ),
         _op(
             Operation.UPDATE,
             (_D, _S, _K),
-            "delta-rs, then the warehouse; last, a whole-table rewrite through the kernel "
-            "with literal or column assignments",
+            "deletion vectors plus new files through the kernel when the table enables "
+            "them (row ids kept under row tracking); otherwise delta-rs, the warehouse, "
+            "and last a bounded whole-table rewrite, with literal or column assignments",
         ),
         _op(
             Operation.MERGE,
-            (_D, _S),
-            "kernel has no MERGE at all; the warehouse merges from a source staged in a volume",
+            (_D, _S, _K),
+            "deletion vectors through the kernel, with clauses evaluated in DuckDB, when the "
+            "table enables them; otherwise delta-rs, then the warehouse, which merges from "
+            "a source staged in a volume",
         ),
         # --- ddl. The kernel rows are metadata-only commits this library writes
         # itself, for path tables delta-rs cannot alter or cannot express.

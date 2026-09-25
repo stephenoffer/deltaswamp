@@ -88,9 +88,9 @@ Alpha. Every feature is tested against real on-disk tables, a fake Unity
 Catalog server that speaks the real `/delta/v1` protocol, and a Delta Sharing
 server. A live Databricks suite runs with a personal access token.
 
-The main gap: deletion vectors are not written yet, so DML on tables only the
-kernel can write rewrites the whole table (up to a size bound). The
-[changelog](CHANGELOG.md) lists the rest.
+DELETE, UPDATE and MERGE write deletion vectors, as Databricks does, on every
+table that enables them, catalog-managed and row-tracked tables included. The
+[changelog](CHANGELOG.md) lists the known limits.
 
 ## Docs
 

@@ -101,12 +101,17 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
         _prop("delta.enableChangeDataFeed", _H, _H, _H),
         _prop(
             "delta.enableDeletionVectors",
-            _H,
+            # Treated as rejected at create too, so such a create goes to the
+            # kernel: delta-rs 1.6.5 answers it by stamping a variantType
+            # reader+writer feature nobody asked for (and with a v2 checkpoint
+            # policy writes a protocol that violates the spec, then panics).
+            _RJ,
             _RJ,
             _H,
             False,
-            "delta-rs also writes duplicate feature entries and an unexpected "
-            "variantType into the protocol when this is enabled at create",
+            "delta-rs writes duplicate feature entries and an unexpected "
+            "variantType reader+writer feature into the protocol when this is "
+            "enabled, at create or later, so the kernel creates DV tables",
         ),
         _prop("delta.dataSkippingNumIndexedCols", _H, _H, _H),
         _prop("delta.checkpoint.writeStatsAsStruct", _H, _H, _H),

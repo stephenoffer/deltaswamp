@@ -14,7 +14,7 @@ FEATURES: list[str]
 One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
 "uc_create_table_request", "checkpoint", "file_restricted_scan",
-"distributed_write". Gate on this
+"distributed_write", "deletion_vector_dml", "materialized_row_ids". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
 
@@ -236,8 +236,16 @@ class Snapshot:
         columns: list[str] | None = None,
         predicate: str | None = None,
         files: list[str] | None = None,
+        row_positions: bool = False,
+        row_ids: bool = False,
     ) -> Any:
         """Read the table as an Arrow stream, with deletion vectors applied.
+
+        `row_positions` appends `__deltaswamp_file` (each row's data file, as
+        the log stores its path) and `__deltaswamp_row_index` (its physical
+        position in that file): the address a deletion vector uses. `row_ids`
+        (which needs `row_positions`, and row tracking enabled) also appends
+        `__deltaswamp_row_id`, each row's stable row id.
 
         `predicate` is a JSON string used ONLY to skip files (by statistics and
         partition values); rows that do not match can still be returned, so the
@@ -391,6 +399,33 @@ class Snapshot:
         atomic. `overwrite` removes every file visible in this snapshot in the
         same commit. Raises the same errors as `append`.
         """
+
+    def commit_dml(
+        self,
+        deletions: Any,
+        data: Any | None = None,
+        uc: UcCommitConfig | None = None,
+        engine_info: str | None = None,
+        operation: str | None = None,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, str] | None = None,
+    ) -> tuple[int, int, int, int]:
+        """Commit row-level DML as deletion vectors, in one transaction.
+
+        `deletions` is an Arrow stream of `path` and `row_index` columns, as a
+        positional scan reports them. Each touched file's new deletions are
+        unioned with its existing vector; a file left with no rows is removed
+        (or, where row tracking forbids removes, keeps a full vector). `data`,
+        if given, is appended in the same commit; a `__deltaswamp_row_id`
+        column in it is written to the table's materialized row-id column, so
+        updated rows keep their ids. Returns `(version, deleted_rows,
+        deletion_vectors_added, files_removed)`; nothing to change commits
+        nothing and returns this snapshot's version.
+        """
+
+    @property
+    def deletion_vectors_enabled(self) -> bool:
+        """Whether the table accepts deletion-vector writes."""
 
     def publish(self, uc: UcCommitConfig | None = None) -> int:
         """Publish ratified-but-unpublished commits into `_delta_log/`."""

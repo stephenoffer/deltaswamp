@@ -160,6 +160,10 @@ code and covered by a test.
 
 - Rows are never reordered before a deletion vector is applied. A DV is a
   positional mask over a file's rows in physical order.
+- A DML commit's deletion vectors are unions with each file's existing
+  vector, so a second DELETE never resurrects rows the first removed. Every
+  row is addressed by its file's log path and its physical index, read in the
+  same snapshot the commit is staged against.
 - Deletion-vector concurrency is bounded by a constant, never by file count.
   Unbounded `spawn_blocking` exhausts the pool and deadlocks the runtime.
 - The catalog's log tail must be contiguous. A gap means a stale or partial
@@ -176,6 +180,24 @@ code and covered by a test.
   writer causes a conflict, not a lost commit.
 - Unknown feature names never raise, or the first table to adopt a new
   writer-only feature would become unreadable.
+
+## Deletion-vector DML
+
+DELETE, UPDATE, replaceWhere and MERGE on a table with deletion vectors enabled
+run in two halves. Python reads the files the predicate cannot skip through a
+*positional* scan, which tags every surviving row with its data file and its
+physical row index, and evaluates the predicate (or, for MERGE, the clauses in
+DuckDB). `crates/native/src/dml.rs` then unions each file's new deletions with
+its existing vector, writes every vector into one file in the protocol's
+format, and commits through the kernel's `update_deletion_vectors`, with any
+rewritten or inserted rows added in the same transaction.
+
+Three cases follow Spark. A file left with no rows is removed, unless row
+tracking forbids removes, in which case it keeps a vector covering every row.
+A rewritten row on a row-tracked table has its old id written to the table's
+materialized row-id column, so its id survives the UPDATE. A DELETE commit adds
+no data, so it needs no CDC files on a change-data-feed table: readers derive
+the deleted rows from the old and new vectors.
 
 ## Distributed reads and writes
 
@@ -235,10 +257,8 @@ from the registry one. Mixing them yields two kernels and two incompatible
 
 ## Not built
 
-- Deletion-vector authoring. Kernel 0.28 has `update_deletion_vectors` only as
-  an internal API, and it is not bound. DML on kernel-only tables is a
-  whole-table rewrite bounded by `KernelEngine.rewrite_max_bytes`, refused on
-  row-tracked tables; MERGE on them needs the warehouse.
+- CDC files. UPDATE and MERGE through the kernel on a change-data-feed table
+  would need them; DELETE through deletion vectors does not.
 - The change feed of a catalog-managed table. The kernel's `TableChanges`
   lists the log itself and would miss unpublished commits.
 - Incremental reads through the kernel's `incremental_scan`. `Table.changes()`

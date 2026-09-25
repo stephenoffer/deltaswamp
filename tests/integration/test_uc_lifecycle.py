@@ -264,6 +264,35 @@ class TestCatalogManagedWithoutDatabricks:
         assert managed.table("main.sales.dml").delete("id = 2")["num_deleted_rows"] == 1
         assert self.rows(managed) == [(1, "a"), (3, "c"), (None, "d")]
 
+    def test_dml_is_written_as_deletion_vectors_through_the_catalog(self, managed: Any) -> None:
+        """A managed table enables deletion vectors, so DML marks rows deleted
+        (staged and ratified by the catalog) instead of rewriting the table."""
+        pytest.importorskip("duckdb")
+        table = managed.table("main.sales.dml")
+        root = pathlib.Path(urlparse(table.location).path)
+        data_files = set(root.rglob("*.parquet")) - set(root.rglob("_delta_log/**/*"))
+        table.delete("id = 2")
+        managed.table("main.sales.dml").update(new_values={"c": "z"}, predicate="id = 3")
+        (
+            managed.table("main.sales.dml")
+            .merge(
+                pa.table({"id": [1, 7], "c": ["m", "n"]}),
+                "t.id = s.id",
+                source_alias="s",
+                target_alias="t",
+            )
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute()
+        )
+        assert self.rows(managed) == [(1, "m"), (3, "z"), (7, "n"), (None, "d")]
+        assert list(root.rglob("deletion_vector_*.bin")), "vectors were written"
+        still = set(root.rglob("*.parquet"))
+        assert data_files <= still, "no original data file was rewritten away"
+        staged = list((root / "_delta_log" / "_staged_commits").glob("*.json"))
+        text = "".join(p.read_text() for p in staged)
+        assert '"deletionVector"' in text, "the vectors went through catalog-staged commits"
+
     def test_update_with_plain_values(self, managed: Any) -> None:
         managed.table("main.sales.dml").update(new_values={"c": "z"}, predicate="id > 1")
         assert self.rows(managed) == [(1, "a"), (2, "z"), (3, "z"), (None, "d")]
@@ -294,14 +323,17 @@ class TestCatalogManagedWithoutDatabricks:
         root = pathlib.Path(urlparse(table.location).path) / "_delta_log"
         assert list(root.glob("*.checkpoint*.parquet")) or list(root.glob("_last_checkpoint"))
 
-    def test_size_limit_refuses_with_a_remedy(self, managed: Any) -> None:
+    def test_deletion_vector_dml_ignores_the_rewrite_size_limit(self, managed: Any) -> None:
+        # The managed table enables deletion vectors, so DML marks rows deleted
+        # rather than rewriting the table, and the rewrite's bound is moot.
         from deltaswamp.engine.kernel import KernelEngine
 
         engine = managed.router.engines[__import__("deltaswamp").Engine.KERNEL]
         engine.rewrite_max_bytes = 1
         try:
-            verdict = managed.table("main.sales.dml").can("delete")
-            assert not verdict.ok
-            assert "1-byte limit" in verdict.reason
+            table = managed.table("main.sales.dml")
+            assert table.properties().get("delta.enableDeletionVectors") == "true"
+            verdict = table.can("delete")
+            assert verdict.ok, verdict.reason
         finally:
             engine.rewrite_max_bytes = KernelEngine.rewrite_max_bytes

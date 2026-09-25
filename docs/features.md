@@ -70,15 +70,17 @@ Several values in one cell are a routing chain, tried in order.
 | Append | all | delta-rs, kernel, iceberg, warehouse | warehouse loads via a staging volume |
 | Append to catalog-managed | DBR, kernel | kernel | UCCommitter; partitioned tables included |
 | Overwrite | all | delta-rs, kernel, iceberg, warehouse | kernel replaces a catalog-managed table in one commit |
-| replaceWhere | DBR, Spark, delta-rs | delta-rs, iceberg, warehouse, kernel | kernel: a bounded whole-table rewrite |
+| replaceWhere | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, iceberg, warehouse | kernel: replaced rows marked deleted, new rows appended, in one commit; a bounded whole-table rewrite on tables without deletion vectors |
 | Dynamic partition overwrite | DBR, Spark | native over delta-rs | predicate derived from the data |
 | Schema merge on write | DBR, Spark, delta-rs | delta-rs | |
 | Save modes | DBR, Spark, delta-rs | native | `Connection.write_table` |
 | Idempotent writes (txnAppId) | DBR, Spark | native | checked here; delta-rs records but does not enforce |
-| DELETE / UPDATE | DBR, Spark, delta-rs | delta-rs, warehouse, kernel (native rewrite) | copy-on-write; the kernel path rewrites the whole table in one commit, bounded in size |
-| MERGE | DBR, Spark, delta-rs | delta-rs, warehouse | one clause API for both; the warehouse merges from a staged source |
-| DML on catalog-managed tables | DBR | kernel (native rewrite), warehouse | DELETE/UPDATE/replaceWhere by rewrite; MERGE needs the warehouse; row-tracked tables need the warehouse |
-| Deletion-vector authoring | DBR, Spark | — | kernel 0.28 has `update_deletion_vectors` only as an internal API; not bound yet |
+| DELETE / UPDATE | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, warehouse | deletion vectors on tables that enable them; otherwise delta-rs copy-on-write, and last a bounded whole-table rewrite through the kernel |
+| MERGE | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, warehouse | one clause API for all three; the kernel evaluates clauses with DuckDB (`deltaswamp[duckdb]`), the warehouse merges from a staged source |
+| DML on catalog-managed tables | DBR | kernel (deletion vectors), warehouse | DELETE/UPDATE/replaceWhere/MERGE as deletion vectors through UCCommitter; row ids kept on row-tracked tables. Without deletion vectors, DELETE/UPDATE/replaceWhere are a bounded rewrite and MERGE needs the warehouse |
+| Deletion-vector authoring | DBR, Spark | kernel | bitmaps computed here, written in the protocol's file format, committed through the kernel's DV update; a second DELETE unions with the existing vector; files left empty are removed |
+| Row-id preservation on UPDATE / MERGE | DBR, Spark | kernel | updated rows' ids are written to the table's materialized row-id column |
+| DML + CDF | DBR, Spark | kernel (DELETE), delta-rs, warehouse | a deletion-vector DELETE needs no CDC files; UPDATE and MERGE on a CDF table need CDC files the kernel cannot write |
 | Row-level concurrency | DBR | — | a Databricks conflict-detection feature |
 | Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction. Catalog-managed tables included |
 | COPY INTO / Auto Loader | DBR | warehouse (`Connection.sql(engine="warehouse")`) | ingestion, not table access |
@@ -198,7 +200,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 
 | Gap | Blocker |
 |---|---|
-| Deletion-vector authoring | kernel 0.28 has `update_deletion_vectors` only as an internal API, not bound yet. DML on kernel-only tables is a bounded whole-table rewrite; MERGE and row-tracked tables need the warehouse |
+| UPDATE, MERGE and replaceWhere on a change-data-feed table the kernel alone can write | the kernel cannot write CDC files, and those commits need them; DELETE through deletion vectors does not |
 | CDF on catalog-managed tables outside Databricks | the kernel's `TableChanges` takes no catalog commit tail |
 | Incremental reads without a change feed | the kernel's `incremental_scan` is not bound yet; `Table.changes()` covers tables with CDF |
 | Databricks server-side behavior (predictive optimization, auto compaction, row-level concurrency, Photon, CLUSTER BY AUTO) | these are things a Databricks cluster does, not table formats; the warehouse fallback is the only way in |

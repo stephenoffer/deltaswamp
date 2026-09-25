@@ -138,6 +138,25 @@ class TestResolution:
         assert table.resolved.table_uuid is None
         assert table.to_arrow().num_rows == 3
 
+    def test_reads_a_deletion_vector_databricks_wrote(
+        self, live_connection: Any, scratch_sql: Any
+    ) -> None:
+        """A Databricks DELETE writes a deletion vector (row tracking is on by
+        default too); the kernel must apply it exactly as Databricks does."""
+        name, run = scratch_sql
+        run(f"ALTER TABLE {name} SET TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')")
+        run(f"DELETE FROM {name} WHERE id = 2")
+        table = live_connection.table(name)
+        assert "deletionVectors" in {str(getattr(f, "value", f)) for f in table.features()}
+        files = table.files()
+        dvs = [d for d in files.column("deletion_vector").to_pylist() if d]
+        assert dvs, "Databricks should have written a deletion vector, not rewritten the file"
+        assert sorted(table.to_arrow().column("id").to_pylist()) == [1, 3]
+        # DML on the table routes to the kernel's deletion-vector path when UC
+        # allows external writes, and is refused with the reason when it does not.
+        verdict = table.can("delete")
+        assert verdict.ok or "external" in verdict.reason.lower()
+
     def test_a_missing_table_says_so(self, live_connection: Any, live_config: Any) -> None:
         with pytest.raises(DeltaSwampError, match="does not exist"):
             live_connection.table(f"{live_config.prefix}.definitely_not_here_9f3a")
