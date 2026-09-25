@@ -486,7 +486,21 @@ Where a catalog does arbitrate and rejects the commit, the fragments stay valid
 -- they describe data files, which carry no version -- so the same fragments can
 be committed again against a fresh snapshot, which `retries=` does for tables
 this library commits itself (an append on a path table retries by default, as
-`Table.append` does).
+`Table.append` does: up to 15 times, with a jittered backoff between attempts).
+
+A concurrent change to the schema, the partition columns, column mapping or a
+CHECK constraint is the exception (adding a nullable column is not: the new
+files read it as null, like every older file): the fragments' files were
+written for the old layout, so committing them would leave the table unreadable or put values in
+the wrong columns. `commit()` raises `MetadataChangedError` (a
+`CommitConflictError`) and never retries it; plan the write again. A commit
+that hits a catalog's backfill demand publishes the table and commits again,
+as `Table.append` does.
+
+Fragments that carry no files (every worker's data was empty) commit nothing:
+an append returns the current version without adding an empty one, unless it
+has a `txn=` to record. An overwrite with no files would empty the table, so it
+is refused unless `commit(fragments, allow_empty_overwrite=True)` says so.
 
 A guarded overwrite commits against the planned snapshot itself, so a writer
 that lands between the check and the commit makes it conflict rather than
@@ -545,10 +559,12 @@ All inherit from `DeltaSwampError`.
 | `CredentialError` | vending or refresh failed |
 | `PreflightError` | a workspace prerequisite is not satisfied |
 | `CommitConflictError` | another writer took that version first |
+| `MetadataChangedError` | a `CommitConflictError`: a concurrent commit changed the schema, partitioning or column mapping, so the write must be planned again rather than retried |
 | `TransientCommitError` | a commit failed for a transient reason; the table is unchanged, so retry it as is |
 | `BackfillRequiredError` | the catalog wants staged commits published |
 | `CorruptTableError` | on-disk state failed a correctness check |
 | `MissingDataFileError` | a `CorruptTableError`: a file the snapshot references was removed (VACUUM, manual delete); `.path` names it |
+| `ChangeFeedSchemaChangeError` | an `UnreachableTableError`: the change feed range crosses a schema change its rows cannot be read across; `.version` names the commit that changed it |
 | `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
 | `EnginePanicError` | an engine panicked across the FFI boundary |
 

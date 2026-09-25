@@ -14,6 +14,7 @@ from .credentials import Cloud, CredentialProvider, Credentials
 from .distributed import ScanPlan, WritePlan
 from .errors import (
     BackfillRequiredError,
+    ChangeFeedSchemaChangeError,
     CommitConflictError,
     CorruptTableError,
     CredentialError,
@@ -26,6 +27,7 @@ from .errors import (
     IgnoredPropertyWarning,
     InvalidArgumentError,
     InvalidReferenceError,
+    MetadataChangedError,
     MissingDataFileError,
     PreflightError,
     PropertyNotSupportedError,
@@ -73,6 +75,7 @@ __all__ = [
     "EXPECTED_KERNEL_VERSION",
     "BackfillRequiredError",
     "Capability",
+    "ChangeFeedSchemaChangeError",
     "Cloud",
     "CommitConflictError",
     "Connection",
@@ -90,6 +93,7 @@ __all__ = [
     "IgnoredPropertyWarning",
     "InvalidArgumentError",
     "InvalidReferenceError",
+    "MetadataChangedError",
     "MissingDataFileError",
     "Operation",
     "PredicateError",

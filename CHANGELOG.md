@@ -50,8 +50,12 @@ First release.
 - The kernel cannot write CDC files, so UPDATE and MERGE on a change-data-feed
   table it alone can write need the SQL fallback. DELETE through deletion
   vectors needs none.
-- The kernel's change feed fails mid-stream when the range crosses a schema
-  change. Start the range after the change, or read it through the warehouse.
+- The change feed fails when the range crosses an incompatible schema change,
+  with `ChangeFeedSchemaChangeError` naming the version. Start the range after
+  the change, or read it through the warehouse.
+- Commits the kernel writes, including distributed ones, record empty
+  `operationParameters`: delta_kernel 0.28 overwrites whatever the engine
+  supplies. `isBlindAppend` still tells an append from an overwrite.
 - The change feed and history of a catalog-managed table need the warehouse.
 - Incremental reads without a change feed are not built.
 - Databricks allowlists which connectors may write through the Unity Catalog

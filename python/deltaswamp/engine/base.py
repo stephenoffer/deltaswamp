@@ -228,7 +228,7 @@ class TranslatingStream:
     get its message, as the C stream interface carries no exception type.
     """
 
-    def __init__(self, source: Any, context: str) -> None:
+    def __init__(self, source: Any, context: str, translate: Any = None) -> None:
         import pyarrow as pa
 
         self._reader = (
@@ -237,6 +237,9 @@ class TranslatingStream:
             else pa.RecordBatchReader.from_stream(source)
         )
         self._context = context
+        #: A further `exc -> Exception | None` for failures particular to one
+        #: kind of read, consulted when the failure is not a missing file.
+        self._translate = translate
         self._batches = self._iterate()
         self.schema = self._reader.schema
 
@@ -248,6 +251,8 @@ class TranslatingStream:
                 return
             except Exception as exc:
                 translated = missing_file_error(exc, self._context)
+                if translated is None and self._translate is not None:
+                    translated = self._translate(exc)
                 if translated is None:
                     raise
                 raise translated from exc
@@ -288,7 +293,7 @@ class TranslatingStream:
         return getattr(self._reader, name)
 
 
-def translating_stream(source: Any, context: str) -> Any:
+def translating_stream(source: Any, context: str, translate: Any = None) -> Any:
     """`source` wrapped in a TranslatingStream, or as is without pyarrow."""
     if not hasattr(source, "__arrow_c_stream__"):
         return source
@@ -296,4 +301,4 @@ def translating_stream(source: Any, context: str) -> Any:
         import pyarrow  # noqa: F401
     except ImportError:
         return source
-    return TranslatingStream(source, context)
+    return TranslatingStream(source, context, translate)

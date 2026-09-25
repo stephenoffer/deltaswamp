@@ -18,6 +18,8 @@ from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
 from typing import Any, ClassVar, cast
 
+from ._util import commit_backoff
+
 __all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance"]
 
 
@@ -98,6 +100,12 @@ class ScanPlan:
         return translating_stream(stream, f"{where}{at}")
 
     def partitions(self, n: int) -> list[tuple[Any, ...]]:
+        from .errors import InvalidArgumentError
+
+        # 0, -5 and True quietly came back as one group, and None as a bare
+        # TypeError from the comparison inside `balance`.
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise InvalidArgumentError(f"partitions(n) needs a positive int, not {n!r}")
         return balance(self.splits, n)
 
 
@@ -132,10 +140,11 @@ class WritePlan:
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
     #: three `CommitConflictError`s -- and rebasing an append is always correct,
-    #: so the default matches `KernelEngine.metadata_commit_attempts` rather
-    #: than leaving every connector to write the same loop. An overwrite gets
-    #: none, and so does a catalog-managed table, which cannot rebase here.
-    default_append_retries: ClassVar[int] = 5
+    #: so the default matches `KernelEngine.append_commit_retries` (and
+    #: delta-rs), with a jittered backoff between attempts, rather than leaving
+    #: every connector to write the same loop. An overwrite gets none, and so
+    #: does a catalog-managed table, which cannot rebase here.
+    default_append_retries: ClassVar[int] = 15
 
     @property
     def overwrite(self) -> bool:
@@ -179,6 +188,7 @@ class WritePlan:
         operation: str | None = "WRITE",
         retries: int | None = None,
         allow_concurrent_overwrite: bool = False,
+        allow_empty_overwrite: bool = False,
     ) -> int:
         """Driver side: commit every fragment as one transaction.
 
@@ -207,10 +217,21 @@ class WritePlan:
         None, an ordinary append on a path table gets `default_append_retries`;
         an overwrite gets none, because retrying one means overwriting the
         writer that just won.
+
+        A concurrent change to the schema (other than adding a nullable
+        column), partitioning or column mapping is never retried: the
+        fragments' files were written for the old layout, so the commit raises
+        `MetadataChangedError` and the write must be planned again.
+
+        No fragments with any files (every worker's data was empty) commits
+        nothing: an append returns the current version without adding an
+        empty one, and an overwrite -- which would empty the table -- is
+        refused unless `allow_empty_overwrite=True` says that is intended.
         """
         from .errors import (
             CommitConflictError,
             InvalidArgumentError,
+            MetadataChangedError,
             TransientCommitError,
             UnreachableTableError,
         )
@@ -237,6 +258,23 @@ class WritePlan:
             )
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
             raise InvalidArgumentError(f"retries must be a non-negative int, not {retries!r}")
+        if not any(collected):
+            # A job whose workers all produced nothing added an empty version
+            # on every call (and every retry of the job), and an overwrite
+            # silently truncated the table. With a txn the commit still
+            # matters -- it records that the batch is done -- so it goes ahead.
+            if self.overwrite and not allow_empty_overwrite:
+                raise UnreachableTableError(
+                    "commit this overwrite",
+                    "no fragment carries any files, so it would remove every row in the "
+                    "table and add none",
+                    "pass allow_empty_overwrite=True if emptying the table is intended",
+                )
+            if not self.overwrite and self.txn is None:
+                current = self._with_fresh_tail(self.table) or self.table
+                version_now = self.engine.detail(current).get("version")
+                if version_now is not None:
+                    return int(version_now)
         attempts = retries + 1
         last: Exception | None = None
         conflict_version = -1
@@ -266,15 +304,21 @@ class WritePlan:
             if self.overwrite and not allow_concurrent_overwrite:
                 self._refuse_if_the_table_moved(table)
             try:
-                version: int = self.engine.commit_files(
+                version: int = self._backfilled(
+                    lambda target: self.engine.commit_files(
+                        target,
+                        collected,
+                        overwrite=self.overwrite,
+                        operation=operation,
+                        txn=self.txn,
+                        commit_metadata=self.commit_metadata,
+                        **({"version": pinned} if pinned is not None else {}),
+                    ),
                     table,
-                    collected,
-                    overwrite=self.overwrite,
-                    operation=operation,
-                    txn=self.txn,
-                    commit_metadata=self.commit_metadata,
-                    **({"version": pinned} if pinned is not None else {}),
                 )
+            except MetadataChangedError:
+                # The files do not fit the table any more: no retry can help.
+                raise
             except TransientCommitError as exc:
                 # Nobody won the version and the table is unchanged, so the
                 # very same commit can go again -- which `retries` promises.
@@ -283,6 +327,7 @@ class WritePlan:
                 last = exc
                 if attempts == 1 or self.table.is_catalog_managed:
                     raise
+                commit_backoff(attempt)
                 continue
             except CommitConflictError as exc:
                 last = exc
@@ -304,6 +349,8 @@ class WritePlan:
                         "re-open the table through the catalog and commit the same "
                         "fragments against the fresh snapshot -- they stay valid",
                     ) from exc
+                # Losers retrying at once collide again; spread them out.
+                commit_backoff(attempt)
                 continue
             return version
 
@@ -314,6 +361,34 @@ class WritePlan:
             f"another writer committed first on each of {attempts} attempts ({last}). "
             "The fragments are still valid: re-open the table and commit them again.",
         )
+
+    def _backfilled(self, commit: Any, table: Any) -> int:
+        """`commit(table)`; on a catalog's backfill demand, publish and commit once more.
+
+        What `Table._backfilled` does for `Table.append`. Nothing on this path
+        ever published, so once the catalog's cap of unpublished commits was
+        reached every distributed commit failed with the 429 -- after its job
+        had run -- while appends through the same table kept working. The
+        refused commit changed nothing and the fragments stay valid, so the
+        same commit can go again once the tail is published.
+        """
+        from .errors import BackfillRequiredError, DeltaSwampError
+
+        try:
+            result: int = commit(table)
+            return result
+        except BackfillRequiredError as exc:
+            if not getattr(table, "is_catalog_managed", False) or self.catalog is None:
+                # Without the catalog the tail cannot be re-read after
+                # publishing, so a second commit would race a stale view.
+                raise
+            try:
+                self.engine.publish(table)
+            except DeltaSwampError:
+                raise exc from None
+            refreshed = self._with_fresh_tail(table)
+            result = commit(refreshed if refreshed is not None else table)
+            return result
 
     def _already_landed(self, table: Any, fragments: list[bytes]) -> bool:
         """Whether any fragment's data file is already live in the table."""
@@ -629,7 +704,7 @@ def DeltaSwampDatasource(plan: ScanPlan) -> Any:
         ) -> list[Any]:
             # An empty plan still gets one task, so the dataset has a schema
             # rather than none at all.
-            groups = self._plan.partitions(parallelism) or [()]
+            groups = self._plan.partitions(max(1, int(parallelism))) or [()]
             tasks = []
             for group in groups:
                 # Each task carries only its own splits: closing over the whole

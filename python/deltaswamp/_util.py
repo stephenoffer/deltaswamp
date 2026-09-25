@@ -52,3 +52,18 @@ def http_error_text(exc: BaseException) -> str:
     status = getattr(response, "status_code", None)
     message = str(exc).strip()
     return f"HTTP {status}: {message}" if status is not None else message
+
+
+def commit_backoff(attempt: int, *, base: float = 0.02, cap: float = 1.0) -> None:
+    """Sleep before re-attempting a commit that lost its race.
+
+    Writers that collide retry in lockstep without it: each re-reads the same
+    snapshot at the same moment and they collide again, so eight threads
+    appending at once used up five immediate retries and some still failed.
+    Full jitter spreads them out; the cap keeps a long losing streak from
+    stalling a writer for more than about a second at a time.
+    """
+    import random
+    import time
+
+    time.sleep(random.uniform(0, min(cap, base * (2**attempt))))

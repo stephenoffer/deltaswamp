@@ -108,6 +108,28 @@ class CommitConflictError(DeltaSwampError):
         return (type(self), (self.version, str(self)), self.__dict__)
 
 
+class MetadataChangedError(CommitConflictError):
+    """A concurrent commit changed the schema, partitioning or column mapping.
+
+    Delta's MetadataChangedException. Data files written against the old
+    layout cannot be committed into the new one -- the table would stop
+    reading, or a column's values would land in a column that no longer
+    holds them -- so, unlike a plain conflict, retrying the same commit can
+    never succeed: re-plan and write the data again.
+    """
+
+
+class ChangeFeedSchemaChangeError(UnreachableTableError):
+    """The change feed spans a schema change it cannot read across.
+
+    Spark's DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE. `version` is
+    the commit that changed the schema (None if it could not be found), so a
+    streaming consumer can restart the feed after it.
+    """
+
+    version: int | None = None
+
+
 class BackfillRequiredError(DeltaSwampError):
     """The catalog is refusing commits until unbackfilled commits are published.
 

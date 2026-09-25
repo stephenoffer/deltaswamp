@@ -382,11 +382,12 @@ class TestDistributedWrite:
         plan.commit([plan.write(pa.table({"id": [9], "city": ["z"]}))])
         assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [9]
 
-    def test_committing_nothing_is_still_a_commit(self, writable_catalog_managed: Any) -> None:
-        """A job that produced no data advances the table rather than erroring."""
+    def test_committing_nothing_adds_no_commit(self, writable_catalog_managed: Any) -> None:
+        """A job that produced no data returns the current version rather than erroring."""
         conn = writable_catalog_managed
+        before = conn.table("main.sales.cm").version
         version = conn.table("main.sales.cm").plan_write().commit([])
-        assert isinstance(version, int)
+        assert version == before == conn.table("main.sales.cm").version
         assert conn.table("main.sales.cm").to_arrow().num_rows == 0
 
     def test_alter_is_still_refused(self, writable_catalog_managed: Any) -> None:
