@@ -64,6 +64,16 @@ class CredentialExpiryWarning(UserWarning):
     """
 
 
+class EngineFallbackWarning(UserWarning):
+    """An engine failed on a read it claimed, and the next engine is serving it.
+
+    Routing is decided from the protocol, which cannot foresee every defect in
+    an engine: delta-rs, for one, cannot parse the file statistics Databricks
+    writes for a CLONE. Reads are retried on the next capable engine, and this
+    says which one broke so the cost of the detour is never invisible.
+    """
+
+
 class IgnoredPropertyWarning(UserWarning):
     """A property will be stored but nothing here acts on it."""
 

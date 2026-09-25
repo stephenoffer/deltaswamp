@@ -121,7 +121,7 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 | Table and column comments | all | delta-rs, native, warehouse | |
 | SET / UNSET TBLPROPERTIES | all | delta-rs, native, warehouse | native validates keys and raises the protocol when a value implies a feature |
 | ADD / DROP CHECK constraint | DBR, Spark, delta-rs | delta-rs, native (drop), warehouse | adding validates existing rows, which delta-rs does |
-| ADD FEATURE | DBR, Spark, delta-rs | delta-rs, native, warehouse | refuses features that need a backfill (row tracking) |
+| ADD FEATURE | DBR, Spark, delta-rs | delta-rs (features it can write), native, warehouse | native adds dependencies alongside and refuses features that need a backfill (row tracking) |
 | DROP FEATURE | DBR, Spark | warehouse | needs history truncation and checkpoint protection |
 | CLUSTER BY (change keys) | DBR, Spark | native, warehouse | writes the `delta.clustering` domain |
 | CLUSTER BY AUTO | DBR | warehouse | predictive optimization chooses keys |
@@ -131,13 +131,15 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 
 ## Table features
 
-`docs/conformance.md` has the full per-engine matrix for all 34 features.
-In summary: the kernel reads every standard feature except geospatial (gated
-in 0.28). delta-rs refuses 19 of them outright, including `catalogManaged`,
-`vacuumProtocolCheck`, `domainMetadata` (so every liquid-clustered and
-row-tracked table), type widening and in-commit timestamps. Collations and
-checkpoint protection have no kernel variant and block writes on both
-engines.
+`docs/conformance.md` has the full per-engine matrix for all 36 features.
+In summary: the kernel reads every standard feature except geospatial and
+adaptiveMetadata-preview (both gated off in this build). For reads, delta-rs
+refuses seven reader-writer features: `catalogManaged` and its preview, type
+widening and variant shredding (two spellings each), and `vacuumProtocolCheck`.
+Writer-only features such as `domainMetadata` (so every liquid-clustered and
+row-tracked table) and in-commit timestamps block its writes but not its reads.
+Collations, checkpoint protection and `icebergWriterCompatV1` have no kernel
+variant; all three are writer-only, so both engines read and neither writes.
 
 ## Maintenance and the log
 

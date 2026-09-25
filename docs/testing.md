@@ -85,6 +85,32 @@ Each test creates what it needs under a random name and drops it afterwards,
 including when it fails. Anything that cannot be verified on your workspace is
 skipped with a reason rather than quietly passing.
 
+### The shape matrix
+
+`tests/integration/test_live_matrix.py` builds one managed table per shape
+Databricks produces and checks deltaswamp against the warehouse on each. The
+shapes: deletion vectors present, a legacy protocol, partitioning, liquid and
+automatic clustering, column mapping by name and id after renames and drops,
+change data feed, identity, generated columns, constraints, defaults, type
+widening, variant and shredded variant, TIMESTAMP_NTZ, collations, v2
+checkpoints, UniForm, in-commit timestamps, checkpoint protection, nested
+types, row filters, column masks, geometry, catalog-managed and empty. It
+asserts that:
+
+- direct reads agree with the warehouse row for row, or are refused with a
+  reason, exactly for the shapes expected;
+- fallback reads, predicates, time travel and the change feed agree;
+- every claimed log read works, and `features()` matches `DESCRIBE DETAIL`;
+- writes, maintenance, DDL and RESTORE through the warehouse land as the
+  warehouse sees them.
+
+It is opt-in on top of the live suite, because it creates around thirty tables
+(all dropped afterwards):
+
+```bash
+DELTASWAMP_TEST_MATRIX=1 pytest tests/integration/test_live_matrix.py -v
+```
+
 ### A note on PATs
 
 A personal access token cannot be refreshed. Anything running longer than its

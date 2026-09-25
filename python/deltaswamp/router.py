@@ -44,6 +44,13 @@ _CATALOG_MANAGED_ALTER_OPS: frozenset[Operation] = METADATA_OPERATIONS | {
 #: Engines that read and write storage directly, with a vended credential. The
 #: SQL warehouse is not one: it runs inside Databricks.
 _DIRECT_ENGINES: frozenset[EngineKind] = frozenset({EngineKind.KERNEL, EngineKind.DELTARS})
+_COLLATIONS: frozenset[str] = frozenset({"collations", "collations-preview"})
+_APPEND_ONLY_FORBIDS: frozenset[Operation] = frozenset(
+    {Operation.DELETE, Operation.UPDATE, Operation.OVERWRITE, Operation.REPLACE_WHERE}
+)
+_ACCESS_POLICY_FORBIDS: frozenset[Operation] = frozenset(
+    {Operation.TIME_TRAVEL, Operation.CDF, Operation.RESTORE}
+)
 
 
 @dataclass
@@ -59,6 +66,7 @@ class Router:
         table: ResolvedTable,
         *,
         needs: frozenset[str] = frozenset(),
+        exclude: frozenset[EngineKind] = frozenset(),
         **shape: object,
     ) -> Capability:
         """Decide how `operation` would be served, without performing it.
@@ -85,10 +93,19 @@ class Router:
             return Capability(operation, ok=False, reason=f"unknown operation {operation.value}")
 
         for kind in routing.engines:
+            if kind in exclude:
+                reasons.append(f"{kind.value}: already tried, and failed")
+                continue
             engine = self.engines.get(kind)
             if engine is None:
                 reasons.append(f"{kind.value}: engine not configured")
                 continue
+
+            if kind is not EngineKind.SQL:
+                warehouse_only = self._warehouse_only(operation, table)
+                if warehouse_only is not None:
+                    reasons.append(f"{kind.value}: {warehouse_only}")
+                    continue
 
             if kind is EngineKind.SQL and not self.allow_sql_fallback:
                 reasons.append(
@@ -110,9 +127,33 @@ class Router:
                 )
                 continue
 
+            # Nor can a direct engine serve a table whose log it failed to read.
+            # The catalog-level check lets this through when the warehouse is
+            # available, so it has to be enforced per engine here: otherwise the
+            # kernel is chosen on an empty feature list and fails the same way.
+            if (
+                kind in _DIRECT_ENGINES
+                and table.open_error is not None
+                and operation is not Operation.CREATE
+            ):
+                reasons.append(
+                    f"{kind.value}: the Delta log could not be read ({table.open_error})"
+                )
+                continue
+
             missing = [need for need in needs if not getattr(engine, f"supports_{need}", False)]
             if missing:
                 reasons.append(f"{kind.value}: does not support {', '.join(missing)}")
+                continue
+
+            if "predicates" in needs and kind in _DIRECT_ENGINES and table.features & _COLLATIONS:
+                # A wrong answer, not an error: both engines compare bytes, so
+                # `name = 'oslo'` misses 'Oslo' in a UTF8_LCASE column, and file
+                # skipping on the same bounds can drop matching files outright.
+                reasons.append(
+                    f"{kind.value}: the table has collated columns, and a direct engine "
+                    "evaluates predicates by byte order rather than by the collation"
+                )
                 continue
 
             result: Capability = engine.supports(operation, table, **shape)  # type: ignore[attr-defined]
@@ -137,10 +178,11 @@ class Router:
         table: ResolvedTable,
         *,
         needs: frozenset[str] = frozenset(),
+        exclude: frozenset[EngineKind] = frozenset(),
         **shape: object,
     ) -> object:
         """Return the engine that will serve `operation`, or raise explaining why not."""
-        capability = self.capability(operation, table, needs=needs, **shape)
+        capability = self.capability(operation, table, needs=needs, exclude=exclude, **shape)
         if capability.ok and capability.engine is not None:
             engine = self.engines.get(capability.engine)
             if engine is not None:
@@ -168,6 +210,38 @@ class Router:
         if table.external_read_supported is False:
             return False
         return not (operation not in READ_OPERATIONS and table.external_write_supported is False)
+
+    @staticmethod
+    def _warehouse_only(operation: Operation, table: ResolvedTable) -> str | None:
+        """Why only the warehouse can serve this, or None.
+
+        Kept apart from the refusal itself: with the fallback on, these shapes
+        are served by SQL rather than refused, so the router skips every other
+        engine instead. They used to refuse outright while naming
+        `allow_sql_fallback=True` as the remedy, so following it changed nothing.
+        """
+        if table.table_type is TableType.FOREIGN:
+            return (
+                "the table is FOREIGN (federated). Depending on subtype its data lives "
+                "in another system entirely, or is reachable only through the Iceberg "
+                "REST catalog; credential vending does not cover it"
+            )
+        # The legacy hive_metastore catalog is not a Unity Catalog securable, so
+        # it can be neither vended nor reached through the UC Delta API.
+        if (table.ref.catalog or "").lower() == "hive_metastore":
+            return (
+                "the table is in the legacy hive_metastore catalog, which is not a "
+                "Unity Catalog securable and cannot be credential-vended"
+            )
+        # UCCommitter rejects protocol, metadata and clustering-domain changes at
+        # version >= 1, so ALTER on a catalog-managed table is not ours to make.
+        if table.is_catalog_managed and operation in _CATALOG_MANAGED_ALTER_OPS:
+            return (
+                "the table is catalog-managed, and its commit protocol refuses "
+                "protocol, metadata and clustering changes after version 0. Schema "
+                "and property changes have to go through the catalog's own APIs"
+            )
+        return None
 
     def _catalog_level_block(self, operation: Operation, table: ResolvedTable) -> Capability | None:
         """Refusals decidable from catalog metadata alone, before any log read."""
@@ -249,42 +323,38 @@ class Router:
                 remedy="ds.connect(..., allow_sql_fallback=True)",
             )
 
-        if table.table_type is TableType.FOREIGN:
+        # Refusals no engine can get around, because the table itself forbids
+        # the operation. Each was confirmed against a live warehouse.
+        if (
+            operation in _APPEND_ONLY_FORBIDS
+            and table.properties.get("delta.appendOnly", "").lower() == "true"
+        ):
             return Capability(
                 operation,
                 ok=False,
                 reason=(
-                    "the table is FOREIGN (federated). Depending on subtype its data lives "
-                    "in another system entirely, or is reachable only through the Iceberg "
-                    "REST catalog; credential vending does not cover it"
+                    "the table is append-only (delta.appendOnly=true), which forbids "
+                    "removing or rewriting rows"
                 ),
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy="t.set_properties({'delta.appendOnly': 'false'}) if that is intended",
+            )
+        if table.access_policy and operation in _ACCESS_POLICY_FORBIDS:
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    f"the table has {table.access_policy}, and Databricks refuses time "
+                    "travel, change data feed and RESTORE on a table with a row filter or "
+                    "column mask, since earlier versions would escape the policy"
+                ),
             )
 
-        # The legacy hive_metastore catalog is not a Unity Catalog securable, so
-        # it can be neither vended nor reached through the UC Delta API.
-        if (table.ref.catalog or "").lower() == "hive_metastore":
+        warehouse_only = self._warehouse_only(operation, table)
+        if warehouse_only is not None and not sql_fallback:
             return Capability(
                 operation,
                 ok=False,
-                reason=(
-                    "the table is in the legacy hive_metastore catalog, which is not a "
-                    "Unity Catalog securable and cannot be credential-vended"
-                ),
-                remedy="ds.connect(..., allow_sql_fallback=True)",
-            )
-
-        # UCCommitter rejects protocol, metadata and clustering-domain changes at
-        # version >= 1, so ALTER on a catalog-managed table is not ours to make.
-        if table.is_catalog_managed and operation in _CATALOG_MANAGED_ALTER_OPS:
-            return Capability(
-                operation,
-                ok=False,
-                reason=(
-                    "the table is catalog-managed, and its commit protocol refuses "
-                    "protocol, metadata and clustering changes after version 0. Schema "
-                    "and property changes have to go through the catalog's own APIs"
-                ),
+                reason=warehouse_only,
                 remedy="ds.connect(..., allow_sql_fallback=True)",
             )
 
@@ -296,15 +366,18 @@ class Router:
         # unconditionally while naming `allow_sql_fallback=True` as the remedy,
         # which meant following the advice changed nothing.
         if table.external_read_supported is False and not sql_fallback:
+            reason = (
+                f"the table has {table.access_policy}, and Unity Catalog credential vending "
+                "refuses any table with a row filter or column mask: only a Databricks "
+                "engine can evaluate them"
+                if table.access_policy
+                else "Unity Catalog reports no external-engine read support for this table "
+                "(HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT absent)"
+            )
             return Capability(
                 operation,
                 ok=False,
-                reason=(
-                    "Unity Catalog reports no external-engine read support for this table "
-                    "(HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT absent). The usual cause is a "
-                    "row filter or column mask, which makes credential vending refuse the "
-                    "table outright"
-                ),
+                reason=reason,
                 remedy="ds.connect(..., allow_sql_fallback=True)",
             )
 

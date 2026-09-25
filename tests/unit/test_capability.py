@@ -80,7 +80,15 @@ class TestEnginesFailInOppositeDirections:
             for f, r in FEATURE_SUPPORT.items()
             if r.kernel_read is not Support.NO and r.deltars_read is Support.NO
         ]
-        assert len(kernel_only) >= 15, kernel_only
+        # Probed against deltalake 1.6.5: writer-only features such as
+        # domainMetadata and rowTracking block delta-rs *writes*, not reads, so
+        # the read gap is the reader-writer features below.
+        assert {
+            "catalogManaged",
+            "vacuumProtocolCheck",
+            "typeWidening",
+            "variantShredding",
+        } <= set(kernel_only), kernel_only
 
     def test_scan_prefers_kernel(self) -> None:
         assert OPERATION_ENGINES[Operation.SCAN].primary is Engine.KERNEL

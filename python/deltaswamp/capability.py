@@ -147,6 +147,8 @@ class TableFeature(StrEnum):
     ICEBERG_COMPAT_V1 = "icebergCompatV1"
     ICEBERG_COMPAT_V2 = "icebergCompatV2"
     ICEBERG_COMPAT_V3 = "icebergCompatV3"
+    ICEBERG_WRITER_COMPAT_V1 = "icebergWriterCompatV1"
+    ICEBERG_WRITER_COMPAT_V3 = "icebergWriterCompatV3"
     # NB: serialises as "clustering", NOT "clusteredTable". Easy to get wrong.
     CLUSTERING = "clustering"
     MATERIALIZE_PARTITION_COLUMNS = "materializePartitionColumns"
@@ -331,18 +333,18 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _W,
             _Y,
             _N,
-            _N,
+            _Y,
             _N,
             "delta-rs has the enum variant but it is commented out of writer_features",
             "delta-rs#3249",
         ),
-        _row(TableFeature.IN_COMMIT_TIMESTAMP, _W, _Y, _Y, _N, _N, "", "delta-rs#3253"),
+        _row(TableFeature.IN_COMMIT_TIMESTAMP, _W, _Y, _Y, _Y, _N, "", "delta-rs#3253"),
         _row(
             TableFeature.ROW_TRACKING,
             _W,
             _Y,
             _P,
-            _N,
+            _Y,
             _N,
             "kernel assigns fresh row IDs only; it rejects commits with staged removes "
             "because it cannot preserve IDs across a rewrite. Requires domainMetadata.",
@@ -353,20 +355,40 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _W,
             _Y,
             _Y,
-            _N,
+            _Y,
             _N,
             "delta-rs has no domain metadata support, so EVERY liquid-clustered and "
             "row-tracked table is delta-rs-unwritable",
             "delta-rs#3249",
         ),
-        _row(TableFeature.ICEBERG_COMPAT_V1, _W, _Y, _N, _N, _N, "", "delta-rs#3249"),
-        _row(TableFeature.ICEBERG_COMPAT_V2, _W, _Y, _N, _N, _N, "", "delta-rs#3249"),
+        _row(TableFeature.ICEBERG_COMPAT_V1, _W, _Y, _N, _Y, _N, "", "delta-rs#3249"),
+        _row(TableFeature.ICEBERG_COMPAT_V2, _W, _Y, _N, _Y, _N, "", "delta-rs#3249"),
+        _row(
+            TableFeature.ICEBERG_WRITER_COMPAT_V1,
+            _W,
+            _Y,
+            _N,
+            _Y,
+            _N,
+            "Databricks sets it on every USING ICEBERG table, which is catalog-managed "
+            "Delta with UniForm underneath (observed live). No kernel 0.28 variant, so "
+            "writer-only and unknown: reads unaffected, writes blocked on both engines.",
+        ),
+        _row(
+            TableFeature.ICEBERG_WRITER_COMPAT_V3,
+            _W,
+            _Y,
+            _N,
+            _Y,
+            _N,
+            "see icebergWriterCompatV1",
+        ),
         _row(
             TableFeature.ICEBERG_COMPAT_V3,
             _W,
             _Y,
             _Y,
-            _N,
+            _Y,
             _N,
             "requires columnMapping + rowTracking; permits deletion vectors (V1/V2 do not)",
         ),
@@ -375,19 +397,19 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _W,
             _Y,
             _Y,
-            _N,
+            _Y,
             _N,
             "wire name is 'clustering', not 'clusteredTable'. Requires domainMetadata. "
             "UCCommitter rejects clustering changes at version >= 1.",
             "delta-rs#2043",
         ),
-        _row(TableFeature.MATERIALIZE_PARTITION_COLUMNS, _W, _Y, _Y, _N, _N),
+        _row(TableFeature.MATERIALIZE_PARTITION_COLUMNS, _W, _Y, _Y, _Y, _N),
         _row(
             TableFeature.ALLOW_COLUMN_DEFAULTS,
             _W,
             _Y,
             _Y,
-            _N,
+            _Y,
             _N,
             "kernel requires ack_column_defaults() before write; connector materialises "
             "the defaults itself. ALTER TABLE is rejected on such tables.",
@@ -451,8 +473,30 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
         ),
         _row(TableFeature.VARIANT_TYPE, _RW, _Y, _Y, _Y, _Y),
         _row(TableFeature.VARIANT_TYPE_PREVIEW, _RW, _Y, _Y, _Y, _Y),
-        _row(TableFeature.VARIANT_SHREDDING, _RW, _Y, _Y, _N, _N),
-        _row(TableFeature.VARIANT_SHREDDING_PREVIEW, _RW, _Y, _Y, _N, _N),
+        _row(
+            TableFeature.VARIANT_SHREDDING,
+            _RW,
+            _P,
+            _Y,
+            _N,
+            _N,
+            "reads unshredded files only. Databricks enables shredding on every VARIANT "
+            "table, but shreds a file only when its values share a shape, so nothing in "
+            "the log says which tables fail; the kernel reads eagerly and a shredded file "
+            "hands the read to the next engine",
+        ),
+        _row(
+            TableFeature.VARIANT_SHREDDING_PREVIEW,
+            _RW,
+            _P,
+            _Y,
+            _N,
+            _N,
+            "reads unshredded files only. Databricks enables shredding on every VARIANT "
+            "table, but shreds a file only when its values share a shape, so nothing in "
+            "the log says which tables fail; the kernel reads eagerly and a shredded file "
+            "hands the read to the next engine",
+        ),
         # Both sit behind a kernel cargo feature this build deliberately does not
         # enable (see crates/native/Cargo.toml), so for *this* binary they are
         # unsupported in both directions. Recording what kernel could do behind
@@ -476,27 +520,31 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             _N,
             "kernel gates reads behind geo-type-in-dev, which this build does not "
-            "enable, and errors on writes regardless. One feature covers both "
-            "geometry and geography.",
+            "enable, fails on the geometry(...) schema type (observed live), and "
+            "errors on writes regardless. One feature covers both geometry and "
+            "geography.",
         ),
         # --- no kernel variant at all
         _row(
             TableFeature.COLLATIONS,
-            _RW,
+            _W,
+            _P,
             _N,
+            _P,
             _N,
-            _N,
-            _N,
-            "Databricks DBR 16.1. No kernel 0.28 variant -> classified Unknown -> "
-            "writes blocked on both engines. Route to SQL.",
+            "Databricks DBR 16.1, writer-only (observed live), so both engines open the "
+            "table. Reads are partial: neither engine knows collation order, so a "
+            "predicate on a collated column compares bytes -- name = 'oslo' misses "
+            "'Oslo' under UTF8_LCASE. Predicate scans route to SQL. No kernel 0.28 "
+            "variant, so writes are blocked on both engines.",
         ),
-        _row(TableFeature.COLLATIONS_PREVIEW, _RW, _N, _N, _N, _N, "see collations"),
+        _row(TableFeature.COLLATIONS_PREVIEW, _W, _P, _N, _P, _N, "see collations"),
         _row(
             TableFeature.CHECKPOINT_PROTECTION,
             _W,
+            _Y,
             _N,
-            _N,
-            _N,
+            _Y,
             _N,
             "Databricks DBR 16.3, added when a table feature is dropped. Ignoring it "
             "during metadata cleanup can delete the checkpoint that makes a downgraded "
@@ -646,9 +694,11 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(
             Operation.CDF,
-            (_D, _K, _SH, _S),
-            "delta-rs serves path tables it can open; the kernel's TableChanges takes the "
-            "ones it cannot. Catalog-managed tables have no CDF outside Databricks",
+            (_K, _D, _SH, _S),
+            "the kernel's TableChanges comes first: delta-rs cannot decode the CDF files "
+            "Databricks writes (arrow-rs fails with 'cannot skip miniblock' on their "
+            "DELTA_BINARY_PACKED pages), and refuses column-mapped tables outright. "
+            "Catalog-managed tables have no CDF outside Databricks",
         ),
         _op(
             Operation.INCREMENTAL,
@@ -731,11 +781,18 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         _op(
             Operation.SET_PROPERTIES,
             (_D, _K, _S),
-            "delta-rs rejects most of the property surface on ALTER; the kernel path "
-            "accepts what it can validate",
+            "delta-rs takes the keys it handles at create, probed against deltalake "
+            "1.6.5; it rejects column mapping, row tracking, in-commit timestamps and "
+            "type widening, and enabling deletion vectors through it stamps a bogus "
+            "variantType feature, so those go to the kernel",
         ),
         _op(Operation.UNSET_PROPERTIES, (_K, _S), "delta-rs has no way to remove a property"),
-        _op(Operation.ADD_FEATURE, (_D, _K, _S), "delta-rs first; kernel for the rest"),
+        _op(
+            Operation.ADD_FEATURE,
+            (_D, _K, _S),
+            "delta-rs only for features it can then write, with their dependencies "
+            "present; otherwise the kernel, which adds dependencies alongside",
+        ),
         _op(
             Operation.ADD_CONSTRAINT,
             (_D, _S),
@@ -996,7 +1053,7 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
         # --- both engines handle these
         _prop("delta.appendOnly", _H, _H, _H),
         _prop("delta.columnMapping.mode", _H, _RJ, _H),
-        _prop("delta.enableChangeDataFeed", _H, _RJ, _H),
+        _prop("delta.enableChangeDataFeed", _H, _H, _H),
         _prop(
             "delta.enableDeletionVectors",
             _H,
@@ -1006,31 +1063,31 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
             "delta-rs also writes duplicate feature entries and an unexpected "
             "variantType into the protocol when this is enabled at create",
         ),
-        _prop("delta.dataSkippingNumIndexedCols", _H, _RJ, _H),
-        _prop("delta.checkpoint.writeStatsAsStruct", _H, _RJ, _H),
+        _prop("delta.dataSkippingNumIndexedCols", _H, _H, _H),
+        _prop("delta.checkpoint.writeStatsAsStruct", _H, _H, _H),
         # --- delta-rs stores but does not act on
         _prop(
             "delta.checkpointPolicy",
             _ST,
-            _RJ,
+            _ST,
             _H,
             False,
             "delta-rs stores it but adds no v2Checkpoint feature, so a v2 policy "
             "is inert there; the kernel honors it",
         ),
-        _prop("delta.checkpointInterval", _ST, _RJ, _H),
+        _prop("delta.checkpointInterval", _H, _H, _H),
         _prop("delta.logRetentionDuration", _H, _H, _H),
         _prop("delta.deletedFileRetentionDuration", _H, _H, _H),
-        _prop("delta.enableExpiredLogCleanup", _ST, _RJ, _H),
-        _prop("delta.setTransactionRetentionDuration", _ST, _RJ, _H),
-        _prop("delta.dataSkippingStatsColumns", _ST, _RJ, _H),
-        _prop("delta.checkpoint.writeStatsAsJson", _ST, _RJ, _H),
+        _prop("delta.enableExpiredLogCleanup", _ST, _ST, _H),
+        _prop("delta.setTransactionRetentionDuration", _ST, _ST, _H),
+        _prop("delta.dataSkippingStatsColumns", _ST, _ST, _H),
+        _prop("delta.checkpoint.writeStatsAsJson", _ST, _ST, _H),
         _prop("delta.targetFileSize", _H, _H, _UN, False, "delta-rs-only writer hint"),
         _prop("delta.isolationLevel", _H, _H, _UN),
-        _prop("delta.tuneFileSizesForRewrites", _ST, _RJ, _UN, True),
-        _prop("delta.autoOptimize.optimizeWrite", _ST, _RJ, _UN, True),
-        _prop("delta.autoOptimize.autoCompact", _ST, _RJ, _UN, True),
-        _prop("delta.randomizeFilePrefixes", _ST, _RJ, _UN, True),
+        _prop("delta.tuneFileSizesForRewrites", _ST, _ST, _UN, True),
+        _prop("delta.autoOptimize.optimizeWrite", _ST, _ST, _UN, True),
+        _prop("delta.autoOptimize.autoCompact", _ST, _ST, _UN, True),
+        _prop("delta.randomizeFilePrefixes", _ST, _ST, _UN, True),
         # --- kernel only: delta-rs rejects these outright
         _prop("delta.enableRowTracking", _RJ, _RJ, _H),
         _prop("delta.enableInCommitTimestamps", _RJ, _RJ, _H),
@@ -1069,7 +1126,7 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
         _prop(
             "delta.minWriterVersion",
             _H,
-            _RJ,
+            _H,
             _UN,
             False,
             "raises the protocol without adding the matching features; prefer "

@@ -35,8 +35,11 @@ most complete, and it's C++.
 ## What makes it work
 
 Two open-source engines fail in opposite directions, so deltaswamp composes them
-per operation instead of picking one. delta-kernel reads 19 table features
-delta-rs refuses to open, including every `catalogManaged` table. delta-rs has
+per operation instead of picking one. delta-kernel opens tables delta-rs
+refuses to, including every `catalogManaged` table and anything with type
+widening, `vacuumProtocolCheck` or shredded variants, and it writes through
+several writer features that block delta-rs, in-commit timestamps and liquid
+clustering among them. delta-rs has
 MERGE, OPTIMIZE, VACUUM and RESTORE, none of which the kernel implements. So the
 kernel reads, delta-rs writes and maintains, and a Databricks SQL warehouse is
 an opt-in fallback for what neither can do.

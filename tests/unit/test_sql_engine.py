@@ -595,8 +595,11 @@ class TestStagedWrites:
         assert path.startswith("/Volumes/cat/sch/vol/deltaswamp-staging/")
         assert path.endswith(".parquet")
         assert pq.read_table(io.BytesIO(client.files.uploaded[path])).equals(data)
+        # Projected to the data's own columns: read_files adds `_rescued_data`,
+        # which INSERT ... BY NAME rejects as an extra column.
         assert rec.last == (
-            f"INSERT INTO {NAME} BY NAME SELECT * FROM read_files('{path}', format => 'parquet')"
+            f"INSERT INTO {NAME} BY NAME SELECT * FROM (SELECT `id`, `city` "
+            f"FROM read_files('{path}', format => 'parquet'))"
         )
         assert client.files.deleted == [path]
 
@@ -632,7 +635,9 @@ class TestStagedWrites:
     def test_overwrite(self) -> None:
         eng, rec, client = engine()
         eng.overwrite(table(), pa.table({"id": [1]}))
-        assert rec.last.startswith(f"INSERT OVERWRITE {NAME} BY NAME SELECT * FROM read_files(")
+        assert rec.last.startswith(
+            f"INSERT OVERWRITE {NAME} BY NAME SELECT * FROM (SELECT `id` FROM read_files("
+        )
         assert client.files.deleted
 
     def test_replace_where_orders_columns_like_the_table(self) -> None:
@@ -643,7 +648,7 @@ class TestStagedWrites:
         assert rec.sql == [
             f"SELECT * FROM {NAME} LIMIT 0",
             f"INSERT INTO {NAME} REPLACE WHERE day = 'd1' SELECT `id`, `day` "
-            f"FROM read_files('{path}', format => 'parquet')",
+            f"FROM (SELECT `day`, `id` FROM read_files('{path}', format => 'parquet'))",
         ]
         assert client.files.deleted == [path]
 
@@ -695,8 +700,8 @@ class TestMerge:
         )
         path = _staged_path(client)
         assert rec.last == (
-            f"MERGE INTO {NAME} AS `t` USING (SELECT * FROM read_files('{path}', format => "
-            "'parquet')) AS `s` ON t.id = s.id"
+            f"MERGE INTO {NAME} AS `t` USING (SELECT * FROM (SELECT `id`, `v`, `ts` "
+            f"FROM read_files('{path}', format => 'parquet'))) AS `s` ON t.id = s.id"
             " WHEN MATCHED AND s.ts > t.ts THEN UPDATE SET `t`.`v` = s.v"
             " WHEN MATCHED THEN UPDATE SET `t`.`id` = `s`.`id`, `t`.`v` = `s`.`v`"
             " WHEN MATCHED AND s.v IS NULL THEN DELETE"

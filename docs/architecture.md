@@ -66,13 +66,15 @@ asserts against.
 The two open-source engines fail in opposite directions, so this library
 composes them per operation instead of choosing one.
 
-delta-kernel evaluates feature support per operation and ignores writer-only
-features when reading. delta-rs does a flat set-difference against a hardcoded
-list, and its write check calls its read check first. The practical consequence
-is large: there are 19 table features the kernel reads happily and delta-rs
-refuses to even open, including every `catalogManaged` table and anything
-carrying `vacuumProtocolCheck`, which blocks reads because it is a ReaderWriter
-feature despite the name.
+delta-kernel evaluates feature support per operation, ignores writer-only
+features when reading, and writes several that delta-rs cannot. delta-rs also
+ignores writer-only features on read -- probed against deltalake 1.6.5, it opens
+row-tracked, liquid-clustered and in-commit-timestamp tables -- but refuses
+seven reader-writer features the kernel reads: `catalogManaged` (and its
+preview), type widening (both spellings), shredded variants (both spellings),
+and `vacuumProtocolCheck`, which blocks reads because it is a ReaderWriter
+feature despite the name. On the write side the gap is wider: eleven writer
+features delta-rs reads but will not write, several of which the kernel does.
 
 Run it the other way and delta-rs wins outright. The kernel has no MERGE, no
 `replaceWhere`, no schema evolution on write, no OPTIMIZE, no Z-ORDER, no

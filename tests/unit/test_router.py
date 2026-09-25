@@ -108,11 +108,17 @@ class TestCatalogLevelRefusals:
         assert not got.ok and "FOREIGN" in got.reason
 
     def test_manifest_absent_read_capability_is_decisive(self) -> None:
-        """A row filter removes an ordinary managed table from the eligible set,
-        and nothing in the protocol reveals that."""
         got = router().capability(Operation.SCAN, table(external_read_supported=False))
         assert not got.ok
-        assert "row filter" in got.reason
+        assert "HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT" in got.reason
+
+    def test_access_policy_is_named_in_the_refusal(self) -> None:
+        """A row filter or mask makes vending refuse, while the manifest still
+        claims direct reads -- so the catalog reports the policy itself."""
+        t = table(external_read_supported=False, access_policy="row filter main.s.rf")
+        got = router().capability(Operation.SCAN, t)
+        assert not got.ok
+        assert "row filter main.s.rf" in got.reason
 
     def test_manifest_write_capability_blocks_writes_only(self) -> None:
         t = table(external_write_supported=False, external_read_supported=True)

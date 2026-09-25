@@ -190,6 +190,9 @@ class ResolvedTable:
     # not tell you.
     external_read_supported: bool | None = None
     external_write_supported: bool | None = None
+    #: A row filter or column mask, described. Either one makes credential
+    #: vending refuse the table while its manifest still claims direct reads.
+    access_policy: str | None = None
 
     # Catalog-managed state, supplied to SnapshotBuilder.
     log_tail: tuple[LogTailEntry, ...] = ()

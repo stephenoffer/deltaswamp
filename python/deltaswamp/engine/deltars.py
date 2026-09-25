@@ -24,6 +24,7 @@ from collections.abc import Iterator
 from typing import Any, Literal
 
 from ..capability import (
+    FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
     OPERATION_ENGINES,
     Capability,
@@ -41,6 +42,11 @@ from ..properties import effect_for, validate_properties
 from .base import missing_method
 
 __all__ = ["DeltaRsEngine"]
+
+_RESTORE_DV_REASON = (
+    "the table has deletion vectors, and delta-rs RESTORE silently fails to revert DV "
+    "changes -- it reports success and leaves the rows deleted (delta-rs#4613)"
+)
 
 _READ_ONLY_OPS: frozenset[Operation] = frozenset(
     {Operation.SCAN, Operation.TIME_TRAVEL, Operation.CDF, Operation.HISTORY, Operation.DETAIL}
@@ -121,6 +127,18 @@ class DeltaRsEngine:
                 remedy="read the source table directly",
             )
 
+        if _vends_gcs_bearer_token(table):
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is on GCS and its credential is a vended OAuth bearer token, "
+                    "which deltalake cannot use: it ignores the token and falls back to the "
+                    "GCE metadata server"
+                ),
+                remedy="reads route to the kernel, whose store accepts bearer tokens",
+            )
+
         writing = operation not in _READ_ONLY_OPS
 
         if writing and table.has_iceberg_compat:
@@ -171,6 +189,26 @@ class DeltaRsEngine:
                 remedy="the kernel sets clustering through its data layout",
             )
 
+        # Refusals that depend on the table's shape belong here rather than
+        # inside the operation: raised at run time, they stop the router from
+        # trying the next engine, which can often serve the same request.
+        if operation is Operation.CDF:
+            try:
+                self._guard_cdf(table)
+            except UnreachableTableError as exc:
+                return Capability(operation, ok=False, reason=exc.reason, remedy=exc.remedy or "")
+        if operation is Operation.RESTORE and "deletionVectors" in table.reader_features:
+            return Capability(operation, ok=False, reason=_RESTORE_DV_REASON)
+        if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
+            refusal = _add_feature_refusal(table, shape["features"])
+            if refusal is not None:
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason=refusal,
+                    remedy="the kernel adds the feature together with its dependencies",
+                )
+
         unusable = self._unusable_properties(shape.get("properties"), operation)
         if unusable:
             return Capability(
@@ -208,6 +246,7 @@ class DeltaRsEngine:
         if table.credential_provider is not None:
             op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
             options.update(table.credential_provider.credentials(op).as_storage_options())
+            _pin_s3_endpoint(options)
         return options
 
     def _open(
@@ -621,11 +660,7 @@ class DeltaRsEngine:
             # delta-rs 0.31+ proceeds without error and leaves DV changes in
             # place, so the table reads wrong afterwards (delta-rs#4613).
             raise UnreachableTableError(
-                "restore",
-                "the table has deletion vectors, and delta-rs RESTORE silently fails to "
-                "revert DV changes -- it reports success and leaves the rows deleted "
-                "(delta-rs#4613)",
-                "perform the restore from Databricks",
+                "restore", _RESTORE_DV_REASON, "perform the restore from Databricks"
             )
         result: dict[str, Any] = self._open(table, write=True).restore(target, **kwargs)
         return result
@@ -647,7 +682,20 @@ class DeltaRsEngine:
             self._open(table, write=True).alter.set_table_properties(properties, **kwargs)
 
     def add_feature(self, table: ResolvedTable, feature: Any, **kwargs: Any) -> None:
-        self._open(table, write=True).alter.add_feature(feature, **kwargs)
+        from deltalake import TableFeatures
+
+        names = feature if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
+        members = []
+        for name in names:
+            wire = _wire_name(name)
+            if wire not in _DELTARS_FEATURES:
+                raise UnreachableTableError(
+                    f"add table feature {wire!r} with delta-rs",
+                    "delta-rs's TableFeatures has no member for it",
+                )
+            members.append(getattr(TableFeatures, _DELTARS_FEATURES[wire]))
+        kwargs.setdefault("allow_protocol_versions_increase", True)
+        self._open(table, write=True).alter.add_feature(members, **kwargs)
 
     def add_constraint(
         self, table: ResolvedTable, constraints: dict[str, str], **kwargs: Any
@@ -729,6 +777,100 @@ class DeltaRsEngine:
 
     def execute_scan(self, table: ResolvedTable, splits: list[Any], **kwargs: Any) -> Any:
         raise NotImplementedError("see plan_scan")
+
+
+#: Wire name -> member of `deltalake.TableFeatures`, which is all delta-rs's
+#: `alter.add_feature` accepts; it raises a TypeError on a plain string.
+_DELTARS_FEATURES: dict[str, str] = {
+    "appendOnly": "AppendOnly",
+    "changeDataFeed": "ChangeDataFeed",
+    "checkConstraints": "CheckConstraints",
+    "columnMapping": "ColumnMapping",
+    "deletionVectors": "DeletionVectors",
+    "domainMetadata": "DomainMetadata",
+    "generatedColumns": "GeneratedColumns",
+    "icebergCompatV1": "IcebergCompatV1",
+    "identityColumns": "IdentityColumns",
+    "invariants": "Invariants",
+    "rowTracking": "RowTracking",
+    "timestampNanos": "TimestampNanos",
+    "timestampNtz": "TimestampWithoutTimezone",
+    "v2Checkpoint": "V2Checkpoint",
+    "variantType": "VariantType",
+    "variantType-preview": "VariantTypePreview",
+}
+
+
+def _wire_name(feature: Any) -> str:
+    value = getattr(feature, "value", feature)
+    return str(value)
+
+
+def _add_feature_refusal(table: ResolvedTable, features: Any) -> str | None:
+    """Why delta-rs must not add these features, or None if it may.
+
+    delta-rs adds whatever it is told, including features it cannot then write
+    and without their dependencies: rowTracking arrives without domainMetadata,
+    and the result is a table neither engine will write.
+    """
+    names = features if isinstance(features, (list, tuple, set, frozenset)) else [features]
+    wires = {_wire_name(n) for n in names}
+    present = set(table.reader_features) | set(table.writer_features) | wires
+    for wire in sorted(wires):
+        feature = feature_from_wire(wire)
+        if feature is None or wire not in _DELTARS_FEATURES:
+            return f"delta-rs cannot add {wire!r}: it has no such table feature"
+        if FEATURE_SUPPORT[feature].deltars_write is not Support.YES:
+            return f"adding {wire!r} with delta-rs would leave a table delta-rs cannot write"
+        missing = {d.value for d in FEATURE_DEPENDENCIES.get(feature, frozenset())} - present
+        if missing:
+            return (
+                f"{wire!r} requires {', '.join(sorted(missing))}, which delta-rs does not "
+                "add alongside it"
+            )
+    return None
+
+
+def _vends_gcs_bearer_token(table: ResolvedTable) -> bool:
+    """Whether reaching this table means a GCS OAuth bearer token.
+
+    Both Unity Catalog flavours vend GCS access as a raw token. object_store has
+    no option key for one -- the native crate builds its GCS store by hand for
+    exactly this -- and deltalake silently drops it.
+    """
+    location = table.location or ""
+    provider = table.credential_provider
+    if not location.startswith("gs://") or provider is None:
+        return False
+    from ..credentials.base import StaticCredentialProvider
+
+    if isinstance(provider, StaticCredentialProvider):
+        # Held, not minted, so reading it costs nothing -- and an expired one
+        # must not turn a routing question into a raise.
+        return "google_bearer_token" in provider._credentials.secrets
+    return True
+
+
+_S3_ENDPOINT_KEYS = frozenset({"aws_endpoint", "aws_endpoint_url", "endpoint", "endpoint_url"})
+
+
+def _pin_s3_endpoint(options: dict[str, str]) -> None:
+    """Give vended S3 keys an explicit regional endpoint.
+
+    With no endpoint, delta-rs treats the store as real AWS and builds an AWS SDK
+    config via `aws_config::from_env()`, whose region chain ignores the
+    `aws_region` we pass and ends at EC2 instance metadata. Off EC2 that costs
+    three one-second connect timeouts on the first open in every process, and
+    the SDK config is pointless here: the credentials are already static. An
+    endpoint makes delta-rs hand the keys straight to object_store instead.
+    """
+    region = options.get("aws_region")
+    if not region or "aws_access_key_id" not in options:
+        return
+    if any(k.lower() in _S3_ENDPOINT_KEYS for k in options):
+        return
+    suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+    options["aws_endpoint"] = f"https://s3.{region}.{suffix}"
 
 
 def _sql_literal(value: Any) -> str:

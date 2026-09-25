@@ -153,6 +153,16 @@ def _sdk_privileges(privileges: Iterable[str]) -> list[Any]:
     return out
 
 
+def _external(capabilities: frozenset[str] | None, flag: str, policy: str | None) -> bool | None:
+    """One manifest flag, overridden by a fine-grained access policy.
+
+    None means the catalog was never asked, which is not a refusal.
+    """
+    if policy is not None:
+        return False
+    return None if capabilities is None else flag in capabilities
+
+
 class DatabricksUnityCatalog:
     """Resolves tables in a Databricks-hosted Unity Catalog metastore.
 
@@ -275,6 +285,7 @@ class DatabricksUnityCatalog:
             properties.update(getattr(runtime, "delta_runtime_properties", None) or {})
 
         table_type = self._table_type(info)
+        policy = self._access_policy(info)
         resolved = ResolvedTable(
             ref=ref,
             location=getattr(info, "storage_location", None),
@@ -290,12 +301,9 @@ class DatabricksUnityCatalog:
             # exposes no Delta metadata id, so there is nothing to compare.
             etag=getattr(info, "etag", None),
             properties=properties,
-            external_read_supported=(
-                None if capabilities is None else CAP_EXTERNAL_READ in capabilities
-            ),
-            external_write_supported=(
-                None if capabilities is None else CAP_EXTERNAL_WRITE in capabilities
-            ),
+            external_read_supported=_external(capabilities, CAP_EXTERNAL_READ, policy),
+            external_write_supported=_external(capabilities, CAP_EXTERNAL_WRITE, policy),
+            access_policy=policy,
             credential_provider=(
                 DatabricksCredentialProvider(
                     table_id=info.table_id,
@@ -497,6 +505,7 @@ class DatabricksUnityCatalog:
                 raw=f"{catalog}.{schema}.{info.name}",
             )
             caps = self._manifest_capabilities(info)
+            policy = self._access_policy(info)
             out.append(
                 ResolvedTable(
                     ref=ref,
@@ -505,8 +514,9 @@ class DatabricksUnityCatalog:
                     data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
                     securable_kind=self._securable_kind(info),
                     table_id=getattr(info, "table_id", None),
-                    external_read_supported=(None if caps is None else CAP_EXTERNAL_READ in caps),
-                    external_write_supported=(None if caps is None else CAP_EXTERNAL_WRITE in caps),
+                    external_read_supported=_external(caps, CAP_EXTERNAL_READ, policy),
+                    external_write_supported=_external(caps, CAP_EXTERNAL_WRITE, policy),
+                    access_policy=policy,
                 )
             )
         return out
@@ -554,6 +564,27 @@ class DatabricksUnityCatalog:
                 cache = {}
             self._manifest_cache[key] = cache
         return self._manifest_cache[key].get(ref.table or "")
+
+    @staticmethod
+    def _access_policy(info: Any) -> str | None:
+        """The row filter or column masks on a table, described, or None.
+
+        Credential vending refuses such a table ("row filter or column mask not
+        supported on assigned clusters"), yet its capability manifest still
+        carries HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT -- observed on a live
+        workspace -- so the manifest alone cannot be trusted to rule it out.
+        """
+        found: list[str] = []
+        row_filter = getattr(info, "row_filter", None)
+        if row_filter is not None:
+            name = getattr(row_filter, "function_name", None)
+            found.append(f"row filter {name}" if name else "a row filter")
+        for column in getattr(info, "columns", None) or ():
+            mask = getattr(column, "mask", None)
+            if mask is not None:
+                name = getattr(mask, "function_name", None)
+                found.append(f"column mask on {column.name}" + (f" ({name})" if name else ""))
+        return "; ".join(found) or None
 
     @staticmethod
     def _manifest_capabilities(info: Any) -> frozenset[str] | None:

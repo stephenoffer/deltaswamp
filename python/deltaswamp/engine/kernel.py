@@ -10,11 +10,13 @@ it is a ReaderWriter feature, anything carrying `vacuumProtocolCheck`.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 from collections.abc import Iterator
 from typing import Any
 
 from ..capability import (
+    FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
     METADATA_OPERATIONS,
     Capability,
@@ -124,6 +126,9 @@ _IMPLEMENTED: frozenset[Operation] = frozenset(
 )
 
 
+_SHREDDING: frozenset[str] = frozenset({"variantShredding", "variantShredding-preview"})
+
+
 #: Features that block even a metadata-only commit written here: their
 #: semantics live in the schema or the log in ways this path does not model.
 _METADATA_BLOCKERS: frozenset[TableFeature] = frozenset(
@@ -134,6 +139,9 @@ _METADATA_BLOCKERS: frozenset[TableFeature] = frozenset(
         TableFeature.CATALOG_OWNED_PREVIEW,
         TableFeature.ADAPTIVE_METADATA_PREVIEW,
         TableFeature.GEOSPATIAL,
+        # Governs which checkpoints may be removed; readable, but a commit
+        # written without modelling it can corrupt history.
+        TableFeature.CHECKPOINT_PROTECTION,
     }
 )
 
@@ -346,6 +354,20 @@ class KernelEngine:
                     ),
                 )
 
+        if operation is Operation.CDF and table.is_catalog_managed:
+            # Decided here rather than in cdf(), so the router can move on to the
+            # warehouse's table_changes() instead of failing.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the kernel's TableChanges lists the log directly and takes no catalog "
+                    "commit tail, so on a catalog-managed table it would silently miss "
+                    "unpublished commits"
+                ),
+                remedy="ds.connect(..., allow_sql_fallback=True) reads it with table_changes()",
+            )
+
         if operation is Operation.SCAN and table.is_shallow_clone:
             # Its add actions point at the source table's files by absolute path.
             # Kernel resolves those before we see them, so we cannot scope
@@ -443,6 +465,27 @@ class KernelEngine:
         so both halves mean the same thing. Columns the predicate needs but the
         caller did not ask for are read and then dropped.
         """
+        stream = self._scan(table, columns, predicate, version, timestamp)
+        if table.features & _SHREDDING and importlib.util.find_spec("pyarrow") is not None:
+            # Databricks puts variantShredding (and enableVariantShredding) on
+            # every VARIANT table, but whether a file is actually shredded
+            # depends on its data, and the kernel fails on the ones that are.
+            # Reading eagerly raises that failure here, inside the call, where
+            # Table can hand the read to the next engine -- a lazy stream would
+            # raise it mid-iteration, past the point of any retry.
+            import pyarrow as pa
+
+            return pa.table(stream)
+        return stream
+
+    def _scan(
+        self,
+        table: ResolvedTable,
+        columns: list[str] | None,
+        predicate: str | None,
+        version: int | None,
+        timestamp: Any,
+    ) -> Any:
         snapshot = self.snapshot(table, version=version, timestamp=timestamp)
         if predicate is None:
             return snapshot.scan(columns=columns)
@@ -1112,9 +1155,19 @@ class KernelEngine:
         from . import metadata as m
 
         names = feature if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
+        wires = {str(getattr(n, "value", n)) for n in names}
+        # A feature arrives with what it depends on (rowTracking needs
+        # domainMetadata), or the commit is one other engines reject.
+        pending = list(wires)
+        while pending:
+            known = feature_from_wire(pending.pop())
+            for dep in FEATURE_DEPENDENCIES.get(known, frozenset()) if known else ():
+                if dep.value not in wires:
+                    wires.add(dep.value)
+                    pending.append(dep.value)
 
         def mutate(state: Any) -> Any:
-            props = {f"delta.feature.{getattr(n, 'value', n)}": "supported" for n in names}
+            props = {f"delta.feature.{n}": "supported" for n in sorted(wires)}
             return m.set_properties(state, props)
 
         return self._commit_metadata(table, mutate)

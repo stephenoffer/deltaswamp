@@ -304,6 +304,83 @@ reachable offline:
   OPTIMIZE, ANALYZE, ADD COLUMN and the comment/property DDL from unreachable to
   working.
 
+### Fixed by the live shape audit
+
+Found by building one managed table per shape Databricks produces (deletion
+vectors present, column mapping after renames, liquid and automatic clustering,
+type widening, variant, collations, geometry, row filters, masks, clones,
+catalog-managed, UniForm, and more) and checking every read, write and claim
+against the warehouse. `tests/integration/test_live_matrix.py` keeps doing so.
+
+- **Row filters and column masks were claimed readable, then failed.** Vending
+  refuses such a table, but its capability manifest keeps
+  `HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT`, so the router chose the kernel and
+  the read died on a `CredentialError` with the warehouse never tried. The
+  catalog now reads `row_filter` and column `mask` from the table itself; the
+  refusal names the policy, and with the fallback on the warehouse serves the
+  filtered, masked rows.
+- **Predicates on collated columns returned wrong answers.** Neither engine
+  knows collation order: `name = 'oslo'` on a `UTF8_LCASE` column found one row
+  where Databricks finds two. Predicate scans on a table with `collations` no
+  longer go to a direct engine. `collations` is also writer-only, so both
+  engines do read these tables, which the matrix denied.
+- **Every SQL-fallback append, overwrite and MERGE failed.** `read_files` adds a
+  `_rescued_data` column, and `INSERT ... BY NAME` rejected it as
+  `TOO_MANY_DATA_COLUMNS`. The staged relation is projected to the uploaded
+  columns.
+- **Change data feeds of Databricks tables could not be read.** delta-rs came
+  first and cannot decode the CDF files Databricks writes ("cannot skip
+  miniblock of size 256"). The kernel now serves CDF. delta-rs's refusals for
+  column-mapped CDF, and for RESTORE on deletion vectors, moved into
+  `supports()`, so the router can try the next engine instead of raising.
+- **Shredded variants and geometry columns were claimed readable.** Databricks
+  enables shredding on every VARIANT table but shreds a file only when its
+  values share a shape, and the kernel fails on shredded files mid-stream. On
+  such tables the kernel now reads eagerly, so the failure happens inside the
+  call and the read moves to the next engine. A `geometry(...)` type breaks both
+  engines' log parsing: the router no longer picks a direct engine for a table
+  whose log failed to open even when the fallback is on, and the protocol is
+  recovered from the catalog's `delta.feature.*` properties so the refusal
+  names `geospatial`.
+- **`add_feature` could leave a table no engine would write.** delta-rs was
+  first for every feature, took only its own enum (a `TypeError` on a name),
+  and added `rowTracking` without `domainMetadata`. It now takes only features
+  it can then write with their dependencies present; the kernel adds
+  dependencies alongside.
+- **Managed tables could not be created.** Databricks refuses its staging-table
+  API to connectors it has not allowlisted. With the fallback on,
+  `create_table` and `write_table` now issue `CREATE TABLE` on the warehouse.
+- **A read an engine claimed but could not do failed outright.** delta-rs cannot
+  parse the statistics Databricks writes for a CLONE (`-1` where it wants a
+  u64). Read-only operations now move to the next capable engine and say so
+  with `EngineFallbackWarning`.
+- The first delta-rs open of an S3 table in each process spent ~3s on EC2
+  metadata timeouts: without an endpoint delta-rs builds an AWS SDK config whose
+  region chain ignores `aws_region`. Vended keys now carry a regional endpoint.
+- Vended GCS bearer tokens are ignored by deltalake, which then tries the GCE
+  metadata server; delta-rs now refuses those tables.
+- The warehouse no longer claims Z-ORDER on liquid-clustered tables, a type
+  change without type widening, a column drop or rename without column mapping,
+  or DESCRIBE HISTORY/DETAIL on views and materialized views -- all of which
+  Databricks rejects. No engine claims DELETE, UPDATE or an overwrite on an
+  append-only table, or time travel, CDF or RESTORE on one with a row filter or
+  mask.
+- **Reads after a write through the same handle were stale on catalog-managed
+  tables.** The snapshot stayed pinned to the catalog version captured at
+  resolve time, so a DELETE followed by `count()` returned the old count, and a
+  MERGE sourced from `head()` inserted rows it should have matched. A commit
+  now re-resolves the commit tail before the next operation.
+- **FOREIGN, `hive_metastore` and catalog-managed ALTER were refused even with
+  the fallback on**, while naming `allow_sql_fallback=True` as the remedy.
+  They now route to the warehouse.
+- `history()` returned `timestamp` as epoch milliseconds from delta-rs and as a
+  datetime from the warehouse; it is milliseconds from every engine.
+- The feature and property matrices were re-probed against deltalake 1.6.5.
+  delta-rs reads writer-only features (row tracking, clustering, in-commit
+  timestamps, identity columns and more), which were marked unreadable, and its
+  ALTER takes most properties it takes at create. `icebergWriterCompatV1/V3`,
+  which Databricks sets on every `USING ICEBERG` table, are now known features.
+
 ### Changed
 
 - `vacuum()` defaults to Delta's standard (full) VACUUM on every engine;
@@ -313,10 +390,23 @@ reachable offline:
 
 ### Known limits
 
-- **There is no way to author deletion vectors.** `Transaction::update_deletion_vectors`
-  is absent from delta-kernel 0.28. DML on kernel-only tables is a whole-table
-  rewrite bounded by `KernelEngine.rewrite_max_bytes`, refused on row-tracked
-  tables; MERGE on those tables needs the SQL fallback.
+- **Deletion vectors are not authored here yet.** delta-kernel 0.28 has the
+  pieces (`StreamingDeletionVectorWriter`, and `update_deletion_vectors` behind
+  the `internal-api` feature this crate enables), but they are not bound. DML on
+  kernel-only tables is a whole-table rewrite bounded by
+  `KernelEngine.rewrite_max_bytes`, refused on row-tracked tables; MERGE on
+  those tables needs the SQL fallback.
+- The kernel's change feed fails when the requested range crosses a schema
+  change (a column added or dropped), and the error surfaces mid-stream, so it
+  cannot be retried elsewhere. Start the range after the change, or read it
+  through the warehouse's `table_changes()`.
+- Managed Databricks tables grant no external writes
+  (`HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT` is absent, catalog-managed tables
+  included, unless the workspace preview is on), so every write to one goes
+  through the SQL fallback. History of a catalog-managed table likewise needs
+  the warehouse until the kernel's commit-range API is bound.
+- A Delta Sharing server may omit table configuration, so change-feed support
+  on a share is discovered by asking, not decided up front.
 - The change feed of a catalog-managed table needs the SQL fallback; the
   kernel's TableChanges takes no catalog commit tail.
 - Incremental reads without a change feed (the kernel's `incremental_scan`)
@@ -325,7 +415,7 @@ reachable offline:
   records the transaction identifier and appends the same one again, so the last
   committed version is checked before writing. A concurrent writer can still
   commit in between.
-- Parts of the SQL fallback and governance have been verified against fakes,
-  not a live workspace: statement parameters inside `TIMESTAMP AS OF` and
-  `table_changes()`, `INSERT ... BY NAME` / `WITH SCHEMA EVOLUTION`, the lineage
-  response shape, and the Databricks staging-table response.
+- `INSERT ... WITH SCHEMA EVOLUTION` has been verified against fakes only.
+  Timestamp travel and `table_changes()` by timestamp, `INSERT ... BY NAME`,
+  MERGE, the staging-table refusal, lineage, grants, tags, keys, volumes, clones
+  and UNDROP have been run against a live workspace.

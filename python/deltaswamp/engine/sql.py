@@ -79,7 +79,7 @@ _NOT_WRITABLE_TYPES = frozenset(
 
 #: Reads that only make sense on a Delta table with a transaction log.
 _LOG_READS: frozenset[Operation] = frozenset(
-    {Operation.TIME_TRAVEL, Operation.CDF, Operation.HISTORY}
+    {Operation.TIME_TRAVEL, Operation.CDF, Operation.HISTORY, Operation.DETAIL}
 )
 
 #: Tuning knobs from the delta-rs signatures that have no meaning on a
@@ -396,6 +396,57 @@ class SqlEngine:
                 ok=False,
                 reason=f"the table is a {kind.value}, which has no Delta log to read",
             )
+        if kind is TableType.MATERIALIZED_VIEW and operation in _LOG_READS:
+            # A materialized view is backed by Delta, but its log belongs to the
+            # pipeline: DESCRIBE HISTORY and DESCRIBE DETAIL both fail with
+            # EXPECT_TABLE_NOT_VIEW (observed live).
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is a materialized view, whose Delta log is managed by its "
+                    "pipeline; the warehouse refuses DESCRIBE HISTORY and DESCRIBE DETAIL on it"
+                ),
+            )
+        widening = {"typeWidening", "typeWidening-preview"} & table.features or (
+            table.properties.get("delta.enableTypeWidening", "").lower() == "true"
+        )
+        if operation is Operation.ALTER_COLUMN_TYPE and table.features and not widening:
+            # Databricks answers DELTA_UNSUPPORTED_ALTER_TABLE_CHANGE_COL_OP even
+            # for INT -> BIGINT until type widening is on (observed live).
+            return Capability(
+                operation,
+                ok=False,
+                reason="type widening is not enabled on this table, and Databricks changes "
+                "a column's type only under it",
+                remedy="t.set_properties({'delta.enableTypeWidening': 'true'}) first",
+            )
+        mapping = table.properties.get("delta.columnMapping.mode", "none").lower()
+        if (
+            operation in (Operation.DROP_COLUMN, Operation.RENAME_COLUMN)
+            and table.features
+            and mapping not in ("name", "id")
+        ):
+            # DELTA_UNSUPPORTED_DROP_COLUMN otherwise (observed live): without
+            # column mapping a column's name is also its name in every file.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table does not use column mapping, and Databricks renames or "
+                "drops a column only under it",
+                remedy="t.set_properties({'delta.columnMapping.mode': 'name'}) first",
+            )
+        if operation is Operation.ZORDER and "clustering" in table.features:
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is liquid-clustered, and Databricks refuses Z-ORDER on it "
+                    "(DELTA_CLUSTERING_WITH_ZORDER_BY)"
+                ),
+                remedy="t.optimize() clusters by the table's clustering keys; "
+                "t.cluster_by([...]) changes them",
+            )
         if kind in _NOT_WRITABLE_TYPES and operation not in READ_OPERATIONS:
             return Capability(
                 operation,
@@ -680,8 +731,15 @@ class SqlEngine:
         path = f"/Volumes/{catalog}/{schema}/{volume}/{_STAGING_DIR}/{uuid.uuid4().hex}.parquet"
         files = self._workspace().files
         files.upload(path, io.BytesIO(payload), overwrite=False)
+        # Projected to the uploaded columns: read_files adds a `_rescued_data`
+        # column of its own, which makes INSERT ... BY NAME fail with
+        # TOO_MANY_DATA_COLUMNS on every table (observed live).
+        relation = (
+            f"(SELECT {_columns(arrow.column_names)} "
+            f"FROM read_files({_literal(path)}, format => 'parquet'))"
+        )
         try:
-            yield f"read_files({_literal(path)}, format => 'parquet')", arrow
+            yield relation, arrow
         finally:
             try:
                 files.delete(path)
@@ -1081,6 +1139,44 @@ class SqlEngine:
     ) -> dict[str, Any]:
         self.execute(operation, f"ALTER TABLE {_name(table)} {clause}", fetch=False)
         return _ok()
+
+    def create_managed(
+        self,
+        full_name: str,
+        schema: Any,
+        *,
+        partition_by: list[str] | None = None,
+        cluster_by: list[str] | None = None,
+        properties: dict[str, str] | None = None,
+        comment: str | None = None,
+    ) -> None:
+        """CREATE TABLE through the warehouse: an ordinary Databricks managed table.
+
+        The route when Unity Catalog's staging-table API refuses this client,
+        which Databricks does for any connector it has not allowlisted.
+        """
+        if partition_by and cluster_by:
+            raise UnreachableTableError(
+                f"create {full_name}", "a table is partitioned or clustered, not both"
+            )
+        nullable = {}
+        if hasattr(schema, "names") and hasattr(schema, "field"):
+            nullable = {schema.field(i).name: schema.field(i).nullable for i in range(len(schema))}
+        columns = ", ".join(
+            f"{_quote(n)} {_sql_type(t)}" + ("" if nullable.get(n, True) else " NOT NULL")
+            for n, t in _column_types(schema)
+        )
+        sql = f"CREATE TABLE {_qualified(full_name)} ({columns}) USING DELTA"
+        if partition_by:
+            sql += f" PARTITIONED BY ({_columns(partition_by)})"
+        if cluster_by:
+            sql += f" CLUSTER BY ({_columns(cluster_by)})"
+        if comment:
+            sql += f" COMMENT {_literal(comment)}"
+        if properties:
+            pairs = ", ".join(f"{_literal(k)} = {_literal(v)}" for k, v in properties.items())
+            sql += f" TBLPROPERTIES ({pairs})"
+        self.execute(Operation.CREATE, sql, fetch=False)
 
     def add_columns(self, table: ResolvedTable, fields: Any, **kwargs: Any) -> dict[str, Any]:
         """ADD COLUMNS. `fields` is ``{name: sql_type}`` or Arrow fields/schema."""

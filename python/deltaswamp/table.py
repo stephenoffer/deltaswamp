@@ -14,9 +14,11 @@ and everything afterwards routes on the complete picture.
 from __future__ import annotations
 
 import dataclasses
+import warnings
+from collections.abc import Callable
 from typing import Any
 
-from .capability import Capability, Operation
+from .capability import FEATURE_SUPPORT, Capability, FeatureKind, Operation, feature_from_wire
 from .capability import Engine as EngineKind
 from .catalog import Catalog, ResolvedTable, TableType
 from .catalog.filesystem import FilesystemCatalog
@@ -27,6 +29,7 @@ from .engine.kernel import KernelEngine
 from .errors import (
     CorruptTableError,
     DeltaSwampError,
+    EngineFallbackWarning,
     FallbackRequiredError,
     InvalidReferenceError,
     UnreachableTableError,
@@ -361,7 +364,23 @@ class Connection:
         from . import __version__, _native
         from .engine.metadata import arrow_to_delta_schema, initial_actions
 
-        staging = catalog.create_staging_table(ref)
+        try:
+            staging = catalog.create_staging_table(ref)
+        except DeltaSwampError:
+            # Nothing has been written yet, so the warehouse can take over
+            # cleanly -- if the caller allowed it.
+            sql: Any = self.router.engines.get(EngineKind.SQL)
+            if not self.router.allow_sql_fallback or sql is None:
+                raise
+            sql.create_managed(
+                ref.full_name,
+                schema,
+                partition_by=partition_by,
+                cluster_by=cluster_by,
+                properties=properties,
+                comment=comment,
+            )
+            return self.table(ref.full_name)
         configuration: dict[str, str] = {}
         # What the kernel's own UC create flow writes, then what this catalog
         # says it requires, then what the caller asked for.
@@ -823,6 +842,48 @@ class Connection:
         return list(check()) if callable(check) else []
 
 
+def _protocol_from_properties(resolved: ResolvedTable) -> dict[str, Any]:
+    """The protocol as the catalog records it, for a log no engine could read.
+
+    Unity Catalog mirrors `delta.minReaderVersion`, `delta.minWriterVersion` and
+    one `delta.feature.<name>` per feature into the table's properties. That is
+    enough to name the feature that makes the log unreadable -- which beats
+    reporting an empty feature set.
+    """
+    if resolved.reader_features or resolved.writer_features:
+        return {}
+    props = resolved.properties
+    names = {
+        key.removeprefix("delta.feature.")
+        for key, value in props.items()
+        if key.startswith("delta.feature.") and value.lower() in ("supported", "enabled")
+    }
+    if not names:
+        return {}
+
+    def version(key: str) -> int | None:
+        try:
+            return int(props[key])
+        except (KeyError, ValueError):
+            return None
+
+    reader_version = version("delta.minReaderVersion")
+    readers = set()
+    if reader_version is not None and reader_version >= 3:
+        for name in names:
+            feature = feature_from_wire(name)
+            # Unknown names are kept as reader features: refusing too much is
+            # recoverable, claiming a read that fails is not.
+            if feature is None or FEATURE_SUPPORT[feature].kind is not FeatureKind.WRITER:
+                readers.add(name)
+    return {
+        "min_reader_version": reader_version,
+        "min_writer_version": version("delta.minWriterVersion"),
+        "reader_features": frozenset(readers),
+        "writer_features": frozenset(names),
+    }
+
+
 class Table:
     """One table. Reads, writes, and an honest account of what it cannot do."""
 
@@ -833,6 +894,9 @@ class Table:
         self._resolved = resolved
         self._version = version
         self._enriched = False
+        #: Set by a commit through this handle on a table whose commit tail lives
+        #: in the catalog; the next operation re-resolves before reading.
+        self._catalog_stale = False
         # What the catalog said, kept apart from what the log says: the log is
         # the truth for table properties, and re-enrichment after an ALTER must
         # not let a stale earlier read win.
@@ -891,8 +955,20 @@ class Table:
         Enrichment caches the feature lists and properties read from the log.
         Any write or ALTER changes them, so a Table that kept the cache would
         keep reporting what was true before the call it just made.
+
+        A catalog-managed table needs more: its snapshot is pinned to the
+        catalog version captured at resolve time, so the kernel would keep
+        reading the table as it was before this very write (observed live: a
+        DELETE, then `count()` on the same handle returned the old count). Its
+        commit tail is re-fetched on the next operation, not here, so a failure
+        to reach the catalog surfaces there rather than after a write that
+        succeeded.
         """
         self._enriched = False
+        if self._version is None and (
+            self._resolved.is_catalog_managed or self._resolved.max_catalog_version is not None
+        ):
+            self._catalog_stale = True
 
     def _enrich(self) -> ResolvedTable:
         """Fill in the protocol feature lists by reading the log once.
@@ -903,6 +979,11 @@ class Table:
         open the table -- in which case routing proceeds on partial information
         and the engines themselves produce the refusal.
         """
+        if self._catalog_stale:
+            fresh = self._connection._reresolve(self).resolved
+            self._resolved = fresh
+            self._catalog_properties = dict(fresh.properties)
+            self._catalog_stale = False
         if self._enriched or self._resolved.location is None:
             return self._resolved
 
@@ -935,7 +1016,9 @@ class Table:
             return self._resolved
 
         if last_error is not None:
-            self._resolved = dataclasses.replace(self._resolved, open_error=last_error)
+            self._resolved = dataclasses.replace(
+                self._resolved, open_error=last_error, **_protocol_from_properties(self._resolved)
+            )
         return self._resolved
 
     # ------------------------------------------------------------ capabilities
@@ -968,6 +1051,44 @@ class Table:
     ) -> Any:
         return self._connection.router.engine_for(operation, self._enrich(), needs=needs, **shape)
 
+    def _read(
+        self,
+        operation: Operation,
+        call: Callable[[Any], Any],
+        needs: frozenset[str] = frozenset(),
+    ) -> Any:
+        """Serve a read-only operation, moving to the next engine if one breaks.
+
+        Routing decides from the protocol, but an engine can still choke on a
+        table it claims -- delta-rs cannot parse the file statistics Databricks
+        writes for a CLONE, for one. A read changes nothing, so trying the next
+        engine that claims it is safe. Refusals raised by this library are
+        deliberate and propagate as they are.
+        """
+        tried: set[EngineKind] = set()
+        while True:
+            engine: Any = self._connection.router.engine_for(
+                operation, self._enrich(), needs=needs, exclude=frozenset(tried)
+            )
+            try:
+                return call(engine)
+            except DeltaSwampError:
+                raise
+            except Exception as exc:
+                tried.add(engine.kind)
+                try:
+                    self._connection.router.engine_for(
+                        operation, self._resolved, needs=needs, exclude=frozenset(tried)
+                    )
+                except DeltaSwampError:
+                    raise exc from None
+                warnings.warn(
+                    f"{engine.kind.value} failed to serve {operation.value} "
+                    f"({type(exc).__name__}: {str(exc)[:200]}); trying the next engine",
+                    EngineFallbackWarning,
+                    stacklevel=3,
+                )
+
     # ------------------------------------------------------------------- read
 
     def scan(
@@ -995,14 +1116,17 @@ class Table:
             needs.add("predicates")
         if timestamp is not None:
             needs.add("timestamp_travel")
-        engine = self._engine(op, frozenset(needs))
-        return engine.scan(
-            self._resolved,
-            columns=columns,
-            predicate=predicate,
-            version=version if version is not None else self._version,
-            timestamp=timestamp,
-            limit=limit,
+        return self._read(
+            op,
+            lambda engine: engine.scan(
+                self._resolved,
+                columns=columns,
+                predicate=predicate,
+                version=version if version is not None else self._version,
+                timestamp=timestamp,
+                limit=limit,
+            ),
+            frozenset(needs),
         )
 
     def to_arrow(self, **kwargs: Any) -> Any:
@@ -1212,17 +1336,29 @@ class Table:
 
     def files(self) -> Any:
         """The table's live data files: path, size, partition values and statistics."""
-        return self._engine(Operation.FILES).files(self._resolved, version=self._version)
+        return self._read(
+            Operation.FILES, lambda engine: engine.files(self._resolved, version=self._version)
+        )
 
     def history(self, limit: int | None = None) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = self._engine(Operation.HISTORY).history(
-            self._resolved, limit=limit
+        """Commit history, newest first. `timestamp` is epoch milliseconds.
+
+        Milliseconds is what the Delta log records and what delta-rs and the
+        Iceberg engine return; the warehouse returns a datetime, so it is
+        converted here and the type no longer depends on which engine served.
+        """
+        result: list[dict[str, Any]] = self._read(
+            Operation.HISTORY, lambda engine: engine.history(self._resolved, limit=limit)
         )
+        for entry in result:
+            stamp: Any = entry.get("timestamp")
+            if hasattr(stamp, "timestamp"):
+                entry["timestamp"] = round(stamp.timestamp() * 1000)
         return result
 
     def detail(self) -> dict[str, Any]:
-        result: dict[str, Any] = self._engine(Operation.DETAIL).detail(
-            self._resolved, version=self._version
+        result: dict[str, Any] = self._read(
+            Operation.DETAIL, lambda engine: engine.detail(self._resolved, version=self._version)
         )
         return result
 
@@ -1231,7 +1367,8 @@ class Table:
 
         Rows carry `_change_type`, `_commit_version` and `_commit_timestamp`.
         """
-        return self._engine(Operation.CDF).cdf(self._resolved, **_given(kwargs))
+        given = _given(kwargs)
+        return self._read(Operation.CDF, lambda engine: engine.cdf(self._resolved, **given))
 
     def changes(
         self,
@@ -1570,7 +1707,10 @@ class Table:
         self._invalidate()
 
     def add_feature(self, feature: Any, **kwargs: Any) -> None:
-        self._engine(Operation.ADD_FEATURE).add_feature(self._resolved, feature, **kwargs)
+        names = list(feature) if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
+        self._engine(Operation.ADD_FEATURE, features=names).add_feature(
+            self._resolved, feature, **kwargs
+        )
         self._invalidate()
 
     def drop_feature(self, feature: str, **kwargs: Any) -> dict[str, Any]:
