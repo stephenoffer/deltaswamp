@@ -11,6 +11,7 @@ Uses stdlib HTTP so the base install needs no extra dependency.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import urllib.error
@@ -295,11 +296,9 @@ class OSSUnityCatalog:
         # Every Unity Catalog table is reachable through the catalog's Iceberg
         # REST endpoint when it has Iceberg metadata (managed Iceberg, foreign
         # Iceberg, UniForm); the Iceberg engine decides whether it applies.
-        import dataclasses as _dc
-
         from ..engine.iceberg import iceberg_rest_uri
 
-        resolved = _dc.replace(
+        resolved = dataclasses.replace(
             resolved, iceberg_rest_uri=iceberg_rest_uri(self._base_url, databricks=False)
         )
 
@@ -308,9 +307,8 @@ class OSSUnityCatalog:
         return resolved
 
     def _with_catalog_commits(self, resolved: ResolvedTable, ref: TableRef) -> ResolvedTable:
-        import dataclasses
-
-        path = f"{UC_DELTA_API}/catalogs/{ref.catalog}/schemas/{ref.schema}/tables/{ref.table}"
+        assert ref.table
+        path = self._delta_tables_path(ref, f"tables/{_q(ref.table)}")
         body = _request(self._base_url, path, self._token)
         entries, latest, location = parse_commit_tail(body, resolved.location)
         return dataclasses.replace(

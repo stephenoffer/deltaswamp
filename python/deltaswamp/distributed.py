@@ -120,7 +120,7 @@ class WritePlan:
         was made rather than failing on it, which is what an append means.
 
         It still has to win the race for its version, and concurrent jobs
-        genuinely collide: four committing at once leaves one winner and three
+        do collide: four committing at once leaves one winner and three
         conflicts. Rebasing an append is always correct, so `retries` defaults
         to `default_append_retries` and the losers simply commit at the next
         version. Pass `retries=0` to see the conflict instead.

@@ -399,7 +399,7 @@ class SqlEngine:
         if kind is TableType.MATERIALIZED_VIEW and operation in _LOG_READS:
             # A materialized view is backed by Delta, but its log belongs to the
             # pipeline: DESCRIBE HISTORY and DESCRIBE DETAIL both fail with
-            # EXPECT_TABLE_NOT_VIEW (observed live).
+            # EXPECT_TABLE_NOT_VIEW.
             return Capability(
                 operation,
                 ok=False,
@@ -413,7 +413,7 @@ class SqlEngine:
         )
         if operation is Operation.ALTER_COLUMN_TYPE and table.features and not widening:
             # Databricks answers DELTA_UNSUPPORTED_ALTER_TABLE_CHANGE_COL_OP even
-            # for INT -> BIGINT until type widening is on (observed live).
+            # for INT -> BIGINT until type widening is on.
             return Capability(
                 operation,
                 ok=False,
@@ -427,7 +427,7 @@ class SqlEngine:
             and table.features
             and mapping not in ("name", "id")
         ):
-            # DELTA_UNSUPPORTED_DROP_COLUMN otherwise (observed live): without
+            # DELTA_UNSUPPORTED_DROP_COLUMN otherwise: without
             # column mapping a column's name is also its name in every file.
             return Capability(
                 operation,
@@ -733,7 +733,7 @@ class SqlEngine:
         files.upload(path, io.BytesIO(payload), overwrite=False)
         # Projected to the uploaded columns: read_files adds a `_rescued_data`
         # column of its own, which makes INSERT ... BY NAME fail with
-        # TOO_MANY_DATA_COLUMNS on every table (observed live).
+        # TOO_MANY_DATA_COLUMNS on every table.
         relation = (
             f"(SELECT {_columns(arrow.column_names)} "
             f"FROM read_files({_literal(path)}, format => 'parquet'))"

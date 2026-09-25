@@ -37,7 +37,7 @@ from typing import Any
 from ..capability import Capability, Operation
 from ..capability import Engine as EngineKind
 from ..catalog import ResolvedTable
-from ..errors import UnreachableTableError
+from ..errors import SQL_FALLBACK_REMEDY, UnreachableTableError
 from .base import missing_method
 from .sharing import filter_arrow_exact
 
@@ -207,7 +207,7 @@ class IcebergEngine:
                 ok=False,
                 reason="the catalog reports no external-engine read support for this table "
                 "(usually a row filter or column mask)",
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         if operation in _WRITES:
@@ -225,7 +225,7 @@ class IcebergEngine:
                     operation,
                     ok=False,
                     reason="the catalog reports no external-engine write support for this table",
-                    remedy="ds.connect(..., allow_sql_fallback=True)",
+                    remedy=SQL_FALLBACK_REMEDY,
                 )
         elif operation not in _READS:
             return Capability(

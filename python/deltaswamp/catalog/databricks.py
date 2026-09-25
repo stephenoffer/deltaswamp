@@ -321,13 +321,11 @@ class DatabricksUnityCatalog:
         # Every Unity Catalog table is reachable through the catalog's Iceberg
         # REST endpoint when it has Iceberg metadata (managed Iceberg, foreign
         # Iceberg, UniForm); the Iceberg engine decides whether it applies.
-        import dataclasses as _dc
-
         from ..engine.iceberg import iceberg_rest_uri
 
         host = getattr(getattr(self.workspace, "config", None), "host", None) or self._host
         if host:
-            resolved = _dc.replace(
+            resolved = dataclasses.replace(
                 resolved, iceberg_rest_uri=iceberg_rest_uri(host, databricks=True)
             )
 
@@ -465,11 +463,9 @@ class DatabricksUnityCatalog:
 
     def _with_catalog_commits(self, resolved: ResolvedTable) -> ResolvedTable:
         """Attach the ratified commit tail and the max trustworthy version."""
-        import dataclasses
-
         ref = resolved.ref
         assert ref.catalog and ref.schema and ref.table
-        path = f"{UC_DELTA_API_BASE}/catalogs/{ref.catalog}/schemas/{ref.schema}/tables/{ref.table}"
+        path = self._delta_api_tables_path(ref, f"tables/{_segment(ref.table)}")
         try:
             body = self.workspace.api_client.do("GET", path)
         except Exception as exc:
@@ -571,8 +567,8 @@ class DatabricksUnityCatalog:
 
         Credential vending refuses such a table ("row filter or column mask not
         supported on assigned clusters"), yet its capability manifest still
-        carries HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT -- observed on a live
-        workspace -- so the manifest alone cannot be trusted to rule it out.
+        carries HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT, so the manifest alone
+        cannot rule it out.
         """
         found: list[str] = []
         row_filter = getattr(info, "row_filter", None)

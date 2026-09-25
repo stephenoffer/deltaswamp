@@ -103,6 +103,8 @@ class TestChangeDataFeed:
 
     def test_delta_rs_refuses_column_mapped_cdf_up_front(self) -> None:
         """Refused in supports(), so the router can try the next engine."""
+        # The assertions are on delta-rs's own verdicts, not on ours.
+        pytest.importorskip("deltalake")
         table = resolved(
             properties={"delta.enableChangeDataFeed": "true", "delta.columnMapping.mode": "name"}
         )
@@ -122,6 +124,8 @@ class TestChangeDataFeed:
 
 
 def test_restore_on_deletion_vectors_is_refused_in_supports() -> None:
+    # The assertions are on delta-rs's own verdicts, not on ours.
+    pytest.importorskip("deltalake")
     table = resolved(
         reader_features=frozenset({"deletionVectors"}),
         writer_features=frozenset({"deletionVectors"}),
@@ -140,6 +144,8 @@ class TestAddFeature:
     table neither engine would write."""
 
     def test_delta_rs_takes_features_it_can_then_write(self) -> None:
+        # The assertions are on delta-rs's own verdicts, not on ours.
+        pytest.importorskip("deltalake")
         verdict = DeltaRsEngine().supports(
             Operation.ADD_FEATURE, resolved(), features=["changeDataFeed", "v2Checkpoint"]
         )
@@ -208,6 +214,8 @@ class TestFineGrainedAccess:
 
 def test_vended_gcs_bearer_tokens_are_refused_by_delta_rs() -> None:
     """deltalake ignores the token and falls back to the GCE metadata server."""
+    # The assertions are on delta-rs's own verdicts, not on ours.
+    pytest.importorskip("deltalake")
     credentials = Credentials(
         cloud=Cloud.GCP, url="gs://b/t", expires_at=None, secrets={"google_bearer_token": "x"}
     )

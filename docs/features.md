@@ -1,30 +1,12 @@
-# Ecosystem audit
+# Feature map
 
-What exists for Delta Lake and Unity Catalog across Databricks and the open
-ecosystem, what a Python user can reach today, and how deltaswamp gets to each
-piece: by composing an existing library, by a thin integration, or by filling
-a gap itself.
+Every Delta Lake and Unity Catalog feature across Databricks and the open
+ecosystem, and how deltaswamp reaches it. Where a library already does the job,
+deltaswamp calls it. Its own code covers the gaps: the kernel binding,
+metadata-only commits, exact filtering for kernel predicates, staging flows,
+credential lifetimes, GCS bearer tokens and Azure endpoints.
 
-The rule behind every row is the one in the README. If a library already does
-something well, deltaswamp calls it and does not reimplement it. It writes its
-own code only where nothing exists (the kernel binding, metadata-only commits,
-exact filtering for kernel predicates, staging flows), or where the existing
-implementation is wrong for this use (credential lifetimes, GCS bearer tokens,
-Azure endpoints).
-
-- [The landscape](#the-landscape)
-- [How to read the matrices](#how-to-read-the-matrices)
-- [Reading](#reading)
-- [Writing and DML](#writing-and-dml)
-- [Schema and table DDL](#schema-and-table-ddl)
-- [Table features](#table-features)
-- [Maintenance and the log](#maintenance-and-the-log)
-- [Unity Catalog](#unity-catalog)
-- [Sharing and interoperability](#sharing-and-interoperability)
-- [Compute integrations](#compute-integrations)
-- [What remains out of reach](#what-remains-out-of-reach)
-
-## The landscape
+## Building blocks
 
 | Component | What it is | What deltaswamp takes from it |
 |---|---|---|
@@ -37,8 +19,8 @@ Azure endpoints).
 | PyIceberg | Iceberg in Python, including REST catalogs | managed and foreign Iceberg tables through UC's Iceberg REST endpoint |
 | DuckDB, Polars, Daft, Ray | query and compute engines | hand-offs over the Arrow PyCapsule interface, and `Connection.sql` |
 
-Nothing else in Python composes these. Each covers a slice and fails
-differently on the rest, which is the whole case for a router.
+Each covers a slice and fails differently on the rest, which is why
+deltaswamp routes between them.
 
 ## How to read the matrices
 
@@ -96,7 +78,7 @@ Several values in one cell are a routing chain, tried in order.
 | DELETE / UPDATE | DBR, Spark, delta-rs | delta-rs, warehouse, kernel (native rewrite) | copy-on-write; the kernel path rewrites the whole table in one commit, bounded in size |
 | MERGE | DBR, Spark, delta-rs | delta-rs, warehouse | one clause API for both; the warehouse merges from a staged source |
 | DML on catalog-managed tables | DBR | kernel (native rewrite), warehouse | DELETE/UPDATE/replaceWhere by rewrite; MERGE needs the warehouse; row-tracked tables need the warehouse |
-| Deletion-vector authoring | DBR, Spark | — | `Transaction::update_deletion_vectors` does not exist in kernel 0.28 |
+| Deletion-vector authoring | DBR, Spark | — | kernel 0.28 has `update_deletion_vectors` only as an internal API; not bound yet |
 | Row-level concurrency | DBR | — | a Databricks conflict-detection feature |
 | Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction. Catalog-managed tables included |
 | COPY INTO / Auto Loader | DBR | warehouse (`Connection.sql(engine="warehouse")`) | ingestion, not table access |
@@ -212,14 +194,14 @@ variant; all three are writer-only, so both engines read and neither writes.
 | Daft | `to_daft` | |
 | Cross-catalog SQL | `Connection.sql(query, tables=...)` | join a catalog-managed table with a Glue table and a path |
 
-## What remains out of reach
+## Out of reach
 
-Each of these is blocked, and the blocker is named, so it is clear what would
-unblock it.
+Each item names its blocker.
 
-- **Deletion-vector authoring**: delta-kernel-rs 0.28 has no
-  `update_deletion_vectors`. DML on kernel-only tables is therefore a bounded
-  whole-table rewrite, and MERGE and row-tracked tables need the warehouse.
+- **Deletion-vector authoring**: delta-kernel-rs 0.28 has
+  `update_deletion_vectors` only as an internal API, and it is not bound yet.
+  DML on kernel-only tables is therefore a bounded whole-table rewrite, and
+  MERGE and row-tracked tables need the warehouse.
 - **CDF on catalog-managed tables** outside Databricks: the kernel's
   `TableChanges` takes no catalog commit tail.
 - **Incremental reads without a change feed**: `incremental_scan` exists in
@@ -240,28 +222,9 @@ unblock it.
   deltaswamp sends `deltaswamp/<version>` (see `deltaswamp._sdk`), which is a
   precondition, not a solution: the name has to be registered with Databricks.
   Until it is, `create_table` for a managed table and any catalog-managed write
-  need `allow_sql_fallback=True`. **Reads are unaffected** — the commit tail for
-  a catalog-managed table comes from the same API and is served normally, which
-  is verified against a live workspace.
+  need `allow_sql_fallback=True`. Reads are unaffected: the commit tail for a
+  catalog-managed table comes from the same API and is served normally.
 - **Writing to a Unity Catalog managed table from outside Databricks at all**,
   where the metastore withholds `HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT`. This
   is a per-table decision by the catalog, not a protocol limit; the warehouse
   fallback serves those writes and the refusal says so.
-
-## What this pass found and fixed
-
-Auditing against the ecosystem also turned up defects in what already existed.
-They are listed here because each one was a claimed capability that did not
-work:
-
-- Catalog-managed appends never reached the catalog. The UC committer needs a
-  Tokio handle in scope, and the commit ran on a bare thread; no test had driven
-  a commit through a catalog end to end. The fake Unity Catalog now ratifies
-  commits the way the real one does, so this is covered.
-- The "checkpoint deadlock" was not a PyO3 problem. The default engine's
-  single-threaded background executor waits on itself inside the checkpoint
-  writer. Switching to the multi-threaded executor fixed it.
-- `OVERWRITE` was never routed to the kernel, so the documented full overwrite
-  of a catalog-managed table was unreachable.
-- Table properties read back stale after an ALTER.
-- 403s named the wrong missing privilege, because of an enum/str mismatch.

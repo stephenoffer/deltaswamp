@@ -1,7 +1,6 @@
 """Choosing an engine per operation, and explaining every refusal.
 
-The router is where "you shouldn't have to care what connects to what" is either
-kept honest or quietly becomes a lie. It follows three rules:
+The router follows three rules:
 
 1. Ask each candidate engine, in the preference order the conformance matrix
    defines, and take the first that says yes.
@@ -29,7 +28,7 @@ from .capability import (
     Engine as EngineKind,
 )
 from .catalog import ResolvedTable, TableType
-from .errors import FallbackRequiredError, UnreachableTableError
+from .errors import SQL_FALLBACK_REMEDY, FallbackRequiredError, UnreachableTableError
 
 __all__ = ["Router"]
 
@@ -217,8 +216,7 @@ class Router:
 
         Kept apart from the refusal itself: with the fallback on, these shapes
         are served by SQL rather than refused, so the router skips every other
-        engine instead. They used to refuse outright while naming
-        `allow_sql_fallback=True` as the remedy, so following it changed nothing.
+        engine instead.
         """
         if table.table_type is TableType.FOREIGN:
             return (
@@ -320,11 +318,11 @@ class Router:
                 reason=(
                     f"the table is a {kind}, which has no directly readable file surface. {detail}"
                 ),
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         # Refusals no engine can get around, because the table itself forbids
-        # the operation. Each was confirmed against a live warehouse.
+        # the operation.
         if (
             operation in _APPEND_ONLY_FORBIDS
             and table.properties.get("delta.appendOnly", "").lower() == "true"
@@ -355,7 +353,7 @@ class Router:
                 operation,
                 ok=False,
                 reason=warehouse_only,
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         # Both manifest flags describe DIRECT EXTERNAL ENGINE access: vending a
@@ -367,9 +365,8 @@ class Router:
         # which meant following the advice changed nothing.
         if table.external_read_supported is False and not sql_fallback:
             reason = (
-                f"the table has {table.access_policy}, and Unity Catalog credential vending "
-                "refuses any table with a row filter or column mask: only a Databricks "
-                "engine can evaluate them"
+                f"the table has {table.access_policy}, and Unity Catalog vends no "
+                "credentials for tables with row filters or column masks"
                 if table.access_policy
                 else "Unity Catalog reports no external-engine read support for this table "
                 "(HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT absent)"
@@ -378,7 +375,7 @@ class Router:
                 operation,
                 ok=False,
                 reason=reason,
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         writing = operation not in READ_OPERATIONS
@@ -390,7 +387,7 @@ class Router:
                     "Unity Catalog reports no external-engine write support for this table "
                     "(HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT absent)"
                 ),
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         # A table we could not open is not a table we can route. CREATE is
@@ -403,7 +400,7 @@ class Router:
                     "the table's Delta log could not be read, so no direct engine can "
                     f"serve this ({table.open_error})"
                 ),
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         if operation in DATABRICKS_ONLY_OPERATIONS and not self.allow_sql_fallback:
@@ -414,7 +411,7 @@ class Router:
                     f"{operation.value} has no open-source implementation in either delta-rs "
                     "or delta-kernel; it exists only in Databricks"
                 ),
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         return None

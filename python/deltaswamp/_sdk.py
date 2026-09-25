@@ -1,27 +1,13 @@
-"""Building Databricks SDK clients that identify this library.
+"""Databricks SDK clients that identify this library in their User-Agent.
 
-The Unity Catalog Delta API refuses any request whose User-Agent does not name
-the calling application::
-
-    The UC Delta API requires clients to identify the calling application in the
-    User-Agent header. The provided User-Agent 'unknown/0.0.0 databricks-sdk-py/...'
-    is insufficient.
-
-That is a 400 on `create_staging_table` and on every `/delta/v1` commit, so
-without this stamp managed-table creation and every catalog-managed write fail
-against a real workspace -- the two things this library exists to do. The SDK
-sends `unknown/0.0.0` unless a product is set, and nothing else in the stack
-sets one.
-
-The stamp goes on the `Config`, never through `useragent.with_product`, which is
-global process state: an application embedding deltaswamp keeps its own product
-identity, and only the clients built here are relabelled. A caller who passes an
-explicit `Config` with a product already set keeps it.
+The Unity Catalog Delta API rejects clients whose User-Agent names no
+application (the SDK default is `unknown/0.0.0`). The product is set per
+`Config`, not through the global `useragent.with_product`, so an application
+embedding deltaswamp keeps its own identity.
 """
 
 from __future__ import annotations
 
-import contextlib
 from typing import Any
 
 __all__ = ["PRODUCT", "product_kwargs", "sdk_version", "workspace_client"]
@@ -63,8 +49,7 @@ def workspace_client(*, config: Any = None, **kwargs: Any) -> Any:
         if not _has_product(config):
             # Stamping the object rather than rebuilding it keeps whatever auth
             # state the caller already resolved.
-            with contextlib.suppress(Exception):  # a Config that refuses the attribute
-                config._product_info = (PRODUCT, sdk_version())
+            config._product_info = (PRODUCT, sdk_version())
         return WorkspaceClient(config=config)
 
     return WorkspaceClient(**{**product_kwargs(), **kwargs})

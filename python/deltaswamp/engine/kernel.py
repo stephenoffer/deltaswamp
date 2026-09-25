@@ -31,6 +31,7 @@ from ..capability import (
 from ..catalog import ResolvedTable
 from ..credentials import Operation as CredentialOperation
 from ..errors import (
+    SQL_FALLBACK_REMEDY,
     BackfillRequiredError,
     CommitConflictError,
     TransientCommitError,
@@ -275,7 +276,7 @@ class KernelEngine:
                     "the table tracks row ids, and this commit would remove rows whose "
                     "ids delta-kernel 0.28 cannot preserve"
                 ),
-                remedy="ds.connect(..., allow_sql_fallback=True)",
+                remedy=SQL_FALLBACK_REMEDY,
             )
 
         if operation in _REWRITE_OPS:
@@ -621,6 +622,11 @@ class KernelEngine:
             **_feature_usage(snap),
         }
 
+    def txn_version(self, table: ResolvedTable, app_id: str) -> int | None:
+        """The last version committed under `app_id`, or None."""
+        version: int | None = self.snapshot(table).app_id_version(app_id)
+        return version
+
     # ------------------------------------------------------------------ write
 
     def _uc_commit_config(self, table: ResolvedTable) -> Any:
@@ -675,8 +681,7 @@ class KernelEngine:
         **unsupported: Any,
     ) -> int:
         """Append data and commit. Returns the committed version."""
-        # A bare **_ here used to swallow schema_mode, writer_properties and the
-        # rest, so they silently did nothing on a catalog-managed table.
+        # Refuse options this path would otherwise ignore.
         given = {k: v for k, v in unsupported.items() if v is not None}
         if given:
             raise UnreachableTableError(
@@ -1234,7 +1239,7 @@ class KernelEngine:
                     "CLUSTER BY AUTO",
                     "automatic key selection is Databricks predictive optimization, which "
                     "runs server-side",
-                    "ds.connect(..., allow_sql_fallback=True)",
+                    SQL_FALLBACK_REMEDY,
                 )
             columns = [columns]
         return self._commit_metadata(table, lambda s: m.cluster_by(s, list(columns or [])))

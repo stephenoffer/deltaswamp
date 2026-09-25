@@ -276,6 +276,8 @@ class Snapshot:
         writerFeatures (writer 7) only when the versions call for them.
         """
 
+    def app_id_version(self, app_id: str) -> int | None:
+        """The last version committed under `app_id` by a `txn` action, or None."""
     def domain_metadata(self, domain: str) -> str | None:
         """The configuration string of `domain`, or None if it has no live entry.
 

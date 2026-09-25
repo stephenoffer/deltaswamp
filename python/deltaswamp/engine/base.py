@@ -123,7 +123,7 @@ class Engine(Protocol):
 
         Must never raise for an unsupported combination -- return a `Capability`
         with `ok=False` and a reason naming the blocker. The router aggregates
-        these into `Table.capabilities()`, which is the library's honesty surface.
+        these into `Table.capabilities()`.
         """
         ...
 

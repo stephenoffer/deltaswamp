@@ -371,7 +371,7 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _Y,
             _N,
             "Databricks sets it on every USING ICEBERG table, which is catalog-managed "
-            "Delta with UniForm underneath (observed live). No kernel 0.28 variant, so "
+            "Delta with UniForm underneath. No kernel 0.28 variant, so "
             "writer-only and unknown: reads unaffected, writes blocked on both engines.",
         ),
         _row(
@@ -520,7 +520,7 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             _N,
             "kernel gates reads behind geo-type-in-dev, which this build does not "
-            "enable, fails on the geometry(...) schema type (observed live), and "
+            "enable, fails on the geometry(...) schema type, and "
             "errors on writes regardless. One feature covers both geometry and "
             "geography.",
         ),
@@ -532,7 +532,7 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             _P,
             _N,
-            "Databricks DBR 16.1, writer-only (observed live), so both engines open the "
+            "Databricks DBR 16.1, writer-only, so both engines open the "
             "table. Reads are partial: neither engine knows collation order, so a "
             "predicate on a collated column compares bytes -- name = 'oslo' misses "
             "'Oslo' under UTF8_LCASE. Predicate scans route to SQL. No kernel 0.28 "

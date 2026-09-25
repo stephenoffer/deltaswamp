@@ -27,6 +27,7 @@ from .credentials import Operation as CredentialOperation
 from .engine.deltars import DeltaRsEngine
 from .engine.kernel import KernelEngine
 from .errors import (
+    SQL_FALLBACK_REMEDY,
     CorruptTableError,
     DeltaSwampError,
     EngineFallbackWarning,
@@ -625,7 +626,7 @@ class Connection:
                 raise UnreachableTableError(
                     "run SQL on a warehouse",
                     "the SQL warehouse fallback is not enabled on this connection",
-                    "ds.connect(..., allow_sql_fallback=True)",
+                    SQL_FALLBACK_REMEDY,
                 )
             return sql_engine.query(query)
 
@@ -820,7 +821,7 @@ class Connection:
             raise FallbackRequiredError(
                 f"undrop {ref}",
                 "UNDROP is Databricks-only and runs on a SQL warehouse",
-                "ds.connect(..., allow_sql_fallback=True)",
+                SQL_FALLBACK_REMEDY,
             )
         sql_engine.undrop(ref.full_name)
 
@@ -885,7 +886,7 @@ def _protocol_from_properties(resolved: ResolvedTable) -> dict[str, Any]:
 
 
 class Table:
-    """One table. Reads, writes, and an honest account of what it cannot do."""
+    """One table: reads, writes, DDL and maintenance, routed per operation."""
 
     def __init__(
         self, connection: Connection, resolved: ResolvedTable, *, version: int | None = None
@@ -958,8 +959,7 @@ class Table:
 
         A catalog-managed table needs more: its snapshot is pinned to the
         catalog version captured at resolve time, so the kernel would keep
-        reading the table as it was before this very write (observed live: a
-        DELETE, then `count()` on the same handle returned the old count). Its
+        reading the table as it was before this very write. Its
         commit tail is re-fetched on the next operation, not here, so a failure
         to reach the catalog surfaces there rather than after a write that
         succeeded.
@@ -1026,8 +1026,7 @@ class Table:
     def capabilities(self) -> dict[Operation, Capability]:
         """What can and cannot be done with this table, and why.
 
-        The honesty surface. Every refusal names the blocker and, where one
-        exists, the remedy.
+        Every refusal names the blocker and, where one exists, the remedy.
         """
         return self._connection.router.capabilities(self._enrich())
 
@@ -1285,9 +1284,7 @@ class Table:
         """The first `n` rows.
 
         Consumes the scan stream batch by batch and stops as soon as `n` rows
-        are in hand, so this costs one batch on a table of any size. It used to
-        materialise the whole table and slice it, which on a multi-terabyte
-        table never returned.
+        are in hand, so this costs one batch on a table of any size.
 
         The stream is the engine's output, so deletion vectors, column mapping
         and partition values are already applied; stopping early here is not the
@@ -1556,17 +1553,11 @@ class Table:
     def _already_committed(self, txn: tuple[str, int]) -> bool:
         """True if `txn` was already committed, so the write should be skipped.
 
-        Neither engine deduplicates on its own -- verified against delta-rs
-        1.6.5, which records the txn action and appends anyway -- so the guard
-        lives here.
+        Neither engine deduplicates on its own: delta-rs 1.6.5 records the txn
+        action and appends anyway.
         """
         app_id, version = txn
-        try:
-            last = self.txn_version(app_id)
-        except Exception:
-            # No transaction log to read yet, or the engine cannot report it.
-            # Better to write than to silently drop data.
-            return False
+        last = self.txn_version(app_id)
         return last is not None and version <= last
 
     def txn_version(self, app_id: str) -> int | None:
@@ -1577,7 +1568,8 @@ class Table:
             if t.txn_version("nightly-load") != batch_id:
                 t.append(data, txn=("nightly-load", batch_id))
         """
-        version: int | None = self._engine(Operation.APPEND).txn_version(self._resolved, app_id)
+        engine = self._engine(Operation.APPEND, frozenset({"idempotent_txn"}))
+        version: int | None = engine.txn_version(self._resolved, app_id)
         return version
 
     def delete(self, predicate: str | None = None, **kwargs: Any) -> dict[str, Any]:
@@ -1962,7 +1954,7 @@ class Table:
             raise FallbackRequiredError(
                 what,
                 "row filters and column masks are defined in SQL and enforced by Databricks",
-                "ds.connect(..., allow_sql_fallback=True)",
+                SQL_FALLBACK_REMEDY,
             )
         return engine
 

@@ -361,6 +361,16 @@ impl PySnapshot {
         Ok(value)
     }
 
+    /// The last version committed under `app_id` by a `txn` action, or None.
+    fn app_id_version(&self, py: Python<'_>, app_id: &str) -> PyResult<Option<i64>> {
+        let version = py.detach(|| {
+            self.inner
+                .get_app_id_version(app_id, self.engine.as_ref())
+                .map_err(NativeError::from)
+        })?;
+        Ok(version)
+    }
+
     /// This snapshot's commit timestamp in milliseconds: the in-commit
     /// timestamp when ICT is enabled, else the commit file's modification time.
     fn timestamp(&self, py: Python<'_>) -> PyResult<i64> {

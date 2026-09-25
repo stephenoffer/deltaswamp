@@ -1,11 +1,10 @@
-"""Exception hierarchy.
-
-Design rule: every refusal names the blocker and, where one exists, the remedy.
-An opaque "unsupported table feature" error is the thing this library exists to
-eliminate, so we never raise one.
-"""
+"""Exceptions and warnings. Every refusal names the blocker and, where one
+exists, the remedy."""
 
 from __future__ import annotations
+
+#: The remedy for anything only a Databricks SQL warehouse can serve.
+SQL_FALLBACK_REMEDY = "ds.connect(..., allow_sql_fallback=True)"
 
 
 class DeltaSwampError(Exception):
@@ -17,11 +16,7 @@ class InvalidReferenceError(DeltaSwampError):
 
 
 class UnreachableTableError(DeltaSwampError):
-    """The table exists but no available engine can serve the request.
-
-    Carries the reason and, when one exists, the remedy -- so the message is
-    actionable rather than merely negative.
-    """
+    """The table exists but no available engine can serve the request."""
 
     def __init__(self, operation: str, reason: str, remedy: str | None = None) -> None:
         self.operation = operation
@@ -38,40 +33,27 @@ class FallbackRequiredError(UnreachableTableError):
 
 
 class PropertyNotSupportedError(UnreachableTableError):
-    """A table property the chosen engine cannot handle.
-
-    Raised instead of letting delta-rs emit its single opaque message for half
-    the Delta spec ("Error parsing property"), or panic outright.
-    """
+    """A table property the chosen engine cannot handle."""
 
 
 class EnginePanicError(DeltaSwampError):
     """An engine panicked across the FFI boundary.
 
-    A Rust panic surfaces in Python as `pyo3_runtime.PanicException`, which
-    derives from BaseException and so escapes `except Exception`. We convert it
-    so callers can actually handle it.
+    `pyo3_runtime.PanicException` derives from BaseException and escapes
+    `except Exception`, so panics are converted to this.
     """
 
 
 class CredentialExpiryWarning(UserWarning):
     """A read began with a vended credential that is close to expiring.
 
-    Re-vending happens *between* operations: the kernel builds its object store
-    once per snapshot, so a single scan that streams past the credential's
-    lifetime fails partway through with an opaque 403 from the storage layer.
-    Saying so up front turns that into something actionable.
+    Credentials are re-vended between operations, not during one, so a scan
+    that outlives its credential fails partway through with a 403.
     """
 
 
 class EngineFallbackWarning(UserWarning):
-    """An engine failed on a read it claimed, and the next engine is serving it.
-
-    Routing is decided from the protocol, which cannot foresee every defect in
-    an engine: delta-rs, for one, cannot parse the file statistics Databricks
-    writes for a CLONE. Reads are retried on the next capable engine, and this
-    says which one broke so the cost of the detour is never invisible.
-    """
+    """An engine failed on a read it claimed, and the next engine is serving it."""
 
 
 class IgnoredPropertyWarning(UserWarning):
@@ -97,17 +79,13 @@ class CommitConflictError(DeltaSwampError):
 class BackfillRequiredError(DeltaSwampError):
     """The catalog is refusing commits until unbackfilled commits are published.
 
-    This is the HTTP 429 from the UC commit API. It is NOT a rate limit --
-    retrying with backoff instead of publishing will wedge the table.
+    This is the HTTP 429 from the UC commit API. It is not a rate limit:
+    retrying with backoff instead of publishing wedges the table.
     """
 
 
 class TransientCommitError(DeltaSwampError):
-    """A commit failed for a transient reason; the table is unchanged.
-
-    Distinct from a conflict: nobody else won the version, so the very same
-    transaction can simply be tried again.
-    """
+    """A commit failed for a transient reason; retrying the same commit is safe."""
 
 
 class CorruptTableError(DeltaSwampError):

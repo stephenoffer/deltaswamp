@@ -1,9 +1,4 @@
-"""Every write mode, on a real table.
-
-The spec has more write modes than either engine implements, and the ones that
-are missing used to be silently dropped kwargs. Each mode gets a test that
-checks the data afterwards, not just that the call returned.
-"""
+"""Every write mode, on a real table, checked by the data it leaves behind."""
 
 from __future__ import annotations
 
@@ -156,6 +151,17 @@ class TestIdempotentWrites:
         assert plain.txn_version("loader") is None
         plain.append(pa.table({"id": [3], "city": ["cairo"]}), txn=("loader", 7))
         assert plain.txn_version("loader") == 7
+
+    def test_replay_is_a_no_op_on_the_kernel_path(self, conn: Any, tmp_path: Any) -> None:
+        schema = pa.schema([("id", pa.int64())])
+        t = conn.create_table(
+            str(tmp_path / "ict"), schema, properties={"delta.enableInCommitTimestamps": "true"}
+        )
+        assert t.can("append").engine == Engine.KERNEL
+        t.append(pa.table({"id": [1]}), txn=("loader", 1))
+        t.append(pa.table({"id": [1]}), txn=("loader", 1))
+        assert t.txn_version("loader") == 1
+        assert t.count() == 1
 
 
 class TestCommitMetadata:
