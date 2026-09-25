@@ -45,7 +45,7 @@ jobs:
           assert set(available_catalogs()) == {'databricks','filesystem','glue','hive','unity'}
           print('wheel OK', ds.__version__)
           "
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: dist
@@ -60,7 +60,7 @@ jobs:
           args: --out dist
           # rust-toolchain.toml pins the version; the action honours it.
           rust-toolchain: "1.88"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist
