@@ -863,7 +863,7 @@ class TestEnforcementIsNotBypassed:
         plan.commit([plan.write(pa.table({"id": [1]}))])
         assert conn.open_table(location).to_arrow().num_rows == 1, "append still works"
 
-        with pytest.raises(UnreachableTableError, match="row ids|rowTracking"):
+        with pytest.raises(UnreachableTableError, match=r"row ids|rowTracking"):
             conn.open_table(location).plan_write(mode="overwrite")
 
     def test_deletion_vectors_do_not_block_an_overwrite(self, conn: Any) -> None:
