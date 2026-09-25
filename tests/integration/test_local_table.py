@@ -901,3 +901,125 @@ class TestEnforcementIsNotBypassed:
             conn.open_table(amounts).plan_write()
         with pytest.raises(Exception, match=r"(?i)invalid data|constraint"):
             conn.open_table(amounts).append(pa.table({"id": [3], "amt": [-5]}))
+
+
+class TestTheKernelWritePathIsVersionBound:
+    """What rules a table out of a kernel write is its protocol *version*.
+
+    A legacy writer version implies a whole feature set. Version 3 and above
+    imply `checkConstraints`, which the kernel refuses whether or not a single
+    constraint exists -- so enabling change data feed, which alone puts a table
+    at version 4, takes it off the kernel write path entirely. The same features
+    are fine on a version 7 table, where only what is *named* applies.
+    """
+
+    @staticmethod
+    def _table(conn: Any, properties: dict[str, str]) -> Any:
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        conn.create_table(location, pa.schema([("id", pa.int64())]), properties=properties)
+        return location
+
+    @pytest.mark.parametrize(
+        ("properties", "writable"),
+        [
+            ({}, True),
+            ({"delta.enableChangeDataFeed": "true"}, False),
+            ({"delta.columnMapping.mode": "name"}, False),
+            ({"delta.enableChangeDataFeed": "true", "delta.enableRowTracking": "true"}, True),
+            ({"delta.columnMapping.mode": "name", "delta.enableDeletionVectors": "true"}, True),
+        ],
+        ids=["plain-v2", "cdf-v4", "colmap-v5", "cdf-v7", "colmap-v7"],
+    )
+    def test_writability_follows_the_protocol_version(
+        self, conn: Any, properties: dict[str, str], writable: bool
+    ) -> None:
+        location = self._table(conn, properties)
+        if writable:
+            plan = conn.open_table(location).plan_write()
+            plan.commit([plan.write(pa.table({"id": [1]}))])
+            assert conn.open_table(location).to_arrow().num_rows == 1
+        else:
+            with pytest.raises(UnreachableTableError):
+                conn.open_table(location).plan_write()
+
+    def test_a_refusal_says_when_the_feature_is_only_implied(self, conn: Any) -> None:
+        """A CDF table with no constraints must not send its owner hunting."""
+        location = self._table(conn, {"delta.enableChangeDataFeed": "true"})
+        with pytest.raises(UnreachableTableError, match="neither names nor uses") as caught:
+            conn.open_table(location).plan_write()
+        assert "writer version 4 implies" in str(caught.value)
+
+    def test_the_note_omits_a_feature_the_table_really_uses(self, conn: Any) -> None:
+        location = self._table(conn, {"delta.enableChangeDataFeed": "true"})
+        conn.open_table(location).append(pa.table({"id": [1]}))
+        conn.open_table(location).add_constraint({"positive": "id > 0"})
+
+        with pytest.raises(UnreachableTableError) as caught:
+            conn.open_table(location).plan_write()
+        message = str(caught.value)
+        assert "neither names nor uses generatedColumns" in message
+        assert "neither names nor uses checkConstraints" not in message, (
+            "the table really has a constraint; saying otherwise sends the reader astray"
+        )
+
+
+class TestDistributedWriteOutputIsPortable:
+    """A connector's output is worth nothing if only this library can read it."""
+
+    @pytest.mark.parametrize(
+        "properties",
+        [{}, {"delta.enableRowTracking": "true"}, {"delta.enableInCommitTimestamps": "true"}],
+        ids=["plain", "rowTracking", "inCommitTimestamps"],
+    )
+    def test_delta_rs_reads_back_exactly_what_we_wrote(
+        self, conn: Any, properties: dict[str, str]
+    ) -> None:
+        import os
+        import tempfile
+
+        from deltalake import DeltaTable
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        conn.create_table(
+            location,
+            pa.schema([("id", pa.int64()), ("region", pa.string())]),
+            properties=properties,
+        )
+        plan = conn.open_table(location).plan_write()
+        plan.commit(
+            [
+                plan.write(pa.table({"id": [i], "region": ["us" if i % 2 else "eu"]}))
+                for i in range(6)
+            ]
+        )
+
+        ours = conn.open_table(location).to_arrow().to_pydict()
+        theirs = DeltaTable(location).to_pyarrow_table().to_pydict()
+        assert sorted(ours["id"]) == sorted(theirs["id"]) == list(range(6))
+        assert sorted(ours["region"]) == sorted(theirs["region"])
+
+    def test_a_partitioned_write_is_readable_by_delta_rs(self, conn: Any) -> None:
+        import os
+        import tempfile
+
+        from deltalake import DeltaTable
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        conn.create_table(
+            location,
+            pa.schema([("id", pa.int64()), ("region", pa.string())]),
+            partition_by=["region"],
+        )
+        plan = conn.open_table(location).plan_write()
+        plan.commit(
+            [
+                plan.write(pa.table({"id": [1, 2], "region": ["us", "eu"]})),
+                plan.write(pa.table({"id": [3], "region": ["us"]})),
+            ]
+        )
+        theirs = DeltaTable(location).to_pyarrow_table().to_pydict()
+        assert sorted(theirs["id"]) == [1, 2, 3]
+        assert sorted(theirs["region"]) == ["eu", "us", "us"]

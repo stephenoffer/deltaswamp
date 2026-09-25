@@ -160,10 +160,17 @@ class ResolvedTable:
     properties: dict[str, str] = field(default_factory=dict)
     # Empty for an unpartitioned table, or before the log has been read.
     partition_columns: tuple[str, ...] = ()
-    #: Whether any column really carries a Delta invariant. The `invariants`
-    #: feature is implied by writer version 2, so nearly every legacy table
-    #: lists it; only the tables that actually use one need different routing.
+    #: Whether the table really uses the features its protocol version implies.
+    #:
+    #: A legacy writer version implies a whole set of features whether or not a
+    #: single one is used: version 2 implies `invariants`, version 4 implies
+    #: `checkConstraints` and `generatedColumns`. Enabling change data feed
+    #: alone puts a table at version 4, so routing on the implied name would
+    #: push every CDF table off the kernel write path. These record what the
+    #: table actually does, so only the tables that need delta-rs go there.
     has_invariants: bool = False
+    has_check_constraints: bool = False
+    has_generated_columns: bool = False
 
     # Set when reading the log failed on every engine. The router then refuses
     # direct-storage operations with this as the reason, instead of routing on

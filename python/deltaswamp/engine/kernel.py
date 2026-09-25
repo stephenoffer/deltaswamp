@@ -92,6 +92,24 @@ _REWRITE_OPS: frozenset[Operation] = frozenset(
 #: it refuses at commit -- after the data files are already written.
 _REMOVE_OPS: frozenset[Operation] = _REWRITE_OPS | {Operation.OVERWRITE}
 
+#: Features that block a write only when the table really uses them.
+#:
+#: Just one qualifies, and the distinction is the kernel's, not ours. Writer
+#: version 2 implies `invariants` for nearly every legacy table and the kernel
+#: writes those happily: it inspects the schema and fails only where one really
+#: exists. `checkConstraints` is the opposite -- the kernel refuses any table
+#: whose protocol carries it, used or not, so a table at writer version 3 or
+#: above cannot take a kernel write at all even with no constraint defined.
+#: Verified rather than assumed: a version 4 change-data-feed table with no
+#: constraints is still refused by the kernel, so gating that one on usage
+#: would put the refusal back after the data was written.
+_USAGE_GATED: dict[TableFeature, tuple[str, str]] = {
+    TableFeature.INVARIANTS: (
+        "has_invariants",
+        "a column of this table carries a Delta invariant, which the kernel cannot evaluate",
+    ),
+}
+
 _IMPLEMENTED: frozenset[Operation] = frozenset(
     {
         Operation.SCAN,
@@ -259,6 +277,7 @@ class KernelEngine:
 
         if operation in _WRITE_OPS or operation in METADATA_OPERATIONS:
             write_blockers: list[str] = []
+            usage_blockers: list[str] = []
             metadata_only = operation in METADATA_OPERATIONS
             for name in table.effective_writer_features:
                 feature = feature_from_wire(name)
@@ -283,6 +302,10 @@ class KernelEngine:
                     )
                     if feature in _METADATA_BLOCKERS or unmodelled:
                         write_blockers.append(name)
+                elif feature in _USAGE_GATED:
+                    flag, why = _USAGE_GATED[feature]
+                    if getattr(table, flag, False):
+                        usage_blockers.append(why)
                 elif FEATURE_SUPPORT[feature].kernel_write is Support.NO:
                     write_blockers.append(name)
             if write_blockers:
@@ -292,23 +315,19 @@ class KernelEngine:
                     reason=(
                         "the kernel cannot write these table features: "
                         + ", ".join(sorted(write_blockers))
+                        + self._implied_only_note(table, write_blockers)
                     ),
+                    remedy="write through delta-rs, which serves this table",
                 )
-            if table.has_invariants and not metadata_only:
-                # `invariants` is Supported in name only: the kernel refuses any
-                # write once a column actually carries one, and it does so after
-                # the data files are written. Routing on the feature name would
-                # be far too blunt -- writer version 2 implies it for nearly
-                # every legacy table -- so this keys on the schema itself.
+            if usage_blockers and not metadata_only:
+                # These refuse at commit, after the data files are written, or
+                # worse write data the feature should have checked. delta-rs
+                # evaluates them, so it serves these tables.
                 return Capability(
                     operation,
                     ok=False,
-                    reason=(
-                        "a column of this table carries a Delta invariant, and the kernel "
-                        "refuses to write a table that uses them. delta-rs evaluates "
-                        "invariants and can"
-                    ),
-                    remedy="write through delta-rs, which serves this table",
+                    reason="; ".join(sorted(usage_blockers)),
+                    remedy="write through delta-rs, which evaluates these",
                 )
             if (
                 table.partition_columns
@@ -556,7 +575,7 @@ class KernelEngine:
             "properties": snap.table_properties(),
             "partition_columns": list(snap.partition_columns),
             "metadata_id": snap.metadata_id,
-            "has_invariants": _schema_has_invariants(snap),
+            **_feature_usage(snap),
         }
 
     # ------------------------------------------------------------------ write
@@ -896,6 +915,37 @@ class KernelEngine:
         return version
 
     # ---------------------------------------------------- metadata-only DDL
+
+    @staticmethod
+    def _implied_only_note(table: ResolvedTable, blockers: list[str]) -> str:
+        """Explain any blocker the table never named and does not actually use.
+
+        A legacy writer version implies a whole set of features. Version 4 is
+        reached by enabling change data feed alone, and it implies
+        `checkConstraints`, which the kernel refuses whether or not a single
+        constraint exists. Reporting only the feature name leaves the owner of a
+        CDF table with no constraints hunting for constraints they never wrote.
+
+        Only the features that are genuinely implied *and* unused are named, so
+        a table that really does have a constraint is not told otherwise.
+        """
+        in_use = {
+            "checkConstraints": table.has_check_constraints,
+            "generatedColumns": table.has_generated_columns,
+            "invariants": table.has_invariants,
+        }
+        implied_only = sorted(
+            name for name in set(blockers) - set(table.writer_features) if in_use.get(name) is False
+        )
+        if not implied_only:
+            return ""
+        which = ", ".join(implied_only)
+        it = "them" if len(implied_only) > 1 else "it"
+        return (
+            f". The table neither names nor uses {which}: writer version "
+            f"{table.min_writer_version} implies {it}, and the kernel refuses the table "
+            "on that alone"
+        )
 
     def _metadata_refusal(self, operation: Operation, table: ResolvedTable) -> Capability | None:
         """Refusals specific to the commits this engine writes itself."""
@@ -1314,48 +1364,63 @@ def _conflict_version(message: str) -> int:
     return int(found.group(1)) if found else -1
 
 
-def _schema_has_invariants(snapshot: Any) -> bool:
-    """Whether any column of the schema carries a Delta invariant.
+def _feature_usage(snapshot: Any) -> dict[str, bool]:
+    """Which version-implied features the table actually uses.
 
-    The `invariants` feature is implied by `minWriterVersion` 2, so nearly every
-    legacy table lists it whether or not a single invariant exists. The kernel
-    only fails on the ones that really have them, so the feature name alone is
-    far too blunt to route on -- it would push every legacy table off the kernel
-    write path.
+    A legacy writer version implies a whole set whether or not any is used:
+    version 2 implies `invariants`, version 4 implies `checkConstraints` and
+    `generatedColumns`. Enabling change data feed alone puts a table at version
+    4, so refusing on the implied name would push every CDF table off the kernel
+    write path. These look at the schema and configuration instead.
     """
+    usage = {
+        "has_invariants": False,
+        "has_check_constraints": False,
+        "has_generated_columns": False,
+    }
+    try:
+        properties = snapshot.table_properties() or {}
+    except Exception:
+        properties = {}
+    usage["has_check_constraints"] = any(
+        key.lower().startswith("delta.constraints.") for key in properties
+    )
+
     try:
         metadata = json.loads(snapshot.metadata_json())
     except Exception:
-        return False
+        return usage
     schema = metadata.get("schemaString") or metadata.get("schema_string")
     if isinstance(schema, str):
         try:
             schema = json.loads(schema)
         except ValueError:
-            return False
+            return usage
     if not isinstance(schema, dict):
-        return False
-    return _fields_carry_invariants(schema.get("fields") or [])
+        return usage
+    found = _field_metadata_keys(schema.get("fields") or [])
+    usage["has_invariants"] = "delta.invariants" in found
+    usage["has_generated_columns"] = "delta.generationExpression" in found
+    return usage
 
 
-def _fields_carry_invariants(fields: Any) -> bool:
-    """Walk a Delta schema looking for `delta.invariants`, nested types included."""
+def _field_metadata_keys(fields: Any) -> set[str]:
+    """Every field-metadata key in a Delta schema, nested types included."""
+    keys: set[str] = set()
     if isinstance(fields, dict):
         fields = [fields]
     for field in fields or []:
         if not isinstance(field, dict):
             continue
-        if (field.get("metadata") or {}).get("delta.invariants"):
-            return True
+        keys.update((field.get("metadata") or {}).keys())
         dtype = field.get("type")
         if isinstance(dtype, dict):
-            if _fields_carry_invariants(dtype.get("fields") or []):
-                return True
+            keys |= _field_metadata_keys(dtype.get("fields") or [])
             for nested in ("elementType", "valueType", "keyType"):
                 inner = dtype.get(nested)
-                if isinstance(inner, dict) and _fields_carry_invariants(inner.get("fields") or []):
-                    return True
-    return False
+                if isinstance(inner, dict):
+                    keys |= _field_metadata_keys(inner.get("fields") or [])
+    return keys
 
 
 def _delta_fields(fields: Any) -> list[dict[str, Any]]:

@@ -928,6 +928,8 @@ class Table:
                 properties={**self._catalog_properties, **(detail.get("properties") or {})},
                 partition_columns=tuple(detail.get("partition_columns") or ()),
                 has_invariants=bool(detail.get("has_invariants")),
+                has_check_constraints=bool(detail.get("has_check_constraints")),
+                has_generated_columns=bool(detail.get("has_generated_columns")),
             )
             self._check_identity(detail.get("metadata_id"))
             return self._resolved

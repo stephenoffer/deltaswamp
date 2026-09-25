@@ -496,6 +496,23 @@ What stays on the driver: `delete`, `update`, `merge`, `optimize` and the rest o
 DML. Those are delta-rs operations, not append-shaped, and nothing here splits
 them across workers.
 
+**Which tables a distributed write can serve** is decided by the protocol
+*version*, not by the feature you care about. A legacy writer version implies a
+whole feature set, and version 3 and above imply `checkConstraints`, which the
+kernel refuses whether or not a single constraint is defined. Enabling change
+data feed alone puts a table at version 4, so:
+
+| Table | Distributed write |
+|---|---|
+| writer version 1-2 (plain legacy) | yes |
+| writer version 3-6 (legacy CDF, legacy column mapping) | no -- the version implies `checkConstraints` |
+| writer version 7 (feature-based) | yes, for the features the kernel writes |
+
+Change data feed, column mapping, row tracking, in-commit timestamps, deletion
+vectors and type widening all write fine at version 7, where only what the
+protocol *names* applies. A refusal says when a feature is merely implied, so a
+CDF table with no constraints is not reported as having constraints.
+
 ## Asking what is possible
 
 `capabilities()` reports every operation, whether it can be served, by which

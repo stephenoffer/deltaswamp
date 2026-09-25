@@ -119,6 +119,24 @@ Databricks and the rest of the Delta ecosystem that drove this.
   front. `ResolvedTable.effective_reader_features` /
   `effective_writer_features` expose the merged view, and both engines use them.
 
+### Found while auditing: what a distributed write can actually serve
+
+- A distributed write is ruled in or out by the table's protocol **version**,
+  not by the feature anyone is thinking about. Writer version 3 and above imply
+  `checkConstraints`, which the kernel refuses whether or not a constraint
+  exists, and enabling change data feed alone reaches version 4. The same
+  features write fine at version 7, where only what the protocol names applies.
+  `docs/usage.md` now states this, and a parametrised test pins both sides.
+- A refusal now says when a blocking feature is merely implied by the version
+  and the table neither names nor uses it, so the owner of a change-data-feed
+  table is not sent looking for constraints they never wrote. It names only the
+  features genuinely unused, so a table that does have one is not told it does
+  not.
+- Verified that a distributed write is portable: delta-rs reads back exactly
+  what was written, for every table it can open at all. The three it refuses
+  (deletion vectors, column mapping, type widening) it refused before the write
+  too -- those are the tables this library exists to serve.
+
 ### Fixed: enforcement the kernel path could have skipped
 
 Two features delta-rs evaluates itself, where letting the kernel take the write
