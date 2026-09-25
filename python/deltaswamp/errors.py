@@ -54,6 +54,16 @@ class EnginePanicError(DeltaSwampError):
     """
 
 
+class CredentialExpiryWarning(UserWarning):
+    """A read began with a vended credential that is close to expiring.
+
+    Re-vending happens *between* operations: the kernel builds its object store
+    once per snapshot, so a single scan that streams past the credential's
+    lifetime fails partway through with an opaque 403 from the storage layer.
+    Saying so up front turns that into something actionable.
+    """
+
+
 class IgnoredPropertyWarning(UserWarning):
     """A property will be stored but nothing here acts on it."""
 

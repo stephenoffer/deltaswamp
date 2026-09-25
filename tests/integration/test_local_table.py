@@ -431,3 +431,71 @@ class TestTableIdentity:
     def test_no_catalog_uuid_means_no_check(self, conn: Any, path: str) -> None:
         """Path-based tables have no catalog identity, and that is fine."""
         assert conn.open_table(path).features() is not None
+
+
+class TestUnmodelledWriterFeatures:
+    """Tables carrying a writer feature neither engine understands.
+
+    The Delta protocol is explicit: a writer must not write to a table whose
+    protocol lists a writer feature it does not support. Reads are a different
+    question -- a writer-only feature never blocks one -- and that asymmetry is
+    what lets the kernel out-read delta-rs.
+    """
+
+    @staticmethod
+    def _with_writer_feature(conn: Any, path: str, feature: str) -> Any:
+        """Append a protocol action adding `feature`, as a newer writer would."""
+        import glob
+        import json
+        import os
+
+        t = conn.open_table(path)
+        t.to_arrow()
+        logs = sorted(glob.glob(os.path.join(path, "_delta_log", "*.json")))
+        nxt = int(os.path.basename(logs[-1]).split(".")[0]) + 1
+        with open(os.path.join(path, "_delta_log", f"{nxt:020d}.json"), "w") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "protocol": {
+                            "minReaderVersion": 3,
+                            "minWriterVersion": 7,
+                            "readerFeatures": ["deletionVectors"],
+                            "writerFeatures": ["deletionVectors", feature],
+                        }
+                    }
+                )
+                + "\n"
+            )
+        return conn.open_table(path)
+
+    def test_an_unmodelled_feature_still_reads(self, conn: Any, path: str) -> None:
+        t = self._with_writer_feature(conn, path, "checkpointProtection")
+        assert t.to_arrow().num_rows == 3
+
+    def test_an_unmodelled_feature_blocks_even_a_metadata_commit(
+        self, conn: Any, path: str
+    ) -> None:
+        """checkpointProtection governs which checkpoints may be removed.
+
+        The kernel has no variant for it at all, so it cannot know what the
+        feature requires of a commit. A metadata-only commit was allowed through
+        because it writes no data, which is the wrong test: writing blind to a
+        table whose rules you cannot read risks corrupting history.
+        """
+        t = self._with_writer_feature(conn, path, "checkpointProtection")
+        for op in (Operation.APPEND, Operation.ADD_COLUMN, Operation.SET_PROPERTIES):
+            verdict = t.can(op)
+            assert not verdict.ok, f"{op.value} should be refused"
+            assert "checkpointProtection" in verdict.reason
+
+    def test_a_modelled_feature_still_allows_a_metadata_commit(self, conn: Any, path: str) -> None:
+        """identityColumns is understood; the kernel just cannot write data for it.
+
+        A metadata-only commit writes no rows, so it stays available. Keeping
+        this distinction is the point: the blanket rule would be correct but
+        needlessly refuse half the DDL surface.
+        """
+        t = self._with_writer_feature(conn, path, "identityColumns")
+        assert not t.can(Operation.APPEND).ok
+        assert t.can(Operation.ADD_COLUMN).ok

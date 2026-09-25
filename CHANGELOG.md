@@ -170,6 +170,25 @@ reachable offline:
   do. `tests/fake_uc.py` answered in snake_case, which is why this passed
   offline; it now speaks the real spelling, as its own create-table response
   already did. Both Unity Catalog backends share one tolerant parser.
+- **`head(n)` through the SQL warehouse was a full table scan.** The warehouse
+  computes a result set before streaming any of it, and `scan` issued a bare
+  `SELECT *`, so `head(3)` on a real table ran past the five-minute statement
+  timeout. `limit` is now part of the engine scan protocol: the warehouse turns
+  it into a real `LIMIT`, streaming engines ignore it because the caller stops
+  reading anyway. The same `head(3)` now returns in 1.5s.
+- **A metadata-only commit was allowed on a table carrying a writer feature the
+  kernel cannot model at all.** The Delta protocol is explicit that a writer
+  must not write to such a table, and "it writes no data" is the wrong test: a
+  feature like `checkpointProtection` governs which checkpoints may be removed,
+  so committing blind risks corrupting history rather than losing an edit. A
+  feature the kernel can neither read nor write now blocks metadata commits too,
+  while one it understands but cannot write data for (`identityColumns`,
+  `generatedColumns`) still permits them.
+- A scan that begins with a nearly expired vended credential now raises
+  `CredentialExpiryWarning` naming `plan_scan()` as the remedy. The object store
+  is built once per snapshot, so such a read fails partway through with a bare
+  403 from storage; mid-scan refresh remains unbuilt.
+
 - **The SQL fallback could not serve a table Unity Catalog had withdrawn from
   credential vending**, which is exactly the case it exists for. The manifest
   flags describe *direct external engine* access, and a warehouse runs inside

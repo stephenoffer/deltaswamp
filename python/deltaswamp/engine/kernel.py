@@ -236,7 +236,20 @@ class KernelEngine:
                     # A metadata-only commit writes no data, so features that
                     # govern data (constraints, generated and identity columns)
                     # do not block it. Ones that change what a schema *means* do.
-                    if feature in _METADATA_BLOCKERS:
+                    #
+                    # A feature the kernel can neither read nor write is one it
+                    # cannot model at all, and the protocol is explicit that a
+                    # writer must not write to a table carrying a writer feature
+                    # it does not support -- metadata-only commits included,
+                    # since an unmodelled feature may constrain every commit.
+                    # `checkpointProtection` is exactly that: it governs which
+                    # checkpoints may be removed, so writing blind can corrupt
+                    # history rather than merely losing an edit.
+                    support = FEATURE_SUPPORT[feature]
+                    unmodelled = (
+                        support.kernel_read is Support.NO and support.kernel_write is Support.NO
+                    )
+                    if feature in _METADATA_BLOCKERS or unmodelled:
                         write_blockers.append(name)
                 elif FEATURE_SUPPORT[feature].kernel_write is Support.NO:
                     write_blockers.append(name)
@@ -354,6 +367,7 @@ class KernelEngine:
         predicate: str | None = None,
         version: int | None = None,
         timestamp: Any = None,
+        limit: int | None = None,
     ) -> Any:
         """Read with deletion vectors applied; a predicate skips files, then filters.
 
@@ -926,12 +940,44 @@ class KernelEngine:
             "retry when the table is less busy",
         )
 
+    #: Warn when a scan starts with less than this much credential life left.
+    #: A long read that outlives its credential fails partway through, and the
+    #: storage layer reports only a 403.
+    expiry_warning_seconds: float = 300.0
+
     def _options(self, table: ResolvedTable, *, write: bool) -> dict[str, str]:
         options = dict(self._base_options)
         if table.credential_provider is not None:
             op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
-            options.update(table.credential_provider.credentials(op).as_storage_options())
+            credentials = table.credential_provider.credentials(op)
+            self._warn_if_short_lived(credentials)
+            options.update(credentials.as_storage_options())
         return options
+
+    def _warn_if_short_lived(self, credentials: Any) -> None:
+        """Say so when the credential may not outlive the read it is about to serve.
+
+        The object store is built once per snapshot and holds this credential
+        for the whole scan, so there is no refresh to rescue a long read.
+        """
+        remaining = getattr(credentials, "expires_at", None)
+        if remaining is None or not credentials.expires_within(self.expiry_warning_seconds):
+            return
+        import time
+        import warnings
+
+        from ..errors import CredentialExpiryWarning
+
+        left = max(0.0, remaining - time.time())
+        warnings.warn(
+            f"the vended credential for this table expires in {left:.0f}s, and it is "
+            "held for the whole scan: the object store is built once per snapshot, so "
+            "a read that runs longer fails partway through with a 403 from storage. "
+            "Split the read with plan_scan()/to_ray_dataset(), where each worker vends "
+            "its own, or re-open the table to mint a fresh one.",
+            CredentialExpiryWarning,
+            stacklevel=4,
+        )
 
     def add_columns(self, table: ResolvedTable, fields: Any, **_: Any) -> int:
         from . import metadata as m

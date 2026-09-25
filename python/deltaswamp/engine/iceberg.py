@@ -366,6 +366,7 @@ class IcebergEngine:
         predicate: str | None = None,
         version: int | None = None,
         timestamp: str | None = None,
+        limit: int | None = None,
     ) -> Any:
         """Read as a `pyarrow.RecordBatchReader`. `version` is an Iceberg snapshot id."""
         pa = importlib.import_module("pyarrow")

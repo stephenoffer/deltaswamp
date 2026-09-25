@@ -547,8 +547,15 @@ class SqlEngine:
         predicate: str | None = None,
         version: int | None = None,
         timestamp: str | None = None,
+        limit: int | None = None,
     ) -> Any:
-        """SELECT the table. `predicate` is a SQL expression, passed verbatim."""
+        """SELECT the table. `predicate` is a SQL expression, passed verbatim.
+
+        `limit` becomes a real `LIMIT`. The warehouse computes the whole result
+        before any of it is streamed back, so without this a `head(3)` on a big
+        table is a full scan billed to the warehouse -- and slow enough to hit
+        the statement timeout.
+        """
         binder = ParameterBinder()
         projection = _columns(columns) if columns else "*"
         sql = f"SELECT {projection} FROM {_name(table)}"
@@ -558,6 +565,8 @@ class SqlEngine:
             sql += f" TIMESTAMP AS OF {binder.bind(_timestamp_text(timestamp), type='TIMESTAMP')}"
         if predicate:
             sql += f" WHERE {predicate}"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
         op = Operation.TIME_TRAVEL if version is not None or timestamp else Operation.SCAN
         return self._query(op, sql, binder)
 

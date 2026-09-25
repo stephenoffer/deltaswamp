@@ -135,8 +135,14 @@ class Engine(Protocol):
         predicate: str | None = None,
         version: int | None = None,
         timestamp: str | None = None,
+        limit: int | None = None,
     ) -> Any:
         """Read the table, returning a PyCapsule-exporting Arrow stream.
+
+        `limit` is a hint: an engine that streams may ignore it, because the
+        caller stops consuming once it has enough. An engine that computes the
+        whole result somewhere else first -- the SQL warehouse -- must push it
+        down, or `head(3)` costs a full table scan on the warehouse.
 
         The in-process path. Implementations must apply deletion vectors without
         reordering rows within a file -- a DV is a positional keep-mask, so any

@@ -153,6 +153,13 @@ streams past the credential's lifetime will fail. Pushing refresh down into Rust
 needs an `object_store::CredentialProvider` that calls back into the Python
 provider, and that is not built yet.
 
+Until it is, the condition is at least announced rather than discovered: a scan
+that starts with less than `KernelEngine.expiry_warning_seconds` of credential
+life raises `CredentialExpiryWarning` naming the remedy, because the failure it
+precedes surfaces as a bare 403 from the storage layer several frames down.
+`plan_scan()` and `to_ray_dataset()` sidestep it entirely -- each worker vends
+its own credential for its own slice, so no single read has to outlive one.
+
 Providers are picklable and credentials are not. A provider holds configuration
 and mints on demand, so a distributed worker receives no secret and re-vends
 when its own copy expires. `__getstate__` drops the live client, the cached

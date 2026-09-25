@@ -238,6 +238,7 @@ class DeltaRsEngine:
         predicate: str | None = None,
         version: int | None = None,
         timestamp: str | None = None,
+        limit: int | None = None,
     ) -> Any:
         dt = self._open(table, version=version)
         if timestamp is not None:

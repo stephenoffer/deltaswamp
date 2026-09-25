@@ -593,6 +593,7 @@ class SharingEngine:
         predicate: str | None = None,
         version: int | None = None,
         timestamp: str | None = None,
+        limit: int | None = None,
     ) -> Any:
         """Read a shared table as a `pyarrow.RecordBatchReader`.
 

@@ -170,6 +170,39 @@ class TestReads:
         eng.scan(table(), predicate="id > 3", version=7)
         assert rec.last == f"SELECT * FROM {NAME} VERSION AS OF 7 WHERE id > 3"
 
+    def test_limit_is_pushed_into_the_statement(self) -> None:
+        """The warehouse computes the whole result before streaming any of it.
+
+        Without a real LIMIT, `head(3)` on a large table is a full scan billed
+        to the warehouse, and slow enough to hit the statement timeout -- which
+        is how this was found, on a table that took over five minutes.
+        """
+        eng, rec, _ = engine()
+        eng.scan(table(), limit=3)
+        assert rec.last == f"SELECT * FROM {NAME} LIMIT 3"
+
+    def test_limit_composes_with_predicate_and_travel(self) -> None:
+        eng, rec, _ = engine()
+        eng.scan(table(), predicate="id > 3", version=7, limit=5)
+        assert rec.last == f"SELECT * FROM {NAME} VERSION AS OF 7 WHERE id > 3 LIMIT 5"
+
+    def test_no_limit_means_no_clause(self) -> None:
+        eng, rec, _ = engine()
+        eng.scan(table())
+        assert "LIMIT" not in rec.last
+
+    def test_limit_cannot_carry_sql(self) -> None:
+        """A LIMIT cannot be a bound parameter, so it is coerced, not spliced.
+
+        Every other value in this engine goes through the binder; this one
+        cannot, which is exactly the shape that becomes an injection.
+        """
+        eng, rec, _ = engine()
+        with pytest.raises((ValueError, TypeError)):
+            eng.scan(table(), limit="1; DROP TABLE x; --")  # type: ignore[arg-type]
+        eng.scan(table(), limit=5)
+        assert rec.last.endswith("LIMIT 5")
+
     def test_timestamp_travel_is_a_parameter(self) -> None:
         eng, rec, _ = engine()
         eng.scan(table(), timestamp="2024-01-01'; DROP TABLE x; --")

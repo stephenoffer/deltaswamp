@@ -10,6 +10,7 @@ which speaks the REST protocol over a real socket.
 from __future__ import annotations
 
 import json
+import pathlib
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -370,6 +371,64 @@ class TestLiveRegressions:
         creds = provider._to_credentials(response, CredOp.READ)
         assert creds.secrets["aws_region"] == "us-west-2"
 
+    def test_vended_gcs_token_becomes_the_store_layer_key(self) -> None:
+        """UC vends GCS as a raw OAuth2 bearer token.
+
+        delta-rs maps such a token onto `google_application_credentials`, which
+        object_store reads as a *file path*, so that route is broken for vended
+        tokens. The Rust store layer here consumes `google_bearer_token`
+        instead; this pins the Python half of that contract, which the Rust
+        unit tests in `crates/native/src/store.rs` cannot see.
+        """
+        from deltaswamp.credentials.base import Cloud
+        from deltaswamp.credentials.base import Operation as CredOp
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider
+
+        provider = DatabricksCredentialProvider(
+            table_id="tid-1", table_url="gs://bucket/t", host="h", token="t"
+        )
+        response = SimpleNamespace(
+            url="gs://bucket/t",
+            expiration_time=None,
+            gcp_oauth_token=SimpleNamespace(oauth_token="ya29.TOKEN"),
+        )
+        creds = provider._to_credentials(response, CredOp.READ)
+        assert creds.cloud is Cloud.GCP
+        assert creds.secrets == {"google_bearer_token": "ya29.TOKEN"}
+        assert "google_application_credentials" not in creds.secrets
+
+    def test_the_store_layer_accepts_the_key_we_send(self) -> None:
+        """The Python key and the Rust alias list must not drift apart."""
+        store_rs = (
+            pathlib.Path(__file__).parents[2] / "crates" / "native" / "src" / "store.rs"
+        ).read_text()
+        assert '"google_bearer_token"' in store_rs
+
+    def test_vended_azure_sas_gets_an_explicit_endpoint(self) -> None:
+        """Account-name inference breaks on private-link and sovereign hosts."""
+        from deltaswamp.credentials.base import Cloud
+        from deltaswamp.credentials.base import Operation as CredOp
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider
+
+        provider = DatabricksCredentialProvider(
+            table_id="tid-1",
+            table_url="abfss://c@acct.dfs.core.windows.net/t",
+            host="h",
+            token="t",
+        )
+        response = SimpleNamespace(
+            url="abfss://c@acct.dfs.core.windows.net/t",
+            expiration_time=None,
+            azure_user_delegation_sas=SimpleNamespace(sas_token="sv=SECRET"),
+        )
+        creds = provider._to_credentials(response, CredOp.READ)
+        assert creds.cloud is Cloud.AZURE
+        assert creds.secrets["azure_endpoint"] == "https://acct.dfs.core.windows.net"
+        # Azure SAS is path-scoped, so the store registry must key on the path
+        # rather than the bucket, or the second table in a container gets the
+        # first one's signature and a 403.
+        assert creds.scope_prefix == "abfss://c@acct.dfs.core.windows.net/t"
+
     def test_region_falls_back_to_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from deltaswamp.credentials.databricks import DatabricksCredentialProvider
 
@@ -438,6 +497,48 @@ class TestLiveRegressions:
         assert entries == ()
         assert latest is None
         assert location == "s3://fallback"
+
+    def test_a_short_lived_credential_warns_before_the_read(self) -> None:
+        """A long scan outliving its credential fails with a bare 403.
+
+        The object store is built once per snapshot and holds the credential for
+        the whole scan, so there is no refresh to rescue it. Saying so up front
+        is the difference between an actionable message and a 403 from three
+        layers down.
+        """
+        import time
+        import warnings as w
+
+        from deltaswamp.credentials.base import Cloud, Credentials
+        from deltaswamp.engine.kernel import KernelEngine
+        from deltaswamp.errors import CredentialExpiryWarning
+
+        engine = KernelEngine()
+        soon = Credentials(
+            cloud=Cloud.AWS, url="s3://b/t", expires_at=time.time() + 30, secrets={"k": "v"}
+        )
+        with w.catch_warnings(record=True) as caught:
+            w.simplefilter("always")
+            engine._warn_if_short_lived(soon)
+        assert len(caught) == 1
+        assert issubclass(caught[0].category, CredentialExpiryWarning)
+        assert "plan_scan" in str(caught[0].message)
+
+    def test_a_long_lived_credential_is_silent(self) -> None:
+        import time
+        import warnings as w
+
+        from deltaswamp.credentials.base import Cloud, Credentials
+        from deltaswamp.engine.kernel import KernelEngine
+
+        engine = KernelEngine()
+        for expires_at in (time.time() + 86400, None):  # plenty of time, and "no TTL given"
+            with w.catch_warnings(record=True) as caught:
+                w.simplefilter("always")
+                engine._warn_if_short_lived(
+                    Credentials(cloud=Cloud.AWS, url="s3://b/t", expires_at=expires_at)
+                )
+            assert caught == [], f"expires_at={expires_at} should not warn"
 
     def test_the_provider_stays_picklable_with_a_region(self) -> None:
         import pickle

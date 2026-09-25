@@ -974,8 +974,14 @@ class Table:
         predicate: str | None = None,
         version: int | None = None,
         timestamp: str | None = None,
+        limit: int | None = None,
     ) -> Any:
-        """Read the table as an Arrow stream (exports `__arrow_c_stream__`)."""
+        """Read the table as an Arrow stream (exports `__arrow_c_stream__`).
+
+        `limit` is a hint passed to the engine. Streaming engines ignore it and
+        the caller simply stops reading; the SQL warehouse turns it into a real
+        `LIMIT`, because it computes the result set before streaming any of it.
+        """
         # `version or timestamp` would treat version 0 as no time travel.
         travelling = version is not None or timestamp is not None
         op = Operation.TIME_TRAVEL if travelling else Operation.SCAN
@@ -993,6 +999,7 @@ class Table:
             predicate=predicate,
             version=version if version is not None else self._version,
             timestamp=timestamp,
+            limit=limit,
         )
 
     def to_arrow(self, **kwargs: Any) -> Any:
@@ -1108,6 +1115,9 @@ class Table:
         the positional mapping a deletion vector depends on.
         """
         pa = _require("pyarrow", "pyarrow")
+        # The limit is a hint to the engine as well as a client-side stop: the
+        # warehouse would otherwise compute the entire result set first.
+        kwargs.setdefault("limit", n)
         reader = pa.RecordBatchReader.from_stream(self.scan(**kwargs))
         batches, taken = [], 0
         if n > 0:
