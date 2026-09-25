@@ -71,7 +71,7 @@ deduplicates, and save modes come from `Connection.write_table`.
 |---|---|---|---|
 | append | `t.append(data)` | delta-rs, kernel, iceberg, sql | the warehouse stages data in a volume |
 | full overwrite | `t.overwrite(data)` | delta-rs, kernel | the kernel replaces a catalog-managed table in one commit |
-| replaceWhere | `t.overwrite(data, predicate=...)` | delta-rs, iceberg, sql, kernel | kernel: a bounded whole-table rewrite |
+| replaceWhere | `t.overwrite(data, predicate=...)` | kernel (deletion vectors), delta-rs, iceberg, sql, kernel (rewrite) | on a table with deletion vectors enabled the kernel marks the replaced rows deleted and appends the new ones; otherwise the kernel's last resort is a bounded whole-table rewrite |
 | dynamic partition overwrite | `t.overwrite(data, partition_overwrite='dynamic')` | delta-rs | emulated; predicate built from the partition values in `data` |
 | schema merge | `t.append(data, schema_mode='merge')` | delta-rs | routes as MERGE_SCHEMA, not APPEND |
 | schema overwrite / RTAS | `t.replace(data)` | delta-rs | |
@@ -80,7 +80,7 @@ deduplicates, and save modes come from `Connection.write_table`.
 | idempotent write | `t.append(data, txn=(app_id, version))` | enforced here | neither engine deduplicates; verified against delta-rs 1.6.5 |
 | commit metadata | `t.append(data, commit_metadata={...})` | delta-rs | shows up in `history()` |
 | distributed write | `t.plan_write()` / `plan.write()` / `plan.commit()` | kernel | workers write files, the driver commits them as one version; refused at plan time, before any file is written |
-| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | delta-rs, sql, kernel | copy-on-write on delta-rs; the kernel rewrites the whole table (bounded) for tables only it can write; MERGE on those needs the warehouse |
+| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | kernel (deletion vectors), delta-rs, sql | on a table with deletion vectors enabled the kernel writes them, as Databricks does, catalog-managed and row-tracked tables included; elsewhere delta-rs is copy-on-write and the kernel's last resort is a bounded whole-table rewrite (no MERGE) |
 
 ## Where every operation routes
 
@@ -101,12 +101,12 @@ serve.
 | `files` | deltars, kernel | delta-rs lists add actions with stats; the kernel lists the files of tables delta-rs cannot open |
 | `append` | deltars, kernel, iceberg, sql | delta-rs for path and external tables; it refuses catalog-managed tables, which then fall through to kernel and UCCommitter. The warehouse loads through a staging volume when neither can |
 | `overwrite` | deltars, kernel, iceberg, sql | delta-rs first; the kernel replaces a catalog-managed table in one commit |
-| `replace_where` | deltars, iceberg, sql, kernel | delta-rs, PyIceberg for Iceberg tables, the warehouse; last, the kernel rewrites the whole table in one commit, bounded in size |
+| `replace_where` | deltars, iceberg, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs, PyIceberg for Iceberg tables, the warehouse, and last a bounded whole-table rewrite through the kernel |
 | `create` | deltars, kernel | delta-rs creates path and external tables; the kernel takes over when the properties or clustering exceed what delta-rs accepts, and for managed tables, whose storage the catalog allocates through its staging-table API |
 | `merge_schema` | deltars, sql | kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH SCHEMA EVOLUTION |
-| `delete` | deltars, sql, kernel | delta-rs copy-on-write, then the warehouse; last, a whole-table rewrite through the kernel, since kernel 0.28 cannot author deletion vectors |
-| `update` | deltars, sql, kernel | delta-rs, then the warehouse; last, a whole-table rewrite through the kernel with literal or column assignments |
-| `merge` | deltars, sql | kernel has no MERGE at all; the warehouse merges from a source staged in a volume |
+| `delete` | deltars, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs copy-on-write, then the warehouse, and last a bounded whole-table rewrite through the kernel |
+| `update` | deltars, sql, kernel | deletion vectors plus new files through the kernel when the table enables them (row ids kept under row tracking); otherwise delta-rs, the warehouse, and last a bounded whole-table rewrite, with literal or column assignments |
+| `merge` | deltars, sql, kernel | deletion vectors through the kernel, with clauses evaluated in DuckDB, when the table enables them; otherwise delta-rs, then the warehouse, which merges from a source staged in a volume |
 | `add_column` | deltars, kernel, sql | delta-rs first; kernel for tables it cannot write |
 | `drop_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no DROP COLUMN |
 | `rename_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no RENAME COLUMN |
@@ -143,8 +143,10 @@ serve.
 
 delta-rs rejects part of the Delta property surface with a single opaque
 message, and panics on `delta.minReaderVersion`. On ALTER it takes what it takes
-at create, except `delta.enableDeletionVectors`, which it accepts but answers by
-stamping a spurious `variantType` feature into the protocol. The kernel accepts nearly all
+at create. It accepts `delta.enableDeletionVectors` but answers it, at create
+or later, by stamping a spurious `variantType` reader+writer feature into the
+protocol, so deltaswamp treats the key as rejected and creates DV tables with
+the kernel. The kernel accepts nearly all
 of it. `validate_properties` checks against this table first, so the failure
 names the key and the remedy, and a create delta-rs cannot serve falls through
 to the kernel automatically.
@@ -163,7 +165,7 @@ to the kernel automatically.
 | `delta.dataSkippingStatsColumns` | stored, inert | stored, inert | honored |
 | `delta.deletedFileRetentionDuration` | honored | honored | honored |
 | `delta.enableChangeDataFeed` | honored | honored | honored |
-| `delta.enableDeletionVectors` | honored | rejected | honored |
+| `delta.enableDeletionVectors` | rejected | rejected | honored |
 | `delta.enableExpiredLogCleanup` | stored, inert | stored, inert | honored |
 | `delta.enableIcebergCompatV2` | rejected | rejected | n/a |
 | `delta.enableIcebergCompatV3` | rejected | rejected | honored |

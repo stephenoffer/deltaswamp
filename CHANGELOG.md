@@ -23,8 +23,11 @@ First release.
   change data feed, file listing and `changes()` for following a table.
 - Every write mode: append, overwrite, `replaceWhere`, dynamic partition
   overwrite, schema merge, save modes, commit metadata and idempotent writes.
-- DELETE, UPDATE and MERGE, including a bounded whole-table rewrite for tables
-  only the kernel can write.
+- DELETE, UPDATE, replaceWhere and MERGE written as deletion vectors on tables
+  that enable them, including catalog-managed and row-tracked tables (row ids
+  are kept). MERGE through the kernel evaluates its clauses with DuckDB. Tables
+  without deletion vectors get copy-on-write, with a bounded whole-table rewrite
+  for tables only the kernel can write.
 - Metadata-only ALTER commits for what delta-rs cannot do: column rename and
   drop under column mapping, type widening, SET NOT NULL, clustering keys and
   unset properties.
@@ -41,11 +44,12 @@ First release.
 
 ### Known limits
 
-- Deletion vectors are not authored. delta-kernel 0.28 has
-  `update_deletion_vectors` only as an internal API, and it is not bound yet.
-  DML on kernel-only tables is a whole-table rewrite bounded by
-  `KernelEngine.rewrite_max_bytes` and refused on row-tracked tables; MERGE on
-  those tables needs the SQL fallback.
+- On a kernel-only table without deletion vectors, DML is a whole-table
+  rewrite bounded by `KernelEngine.rewrite_max_bytes` and refused on
+  row-tracked tables, and MERGE needs the SQL fallback.
+- The kernel cannot write CDC files, so UPDATE and MERGE on a change-data-feed
+  table it alone can write need the SQL fallback. DELETE through deletion
+  vectors needs none.
 - The kernel's change feed fails mid-stream when the range crosses a schema
   change. Start the range after the change, or read it through the warehouse.
 - The change feed and history of a catalog-managed table need the warehouse.

@@ -19,6 +19,7 @@ use pyo3_arrow::{PyRecordBatchReader, PySchema, PyTable};
 use url::Url;
 
 use crate::commit::{self, SharedEngine, UcCommitConfig};
+use crate::dml;
 use crate::error::{NativeError, Result};
 use crate::files;
 use crate::predicate::parse_predicate;
@@ -337,14 +338,34 @@ impl PySnapshot {
     /// Unlisted files are dropped before any I/O; unknown paths are ignored;
     /// `[]` gives an empty stream. Output is otherwise identical to the full
     /// scan, so the union of scans over a partition of `files()` equals it.
-    #[pyo3(signature = (columns = None, predicate = None, files = None))]
+    ///
+    /// `row_positions` appends two columns that address each row the way a
+    /// deletion vector does: `__deltaswamp_file` (the data file's log path) and
+    /// `__deltaswamp_row_index` (its physical position in that file, counted
+    /// before any deletion vector). Rows already deleted are not returned.
+    /// `row_ids` (with `row_positions`, on a table with row tracking enabled)
+    /// adds `__deltaswamp_row_id`, each row's stable row id.
+    #[pyo3(signature = (
+        columns = None,
+        predicate = None,
+        files = None,
+        row_positions = false,
+        row_ids = false,
+    ))]
     fn scan(
         &self,
         py: Python<'_>,
         columns: Option<Vec<String>>,
         predicate: Option<String>,
         files: Option<Vec<String>>,
+        row_positions: bool,
+        row_ids: bool,
     ) -> PyResult<PyRecordBatchReader> {
+        if row_ids && !row_positions {
+            return Err(
+                NativeError::Invalid("row_ids=True needs row_positions=True".to_string()).into(),
+            );
+        }
         let reader = py.detach(|| -> Result<KernelBatchReader> {
             let full = self.inner.schema();
             let predicate = parse_predicate(predicate.as_deref(), full.as_ref())?;
@@ -372,20 +393,31 @@ impl PySnapshot {
                 .table_configuration()
                 .logical_partition_columns()
                 .to_vec();
-            let only_partitions = schema.num_fields() > 0
+            let only_partitions = !row_positions
+                && schema.num_fields() > 0
                 && schema
                     .fields()
                     .all(|f| partition_columns.iter().any(|p| p == f.name()));
-            if only_partitions {
+            if only_partitions || row_positions {
                 schema = Arc::new(schema.add_metadata_column(
                     crate::scan::ROW_COUNT_COLUMN,
                     delta_kernel::schema::MetadataColumnSpec::RowIndex,
+                )?);
+            }
+            if row_ids {
+                schema = Arc::new(schema.add_metadata_column(
+                    crate::scan::ROW_ID_COLUMN,
+                    delta_kernel::schema::MetadataColumnSpec::RowId,
                 )?);
             }
             builder = builder.with_schema(schema);
 
             let scan = builder.build()?;
             let engine = self.engine.clone() as Arc<dyn Engine>;
+            if row_positions {
+                let paths = files.map(|f| f.into_iter().collect());
+                return KernelBatchReader::try_new_positional(&scan, engine, paths);
+            }
             let reader = match files {
                 Some(files) => KernelBatchReader::try_new_restricted(
                     &scan,
@@ -623,6 +655,78 @@ impl PySnapshot {
             )
         })?;
         Ok(version)
+    }
+
+    /// Commit row-level DML as deletion vectors, the way Databricks writes it.
+    ///
+    /// `deletions` is an Arrow stream with columns `path` and `row_index`: the
+    /// rows to delete, addressed as a positional scan (`row_positions=True`)
+    /// reports them. `data`, if given, is appended in the same commit -- an
+    /// UPDATE's rewritten rows. `whole_files` names files to delete entirely
+    /// (every live row) without listing rows. Returns `(version, deleted_rows,
+    /// deletion_vectors_added, files_removed)`; a DML that changes nothing
+    /// commits nothing and returns this snapshot's version.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        deletions,
+        data = None,
+        whole_files = None,
+        uc = None,
+        engine_info = None,
+        operation = None,
+        txn = None,
+        commit_metadata = None,
+    ))]
+    fn commit_dml(
+        &self,
+        py: Python<'_>,
+        deletions: PyRecordBatchReader,
+        data: Option<PyRecordBatchReader>,
+        whole_files: Option<Vec<String>>,
+        uc: Option<UcCommitConfig>,
+        engine_info: Option<String>,
+        operation: Option<String>,
+        txn: Option<(String, i64)>,
+        commit_metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<(u64, u64, usize, usize)> {
+        let deletions = deletions.into_reader()?;
+        let data = data.map(|d| d.into_reader()).transpose()?;
+        let outcome = py.detach(|| -> Result<dml::DmlOutcome> {
+            let deletions: std::result::Result<Vec<_>, _> = deletions.collect();
+            let deletions = dml::deletions_from_batches(&deletions.map_err(NativeError::from)?)?;
+            let batches = match data {
+                Some(reader) => {
+                    let batches: std::result::Result<Vec<_>, _> = reader.collect();
+                    batches.map_err(NativeError::from)?
+                }
+                None => Vec::new(),
+            };
+            dml::commit_dml(
+                self.inner.clone(),
+                self.engine.clone(),
+                deletions,
+                whole_files.unwrap_or_default().into_iter().collect(),
+                batches,
+                uc,
+                engine_info,
+                operation,
+                txn,
+                commit_metadata,
+            )
+        })?;
+        Ok((
+            outcome.version,
+            outcome.deleted_rows,
+            outcome.deletion_vectors_added,
+            outcome.files_removed,
+        ))
+    }
+
+    /// Whether this table accepts deletion-vector writes: the feature on both
+    /// sides of the protocol and `delta.enableDeletionVectors=true`.
+    #[getter]
+    fn deletion_vectors_enabled(&self) -> bool {
+        dml::deletion_vectors_enabled(&self.inner)
     }
 
     /// Publish ratified-but-unpublished commits into `_delta_log/`.

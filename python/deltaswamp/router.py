@@ -259,6 +259,30 @@ _ACCESS_POLICY_FORBIDS: frozenset[Operation] = frozenset(
 )
 
 
+#: DML that the kernel writes as deletion vectors when a table enables them.
+_DV_DML: frozenset[Operation] = frozenset(
+    {Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE, Operation.MERGE}
+)
+
+
+def _preference(
+    operation: Operation, table: ResolvedTable, engines: tuple[EngineKind, ...]
+) -> tuple[EngineKind, ...]:
+    """`engines` in the order to ask them for this table.
+
+    On a table with deletion vectors enabled, row-level DML goes to the kernel
+    first, which marks rows deleted as Databricks does. delta-rs would rewrite
+    every touched file instead (it never emits deletion vectors), which is
+    correct but costs a full rewrite of each file and ignores the table's
+    setting. Where the kernel refuses, the usual order still applies.
+    """
+    from .engine.kernel import deletion_vectors_writable
+
+    if operation in _DV_DML and EngineKind.KERNEL in engines and deletion_vectors_writable(table):
+        return (EngineKind.KERNEL, *(k for k in engines if k is not EngineKind.KERNEL))
+    return engines
+
+
 @dataclass
 class Router:
     """Routes operations to engines for one connection."""
@@ -313,7 +337,7 @@ class Router:
         # still serve the table. They still hold for every direct engine.
         direct_refusal = self._direct_refusal(operation, table)
 
-        for kind in routing.engines:
+        for kind in _preference(operation, table, routing.engines):
             if kind in exclude:
                 reasons.append(f"{kind.value}: already tried, and failed")
                 continue

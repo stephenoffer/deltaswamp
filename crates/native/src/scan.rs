@@ -16,6 +16,11 @@
 //! deletion-vector I/O. Everything after that -- DV mask, physical->logical
 //! transform, per-file batch order -- is exactly what `execute` does, so a
 //! restricted scan over every file equals the full scan.
+//!
+//! A *positional* scan ([`KernelBatchReader::try_new_positional`]) is the same
+//! restricted read with each surviving row tagged by its data file's log path
+//! and its physical row index within that file. Those two values are exactly
+//! what a deletion vector addresses, so DML computes its DVs from them.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -88,6 +93,14 @@ pub fn resolve_columns(
 /// the Parquet read schema is never empty; it never reaches the caller.
 pub const ROW_COUNT_COLUMN: &str = "__deltaswamp_row_index";
 
+/// Name of the column a positional scan adds: each row's data file, as its
+/// path is stored in the log (relative and URL-encoded, as `files()` shows it).
+pub const FILE_PATH_COLUMN: &str = "__deltaswamp_file";
+
+/// Name of the column a positional scan adds on request: each row's stable
+/// row id, on a table with row tracking enabled.
+pub const ROW_ID_COLUMN: &str = "__deltaswamp_row_id";
+
 impl KernelBatchReader {
     /// This reader with the top-level column `name` removed from its schema
     /// and from every batch (row counts are kept).
@@ -128,18 +141,35 @@ impl KernelBatchReader {
         engine: Arc<dyn Engine>,
         paths: HashSet<String>,
     ) -> Result<Self> {
-        let iter = RestrictedScan {
-            metadata: Box::new(scan.scan_metadata(engine.as_ref())?),
-            engine,
-            table_root: scan.snapshot().table_root().clone(),
-            physical_schema: scan.physical_schema().clone(),
-            logical_schema: scan.logical_schema().clone(),
-            paths,
-            pending: VecDeque::new(),
-            current: None,
-            finished: false,
-        };
+        let iter = RestrictedScan::new(scan, engine, Some(paths), false)?;
         Self::from_parts(scan.logical_schema().as_ref(), iter)
+    }
+
+    /// Read with every row tagged by its data file ([`FILE_PATH_COLUMN`]).
+    ///
+    /// The scan's schema must already carry a row-index metadata column; with
+    /// it, each row is addressed by `(file, physical row index)`, which is what
+    /// a deletion vector records. Rows a deletion vector already removed are
+    /// not returned, but the survivors keep their physical indexes.
+    pub fn try_new_positional(
+        scan: &Scan,
+        engine: Arc<dyn Engine>,
+        paths: Option<HashSet<String>>,
+    ) -> Result<Self> {
+        let iter = RestrictedScan::new(scan, engine, paths, true)?;
+        let mut reader = Self::from_parts(scan.logical_schema().as_ref(), iter)?;
+        let mut fields: Vec<arrow::datatypes::FieldRef> =
+            reader.schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            FILE_PATH_COLUMN,
+            arrow::datatypes::DataType::Utf8,
+            false,
+        )));
+        reader.schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            reader.schema.metadata().clone(),
+        ));
+        Ok(reader)
     }
 
     /// Wrap any kernel data iterator (a table scan or a change-feed scan).
@@ -252,6 +282,8 @@ type DataIter = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send
 /// The file currently being read: its Parquet batches, the part of its DV
 /// keep-mask not yet consumed, and its physical->logical transform.
 struct OpenFile {
+    /// The file's path as the log stores it.
+    path: String,
     batches: DataIter,
     selection: Option<Vec<bool>>,
     transform: Option<delta_kernel::ExpressionRef>,
@@ -264,13 +296,36 @@ struct RestrictedScan {
     table_root: Url,
     physical_schema: SchemaRef,
     logical_schema: SchemaRef,
-    paths: HashSet<String>,
+    /// The files to read; `None` reads every file the scan plans.
+    paths: Option<HashSet<String>>,
+    /// Append [`FILE_PATH_COLUMN`] to every batch.
+    tag_path: bool,
     pending: VecDeque<ScanFile>,
     current: Option<OpenFile>,
     finished: bool,
 }
 
 impl RestrictedScan {
+    fn new(
+        scan: &Scan,
+        engine: Arc<dyn Engine>,
+        paths: Option<HashSet<String>>,
+        tag_path: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            metadata: Box::new(scan.scan_metadata(engine.as_ref())?),
+            engine,
+            table_root: scan.snapshot().table_root().clone(),
+            physical_schema: scan.physical_schema().clone(),
+            logical_schema: scan.logical_schema().clone(),
+            paths,
+            tag_path,
+            pending: VecDeque::new(),
+            current: None,
+            finished: false,
+        })
+    }
+
     /// Queue the wanted files of the next scan-metadata batch. Returns false
     /// when the log replay is exhausted.
     fn plan_next(&mut self) -> DeltaResult<bool> {
@@ -283,10 +338,11 @@ impl RestrictedScan {
         // Visiting only decodes the scan rows; the DV is not read until the
         // file is opened, so dropping a file here costs no I/O.
         let files = metadata?.visit_scan_files(Vec::new(), collect)?;
+        let paths = &self.paths;
         self.pending.extend(
             files
                 .into_iter()
-                .filter(|file| self.paths.contains(&file.path)),
+                .filter(|file| paths.as_ref().is_none_or(|p| p.contains(&file.path))),
         );
         Ok(true)
     }
@@ -320,6 +376,7 @@ impl RestrictedScan {
             )));
         }
         Ok(OpenFile {
+            path: file.path,
             batches: Box::new(batches),
             selection,
             transform: file.transform,
@@ -331,13 +388,18 @@ impl RestrictedScan {
             if let Some(open) = self.current.as_mut() {
                 match open.batches.next() {
                     Some(Ok(physical)) => {
-                        return Some(Self::finish_batch(
+                        let batch = Self::finish_batch(
                             self.engine.as_ref(),
                             &self.physical_schema,
                             &self.logical_schema,
                             open,
                             physical,
-                        ))
+                        );
+                        return Some(if self.tag_path {
+                            batch.and_then(|b| Self::tag_with_path(b, &open.path))
+                        } else {
+                            batch
+                        });
                     }
                     Some(Err(e)) => return Some(Err(e)),
                     None => self.current = None,
@@ -386,6 +448,26 @@ impl RestrictedScan {
             }
             None => Ok(logical),
         }
+    }
+}
+
+impl RestrictedScan {
+    /// `data` with a constant [`FILE_PATH_COLUMN`] of `path` appended.
+    fn tag_with_path(data: Box<dyn EngineData>, path: &str) -> DeltaResult<Box<dyn EngineData>> {
+        let batch = data.try_into_record_batch()?;
+        let paths = arrow::array::StringArray::from(vec![path; batch.num_rows()]);
+        let mut fields: Vec<arrow::datatypes::FieldRef> =
+            batch.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            FILE_PATH_COLUMN,
+            arrow::datatypes::DataType::Utf8,
+            false,
+        )));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(paths));
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let tagged = RecordBatch::try_new(schema, columns)?;
+        Ok(Box::new(ArrowEngineData::new(tagged)))
     }
 }
 

@@ -87,6 +87,7 @@ _WRITE_OPS: frozenset[Operation] = frozenset(
         Operation.REPLACE_WHERE,
         Operation.DELETE,
         Operation.UPDATE,
+        Operation.MERGE,
     }
 )
 
@@ -100,6 +101,40 @@ _REWRITE_OPS: frozenset[Operation] = frozenset(
 #: a row-tracked table: it cannot preserve the row ids of what it removes, and
 #: it refuses at commit -- after the data files are already written.
 _REMOVE_OPS: frozenset[Operation] = _REWRITE_OPS | {Operation.OVERWRITE}
+
+
+def _row_tracking_enabled(table: ResolvedTable) -> bool:
+    return str(table.properties.get("delta.enableRowTracking", "false")).lower() == "true"
+
+
+def _keeps_row_ids(table: ResolvedTable) -> bool:
+    """Whether DV DML here can keep every row id stable.
+
+    An UPDATE on a table with row tracking enabled needs the table's
+    materialized row-id column to carry the old ids into the new files, and a
+    native build that writes it. Where the feature is merely supported, ids are
+    assigned but not promised stable, so nothing needs carrying.
+    """
+    if not _row_tracking_enabled(table):
+        return True
+    return bool(
+        table.properties.get("delta.rowTracking.materializedRowIdColumnName")
+    ) and _native_has("materialized_row_ids")
+
+
+def deletion_vectors_writable(table: ResolvedTable) -> bool:
+    """Whether DML on `table` may be written as deletion vectors.
+
+    The Delta protocol permits DV writes only when the table supports the
+    feature on both sides and `delta.enableDeletionVectors` is true; a table
+    that merely supports the feature still takes copy-on-write, as in Spark.
+    """
+    return (
+        "deletionVectors" in table.reader_features
+        and "deletionVectors" in table.writer_features
+        and str(table.properties.get("delta.enableDeletionVectors", "false")).lower() == "true"
+    )
+
 
 #: Features that block a write only when the table really uses them.
 #:
@@ -128,6 +163,7 @@ _IMPLEMENTED: frozenset[Operation] = frozenset(
         Operation.CREATE,
         Operation.OVERWRITE,
         Operation.PUBLISH,
+        Operation.MERGE,
     }
     | _REWRITE_OPS
 )
@@ -325,10 +361,20 @@ class KernelEngine:
             if refusal is not None:
                 return refusal
 
-        if operation in _REMOVE_OPS and "rowTracking" in table.effective_writer_features:
+        if operation is Operation.MERGE:
+            refusal = self._merge_refusal(table)
+            if refusal is not None:
+                return refusal
+
+        by_dv = operation in _REWRITE_OPS and self._dv_path(table)
+        row_tracked = "rowTracking" in table.effective_writer_features
+        if row_tracked and operation in _REMOVE_OPS and not (by_dv and _keeps_row_ids(table)):
             # Checked for every remove-staging operation, not just the rewrites:
             # a kernel overwrite removes every visible file in the same commit,
-            # and the commit is refused after the data is written.
+            # and the commit is refused after the data is written. Through
+            # deletion vectors no file is removed and every surviving row keeps
+            # its baseRowId; an UPDATE also writes each rewritten row's old id
+            # into the materialized row-id column, so ids stay stable.
             return Capability(
                 operation,
                 ok=False,
@@ -340,7 +386,7 @@ class KernelEngine:
             )
 
         if operation in _REWRITE_OPS:
-            refusal = self._rewrite_refusal(operation, table)
+            refusal = self._rewrite_refusal(operation, table, by_dv=by_dv)
             if refusal is not None:
                 return refusal
 
@@ -1150,6 +1196,15 @@ class KernelEngine:
             }
             _refuse_options("overwrite with a predicate", kwargs)
             incoming = pa.table(_as_record_batch_reader(data))
+            if self._dv_path(table):
+                result = self._dv_dml(
+                    table,
+                    predicate,
+                    operation="WRITE",
+                    replacement=incoming,
+                    **passthrough,
+                )
+                return int(result["version"])
 
             def replace(current: Any, keep: Any) -> Any:
                 import pyarrow.compute as pc
@@ -1184,11 +1239,57 @@ class KernelEngine:
     #: warehouse, or delta-rs on a table it can open, is the right tool.
     rewrite_max_bytes = 1 << 30
 
-    def _rewrite_refusal(self, operation: Operation, table: ResolvedTable) -> Capability | None:
-        """Whether a whole-table rewrite may serve DELETE/UPDATE/replaceWhere.
+    def _merge_refusal(self, table: ResolvedTable) -> Capability | None:
+        """Why the kernel cannot MERGE into `table`, or None if it can."""
+        if not self._dv_path(table):
+            return Capability(
+                Operation.MERGE,
+                ok=False,
+                reason="the kernel serves MERGE only by writing deletion vectors, and this "
+                "table does not enable them (delta.enableDeletionVectors)",
+                remedy=SQL_FALLBACK_REMEDY,
+            )
+        if (
+            importlib.util.find_spec("duckdb") is None
+            or importlib.util.find_spec("pyarrow") is None
+        ):
+            return Capability(
+                Operation.MERGE,
+                ok=False,
+                reason="the kernel MERGE evaluates its clauses with DuckDB, which is not installed",
+                remedy="pip install 'deltaswamp[duckdb]'",
+            )
+        if table.is_shallow_clone:
+            return Capability(
+                Operation.MERGE,
+                ok=False,
+                reason="a shallow clone's data files belong to the source table (referenced "
+                "by absolute path), which cannot be credential-scoped reliably",
+                remedy=SQL_FALLBACK_REMEDY,
+            )
+        if "rowTracking" in table.effective_writer_features and not _keeps_row_ids(table):
+            return Capability(
+                Operation.MERGE,
+                ok=False,
+                reason="the table tracks row ids but names no materialized row-id column, "
+                "so updated rows could not keep theirs",
+                remedy=SQL_FALLBACK_REMEDY,
+            )
+        return None
+
+    def _dv_path(self, table: ResolvedTable) -> bool:
+        """Whether DELETE/UPDATE/replaceWhere go through deletion vectors here."""
+        return deletion_vectors_writable(table) and _native_has("deletion_vector_dml")
+
+    def _rewrite_refusal(
+        self, operation: Operation, table: ResolvedTable, *, by_dv: bool = False
+    ) -> Capability | None:
+        """Whether a rewrite may serve DELETE/UPDATE/replaceWhere.
 
         Row tracking is handled before this, since it rules out every commit
-        that stages a remove, not only the rewrites.
+        that stages a remove, not only the rewrites. Through deletion vectors
+        only the files the predicate cannot skip are read, and only matching
+        rows are held, so the whole-table size bound does not apply.
         """
         if table.is_shallow_clone:
             # A rewrite reads every live file, and a shallow clone's are the
@@ -1202,7 +1303,7 @@ class KernelEngine:
                 "absolute path), which cannot be credential-scoped reliably",
                 remedy="ds.connect(..., allow_sql_fallback=True) runs it on Databricks",
             )
-        if table.location is None:
+        if table.location is None or by_dv:
             return None
         try:
             size = self._live_bytes(table)
@@ -1244,7 +1345,11 @@ class KernelEngine:
                 "remove or rewrite its data",
             )
         cdf = str(table.properties.get("delta.enableChangeDataFeed", "false")).lower() == "true"
-        if cdf and operation is not Operation.APPEND:
+        dv_delete = operation is Operation.DELETE and self._dv_path(table)
+        if cdf and operation is not Operation.APPEND and not dv_delete:
+            # A DELETE through deletion vectors is exempt: its commit adds no
+            # data, and change-feed readers derive the deleted rows from the
+            # difference between each file's old and new vector.
             return Capability(
                 operation,
                 ok=False,
@@ -1340,6 +1445,201 @@ class KernelEngine:
         self._maybe_checkpoint(table, version, snapshot)
         return {"version": int(version), "num_affected_rows": touched}
 
+    def _dv_dml(
+        self,
+        table: ResolvedTable,
+        predicate: str | None,
+        *,
+        operation: str,
+        transform: Any = None,
+        replacement: Any = None,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+        engine_info: str | None = None,
+    ) -> dict[str, Any]:
+        """DELETE, UPDATE or replaceWhere as deletion vectors, as Databricks writes them.
+
+        Reads only the files the predicate cannot skip, with each row tagged by
+        its file and physical position, and marks the matching rows deleted.
+        `transform` turns the matched rows into their updated form, which is
+        appended in the same commit; `replacement` is appended as given (after
+        checking every row satisfies the predicate, as replaceWhere requires).
+        The commit is staged against the snapshot read, so a concurrent writer
+        makes it conflict rather than be lost.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        snapshot = self.snapshot(table, write=True)
+        schema = _arrow_schema(snapshot)
+        if predicate is None and transform is None and replacement is None:
+            emptied = self._delete_every_file(table, snapshot, txn, commit_metadata, engine_info)
+            if emptied is not None:
+                return emptied
+        node = _canonical_node(sqlpred.parse(predicate), schema) if predicate is not None else None
+        if transform is None:
+            # Only what the predicate reads: a DELETE never needs the rest.
+            wanted = sorted({path[0] for path in sqlpred.columns_of(node)}) if node else []
+            columns: list[str] | None = _with_data_column(snapshot, wanted)
+        else:
+            columns = None
+        skipping = sqlpred.to_kernel_json(node, schema) if node is not None else None
+        # An UPDATE on a row-tracked table carries each row's id into the new
+        # file, so the rewritten row keeps the id it had.
+        row_ids = transform is not None and _row_tracking_enabled(table)
+        extra = {"row_ids": True} if row_ids else {}
+        stream = snapshot.scan(columns=columns, predicate=skipping, row_positions=True, **extra)
+        if node is not None:
+            stream = sqlpred.filter_stream(stream, node)
+        reader = pa.RecordBatchReader.from_stream(stream)
+
+        positions = [_FILE_COLUMN, _ROW_INDEX_COLUMN]
+        matched_batches = []
+        deletion_batches = []
+        for batch in reader:
+            if batch.num_rows == 0:
+                continue
+            deletion_batches.append(
+                pa.record_batch(
+                    [batch.column(_FILE_COLUMN), batch.column(_ROW_INDEX_COLUMN)],
+                    names=["path", "row_index"],
+                )
+            )
+            if transform is not None:
+                matched_batches.append(batch.drop_columns(positions))
+        touched = sum(b.num_rows for b in deletion_batches)
+
+        data = None
+        if transform is not None and matched_batches:
+            data = transform(pa.Table.from_batches(matched_batches))
+        elif replacement is not None:
+            data_schema = pa.schema([f for f in schema])
+            data = _conform(replacement, data_schema)
+            if node is not None:
+                ok = pc.fill_null(_evaluate(data, sqlpred.to_arrow(node, data.schema)), False)
+                bad = data.num_rows - int(pc.sum(ok).as_py() or 0)
+                if bad:
+                    raise UnreachableTableError(
+                        f"overwrite where {predicate}",
+                        f"{bad} row(s) of the new data do not satisfy the predicate, so "
+                        "writing them would add rows outside the range being replaced",
+                        "filter the data to the predicate first",
+                    )
+            if data.num_rows == 0:
+                data = None
+        if touched == 0 and data is None:
+            return {"version": int(snapshot.version), "num_affected_rows": 0}
+
+        deletions = pa.Table.from_batches(
+            deletion_batches,
+            schema=pa.schema([("path", pa.string()), ("row_index", pa.int64())]),
+        )
+        version = self._commit_dv_changes(
+            table,
+            snapshot,
+            deletions,
+            data,
+            operation=operation,
+            txn=txn,
+            commit_metadata=commit_metadata,
+            engine_info=engine_info,
+        )
+        return {"version": version, "num_affected_rows": touched}
+
+    def _delete_every_file(
+        self,
+        table: ResolvedTable,
+        snapshot: Any,
+        txn: tuple[str, int] | None,
+        commit_metadata: dict[str, Any] | None,
+        engine_info: str | None,
+    ) -> dict[str, Any] | None:
+        """DELETE with no predicate: every file goes, without reading a row.
+
+        Returns None when a file's row count is unknown (no statistics), so
+        the caller counts rows the slow way.
+        """
+        import json
+
+        import pyarrow as pa
+
+        files = pa.table(snapshot.files())
+        live = 0
+        for records, dv in zip(
+            files.column("num_records").to_pylist(),
+            files.column("deletion_vector").to_pylist(),
+            strict=True,
+        ):
+            if records is None:
+                return None
+            live += int(records) - (int(json.loads(dv)["cardinality"]) if dv else 0)
+        if live == 0:
+            return {"version": int(snapshot.version), "num_affected_rows": 0}
+        empty = pa.table({"path": pa.array([], pa.string()), "row_index": pa.array([], pa.int64())})
+        version = self._commit_dv_changes(
+            table,
+            snapshot,
+            empty,
+            None,
+            operation="DELETE",
+            whole_files=files.column("path").to_pylist(),
+            txn=txn,
+            commit_metadata=commit_metadata,
+            engine_info=engine_info,
+        )
+        return {"version": version, "num_affected_rows": live}
+
+    def _commit_dv_changes(
+        self,
+        table: ResolvedTable,
+        snapshot: Any,
+        deletions: Any,
+        data: Any,
+        *,
+        operation: str,
+        whole_files: list[str] | None = None,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+        engine_info: str | None = None,
+    ) -> int:
+        """Commit `deletions` (path, row_index) as vectors plus `data`, in one transaction.
+
+        A touched file with no `numRecords` statistic cannot take a vector (its
+        cardinality is tied to that count), so it is rewritten instead, as
+        copy-on-write does: its surviving rows join `data` and the file is
+        removed in the same commit.
+        """
+        deletions, data, whole_files = _rewrite_unsized_files(
+            table, snapshot, deletions, data, list(whole_files or [])
+        )
+        with _library_commit_errors():
+            version, _deleted, _dvs, _removed = snapshot.commit_dml(
+                deletions.to_reader(),
+                data=data.to_reader() if data is not None else None,
+                whole_files=whole_files or None,
+                uc=self._uc_commit_config(table),
+                engine_info=engine_info or _engine_info(),
+                operation=operation,
+                txn=txn,
+                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+            )
+        if int(version) != int(snapshot.version):
+            self._maybe_checkpoint(table, version, snapshot)
+        return int(version)
+
+    def merge(
+        self,
+        table: ResolvedTable,
+        source: Any,
+        predicate: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Start a MERGE, written as deletion vectors. Mirrors delta-rs's clause API."""
+        from .kernel_merge import KernelMerger
+
+        _require_pyarrow("merge on the kernel path")
+        return KernelMerger(self, table, _as_record_batch_reader(source), predicate, **kwargs)
+
     def delete(
         self, table: ResolvedTable, predicate: str | None = None, **unsupported: Any
     ) -> dict[str, Any]:
@@ -1349,9 +1649,12 @@ class KernelEngine:
         NULL result keeps it.
         """
         _refuse_options("delete", unsupported)
-        result = self._rewrite(
-            table, predicate, lambda current, keep: current.filter(keep), operation="DELETE"
-        )
+        if self._dv_path(table):
+            result = self._dv_dml(table, predicate, operation="DELETE")
+        else:
+            result = self._rewrite(
+                table, predicate, lambda current, keep: current.filter(keep), operation="DELETE"
+            )
         return {"num_deleted_rows": result["num_affected_rows"], "version": result["version"]}
 
     def update(
@@ -1408,7 +1711,17 @@ class KernelEngine:
                 out = out.set_column(index, field, new)
             return out
 
-        result = self._rewrite(table, predicate, assign, operation="UPDATE")
+        if self._dv_path(table):
+            result = self._dv_dml(
+                table,
+                predicate,
+                operation="UPDATE",
+                transform=lambda matched: assign(
+                    matched, pa.nulls(matched.num_rows, pa.bool_()).fill_null(False)
+                ),
+            )
+        else:
+            result = self._rewrite(table, predicate, assign, operation="UPDATE")
         return {"num_updated_rows": result["num_affected_rows"], "version": result["version"]}
 
     def publish(self, table: ResolvedTable) -> int:
@@ -1873,6 +2186,50 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
         return _planned_read(snapshot, columns, predicate, files=paths)
+
+
+def _rewrite_unsized_files(
+    table: ResolvedTable, snapshot: Any, deletions: Any, data: Any, whole_files: list[str]
+) -> tuple[Any, Any, list[str]]:
+    """Move deletions from files without `numRecords` into a rewrite.
+
+    Returns the deletions left for vectors, the data with each such file's
+    surviving rows added, and the files to remove whole. Row tracking forbids
+    the remove, so there the native commit refuses with the reason instead.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if deletions.num_rows == 0 or _row_tracking_enabled(table):
+        return deletions, data, whole_files
+    files = pa.table(snapshot.files())
+    unsized = set(files.filter(pc.is_null(files.column("num_records"))).column("path").to_pylist())
+    touched = set(pc.unique(deletions.column("path")).to_pylist())
+    rewrite = sorted(unsized & touched)
+    if not rewrite:
+        return deletions, data, whole_files
+    in_rewrite = pc.is_in(deletions.column("path"), pa.array(rewrite, pa.string()))
+    gone = deletions.filter(in_rewrite)
+    rest = pa.table(snapshot.scan(files=rewrite, row_positions=True))
+    keys = pc.binary_join_element_wise(
+        rest.column(_FILE_COLUMN), pc.cast(rest.column(_ROW_INDEX_COLUMN), pa.string()), "\x00"
+    )
+    gone_keys = pc.binary_join_element_wise(
+        gone.column("path"), pc.cast(gone.column("row_index"), pa.string()), "\x00"
+    )
+    survivors = rest.filter(pc.invert(pc.is_in(keys, gone_keys))).drop_columns(
+        [_FILE_COLUMN, _ROW_INDEX_COLUMN]
+    )
+    if data is None:
+        data = survivors
+    elif survivors.num_rows:
+        data = pa.concat_tables([data, survivors.cast(data.schema)])
+    return deletions.filter(pc.invert(in_rewrite)), data, whole_files + rewrite
+
+
+#: The columns a positional scan (`row_positions=True`) adds to each row.
+_FILE_COLUMN = "__deltaswamp_file"
+_ROW_INDEX_COLUMN = "__deltaswamp_row_index"
 
 
 def _canonical_path(schema: Any, path: tuple[str, ...]) -> tuple[str, ...]:

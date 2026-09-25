@@ -63,12 +63,42 @@ class TestMatrixIsInternallyConsistent:
             )
 
 
+#: Keys delta-rs accepts at create but mishandles, so the matrix treats them
+#: as rejected to keep those creates on the kernel. Each is probed for the
+#: mishandling instead; if that stops, the row can go back to honored.
+_AVOIDED_ON_DELTARS = frozenset({"delta.enableDeletionVectors"})
+
+
 class TestProbesAgainstInstalledDeltaRs:
+    def test_deltars_still_stamps_variant_type_on_deletion_vector_tables(
+        self, tmp_path: Any
+    ) -> None:
+        import json
+
+        from deltalake import write_deltalake
+
+        path = tmp_path / "t"
+        write_deltalake(
+            str(path),
+            pa.table({"id": [1]}),
+            configuration={"delta.enableDeletionVectors": "true"},
+        )
+        log = (path / "_delta_log" / "00000000000000000000.json").read_text()
+        protocol = next(json.loads(x)["protocol"] for x in log.splitlines() if '"protocol"' in x)
+        assert "variantType" in protocol.get("readerFeatures", []), (
+            "delta-rs no longer stamps variantType; delta.enableDeletionVectors can be "
+            "honored on its create path again"
+        )
+
     """If one of these fails, delta-rs changed and the matrix needs updating."""
 
     @pytest.mark.parametrize(
         "key",
-        [k for k, r in PROPERTY_SUPPORT.items() if r.deltars_create is PropertyEffect.REJECTED],
+        [
+            k
+            for k, r in PROPERTY_SUPPORT.items()
+            if r.deltars_create is PropertyEffect.REJECTED and k not in _AVOIDED_ON_DELTARS
+        ],
     )
     def test_rejected_properties_really_are_rejected(self, key: str, tmp_path: Any) -> None:
         value = "true" if key.startswith("delta.enable") else "1"

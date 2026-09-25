@@ -87,9 +87,10 @@ class TestEnginesFailInOppositeDirections:
         """delta-rs cannot decode the CDF files Databricks writes."""
         assert OPERATION_ENGINES[Operation.CDF].primary is Engine.KERNEL
 
-    def test_merge_never_routes_to_kernel(self) -> None:
-        """delta_kernel 0.28 has no MERGE implementation at all."""
-        assert Engine.KERNEL not in OPERATION_ENGINES[Operation.MERGE].engines
+    def test_merge_routes_to_kernel_only_as_deletion_vectors(self) -> None:
+        """delta_kernel 0.28 has no MERGE; deltaswamp assembles one from DV DML,
+        so the kernel is listed last and promoted only on DV-enabled tables."""
+        assert OPERATION_ENGINES[Operation.MERGE].engines[-1] is Engine.KERNEL
 
     @pytest.mark.parametrize(
         "op", [Operation.OPTIMIZE, Operation.VACUUM, Operation.RESTORE, Operation.REPAIR]
@@ -136,11 +137,11 @@ class TestEasilyMissedFacts:
         assert row.deltars_read is Support.NO
         assert row.kernel_read is Support.YES
 
-    def test_deletion_vectors_write_is_partial_on_both_engines(self) -> None:
-        """Kernel installs descriptors but computes no bitmaps; delta-rs never
-        emits DVs at all. Authoring them is work this project has to do."""
+    def test_deletion_vectors_are_authored_on_the_kernel_only(self) -> None:
+        """deltaswamp computes the bitmaps and commits them through the kernel;
+        delta-rs preserves DVs but never emits them."""
         row = FEATURE_SUPPORT[TableFeature.DELETION_VECTORS]
-        assert row.kernel_write is Support.PARTIAL
+        assert row.kernel_write is Support.YES
         assert row.deltars_write is Support.PARTIAL
 
     @pytest.mark.parametrize(

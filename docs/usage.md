@@ -243,15 +243,28 @@ t.update(new_values={"status": "archived"}, predicate="age > 365")  # plain valu
 it. When the warehouse serves it, the builder generates one `MERGE INTO`
 statement, with the source staged in a volume.
 
-On delta-rs all three are copy-on-write: whole Parquet files are rewritten
-rather than deletion vectors emitted. On a table only the kernel can write,
-which includes catalog-managed tables, `delete`, `update` and predicate
-overwrites are served by rewriting the whole table in one commit against the
-snapshot that was read. A concurrent writer makes the commit conflict rather
-than be lost. This is bounded by `KernelEngine.rewrite_max_bytes` (1 GiB by
-default); larger tables go to the warehouse. It is refused on row-tracked
-tables, whose row ids the kernel cannot preserve. On this path `update` takes
-plain values, or SQL that is a literal or a column name.
+On a table with deletion vectors enabled (`delta.enableDeletionVectors`, the
+Databricks default), all three are written as deletion vectors, as Databricks
+writes them: the matching rows are marked deleted in a small
+`deletion_vector_<uuid>.bin`, rewritten and inserted rows go to new files, and
+nothing else is copied. This is the path for catalog-managed tables, and it
+works on row-tracked tables too: surviving rows keep their `baseRowId`, and
+rows an UPDATE or MERGE rewrites keep their row ids through the table's
+materialized row-id column. Only the files the predicate cannot skip are read,
+and the commit is staged against the snapshot that was read, so a concurrent
+writer makes it conflict rather than be lost. A MERGE evaluates its clauses
+with DuckDB (`pip install 'deltaswamp[duckdb]'`), skips target files using the
+source's join keys, and refuses a target row matched by more than one source
+row, as Spark does.
+
+Without deletion vectors, delta-rs serves DML as copy-on-write, rewriting the
+Parquet files that hold matching rows. On a table only the kernel can write,
+`delete`, `update` and predicate overwrites then fall back to rewriting the
+whole table in one commit, bounded by `KernelEngine.rewrite_max_bytes` (1 GiB
+by default) and refused on row-tracked tables; on this path `update` takes
+plain values, or SQL that is a literal or a column name, and MERGE needs the
+warehouse. On a table with the change data feed enabled, the kernel serves only
+DELETE, because UPDATE and MERGE need CDC files it cannot write.
 
 ## Schema, properties and features
 
@@ -596,8 +609,9 @@ a `SqlFallbackWarning` names the warehouse whenever the fallback runs.
 [feature map](features.md) shows how each Databricks and open-source feature is
 reached.
 
-- Deletion vectors are not authored yet, so DML on kernel-only tables is a
-  bounded whole-table rewrite, and MERGE on those tables needs the warehouse.
+- DML on a kernel-only table without deletion vectors is a bounded whole-table
+  rewrite, and MERGE there needs the warehouse. With deletion vectors enabled,
+  UPDATE and MERGE on a change-data-feed table need the warehouse too.
 - The change feed of a catalog-managed table needs the warehouse.
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.

@@ -713,6 +713,7 @@ dependencies = [
  "unity-catalog-delta-rest-client",
  "url",
  "uuid",
+ "z85",
 ]
 
 [[package]]

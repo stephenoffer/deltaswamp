@@ -274,51 +274,82 @@ pub fn write(
     }
 
     let mut txn = transaction;
-    let write_state = txn.write_state()?;
+    stage_batches(
+        &mut txn,
+        &engine,
+        &partition_columns,
+        &table_schema,
+        batches,
+    )?;
 
+    // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
+    // with block_in_place, so the commit must run inside the shared
+    // multi-threaded runtime rather than on a bare Python thread.
+    finish_commit(txn, &engine)
+}
+
+/// Align `batches` with the table schema and coalesce them, as every write does.
+pub(crate) fn prepare_batches(
+    snapshot: &SnapshotRef,
+    batches: Vec<arrow::array::RecordBatch>,
+) -> Result<Vec<arrow::array::RecordBatch>> {
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
+    let table_schema = snapshot.schema();
+    let batches = batches
+        .iter()
+        .map(|b| partition::conform_to_table(b, table_schema.as_ref(), &partition_columns))
+        .collect::<Result<Vec<_>>>()?;
+    partition::coalesce(batches)
+}
+
+/// Merge small batches of one schema, as every write does before writing.
+pub(crate) fn coalesce(
+    batches: Vec<arrow::array::RecordBatch>,
+) -> Result<Vec<arrow::array::RecordBatch>> {
+    partition::coalesce(batches)
+}
+
+/// Write prepared `batches` as Parquet and add them to `txn`.
+///
+/// A partitioned table gets one write context per distinct partition tuple;
+/// see `crate::partition`.
+pub(crate) fn stage_batches(
+    txn: &mut Transaction,
+    engine: &SharedEngine,
+    partition_columns: &[String],
+    table_schema: &delta_kernel::schema::SchemaRef,
+    batches: Vec<arrow::array::RecordBatch>,
+) -> Result<()> {
+    let write_state = txn.write_state()?;
+    let mut staged = Vec::new();
     if partition_columns.is_empty() {
         let write_context = write_state.unpartitioned_write_context()?;
         for batch in batches {
             let data = ArrowEngineData::new(batch);
             let metadata =
                 runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
-            txn.add_files(metadata);
+            staged.push(metadata);
         }
     } else {
-        // One write context per distinct partition tuple; see crate::partition.
         for batch in batches {
             for group in
-                partition::split_by_partition(&batch, &partition_columns, table_schema.as_ref())?
+                partition::split_by_partition(&batch, partition_columns, table_schema.as_ref())?
             {
                 let write_context = write_state.partitioned_write_context(group.values)?;
                 let data = ArrowEngineData::new(group.data);
                 let metadata =
                     runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
-                txn.add_files(metadata);
+                staged.push(metadata);
             }
         }
     }
-
-    // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
-    // with block_in_place, so the commit must run inside the shared
-    // multi-threaded runtime rather than on a bare Python thread.
-    match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
-        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
-        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
-            let version = conflicted.conflict_version();
-            Err(NativeError::CommitConflict(format!(
-                "another writer committed version {version} first. Re-read the snapshot, \
-                 recompute the write, and stage a new commit -- do not reuse the staged file, \
-                 because it encodes a version-specific txnId."
-            )))
-        }
-        Ok(CommitResult::RetryableTransaction(_)) => Err(NativeError::Retryable(
-            "the commit failed with a retryable I/O error; the table state is unchanged, \
-             so the same transaction may be retried"
-                .to_string(),
-        )),
-        Err(err) => Err(classify_kernel_commit_error(err)),
+    for metadata in staged {
+        txn.add_files(metadata);
     }
+    Ok(())
 }
 
 /// Attach arbitrary commit metadata, the way `userMetadata` works elsewhere.
@@ -610,7 +641,7 @@ fn raw_commit_body(actions: &[String]) -> Result<String> {
 /// Shared by the single-shot path and the distributed one so the two cannot
 /// drift on which committer a catalog-managed table gets.
 #[allow(clippy::too_many_arguments)]
-fn begin_transaction(
+pub(crate) fn begin_transaction(
     snapshot: SnapshotRef,
     engine: &SharedEngine,
     uc: &Option<UcCommitConfig>,
@@ -859,7 +890,11 @@ fn batch_paths(batch: &arrow::array::RecordBatch) -> Result<Vec<String>> {
 }
 
 /// Delete data files named relative to `root`; returns the ones that failed.
-fn remove_written(engine: &SharedEngine, root: &url::Url, written: &[String]) -> Vec<String> {
+pub(crate) fn remove_written(
+    engine: &SharedEngine,
+    root: &url::Url,
+    written: &[String],
+) -> Vec<String> {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt;
 
@@ -989,7 +1024,7 @@ fn refuse_duplicate_paths(
 }
 
 /// Run a prepared transaction's commit and classify the outcome.
-fn finish_commit(txn: Transaction, engine: &SharedEngine) -> Result<u64> {
+pub(crate) fn finish_commit(txn: Transaction, engine: &SharedEngine) -> Result<u64> {
     match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
         Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
         Ok(CommitResult::ConflictedTransaction(conflicted)) => {

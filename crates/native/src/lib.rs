@@ -7,6 +7,7 @@
 
 mod changes;
 mod commit;
+mod dml;
 mod error;
 mod files;
 mod functions;
@@ -56,6 +57,10 @@ pub const FEATURES: &[&str] = &[
     // Distributed writes: workers produce data files, a coordinator commits
     // them as one transaction.
     "distributed_write",
+    // Row-level DML as deletion vectors: positional scans and `commit_dml`.
+    "deletion_vector_dml",
+    // UPDATE writes rewritten rows' ids to the materialized row-id column.
+    "materialized_row_ids",
 ];
 
 #[pyfunction]
