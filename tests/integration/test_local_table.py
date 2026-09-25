@@ -11,7 +11,7 @@ from typing import Any
 import deltaswamp as ds
 import pytest
 from deltaswamp.capability import Engine, Operation
-from deltaswamp.errors import UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
@@ -540,7 +540,7 @@ class TestDistributedWrite:
         assert conn.open_table(path).to_arrow().to_pydict()["id"] == [99]
 
     def test_an_unknown_mode_is_refused(self, conn: Any, path: str) -> None:
-        with pytest.raises(UnreachableTableError, match="append"):
+        with pytest.raises(InvalidArgumentError, match="append"):
             conn.open_table(path).plan_write(mode="upsert")
 
     def test_a_partitioned_table_writes_partition_directories(self, conn: Any) -> None:

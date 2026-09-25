@@ -428,7 +428,11 @@ def _hint_leaf(conjunct: str, types: dict[str, tuple[str, str, str]]) -> dict[st
     if raw.startswith("'"):
         if value_type not in ("string", "date"):
             return None
-        value = raw[1:-1].replace("''", "'")
+        from ..predicate import _unescape
+
+        # As the exact filter reads it (Spark's backslash escapes), so the
+        # hint and the filter agree on the value.
+        value = _unescape(raw)
         if value_type == "date":
             from datetime import date
 
@@ -452,6 +456,11 @@ def _hint_leaf(conjunct: str, types: dict[str, tuple[str, str, str]]) -> dict[st
                 # literal in the column's type.
                 return None
         value = raw
+    if value_type in ("float", "double") and (negate or op.startswith("greaterThan")):
+        # Statistics leave NaN out of min/max, and NaN (above every value)
+        # satisfies `f > x` and `f != x`: a server skipping on such a hint
+        # drops files whose NaN rows the exact filter keeps.
+        return None
     node: dict[str, Any] = {
         "op": op,
         "children": [
@@ -885,8 +894,24 @@ class SharingEngine:
     ) -> UnreachableTableError:
         profile = getattr(client, "_profile", None)
         if isinstance(exc, http_error_type()) and getattr(exc, "response", None) is not None:
-            reason = f"the sharing server refused the request ({error_text(exc, profile)})"
+            text = error_text(exc, profile)
+            reason = f"the sharing server refused the request ({text})"
             remedy = _HISTORY_REMEDY if history else None
+            lowered = text.lower()
+            if history and any(
+                marker in lowered
+                for marker in (
+                    "no such version",
+                    "cannot time travel",
+                    "available versions",
+                    "greater than the latest",
+                )
+            ):
+                # The server named the version itself ("no such version", past
+                # the latest): the table's history is shared, and telling the
+                # recipient to ask the provider to share it sent them after the
+                # wrong fix.
+                remedy = "time travel to a version the table has; detail() gives the latest"
         else:
             # A connection failure, a timeout, or a malformed response: nothing
             # to do with history sharing, so do not suggest it.

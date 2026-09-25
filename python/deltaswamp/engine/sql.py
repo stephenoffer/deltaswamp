@@ -48,7 +48,7 @@ from typing import Any
 from ..capability import OPERATION_ENGINES, READ_OPERATIONS, Capability, Operation
 from ..capability import Engine as EngineKind
 from ..catalog import ResolvedTable, TableType
-from ..errors import UnreachableTableError
+from ..errors import InvalidArgumentError, UnreachableTableError
 from ..identity import RefKind, split_identifier
 from .base import missing_method
 from .sql_backend import (
@@ -126,7 +126,7 @@ def _column(column: str | Sequence[str]) -> str:
         return _quote(column)
     parts = list(column)
     if not parts:
-        raise ValueError("a column path needs at least one part")
+        raise InvalidArgumentError("a column path needs at least one part")
     return ".".join(_quote(p) for p in parts)
 
 
@@ -177,7 +177,7 @@ def _sql_type(type_text: str) -> str:
     text = str(type_text).strip()
     unquoted = _QUOTED_IDENTIFIER.sub("", text)
     if not text or _FORBIDDEN_IN_TYPE.search(unquoted):
-        raise ValueError(f"{type_text!r} is not a SQL type")
+        raise InvalidArgumentError(f"{type_text!r} is not a SQL type")
     return text
 
 
@@ -188,10 +188,10 @@ def _principal(principal: str) -> str:
 def _privileges(privileges: str | Sequence[str]) -> str:
     items = [privileges] if isinstance(privileges, str) else list(privileges)
     if not items:
-        raise ValueError("at least one privilege is required")
+        raise InvalidArgumentError("at least one privilege is required")
     for item in items:
         if not _PRIVILEGE.match(item):
-            raise ValueError(f"{item!r} is not a privilege name")
+            raise InvalidArgumentError(f"{item!r} is not a privilege name")
     return ", ".join(" ".join(i.upper().split()) for i in items)
 
 
@@ -214,7 +214,7 @@ def _property_value(key: Any, value: Any) -> str:
     they could no longer read the configuration of.
     """
     if value is None:
-        raise ValueError(f"property {key!r} has the value None; use unset_properties")
+        raise InvalidArgumentError(f"property {key!r} has the value None; use unset_properties")
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
@@ -224,7 +224,7 @@ def _properties(properties: Mapping[str, Any]) -> str:
     unset = sorted(str(k) for k, v in properties.items() if v is None)
     if unset:
         # str(None) would have stored the literal string 'None'.
-        raise ValueError(
+        raise InvalidArgumentError(
             f"property values cannot be None ({', '.join(unset)}); use unset_properties"
         )
     return ", ".join(
@@ -243,7 +243,9 @@ def _predicate(predicate: str | None) -> str | None:
     if not isinstance(predicate, str):
         raise TypeError(f"a predicate must be a SQL string, got {type(predicate).__name__}")
     if not predicate.strip():
-        raise ValueError("the predicate is empty; pass None to mean every row, or a SQL condition")
+        raise InvalidArgumentError(
+            "the predicate is empty; pass None to mean every row, or a SQL condition"
+        )
     return predicate
 
 
@@ -309,6 +311,57 @@ def _rows(result: Any) -> list[dict[str, Any]]:
 def _first(result: Any) -> dict[str, Any]:
     rows = _rows(result)
     return rows[0] if rows else {}
+
+
+def _history_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """One DESCRIBE HISTORY row in the shape delta-rs's history() reports.
+
+    Arrow hands the map columns back as lists of pairs and the timestamp as a
+    datetime, where every other engine gives dicts and epoch milliseconds, so
+    ``entry["operationParameters"]["mode"]`` raised on this engine alone.
+    """
+    import datetime as _dt
+
+    out = dict(row)
+    for key in ("operationParameters", "operationMetrics"):
+        value = out.get(key)
+        if isinstance(value, list):
+            out[key] = dict(value)
+    stamp = out.get("timestamp")
+    if isinstance(stamp, _dt.datetime):
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=_dt.UTC)
+        out["timestamp"] = int(stamp.timestamp() * 1000)
+    if out.get("version") is not None:
+        out["version"] = int(out["version"])
+    return out
+
+
+#: The warehouse's DML metric names, and the delta-rs names for the same count.
+_DML_ALIASES = {
+    "num_updated_rows": "num_target_rows_updated",
+    "num_deleted_rows": "num_target_rows_deleted",
+    "num_inserted_rows": "num_target_rows_inserted",
+}
+
+
+def _dml_metrics(row: dict[str, Any], affected_as: str | None) -> dict[str, Any]:
+    """Warehouse DML metrics, also under the names delta-rs and the kernel use.
+
+    DELETE and UPDATE report only ``num_affected_rows`` and MERGE its own
+    names, so ``t.delete(...)["num_deleted_rows"]`` was a KeyError exactly
+    when the warehouse served the call.
+    """
+    if not row:
+        return _ok()
+    out = dict(row)
+    if affected_as is not None and "num_affected_rows" in out:
+        out.setdefault(affected_as, out["num_affected_rows"])
+    if affected_as is None:
+        for ours, theirs in _DML_ALIASES.items():
+            if ours in out:
+                out.setdefault(theirs, out[ours])
+    return out
 
 
 _OK: dict[str, Any] = {"status": "ok"}
@@ -480,6 +533,8 @@ class SqlEngine:
     supports_idempotent_txn = False
     supports_commit_metadata = False
     supports_writer_properties = False
+    #: The warehouse formats partition values itself.
+    supports_negative_decimal_partition_values = True
     #: Emulated with REPLACE WHERE over the partition values present in the data.
     supports_dynamic_overwrite = True
     #: Server-side-only request shapes: OPTIMIZE FULL, OPTIMIZE ... WHERE and
@@ -528,6 +583,24 @@ class SqlEngine:
         )
         self._selection_error: str | None = None
         self._last_listing_error: str | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The live WorkspaceClient (and the statement backend built on it) and
+        # an explicit SDK Config cannot be pickled, so a Connection or Table
+        # with the fallback enabled failed to pickle once the warehouse had
+        # been used -- or at all, given config=. Ship plain configuration; a
+        # copy rebuilds the client on first use.
+        state = self.__dict__.copy()
+        state["_client"] = None
+        if isinstance(state.get("_backend"), SdkStatementBackend):
+            state["_backend"] = None
+        config = state.get("_config")
+        if config is not None:
+            from ..credentials.databricks import _config_attributes
+
+            state["_config"] = None
+            state["_config_kwargs"] = _config_attributes(config)
+        return state
 
     # ----------------------------------------------------------- capabilities
 
@@ -625,15 +698,21 @@ class SqlEngine:
 
             from .._sdk import PRODUCT, sdk_version, workspace_client
 
-            # Named explicitly rather than splatted: Config's signature is
-            # heterogeneous, so **kwargs defeats type checking here.
-            cfg = self._config or Config(
-                profile=self._profile,
-                host=self._host,
-                token=self._token,
-                product=PRODUCT,
-                product_version=sdk_version(),
-            )
+            carried: dict[str, Any] = getattr(self, "_config_kwargs", None) or {}
+            if self._config is None and carried:
+                # An unpickled copy of an engine built from an explicit Config.
+                identity = {"product": PRODUCT, "product_version": sdk_version()}
+                cfg: Any = Config(**{**carried, **identity})
+            else:
+                # Named explicitly rather than splatted: Config's signature is
+                # heterogeneous, so **kwargs defeats type checking here.
+                cfg = self._config or Config(
+                    profile=self._profile,
+                    host=self._host,
+                    token=self._token,
+                    product=PRODUCT,
+                    product_version=sdk_version(),
+                )
             self._client = workspace_client(config=cfg)
         return self._client
 
@@ -765,7 +844,7 @@ class SqlEngine:
         """
         if version is not None and timestamp is not None:
             # One of them was silently ignored before.
-            raise ValueError("pass version or timestamp, not both")
+            raise InvalidArgumentError("pass version or timestamp, not both")
         binder = ParameterBinder()
         projection = _columns(columns) if columns else "*"
         sql = f"SELECT {projection} FROM {_name(table)}"
@@ -784,14 +863,14 @@ class SqlEngine:
         if limit is not None:
             limit = int(limit)
             if limit < 0:
-                raise ValueError(f"history limit must be >= 0, got {limit}")
+                raise InvalidArgumentError(f"history limit must be >= 0, got {limit}")
             if limit == 0:
                 # `if limit:` read 0 as "no limit" and returned the whole history.
                 return []
         sql = f"DESCRIBE HISTORY {_name(table)}"
         if limit is not None:
             sql += f" LIMIT {limit}"
-        return _rows(self._query(Operation.HISTORY, sql))
+        return [_history_entry(row) for row in _rows(self._query(Operation.HISTORY, sql))]
 
     def detail(self, table: ResolvedTable, *, version: int | None = None) -> dict[str, Any]:
         """DESCRIBE DETAIL, plus the fields the other engines report.
@@ -863,9 +942,9 @@ class SqlEngine:
         """`table_changes(...)`. Versions and timestamps are bound as parameters."""
         _reject_unsupported("read the change data feed", kwargs)
         if starting_version is not None and starting_timestamp is not None:
-            raise ValueError("pass starting_version or starting_timestamp, not both")
+            raise InvalidArgumentError("pass starting_version or starting_timestamp, not both")
         if ending_version is not None and ending_timestamp is not None:
-            raise ValueError("pass ending_version or ending_timestamp, not both")
+            raise InvalidArgumentError("pass ending_version or ending_timestamp, not both")
         binder = ParameterBinder()
         if starting_timestamp is not None:
             start = binder.bind(_timestamp_text(starting_timestamp), type="TIMESTAMP")
@@ -1093,7 +1172,7 @@ class SqlEngine:
         sql = f"DELETE FROM {_name(table)}"
         if _predicate(predicate) is not None:
             sql += f" WHERE {predicate}"
-        return _first(self._query(Operation.DELETE, sql)) or _ok()
+        return _dml_metrics(_first(self._query(Operation.DELETE, sql)), "num_deleted_rows")
 
     def update(
         self,
@@ -1129,13 +1208,13 @@ class SqlEngine:
         }
         if both:
             # Two assignments to one column fail on the warehouse only.
-            raise ValueError(
+            raise InvalidArgumentError(
                 f"column(s) {', '.join(sorted(both))} are set by both updates and new_values"
             )
         sql = f"UPDATE {_name(table)} SET {', '.join(assignments)}"
         if _predicate(predicate) is not None:
             sql += f" WHERE {predicate}"
-        return _first(self._query(Operation.UPDATE, sql, binder)) or _ok()
+        return _dml_metrics(_first(self._query(Operation.UPDATE, sql, binder)), "num_updated_rows")
 
     def merge(
         self,
@@ -1152,14 +1231,14 @@ class SqlEngine:
         _reject_unsupported("merge", kwargs)
         # An empty ON clause was a syntax error only after the source was staged.
         if not isinstance(predicate, str) or not predicate.strip():
-            raise ValueError(
+            raise InvalidArgumentError(
                 f"a MERGE needs a join predicate (its ON condition), got {predicate!r}"
             )
         source_alias = source_alias or "source"
         target_alias = target_alias or "target"
         if source_alias.lower() == target_alias.lower():
             # Aliases resolve case-insensitively: every reference is ambiguous.
-            raise ValueError(f"the source and target aliases are both {source_alias!r}")
+            raise InvalidArgumentError(f"the source and target aliases are both {source_alias!r}")
         if self._staging_volume is None:
             raise UnreachableTableError(
                 "merge via SQL",
@@ -1210,7 +1289,7 @@ class SqlEngine:
 
     def zorder(self, table: ResolvedTable, columns: list[str], **kwargs: Any) -> dict[str, Any]:
         if not columns:
-            raise ValueError("Z-ORDER needs at least one column")
+            raise InvalidArgumentError("Z-ORDER needs at least one column")
         return self.optimize(table, zorder_by=columns, **kwargs)
 
     def vacuum(
@@ -1227,7 +1306,7 @@ class SqlEngine:
         """VACUUM [LITE|FULL] [RETAIN n HOURS] [DRY RUN]. Returns the file paths."""
         _reject_unsupported("vacuum", kwargs)
         if lite and full:
-            raise ValueError("VACUUM is LITE or FULL, not both")
+            raise InvalidArgumentError("VACUUM is LITE or FULL, not both")
         if not enforce_retention_duration:
             raise UnreachableTableError(
                 "vacuum below the retention threshold via SQL",
@@ -1245,7 +1324,9 @@ class SqlEngine:
             if not 0 <= hours < float("inf"):
                 # "RETAIN nan HOURS" / "RETAIN -1 HOURS" failed on the warehouse
                 # with a parse error that named neither the argument nor the value.
-                raise ValueError(f"retention_hours must be a number >= 0, got {retention_hours!r}")
+                raise InvalidArgumentError(
+                    f"retention_hours must be a number >= 0, got {retention_hours!r}"
+                )
             sql += f" RETAIN {int(hours) if hours.is_integer() else hours} HOURS"
         if dry_run:
             sql += " DRY RUN"
@@ -1299,7 +1380,7 @@ class SqlEngine:
         elif purge:
             clause = "APPLY (PURGE)"
         else:
-            raise ValueError("REORG needs purge=True or an iceberg_compat_version")
+            raise InvalidArgumentError("REORG needs purge=True or an iceberg_compat_version")
         where = f" WHERE {predicate}" if _predicate(predicate) is not None else ""
         self._run(Operation.REORG, f"REORG TABLE {_name(table)}{where} {clause}")
         return _ok()
@@ -1317,10 +1398,10 @@ class SqlEngine:
     ) -> dict[str, Any]:
         """CREATE [OR REPLACE] TABLE target {SHALLOW|DEEP} CLONE source [AS OF]."""
         if replace and if_not_exists:
-            raise ValueError("replace and if_not_exists are mutually exclusive")
+            raise InvalidArgumentError("replace and if_not_exists are mutually exclusive")
         if version is not None and timestamp is not None:
             # The timestamp was silently ignored.
-            raise ValueError("pass version or timestamp, not both")
+            raise InvalidArgumentError("pass version or timestamp, not both")
         verb = "CREATE OR REPLACE TABLE" if replace else "CREATE TABLE"
         if if_not_exists:
             verb += " IF NOT EXISTS"
@@ -1348,13 +1429,13 @@ class SqlEngine:
         sql += " DELTA STATISTICS" if delta_statistics else " STATISTICS"
         if isinstance(columns, str):
             if columns.lower() not in ("all", "*"):
-                raise ValueError("columns must be a list of names, or 'all'")
+                raise InvalidArgumentError("columns must be a list of names, or 'all'")
             sql += " FOR ALL COLUMNS"
         elif columns:
             sql += f" FOR COLUMNS {_columns(columns)}"
         if noscan:
             if columns:
-                raise ValueError("NOSCAN computes table-level statistics only")
+                raise InvalidArgumentError("NOSCAN computes table-level statistics only")
             sql += " NOSCAN"
         self._run(Operation.ANALYZE, sql)
         return _ok()
@@ -1395,7 +1476,7 @@ class SqlEngine:
         _reject_unsupported("add columns", kwargs)
         pairs = [f"{_quote(n)} {_sql_type(t)}" for n, t in _column_types(fields)]
         if not pairs:
-            raise ValueError("no columns given")
+            raise InvalidArgumentError("no columns given")
         return self._alter(Operation.ADD_COLUMN, table, f"ADD COLUMNS ({', '.join(pairs)})")
 
     def drop_column(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
@@ -1413,7 +1494,7 @@ class SqlEngine:
         kwargs.pop("raise_if_not_exists", None)
         _reject_unsupported("set table properties", kwargs)
         if not properties:
-            raise ValueError("no properties given")
+            raise InvalidArgumentError("no properties given")
         pairs = _properties(properties)
         return self._alter(Operation.SET_PROPERTIES, table, f"SET TBLPROPERTIES ({pairs})")
 
@@ -1422,7 +1503,7 @@ class SqlEngine:
     ) -> dict[str, Any]:
         keys = [keys] if isinstance(keys, str) else list(keys)
         if not keys:
-            raise ValueError("no property keys given")
+            raise InvalidArgumentError("no property keys given")
         guard = "IF EXISTS " if if_exists else ""
         listed = ", ".join(_literal(k) for k in keys)
         return self._alter(
@@ -1456,11 +1537,13 @@ class SqlEngine:
         """ADD CONSTRAINT ... CHECK. The expression is SQL by contract."""
         _reject_unsupported("add a constraint", kwargs)
         if not constraints:
-            raise ValueError("no constraints given")
+            raise InvalidArgumentError("no constraints given")
         for name, expression in constraints.items():
             # CHECK () or CHECK (None) failed on the warehouse with a parse error.
             if _predicate(expression) is None or not str(name).strip():
-                raise ValueError(f"constraint {name!r} needs a name and a CHECK expression")
+                raise InvalidArgumentError(
+                    f"constraint {name!r} needs a name and a CHECK expression"
+                )
         for name, expression in constraints.items():
             self._alter(
                 Operation.ADD_CONSTRAINT,
@@ -1515,7 +1598,7 @@ class SqlEngine:
         """CLUSTER BY (cols); an empty list or None is NONE; ``"auto"`` is AUTO."""
         if isinstance(columns, str):
             if columns.lower() != "auto":
-                raise ValueError("columns must be a list of names, None, or 'auto'")
+                raise InvalidArgumentError("columns must be a list of names, None, or 'auto'")
             clause = "CLUSTER BY AUTO"
         elif not columns:
             clause = "CLUSTER BY NONE"
@@ -1561,7 +1644,7 @@ class SqlEngine:
         column: str | Sequence[str] | None = None,
     ) -> dict[str, Any]:
         if not tags:
-            raise ValueError("no tags given")
+            raise InvalidArgumentError("no tags given")
         # A key-only tag has an empty value; str(None) stored the text 'None'.
         pairs = ", ".join(
             f"{_literal(k)} = {_literal('' if v is None else str(v))}" for k, v in tags.items()
@@ -1577,7 +1660,7 @@ class SqlEngine:
     ) -> dict[str, Any]:
         keys = [keys] if isinstance(keys, str) else list(keys)
         if not keys:
-            raise ValueError("no tag keys given")
+            raise InvalidArgumentError("no tag keys given")
         target = f"ALTER COLUMN {_column(column)} " if column is not None else ""
         listed = ", ".join(_literal(k) for k in keys)
         return self._alter("unset_tags", table, f"{target}UNSET TAGS ({listed})")
@@ -1685,7 +1768,7 @@ class SqlMerger:
         _predicate(predicate)
         verb, arg = action
         if verb in ("UPDATE", "INSERT") and not arg:
-            raise ValueError(f"a MERGE {verb} clause needs at least one column to set")
+            raise InvalidArgumentError(f"a MERGE {verb} clause needs at least one column to set")
         self._clauses.append((kind, predicate, action))
         return self
 
@@ -1738,7 +1821,7 @@ class SqlMerger:
         if verb == "DELETE":
             return "DELETE"
         if verb in ("UPDATE", "INSERT") and not arg:
-            raise ValueError(f"a MERGE {verb} clause needs at least one column to set")
+            raise InvalidArgumentError(f"a MERGE {verb} clause needs at least one column to set")
         if verb == "UPDATE":
             return "UPDATE SET " + ", ".join(
                 f"{tgt}.{_quote(self._target_column(k))} = {_expression(v)}" for k, v in arg.items()
@@ -1751,7 +1834,7 @@ class SqlMerger:
         excluded = {str(c).lower() for c in arg}
         cols = [c for c in source_columns if c.lower() not in excluded]
         if not cols:
-            raise ValueError("except_cols excludes every source column")
+            raise InvalidArgumentError("except_cols excludes every source column")
         if verb == "UPDATE_ALL":
             if not arg:
                 return "UPDATE SET *"
@@ -1765,7 +1848,7 @@ class SqlMerger:
     def statement(self, relation: str, source_columns: list[str]) -> str:
         """The MERGE text for a source `relation`. Exposed for inspection and tests."""
         if not self._clauses:
-            raise ValueError("a MERGE needs at least one WHEN clause")
+            raise InvalidArgumentError("a MERGE needs at least one WHEN clause")
         evolve = " WITH SCHEMA EVOLUTION" if self._merge_schema else ""
         sql = (
             f"MERGE{evolve} INTO {_name(self._table)} AS {_quote(self._target_alias)} "
@@ -1786,11 +1869,11 @@ class SqlMerger:
     def execute(self) -> dict[str, Any]:
         """Stage the source, run the MERGE, delete the staged file. Returns metrics."""
         if not self._clauses:
-            raise ValueError("a MERGE needs at least one WHEN clause")
+            raise InvalidArgumentError("a MERGE needs at least one WHEN clause")
         with self._engine._staged(self._source) as (relation, arrow):
             sql = self.statement(relation, list(arrow.column_names))
             result = self._engine._query(Operation.MERGE, sql)
-        return _first(result) or _ok()
+        return _dml_metrics(_first(result), None)
 
 
 # ------------------------------------------------------------------ helpers
@@ -1803,20 +1886,22 @@ def _filter_sql(spec: tuple[str, str, Any], binder: ParameterBinder) -> str:
     if op in ("=", "!=", "<", "<=", ">", ">="):
         if value is None:
             if op not in ("=", "!="):
-                raise ValueError(f"cannot compare {column} {op} NULL")
+                raise InvalidArgumentError(f"cannot compare {column} {op} NULL")
             return f"{_quote(column)} IS {'NOT ' if op == '!=' else ''}NULL"
         return f"{_quote(column)} {op} {binder.bind(value)}"
     if op in ("in", "not in"):
         if isinstance(value, str | bytes) or not hasattr(value, "__iter__"):
             # list("abc") is ['a', 'b', 'c']: a lone string would silently
             # become an IN over its characters.
-            raise ValueError(f"an '{op}' filter on {column} needs a list of values, got {value!r}")
+            raise InvalidArgumentError(
+                f"an '{op}' filter on {column} needs a list of values, got {value!r}"
+            )
         values = list(value)
         if not values:
-            raise ValueError(f"an '{op}' filter on {column} needs at least one value")
+            raise InvalidArgumentError(f"an '{op}' filter on {column} needs at least one value")
         markers = ", ".join(binder.bind(v) for v in values)
         return f"{_quote(column)} {op.upper()} ({markers})"
-    raise ValueError(f"unsupported partition filter operator {op!r}")
+    raise InvalidArgumentError(f"unsupported partition filter operator {op!r}")
 
 
 def _type_text(value: Any) -> str:
@@ -1932,10 +2017,14 @@ def _check_volume(volume: str | None) -> tuple[str, str, str] | None:
         return None
     parts = split_identifier(volume)
     if len(parts) != 3:
-        raise ValueError(f"staging_volume must be '<catalog>.<schema>.<volume>', got {volume!r}")
+        raise InvalidArgumentError(
+            f"staging_volume must be '<catalog>.<schema>.<volume>', got {volume!r}"
+        )
     for part in parts:
         if not part.strip() or "/" in part or "\x00" in part or part in (".", ".."):
-            raise ValueError(f"staging_volume part {part!r} cannot appear in a volume path")
+            raise InvalidArgumentError(
+                f"staging_volume part {part!r} cannot appear in a volume path"
+            )
     return parts[0], parts[1], parts[2]
 
 
@@ -1950,7 +2039,7 @@ def _warehouse_from_http_path(http_path: str | None) -> str | None:
         "warehouses",
         "endpoints",
     ):
-        raise ValueError(
+        raise InvalidArgumentError(
             f"{http_path!r} is not a SQL warehouse HTTP path (/sql/1.0/warehouses/<id>)"
         )
     return tail

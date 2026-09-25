@@ -164,7 +164,7 @@ def catalog_for_uri(uri: str | None, **kwargs: Any) -> Catalog:
         if not isinstance(uri, str):
             raise InvalidReferenceError(
                 f"a connection URI must be a string, not {type(uri).__name__}; for a "
-                "local table use conn.path(...) or ds.connect('file://')"
+                "local table use conn.open_table(path) or ds.connect('file://')"
             )
         # An empty URI (an unset environment variable, typically) means "no
         # URI", not a scheme named "".

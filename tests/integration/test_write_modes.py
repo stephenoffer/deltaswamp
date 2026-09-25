@@ -12,7 +12,7 @@ from typing import Any
 import deltaswamp as ds
 import pytest
 from deltaswamp.capability import Engine, Operation
-from deltaswamp.errors import DeltaSwampError, UnreachableTableError
+from deltaswamp.errors import DeltaSwampError, InvalidArgumentError, UnreachableTableError
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
@@ -258,7 +258,7 @@ class TestWriteTableSaveModes:
         assert conn.open_table(plain.location).to_arrow().to_pydict()["id"] == [9]
 
     def test_unknown_mode_is_refused(self, conn: Any, tmp_path: Any) -> None:
-        with pytest.raises(UnreachableTableError, match="'error', 'ignore'"):
+        with pytest.raises(InvalidArgumentError, match="'error', 'ignore'"):
             conn.write_table(str(tmp_path / "x"), pa.table({"id": [1]}), mode="sideways")
 
     def test_schema_is_inferred_from_the_data(self, conn: Any, tmp_path: Any) -> None:

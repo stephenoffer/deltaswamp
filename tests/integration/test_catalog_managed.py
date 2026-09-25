@@ -443,8 +443,10 @@ class TestCommitFailuresReachCallersAsLibraryErrors:
 
         uc, conn = uc_and_conn
         uc.next_commit_status = 409
+        # max_commit_retries=0: a lost race is now re-staged on a fresh tail
+        # by default (w4 catalog flows); without retries it surfaces.
         with pytest.raises(CommitConflictError) as caught:
-            conn.table("main.sales.cm").append(pa.table({"id": [1]}))
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}), max_commit_retries=0)
         assert isinstance(caught.value, DeltaSwampError)
 
     def test_a_429_is_backfill_pressure_not_a_conflict(self, uc_and_conn: Any) -> None:
@@ -453,8 +455,10 @@ class TestCommitFailuresReachCallersAsLibraryErrors:
 
         uc, conn = uc_and_conn
         uc.next_commit_status = 429
+        # A stream: a re-readable batch is now published-and-retried (w4
+        # catalog flows), so only a consumed stream still surfaces the 429.
         with pytest.raises(BackfillRequiredError) as caught:
-            conn.table("main.sales.cm").append(pa.table({"id": [1]}))
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}).to_reader())
         assert not isinstance(caught.value, CommitConflictError)
 
     def test_a_distributed_commit_conflict_is_the_same_error(self, uc_and_conn: Any) -> None:
@@ -469,15 +473,18 @@ class TestCommitFailuresReachCallersAsLibraryErrors:
             plan.commit([fragment])
 
     def test_retrying_a_catalog_managed_commit_says_to_re_open(self, uc_and_conn: Any) -> None:
-        """Retrying here would race against the commit tail captured at resolve."""
-        from deltaswamp.errors import UnreachableTableError
+        """A retry re-reads the commit tail from the catalog, so it can succeed.
 
+        It used to refuse ("re-open the table"), because the tail captured at
+        resolve was all it had; the plan now carries its catalog (w4 catalog
+        flows), so `retries` does what it promises here too.
+        """
         uc, conn = uc_and_conn
         plan = conn.table("main.sales.cm").plan_write()
         fragment = plan.write(pa.table({"id": [1]}))
         uc.next_commit_status = 409
-        with pytest.raises(UnreachableTableError, match="re-open"):
-            plan.commit([fragment], retries=3)
+        plan.commit([fragment], retries=3)
+        assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [1]
 
     def test_the_table_still_works_after_a_refused_commit(self, uc_and_conn: Any) -> None:
         from deltaswamp.errors import CommitConflictError
@@ -485,7 +492,7 @@ class TestCommitFailuresReachCallersAsLibraryErrors:
         uc, conn = uc_and_conn
         uc.next_commit_status = 409
         with pytest.raises(CommitConflictError):
-            conn.table("main.sales.cm").append(pa.table({"id": [1]}))
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}), max_commit_retries=0)
 
         conn.table("main.sales.cm").append(pa.table({"id": [2]}))
         assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [2]

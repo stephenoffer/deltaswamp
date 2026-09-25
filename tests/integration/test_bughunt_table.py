@@ -355,7 +355,7 @@ class TestConnection:
             raise AssertionError("scanned before the engine was checked")
 
         monkeypatch.setattr(Table, "scan", fail)
-        with pytest.raises(UnreachableTableError, match="engine"):
+        with pytest.raises(InvalidArgumentError, match="engine"):
             conn.sql("select 1", tables={"t": path}, engine="spark")
 
     def test_sql_statement_without_a_result_returns_none(self, conn: Any) -> None:

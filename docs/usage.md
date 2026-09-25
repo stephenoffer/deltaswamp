@@ -461,9 +461,17 @@ fragment = plan.write(batch)              # bytes; files are durable, uncommitte
 version = plan.commit(fragments)          # a reader sees all of it or none
 ```
 
-`WritePlan` is picklable and carries the table's *credential provider*, never a
-credential, so each worker vends its own and nothing secret enters a task
-payload.
+`WritePlan` and `ScanPlan` are picklable, and what crosses a process boundary
+carries the table's short-lived, table-scoped *storage* credential (vended on
+the driver when the plan is pickled) and its expiry -- never the catalog's
+credentials (a PAT, an OAuth client secret, a UC bearer token) and never the
+catalog itself. The driver's own plan object keeps full catalog access, so
+`commit()` runs on the driver; a worker's copy cannot commit. A worker whose
+shipped credential is within a minute of expiry raises `CredentialError`
+saying to re-plan on the driver. For jobs that outlive the credential, plan
+with `ship_catalog_auth=True` to ship the catalog's credential provider instead,
+so workers re-vend on their own -- at the cost of the catalog token travelling
+in every task payload.
 
 Concurrency follows what the mode means. An **append** commits against the table
 as it is then, so a writer that arrived while the job ran is not a conflict --
@@ -473,7 +481,15 @@ refused, and `allow_concurrent_overwrite=True` is how you say last-writer-wins.
 Where a catalog does arbitrate and rejects the commit, the fragments stay valid
 -- they describe data files, which carry no version -- so the same fragments can
 be committed again against a fresh snapshot, which `retries=` does for tables
-this library commits itself.
+this library commits itself (an append on a path table retries by default, as
+`Table.append` does).
+
+A guarded overwrite commits against the planned snapshot itself, so a writer
+that lands between the check and the commit makes it conflict rather than
+vanish. An idempotent `txn=` is checked again at commit, so two runs of the same
+job cannot both land, and a retry refuses fragments whose files an earlier,
+seemingly failed attempt already committed. Pass each fragment exactly once: a
+data file named twice in one commit is refused.
 
 Three properties are the point:
 
@@ -540,15 +556,19 @@ All inherit from `DeltaSwampError`.
 | Error | Means |
 |---|---|
 | `InvalidReferenceError` | the reference could not be parsed or resolved |
+| `InvalidArgumentError` | a call's arguments are malformed or contradict each other (also a `ValueError`) |
 | `UnreachableTableError` | no available engine can serve the request |
 | `FallbackRequiredError` | only the SQL fallback could serve it, and it is off |
 | `PropertyNotSupportedError` | a property the chosen engine cannot handle |
 | `CredentialError` | vending or refresh failed |
 | `PreflightError` | a workspace prerequisite is not satisfied |
 | `CommitConflictError` | another writer took that version first |
+| `TransientCommitError` | a commit failed for a transient reason; the table is unchanged, so retry it as is |
 | `BackfillRequiredError` | the catalog wants staged commits published |
 | `CorruptTableError` | on-disk state failed a correctness check |
+| `MissingDataFileError` | a `CorruptTableError`: a file the snapshot references was removed (VACUUM, manual delete); `.path` names it |
 | `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
+| `EnginePanicError` | an engine panicked across the FFI boundary |
 
 A conflict means re-read the snapshot, recompute, then stage again at the next
 version. A backfill demand is backpressure, not a rate limit: retrying it with
@@ -576,8 +596,11 @@ creds.expires_within(300)
 creds.redacted()  # safe to log
 ```
 
-Credential *providers* are picklable; credentials are not. A distributed
-worker receives configuration and re-vends when its own copy expires. Azure
+Credential *providers* are picklable; credentials are not. Pickling a provider
+(or a `Table` or `Connection` holding one) carries its catalog configuration,
+which for a token-authenticated workspace includes the token, so a worker can
+re-vend. Distributed plans do not do this by default; see "Building a
+distributed connector" above. Azure
 user-delegation SAS is scoped to a path, so credentials are keyed by table, and
 Azure always gets an explicit endpoint.
 

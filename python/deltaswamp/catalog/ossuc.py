@@ -14,13 +14,14 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NoReturn, TypeVar
 
-from ..credentials.base import Cloud, Credentials, Operation
+from ..credentials.base import DEFAULT_REFRESH_MARGIN_SECONDS, Cloud, Credentials, Operation
 from ..errors import CredentialError, InvalidReferenceError, PreflightError
 from ..governance import (
     ColumnLineage,
@@ -107,12 +108,22 @@ def _unsupported(method: str) -> NoReturn:
     raise NotImplementedError(f"{method}: {_UNSUPPORTED[method]}")
 
 
+class _Recreated(Exception):
+    """The Delta API described a different table id than the tables API."""
+
+
 class UnityCatalogHTTPError(PreflightError):
     """A non-2xx answer from Unity Catalog, carrying the status code."""
 
     def __init__(self, message: str, status: int) -> None:
         super().__init__(message)
         self.status = status
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # The default rebuilds from `args` alone and this __init__ also needs
+        # `status`: raised while a Ray worker vended credentials, the error
+        # failed to unpickle on the driver and became an unrelated TypeError.
+        return (type(self), (str(self), self.status), self.__dict__)
 
 
 def _request(
@@ -183,6 +194,7 @@ def _parse_vended(
     body: dict[str, Any],
     fallback_url: str | None = None,
     table_id: str | None = None,
+    operation: Operation | None = None,
 ) -> Credentials:
     """Parse a UC temporary-credentials response (table or path).
 
@@ -222,6 +234,11 @@ def _parse_vended(
         "expires_at": expires_at,
         "scope_prefix": url or None,
         "table_id": table_id,
+        # What it was vended for: StaticCredentialProvider refuses to hand a
+        # read-only path credential to a write only when this says READ, and
+        # it was never set here, so a PATH_READ credential went on to a bare
+        # storage 403 mid-commit.
+        "operation": operation,
     }
     if (c := block("aws_temp_credentials")) is not None:
         secrets = {
@@ -267,6 +284,7 @@ def _parse_vended(
             secrets=options,
             scope_prefix=location or None,
             table_id=table_id,
+            operation=operation,
         )
     raise CredentialError(
         f"OSS Unity Catalog returned no recognised credential block: {sorted(body)}"
@@ -300,10 +318,12 @@ class OSSUnityCredentialProvider:
         self._table = ref.table
         self._token = token
         self._cache: dict[Operation, Credentials] = {}
+        self._vended_at: dict[Operation, float] = {}
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["_cache"] = {}
+        state["_vended_at"] = {}
         return state
 
     @property
@@ -321,6 +341,7 @@ class OSSUnityCredentialProvider:
 
     def invalidate(self) -> None:
         self._cache.clear()
+        getattr(self, "_vended_at", {}).clear()
 
     def credentials(self, operation: Operation = Operation.READ) -> Credentials:
         try:
@@ -331,7 +352,7 @@ class OSSUnityCredentialProvider:
                 f"credential operation must be READ or READ_WRITE, not {operation!r}"
             ) from None
         cached = self._cache.get(operation)
-        if cached is not None and not cached.expires_within():
+        if cached is not None and not cached.expires_within(self._margin(operation, cached)):
             return cached
         # Percent-encoded: a name with a space, '#', '?' or '/' otherwise
         # built a different URL (or a different table) entirely.
@@ -340,14 +361,50 @@ class OSSUnityCredentialProvider:
             f"{UC_DELTA_API}/catalogs/{_q(self._catalog or '')}/schemas/{_q(self._schema or '')}"
             f"/tables/{_q(self._table or '')}/credentials?{query}"
         )
-        body = _request(self._base_url, path, self._token)
-        creds = self._parse(body)
+        try:
+            body = _request(self._base_url, path, self._token)
+        except UnityCatalogHTTPError as exc:
+            # Surfaced as a bare HTTP error (a PreflightError), so `except
+            # CredentialError` missed it and nothing said what to do.
+            table = f"{self._catalog}.{self._schema}.{self._table}"
+            hint = {
+                404: "the table no longer exists under this name (dropped, renamed, or "
+                "re-created with a new id); re-resolve it",
+                401: "the catalog token was rejected (expired or invalid)",
+                403: f"the principal may not {operation.value} this table's storage (SELECT "
+                "for READ, MODIFY for READ_WRITE, plus USE SCHEMA and USE CATALOG)",
+            }.get(exc.status, "the server refused the request")
+            raise CredentialError(
+                f"credential vending failed for {table} ({operation.value}): {hint}. "
+                f"Underlying error: {exc}"
+            ) from exc
+        creds = self._parse(body, operation)
         self._cache[operation] = creds
+        vended = getattr(self, "_vended_at", None)
+        if vended is None:
+            vended = self._vended_at = {}
+        vended[operation] = time.time()
         return creds
 
-    def _parse(self, body: dict[str, Any]) -> Credentials:
+    def _margin(self, operation: Operation, cached: Credentials) -> float:
+        """The refresh margin, capped at half the credential's real lifetime.
+
+        A credential issued with less life than the 300s default margin was
+        "expiring" the moment it arrived, so every call re-vended it -- two or
+        three vends per append on a server with short-lived credentials.
+        """
+        vended_at = (getattr(self, "_vended_at", None) or {}).get(operation)
+        if cached.expires_at is None or vended_at is None:
+            return DEFAULT_REFRESH_MARGIN_SECONDS
+        lifetime = max(0.0, float(cached.expires_at) - float(vended_at))
+        return min(DEFAULT_REFRESH_MARGIN_SECONDS, lifetime / 2.0)
+
+    def _parse(self, body: dict[str, Any], operation: Operation | None = None) -> Credentials:
         return _parse_vended(
-            body, fallback_url=getattr(self, "_location", None), table_id=self._table_id
+            body,
+            fallback_url=getattr(self, "_location", None),
+            table_id=self._table_id,
+            operation=operation,
         )
 
 
@@ -382,7 +439,7 @@ class OSSUnityCatalog:
         self._base_url = base_url
         self._token = token
 
-    def resolve(self, ref: TableRef) -> ResolvedTable:
+    def resolve(self, ref: TableRef, *, _retried: bool = False) -> ResolvedTable:
         if ref.kind is not RefKind.CATALOG:
             raise InvalidReferenceError(f"{ref} is a path; use the filesystem catalog")
         # _dotted, not an assert: under `python -O` the assert vanished and a
@@ -408,7 +465,16 @@ class OSSUnityCatalog:
         )
 
         if resolved.is_catalog_managed:
-            resolved = self._with_catalog_commits(resolved, ref)
+            try:
+                resolved = self._with_catalog_commits(resolved, ref)
+            except _Recreated as exc:
+                if _retried:
+                    raise PreflightError(
+                        f"{name} keeps changing identity while being resolved (the tables "
+                        f"API and the Delta API name different table ids, now {exc}); "
+                        "retry once it has settled"
+                    ) from None
+                return self.resolve(ref, _retried=True)
         return resolved
 
     def _resolved_from_info(self, ref: TableRef, info: Mapping[str, Any]) -> ResolvedTable:
@@ -456,6 +522,18 @@ class OSSUnityCatalog:
                 f"the UC Delta API returned a non-object table response for {_dotted(ref)}: "
                 f"{body!r:.200}"
             )
+        metadata = body.get("metadata")
+        tail_id = (
+            (metadata.get("table-uuid") or metadata.get("table_uuid"))
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if tail_id and resolved.table_id and str(tail_id) != str(resolved.table_id):
+            # Two calls, two tables: dropped and re-created between the tables
+            # API lookup and this one. Pairing one table's id and credentials
+            # with the other's commit tail and location read (and committed
+            # to) the wrong table.
+            raise _Recreated(str(tail_id))
         entries, latest, location = parse_commit_tail(body, resolved.location)
         return dataclasses.replace(
             resolved,
@@ -575,7 +653,15 @@ class OSSUnityCatalog:
                     f"cannot {action}: {name} does not exist in Unity Catalog. "
                     f"Underlying error: {exc}"
                 ) from exc
-            if exc.status in (401, 403):
+            if exc.status == 401:
+                # Not a privilege problem: naming grants sent admins after the
+                # wrong fix for what is an expired or wrong token.
+                raise PreflightError(
+                    f"cannot {action}: Unity Catalog rejected the credentials (HTTP 401: "
+                    "the token is missing, expired or invalid for this server). "
+                    f"Underlying error: {exc}"
+                ) from exc
+            if exc.status == 403:
                 raise PreflightError(
                     f"cannot {action}: access to {name} was denied. {_NEEDS[needs]} "
                     f"Underlying error: {exc}"
@@ -993,7 +1079,9 @@ class OSSUnityCatalog:
         # `or`, not setdefault: a present-but-empty url left the credential
         # with no scope and, on Azure, no endpoint.
         body["url"] = body.get("url") or url
-        return _parse_vended(body)
+        return _parse_vended(
+            body, operation=Operation.READ if op == "PATH_READ" else Operation.READ_WRITE
+        )
 
     def _delta_tables_path(self, ref: TableRef, leaf: str) -> str:
         assert ref.catalog and ref.schema

@@ -33,6 +33,18 @@ pub enum NativeError {
     /// Transient I/O failure; the table is unchanged and a retry is safe.
     #[error("{0}")]
     Retryable(String),
+
+    /// The catalog refused the commit's credentials or privileges (401/403).
+    #[error("{0}")]
+    CatalogPermission(String),
+
+    /// The catalog no longer has the table (404): dropped or renamed.
+    #[error("{0}")]
+    CatalogNotFound(String),
+
+    /// Any other refusal of the commit by the catalog.
+    #[error("{0}")]
+    CatalogRejected(String),
 }
 
 pyo3::create_exception!(
@@ -52,6 +64,35 @@ pyo3::create_exception!(
     RetryableError,
     pyo3::exceptions::PyRuntimeError,
     "A transient failure; the table is unchanged and the operation may be retried."
+);
+// Input the extension refuses. A ValueError subclass, so every existing
+// `except ValueError` keeps working while callers can tell the extension's
+// own input errors apart from any other ValueError.
+pyo3::create_exception!(
+    _native,
+    InvalidInputError,
+    pyo3::exceptions::PyValueError,
+    "The extension refused its input: bad arguments, data or fragments."
+);
+// Catalog refusals of a commit. ValueErrors for the same compatibility reason:
+// they reached Python as bare ValueErrors before, and code matched on that.
+pyo3::create_exception!(
+    _native,
+    CatalogCommitError,
+    pyo3::exceptions::PyValueError,
+    "The catalog refused the commit; nothing was committed."
+);
+pyo3::create_exception!(
+    _native,
+    CatalogPermissionError,
+    CatalogCommitError,
+    "The catalog rejected the commit's credentials or privileges (HTTP 401/403)."
+);
+pyo3::create_exception!(
+    _native,
+    CatalogNotFoundError,
+    CatalogCommitError,
+    "The catalog no longer has this table (HTTP 404)."
 );
 
 impl From<NativeError> for PyErr {
@@ -74,6 +115,10 @@ impl From<NativeError> for PyErr {
             NativeError::CommitConflict(_) => CommitConflictError::new_err(message),
             NativeError::BackfillRequired(_) => BackfillRequiredError::new_err(message),
             NativeError::Retryable(_) => RetryableError::new_err(message),
+            NativeError::CatalogPermission(_) => CatalogPermissionError::new_err(message),
+            NativeError::CatalogNotFound(_) => CatalogNotFoundError::new_err(message),
+            NativeError::CatalogRejected(_) => CatalogCommitError::new_err(message),
+            NativeError::Invalid(_) => InvalidInputError::new_err(message),
             _ => PyValueError::new_err(message),
         }
     }

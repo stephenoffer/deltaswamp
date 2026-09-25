@@ -13,7 +13,8 @@ FEATURES: list[str]
 
 One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
-"uc_create_table_request", "checkpoint", "file_restricted_scan". Gate on this
+"uc_create_table_request", "checkpoint", "file_restricted_scan",
+"distributed_write". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
 
@@ -45,6 +46,22 @@ class BackfillRequiredError(RuntimeError):
 
 class RetryableError(RuntimeError):
     """A transient failure; the table is unchanged and a retry is safe."""
+
+class InvalidInputError(ValueError):
+    """The extension refused its input: arguments, data or fragments.
+
+    A ValueError subclass, so existing `except ValueError` clauses still work.
+    Other extension ValueErrors (kernel, Arrow, URL) stay plain ValueErrors.
+    """
+
+class CatalogCommitError(ValueError):
+    """The catalog refused a commit (a status other than 409/429/5xx)."""
+
+class CatalogPermissionError(CatalogCommitError):
+    """The catalog rejected the commit's credentials or privileges (401/403)."""
+
+class CatalogNotFoundError(CatalogCommitError):
+    """The catalog no longer has this table (404)."""
 
 class UcCommitConfig:
     """How to reach Unity Catalog to have a commit ratified."""

@@ -17,12 +17,14 @@ import dataclasses
 import os
 from typing import Any
 
+from .capability import READ_OPERATIONS as _READ_OPERATIONS
 from .capability import Capability, Operation
 from .capability import Engine as EngineKind
 from .catalog import Catalog, ResolvedTable, TableType
 from .catalog.filesystem import FilesystemCatalog
 from .catalog.registry import catalog_for_uri
 from .credentials import Operation as CredentialOperation
+from .engine.base import TranslatingStream, translating_stream
 from .engine.deltars import DeltaRsEngine
 from .engine.kernel import KernelEngine
 from .errors import (
@@ -76,6 +78,13 @@ def connect(
     that reroute changes latency and cost by orders of magnitude, and a silent
     reroute is exactly the kind of surprise this library exists to avoid.
     """
+    if catalog is not None and uri is not None and str(uri).strip():
+        # The URI was silently ignored: ds.connect("hms://...", catalog=cat)
+        # talked to `cat` while the caller believed it reached the metastore.
+        raise InvalidArgumentError(
+            f"pass a connection URI or catalog=, not both (got {uri!r} and a "
+            f"{type(catalog).__name__})"
+        )
     resolved_catalog = catalog or _default_catalog(
         uri, profile=profile, host=host, token=token, config=config
     )
@@ -151,6 +160,46 @@ def _write_data(data: Any) -> Any:
     if data is None:
         raise InvalidArgumentError("no data given to write")
     return data
+
+
+def _only_the_create_commit(log_dir: str) -> bool:
+    """Whether a local _delta_log holds nothing but version 0.
+
+    write_table removes the log of a table it created when the first write
+    fails. Another writer can append to that table in between (it exists from
+    the create on), and removing the log then deleted that writer's committed
+    data along with the empty table.
+    """
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return False
+    versions = {n.split(".", 1)[0] for n in names if n[:1].isdigit()}
+    return versions <= {"0" * 20}
+
+
+#: Writes re-run after a concurrent schema or metadata change beat them.
+_REALIGN_ATTEMPTS = 5
+
+
+def _lost_to_metadata_change(exc: BaseException, data: Any) -> bool:
+    """A delta-rs append conflict with a concurrent metadata commit, re-writable."""
+    from .errors import CommitConflictError
+
+    return (
+        isinstance(exc, CommitConflictError)
+        and "changed since last commit" in str(exc)
+        and not _consumable(data)
+    )
+
+
+def _consumable(data: Any) -> bool:
+    """Whether writing `data` consumes it (a stream), so it cannot be written twice."""
+    return (
+        hasattr(data, "read_next_batch")
+        or hasattr(data, "__next__")
+        or not hasattr(data, "__len__")
+    )
 
 
 def _schema_arg(schema: Any) -> Any:
@@ -553,7 +602,9 @@ class Connection:
     router: Router
     default_catalog: str | None = None
     default_schema: str | None = None
-    storage_options: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Not in repr: these carry object-store secrets (access keys, SAS tokens),
+    # and a Connection printed in a log or a traceback leaked them verbatim.
+    storage_options: dict[str, str] = dataclasses.field(default_factory=dict, repr=False)
 
     def table(self, name: str, *, version: int | None = None) -> Table:
         """Open a table by three-level name, or by path."""
@@ -588,8 +639,25 @@ class Connection:
             )
         return ref
 
+    def _catalog_call(self, method: str, what: str, *args: Any) -> Any:
+        """Call an optional catalog method, refusing cleanly when it is absent.
+
+        The plugin contract is `resolve` and `list_tables`; the built-in path
+        catalog raises NotImplementedError for the rest. Both escaped raw
+        (AttributeError, NotImplementedError) instead of a DeltaSwampError.
+        """
+        fn = getattr(self.catalog, method, None)
+        if not callable(fn):
+            raise UnreachableTableError(
+                what,
+                f"the {getattr(self.catalog, 'name', type(self.catalog).__name__)} catalog "
+                f"does not implement {method}()",
+            )
+        return _call(what, fn, *args)
+
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
-        return self.catalog.list_tables(catalog, schema)
+        what = f"list tables in {catalog}.{schema}"
+        return list(self._catalog_call("list_tables", what, catalog, schema))
 
     def create_table(
         self,
@@ -650,17 +718,35 @@ class Connection:
                     "a Delta table already exists there",
                     "pass mode='ignore' to keep it or mode='overwrite' to replace it",
                 )
-            return self._create_at(
-                FilesystemCatalog().resolve(ref),
-                schema,
-                partition_by=partition_by,
-                cluster_by=cluster_by,
-                # Existence was settled above; the kernel knows no "ignore"
-                # and delta-rs no "create".
-                mode="error" if mode in ("create", "ignore") else mode,
-                properties=properties,
-                comment=comment,
-            )
+            try:
+                return self._create_at(
+                    FilesystemCatalog().resolve(ref),
+                    schema,
+                    partition_by=partition_by,
+                    cluster_by=cluster_by,
+                    # Existence was settled above; the kernel knows no "ignore"
+                    # and delta-rs no "create".
+                    mode="error" if mode in ("create", "ignore") else mode,
+                    properties=properties,
+                    comment=comment,
+                )
+            except Exception as exc:
+                # Another writer created it between the check and this create:
+                # delta-rs answered with a raw DeltaError, and mode="ignore"
+                # failed on exactly the case it exists for.
+                if (
+                    mode not in ("error", "create", "ignore")
+                    or "exist" not in str(exc).lower()
+                    or not self.table_exists(name)
+                ):
+                    raise
+                if mode == "ignore":
+                    return self.table(name)
+                raise UnreachableTableError(
+                    f"create {name}",
+                    "a Delta table already exists there (another writer created it first)",
+                    "pass mode='ignore' to keep it or mode='overwrite' to replace it",
+                ) from exc
 
         lifecycle = self._lifecycle_catalog(f"create the catalog table {ref}")
         if mode == "ignore":
@@ -751,14 +837,28 @@ class Connection:
             location=location,
             credential_provider=StaticCredentialProvider(credentials),
         )
-        self._create_at(
-            staged,
-            schema,
-            partition_by=partition_by,
-            cluster_by=cluster_by,
-            mode="error",
-            properties=properties,
-        )
+        try:
+            self._create_at(
+                staged,
+                schema,
+                partition_by=partition_by,
+                cluster_by=cluster_by,
+                mode="error",
+                properties=properties,
+            )
+        except DeltaSwampError:
+            raise
+        except Exception as exc:
+            # delta-rs' own DeltaError escaped here untranslated, so
+            # `except DeltaSwampError` missed the commonest failure of all:
+            # a table already at the location, which wants registering.
+            if "already exists" not in str(exc).lower():
+                raise
+            raise UnreachableTableError(
+                f"create {ref} at {location}",
+                f"a Delta table already exists at that location ({exc})",
+                f"conn.register_table({str(ref)!r}, {location!r}) registers it as it is",
+            ) from exc
         kernel: Any = self.router.engines[EngineKind.KERNEL]
         try:
             snapshot = kernel.snapshot(staged)
@@ -904,8 +1004,7 @@ class Connection:
 
     def list_catalogs(self) -> list[str]:
         """Catalog names this connection can see."""
-        names: list[str] = self.catalog.list_catalogs()
-        return names
+        return list(self._catalog_call("list_catalogs", "list catalogs"))
 
     def list_schemas(self, catalog: str | None = None) -> list[str]:
         """Schema names in `catalog`, defaulting to the connection's own."""
@@ -914,8 +1013,7 @@ class Connection:
             raise InvalidReferenceError(
                 "no catalog given and the connection has no default_catalog"
             )
-        names: list[str] = self.catalog.list_schemas(target)
-        return names
+        return list(self._catalog_call("list_schemas", f"list schemas in {target}", target))
 
     def drop_table(self, name: str) -> None:
         """Remove a table from the catalog.
@@ -923,7 +1021,7 @@ class Connection:
         For an EXTERNAL table the files remain; only the registration goes.
         """
         ref = self._catalog_ref(name, "drop")
-        _call(f"drop {ref}", self.catalog.drop_table, ref)
+        self._catalog_call("drop_table", f"drop {ref}", ref)
 
     def table_exists(self, name: str) -> bool:
         """Whether a table is already there.
@@ -944,6 +1042,11 @@ class Connection:
             table = self.table(name)
         except DeltaSwampError:
             return False
+        if table.resolved.is_shared:
+            # A shared table has no storage location by design -- the share
+            # serves presigned URLs -- and resolving it already asked the
+            # server. The location test below reported every one absent.
+            return True
         if table.location is None:
             return False
         # Open the log through the engines, which use the table's own vended
@@ -983,9 +1086,11 @@ class Connection:
         otherwise.
         """
         if mode not in ("error", "ignore", "append", "overwrite"):
-            raise UnreachableTableError(
-                f"write with mode={mode!r}",
-                "the modes are 'error', 'ignore', 'append' and 'overwrite'",
+            # A malformed argument, as create_table(mode=...) reports it; not
+            # "no engine can serve this table".
+            raise InvalidArgumentError(
+                f"write_table mode={mode!r}: the modes are 'error', 'ignore', 'append' "
+                "and 'overwrite'"
             )
 
         data = _write_data(data)
@@ -1013,14 +1118,25 @@ class Connection:
         if not exists:
             log_dir = _local_log_dir(name)
             log_existed = log_dir is not None and os.path.exists(log_dir)
-            table = self.create_table(
-                name,
-                schema if schema is not None else _schema_of(data),
-                location=location,
-                partition_by=partition_by,
-                cluster_by=cluster_by,
-                properties=properties,
-            )
+            try:
+                table = self.create_table(
+                    name,
+                    schema if schema is not None else _schema_of(data),
+                    location=location,
+                    partition_by=partition_by,
+                    cluster_by=cluster_by,
+                    properties=properties,
+                )
+            except UnreachableTableError:
+                # Created by another writer since the existence check: the
+                # mode decides, exactly as if it had been there all along.
+                if mode == "error" or not self.table_exists(name):
+                    raise
+                if mode == "ignore":
+                    return self.table(name)
+                return self._write_existing(
+                    name, data, mode, partition_by, properties, write_options
+                )
             try:
                 table.append(data, **write_options)
             except BaseException as exc:
@@ -1028,7 +1144,12 @@ class Connection:
                 # left an empty table behind, and the retry was then refused
                 # because it "already exists". A local log this call created
                 # is removed; elsewhere, say what is left.
-                if log_dir is not None and not log_existed and os.path.isdir(log_dir):
+                if (
+                    log_dir is not None
+                    and not log_existed
+                    and os.path.isdir(log_dir)
+                    and _only_the_create_commit(log_dir)
+                ):
                     import shutil
 
                     shutil.rmtree(log_dir, ignore_errors=True)
@@ -1040,6 +1161,18 @@ class Connection:
                 raise
             return table
 
+        return self._write_existing(name, data, mode, partition_by, properties, write_options)
+
+    def _write_existing(
+        self,
+        name: str,
+        data: Any,
+        mode: str,
+        partition_by: list[str] | None,
+        properties: dict[str, str] | None,
+        write_options: dict[str, Any],
+    ) -> Table:
+        """write_table's append/overwrite into a table that is already there."""
         table = self.table(name)
         # Layout and properties apply when creating; on an existing table
         # they were silently dropped, so the caller believed them applied.
@@ -1102,9 +1235,8 @@ class Connection:
 
         # Refuse an unknown engine before reading every table in `tables`.
         if engine not in ("duckdb", "polars"):
-            raise UnreachableTableError(
-                f"run SQL with engine={engine!r}",
-                "the engines are 'duckdb', 'polars' and 'warehouse'",
+            raise InvalidArgumentError(
+                f"sql engine={engine!r}: the engines are 'duckdb', 'polars' and 'warehouse'"
             )
         pa = _require("pyarrow", "pyarrow")
         module = _require(engine, engine)
@@ -1331,7 +1463,10 @@ class Table:
     # --------------------------------------------------------------- identity
 
     def __repr__(self) -> str:
-        return f"Table({self._resolved.ref}, location={self._resolved.location!r})"
+        # A handle pinned to a past version reads (and refuses writes) as of
+        # that version; printed without it, it looked like the live table.
+        pinned = f", version={self._version}" if self._version is not None else ""
+        return f"Table({self._resolved.ref}, location={self._resolved.location!r}{pinned})"
 
     @property
     def resolved(self) -> ResolvedTable:
@@ -1356,17 +1491,28 @@ class Table:
 
     # ------------------------------------------------------------- enrichment
 
-    def _check_identity(self, metadata_id: str | None) -> None:
+    def _check_identity(
+        self, metadata_id: str | None, properties: dict[str, str] | None = None
+    ) -> None:
         """Refuse a table whose log identity does not match the catalog's.
 
         A table dropped and re-created under the same name keeps the name and
         gets a new id. Reading on with a cached id means reading a different
         table while believing it is the same one.
+
+        A Unity Catalog managed table records the catalog's id in its
+        ``io.unitycatalog.tableId`` property -- what the UC committer itself
+        validates -- and its Metadata.id need not be the same UUID (a writer
+        other than this library picks its own). Matching Metadata.id alone
+        refused such a table as "dropped and re-created" on every open.
         """
         expected = self._resolved.table_uuid
         # Only a managed table's log carries the catalog's id; the catalog gives
         # a registered external table an id of its own.
         if self._resolved.table_type not in (TableType.MANAGED, None):
+            return
+        recorded = (properties or {}).get("io.unitycatalog.tableId")
+        if expected and recorded and expected == recorded:
             return
         if expected and metadata_id and expected != metadata_id:
             raise CorruptTableError(
@@ -1381,8 +1527,64 @@ class Table:
         Enrichment caches the feature lists and properties read from the log.
         Any write or ALTER changes them, so a Table that kept the cache would
         keep reporting what was true before the call it just made.
+
+        A catalog-managed table also carries the commit tail and ratified
+        version captured at resolution. Left alone, the handle kept reading
+        the version before its own write, and its next write re-committed that
+        same version (a 409 from the catalog, every second append); txn=
+        dedup also read the stale snapshot and let a replay through.
         """
         self._enriched = False
+        # An enrichment already in flight on another thread read the log
+        # before this commit; the generation stops it marking its stale
+        # answer as current.
+        self._generation = getattr(self, "_generation", 0) + 1
+        if self._resolved.is_catalog_managed and self._version is None:
+            self._refresh_commit_tail()
+
+    def _refresh_commit_tail(self, *, before_write: bool = False) -> None:
+        """Re-read a catalog-managed table's ratified commits from the catalog.
+
+        `before_write` makes a table that is gone, or that was dropped and
+        re-created under this name, an error now -- before any data file is
+        written -- rather than a raw 404/409 from the commit afterwards, with
+        the files already orphaned in storage.
+        """
+        ref = self._resolved.ref
+        if ref.kind is not RefKind.CATALOG:
+            return
+        try:
+            fresh = self._connection.catalog.resolve(ref)
+        except InvalidReferenceError:
+            if before_write:
+                raise
+            return
+        except DeltaSwampError:
+            # The call that got us here succeeded; a re-open reads the tail.
+            return
+        recreated = any(
+            old and new and old != new
+            for old, new in (
+                (self._resolved.table_uuid, fresh.table_uuid),
+                (self._resolved.table_id, fresh.table_id),
+            )
+        )
+        if recreated:
+            # Keep this handle on the table it named, so its identity check
+            # (and the catalog's uuid assertion) refuse rather than write on.
+            if before_write:
+                raise CorruptTableError(
+                    f"{ref} was dropped and re-created since this handle opened it (the "
+                    f"catalog's table id is now {fresh.table_id or fresh.table_uuid!r}); "
+                    "re-open it with conn.table(...) to write to the new table"
+                )
+            return
+        self._resolved = dataclasses.replace(
+            self._resolved,
+            log_tail=fresh.log_tail,
+            max_catalog_version=fresh.max_catalog_version,
+            etag=fresh.etag or self._resolved.etag,
+        )
 
     def _enrich(self) -> ResolvedTable:
         """Fill in the protocol feature lists by reading the log once.
@@ -1397,6 +1599,7 @@ class Table:
             return self._resolved
 
         last_error: str | None = None
+        generation = getattr(self, "_generation", 0)
         for kind in (EngineKind.KERNEL, EngineKind.DELTARS):
             engine = self._connection.router.engines.get(kind)
             if engine is None or not engine.available():  # type: ignore[attr-defined]
@@ -1411,7 +1614,7 @@ class Table:
             # Checked before anything is cached: raising after the cache was
             # filled let the very next call read the re-created table as if
             # it were the one the catalog described.
-            self._check_identity(detail.get("metadata_id"))
+            self._check_identity(detail.get("metadata_id"), detail.get("properties"))
             self._resolved = dataclasses.replace(
                 self._resolved,
                 # A success clears an earlier failure; left in place it kept
@@ -1427,23 +1630,24 @@ class Table:
                 has_check_constraints=bool(detail.get("has_check_constraints")),
                 has_generated_columns=bool(detail.get("has_generated_columns")),
             )
-            self._enriched = True
+            self._enriched = getattr(self, "_generation", 0) == generation
             return self._resolved
 
         if last_error is not None and self._version is not None:
-            self._check_pinned_version_exists()
+            self._check_pinned_version_exists(last_error)
         # A failure is not cached: a transient vending or network error used to
         # leave this handle refusing every operation for the rest of its life.
         if last_error is not None:
             self._resolved = dataclasses.replace(self._resolved, open_error=last_error)
         return self._resolved
 
-    def _check_pinned_version_exists(self) -> None:
+    def _check_pinned_version_exists(self, error: str = "") -> None:
         """Say so plainly when the handle's version is past the latest one.
 
         Opening at a version that does not exist left every call (history
         included) refusing with "the Delta log could not be read" and advice
-        to enable the SQL warehouse.
+        to enable the SQL warehouse. A version whose commits were cleaned out
+        of the log was reported as "there is no Delta table at this path".
         """
         for kind in (EngineKind.KERNEL, EngineKind.DELTARS):
             engine: Any = self._connection.router.engines.get(kind)
@@ -1458,6 +1662,19 @@ class Table:
                     f"open {self._resolved.ref} at version {self._version}",
                     f"the table has no such version; the latest is {latest}",
                     "open it without version=, or at a committed version",
+                )
+            if (
+                latest is not None
+                and self._version is not None
+                and self._version < latest
+                and (_looks_missing(error) or "invalid table version" in error.lower())
+            ):
+                raise UnreachableTableError(
+                    f"open {self._resolved.ref} at version {self._version}",
+                    f"the table exists (latest version {latest}), but the commits needed to "
+                    f"reconstruct version {self._version} are no longer in its log -- they "
+                    "were removed by log retention or metadata cleanup",
+                    "time travel to a version at or after the table's oldest checkpoint",
                 )
             return
 
@@ -1486,7 +1703,60 @@ class Table:
             raise InvalidArgumentError(
                 f"{operation!r} is not an operation; one of {sorted(o.value for o in Operation)}"
             ) from None
-        return self._connection.router.capability(op, self._enrich(), **shape)
+        # Translate the call's arguments the way the call itself routes them.
+        # Passing them through as a bare shape let `can("append",
+        # schema_mode="merge")` answer for a plain APPEND (kernel: yes) while
+        # the append itself routed as MERGE_SCHEMA and was refused.
+        op, needs = self._call_route(op, shape)
+        return self._connection.router.capability(op, self._enrich(), needs=needs, **shape)
+
+    def _call_route(self, op: Operation, shape: dict[str, Any]) -> tuple[Operation, frozenset[str]]:
+        """The operation and needs a call with these arguments routes on."""
+        needs: set[str] = set()
+        get = shape.get
+        if op in (
+            Operation.APPEND,
+            Operation.OVERWRITE,
+            Operation.REPLACE_WHERE,
+            Operation.MERGE_SCHEMA,
+        ):
+            partition_overwrite = get("partition_overwrite") or "static"
+            needs |= self._write_needs(
+                get("schema_mode"),
+                get("commit_metadata"),
+                get("txn"),
+                get("writer_properties"),
+                partition_overwrite,
+            )
+            if op is Operation.APPEND and get("schema_mode") == "merge":
+                op = Operation.MERGE_SCHEMA
+            elif op is Operation.OVERWRITE and (
+                get("predicate") is not None or partition_overwrite == "dynamic"
+            ):
+                op = Operation.REPLACE_WHERE
+        elif op in (Operation.SCAN, Operation.TIME_TRAVEL):
+            if get("predicate") is not None:
+                needs.add("predicates")
+            if get("timestamp") is not None:
+                needs.add("timestamp_travel")
+            if (
+                get("version") is not None
+                or get("timestamp") is not None
+                or self._version is not None
+            ):
+                op = Operation.TIME_TRAVEL
+        elif op in (Operation.OPTIMIZE, Operation.ZORDER):
+            if get("zorder_by"):
+                op = Operation.ZORDER
+            if get("full"):
+                needs.add("optimize_full")
+            if get("predicate") is not None:
+                needs.add("optimize_predicate")
+        elif op is Operation.CLUSTER_BY:
+            columns = get("columns")
+            if isinstance(columns, str) and columns.lower() == "auto":
+                needs.add("auto_clustering")
+        return op, frozenset(needs)
 
     def _engine(
         self,
@@ -1494,6 +1764,13 @@ class Table:
         needs: frozenset[str] = frozenset(),
         **shape: Any,
     ) -> Any:
+        if operation not in _READ_OPERATIONS and self._version is None:
+            # A write is routed on the protocol as it is now: another process
+            # may have made the table append-only, added a constraint or
+            # renamed a column since this handle last read the log, and the
+            # stale answer sent the write to an engine that then failed with
+            # a raw error instead of the router's refusal.
+            self._enriched = False
         resolved = self._enrich()
         if (
             resolved.open_error is not None
@@ -1545,7 +1822,7 @@ class Table:
         if timestamp is not None:
             needs.add("timestamp_travel")
         engine = self._engine(op, frozenset(needs))
-        return engine.scan(
+        stream = engine.scan(
             self._resolved,
             columns=columns,
             predicate=predicate,
@@ -1553,6 +1830,14 @@ class Table:
             timestamp=timestamp,
             limit=limit,
         )
+        if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
+            return stream
+        # A file VACUUM (or a manual delete) removed fails only once reading
+        # reaches it, as a bare OSError/ArrowInvalid; name it instead.
+        where = self._resolved.location or str(self._resolved.ref)
+        at = version if version is not None else timestamp
+        context = f"{where}" + (f" at {at}" if at is not None else "")
+        return translating_stream(stream, context)
 
     def _travel_version(self, version: int | None, timestamp: Any) -> int | None:
         """The version a read should use: the call's, else the handle's.
@@ -1698,6 +1983,11 @@ class Table:
                 f"cannot {what}: this handle is pinned to version {self._version}; "
                 "open the table without version= to write to it"
             )
+        if self._resolved.is_catalog_managed:
+            # The catalog ratifies only latest+1, so a write from the tail
+            # captured at resolution was a guaranteed 409 once anyone else had
+            # committed -- and stayed one on every retry through this handle.
+            self._refresh_commit_tail(before_write=True)
 
     def to_arrow(self, **kwargs: Any) -> Any:
         pa = _require("pyarrow", "pyarrow")
@@ -1706,7 +1996,10 @@ class Table:
             # The scan treats `limit` as a hint that streaming engines ignore,
             # so to_arrow(limit=1) returned the whole table. Stop at it here.
             return self.head(limit, **kwargs)
-        return pa.table(self.scan(**kwargs))
+        stream = self.scan(**kwargs)
+        # read_all() raises the typed error; pa.table() over the C stream
+        # would flatten it to ArrowInvalid.
+        return stream.read_all() if isinstance(stream, TranslatingStream) else pa.table(stream)
 
     def to_pandas(self, **kwargs: Any) -> Any:
         _require("pandas", "pandas")
@@ -1731,7 +2024,15 @@ class Table:
         """
         duckdb = _require("duckdb", "duckdb")
         data = self.to_arrow(**kwargs)
-        con = connection if connection is not None else duckdb.connect()
+        con = connection
+        if con is None and name is not None:
+            # The view has to live where it can be queried by name. On a
+            # private in-memory connection nothing but the returned relation
+            # could reach it, so `duckdb.sql("... FROM <name>")` failed.
+            default = duckdb.default_connection
+            con = default() if callable(default) else default
+        elif con is None:
+            con = duckdb.connect()
         relation = con.from_arrow(data)
         if name is not None:
             relation.create_view(name, replace=True)
@@ -1743,8 +2044,15 @@ class Table:
         mode: str = "append",
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, Any] | None = None,
+        ship_catalog_auth: bool = False,
     ) -> Any:
         """Plan a distributed write, refusing now if the table will not accept it.
+
+        A pickled plan carries the table's short-lived storage credential and
+        no catalog credentials, so a worker whose credential expires must be
+        given a fresh plan. ``ship_catalog_auth=True`` ships the catalog's
+        credential provider (and so its token) instead, letting workers
+        re-vend on their own.
 
         Returns a picklable `WritePlan`. Ship it to workers, call
         `plan.write(batch)` there, send the fragments back, and commit them all
@@ -1760,13 +2068,21 @@ class Table:
         `mode` is ``append`` or ``overwrite``; overwrite removes every file
         visible in the planned snapshot in the same commit.
         """
-        from .distributed import WritePlan
+        from .distributed import WritePlan, _commit_metadata_arg
 
         if mode not in ("append", "overwrite"):
-            raise UnreachableTableError(
-                f"plan a write with mode={mode!r}",
-                "a distributed write is 'append' or 'overwrite'",
+            raise InvalidArgumentError(
+                f"plan_write mode={mode!r}: a distributed write is 'append' or 'overwrite'"
             )
+        # Settled here, not at commit: a pinned handle, a malformed txn or a
+        # reserved commit_metadata key used to pass planning and fail only
+        # when the job's fragments were committed -- after the compute.
+        self._check_writable(f"plan a distributed {mode}")
+        _check_txn(txn)
+        # A list passes the check but the binding takes only a tuple, so
+        # txn=["job", 1] failed with TypeError at commit, after the job ran.
+        txn = (txn[0], int(txn[1])) if txn is not None else None
+        commit_metadata = _commit_metadata_arg(commit_metadata)
         operation = Operation.OVERWRITE if mode == "overwrite" else Operation.APPEND
         needs = {"distributed_write"}
         if txn is not None:
@@ -1788,6 +2104,12 @@ class Table:
             version=self.version,
             txn=txn,
             commit_metadata=commit_metadata,
+            ship_catalog_auth=bool(ship_catalog_auth),
+            catalog=(
+                self._connection.catalog
+                if self._resolved.is_catalog_managed and self._resolved.ref.kind is RefKind.CATALOG
+                else None
+            ),
         )
 
     def plan_scan(
@@ -1797,8 +2119,12 @@ class Table:
         predicate: str | None = None,
         version: int | None = None,
         timestamp: Any = None,
+        ship_catalog_auth: bool = False,
     ) -> Any:
         """Plan a distributed read: a picklable `ScanPlan` of per-file splits.
+
+        As with `plan_write`, a pickled plan carries a short-lived storage
+        credential and no catalog credentials unless ``ship_catalog_auth=True``.
 
         Ship the plan (or parts of it, via `plan.partitions(n)`) to workers and
         call `plan.read(splits)` there. Each worker re-resolves the same
@@ -1825,12 +2151,23 @@ class Table:
             version=version,
             timestamp=timestamp,
         )
+        # An empty snapshot yields no splits to carry its version, and reading
+        # the plan then resolved the latest one, with its (possibly evolved)
+        # schema. Pin it on the plan itself.
+        planned = splits[0].commit_version if splits else version
+        if planned is None and callable(getattr(engine, "snapshot", None)):
+            try:
+                planned = int(engine.snapshot(self._resolved, timestamp=timestamp).version)
+            except Exception:
+                planned = None
         return ScanPlan(
             engine=engine,
             table=self._resolved,
             splits=tuple(splits),
             columns=tuple(columns) if columns is not None else None,
             predicate=predicate,
+            snapshot_version=planned,
+            ship_catalog_auth=bool(ship_catalog_auth),
         )
 
     def to_ray_dataset(self, *, override_num_blocks: int | None = None, **kwargs: Any) -> Any:
@@ -1894,7 +2231,12 @@ class Table:
         # The limit is a hint to the engine as well as a client-side stop: the
         # warehouse would otherwise compute the entire result set first.
         kwargs["limit"] = n
-        reader = pa.RecordBatchReader.from_stream(self.scan(**kwargs))
+        stream = self.scan(**kwargs)
+        reader = (
+            stream
+            if isinstance(stream, TranslatingStream)
+            else pa.RecordBatchReader.from_stream(stream)
+        )
         batches, taken = [], 0
         if n > 0:
             for batch in reader:
@@ -1924,15 +2266,35 @@ class Table:
         names = list(getattr(schema, "names", None) or [f.name for f in schema])
         narrow = [names[0]] if names and predicate is None else None
         total = 0
-        for batch in pa.RecordBatchReader.from_stream(
-            self.scan(columns=narrow, predicate=predicate)
-        ):
+        stream = self.scan(columns=narrow, predicate=predicate)
+        if not isinstance(stream, TranslatingStream):
+            stream = pa.RecordBatchReader.from_stream(stream)
+        for batch in stream:
             total += batch.num_rows
         return total
 
     def files(self) -> Any:
-        """The table's live data files: path, size, partition values and statistics."""
-        return self._engine(Operation.FILES).files(self._resolved, version=self._version)
+        """The table's live data files: path, size, partition values and statistics.
+
+        One row per file, in delta-rs's flattened layout whichever engine
+        lists them: ``path``, ``size_bytes``, ``modification_time``,
+        ``num_records``, then ``null_count.<col>``, ``min.<col>``,
+        ``max.<col>`` and ``partition.<col>`` by logical column name.
+        """
+        engine = self._engine(Operation.FILES)
+        result = engine.files(self._resolved, version=self._version)
+        try:
+            import pyarrow as pa
+        except ImportError:
+            return result
+        files = pa.table(result)
+        if isinstance(engine, KernelEngine):
+            # The kernel lists raw add actions (`size`, a partition map, the
+            # stats JSON); the same call on a table delta-rs could open had
+            # entirely different columns, so code written against one broke
+            # on the other.
+            files = _flat_files(pa, files, self.schema())
+        return files
 
     def history(self, limit: int | None = None) -> list[dict[str, Any]]:
         _check_count(limit, "limit")
@@ -1955,8 +2317,19 @@ class Table:
 
         Rows carry `_change_type`, `_commit_version` and `_commit_timestamp`.
         """
+        unknown = sorted(set(kwargs) - _CDF_OPTIONS)
+        if unknown:
+            # A misspelt bound (start_version=) reached the engine as a bare
+            # TypeError, or on some engines was accepted and meant "from 0".
+            raise InvalidArgumentError(
+                f"cdf() got unexpected option(s) {unknown}; it takes {sorted(_CDF_OPTIONS)}"
+            )
         if "columns" in kwargs:
             kwargs["columns"] = _columns_arg(kwargs["columns"])
+            if kwargs["columns"] is not None:
+                # delta-rs and the warehouse projected the change metadata
+                # away, so a projected feed could not be told apart by version.
+                kwargs["columns"] += [c for c in _CDF_META if c not in kwargs["columns"]]
         _check_predicate(kwargs.get("predicate"), "read the change data feed")
         start, end = kwargs.get("starting_version"), kwargs.get("ending_version")
         _check_version(start, "starting_version")
@@ -1966,7 +2339,7 @@ class Table:
         for key in ("starting_timestamp", "ending_timestamp"):
             if key in kwargs:
                 kwargs[key] = _timestamp_arg(kwargs[key], key)
-        return self._engine(Operation.CDF).cdf(self._resolved, **_given(kwargs))
+        return _cdf_types(self._engine(Operation.CDF).cdf(self._resolved, **_given(kwargs)))
 
     def changes(
         self,
@@ -2054,15 +2427,27 @@ class Table:
             return pa.RecordBatchReader.from_stream(schema).schema
         return pa.schema(schema)
 
+    def _current(self) -> ResolvedTable:
+        """Protocol state as the log has it now (as pinned, for a pinned handle).
+
+        The cached enrichment is only refreshed by this handle's own commits,
+        so properties() kept answering what was true before another writer's
+        ALTER for the life of the handle -- schema() and version already read
+        the log every time.
+        """
+        if self._version is None:
+            self._enriched = False
+        return self._enrich()
+
     def protocol(self) -> tuple[int | None, int | None]:
-        r = self._enrich()
+        r = self._current()
         return (r.min_reader_version, r.min_writer_version)
 
     def features(self) -> frozenset[str]:
-        return self._enrich().features
+        return self._current().features
 
     def properties(self) -> dict[str, str]:
-        return dict(self._enrich().properties)
+        return dict(self._current().properties)
 
     @property
     def version(self) -> int | None:
@@ -2095,6 +2480,97 @@ class Table:
         if partition_overwrite == "dynamic":
             needs.add("dynamic_overwrite")
         return frozenset(needs)
+
+    def _data_needs(self, data: Any, partition_by: list[str] | None = None) -> frozenset[str]:
+        """Engine capabilities the rows themselves require.
+
+        delta-rs formats a negative decimal partition value with a fractional
+        part as ``-1.-50`` (and -0.5 as ``0.-50``), commits that corrupt
+        partition value, and only then fails re-reading it: the table is left
+        unreadable. Such writes go to an engine that formats them correctly.
+        A stream cannot be inspected without consuming it, so one aimed at a
+        fractional-decimal partition column is treated as if it held one.
+        """
+        try:
+            import pyarrow as pa
+            import pyarrow.compute as pc
+        except ImportError:
+            return frozenset()
+        try:
+            parts = list(partition_by or self._enrich().partition_columns)
+        except DeltaSwampError:
+            return frozenset()
+        if not parts:
+            return frozenset()
+        schema = getattr(data, "schema", None)
+        if not isinstance(schema, pa.Schema):
+            try:
+                schema = self.schema()
+            except DeltaSwampError:
+                return frozenset()
+        wanted = {p.lower() for p in parts}
+        risky = [
+            f.name
+            for f in schema
+            if f.name.lower() in wanted and pa.types.is_decimal(f.type) and f.type.scale > 0
+        ]
+        if not risky:
+            return frozenset()
+        module = type(data).__module__ or ""
+        if module.startswith(("pandas", "polars")) and type(data).__name__ == "DataFrame":
+            try:
+                data = pa.table(data)  # in memory, so inspecting it consumes nothing
+            except Exception:
+                return frozenset({"negative_decimal_partition_values"})
+        if not isinstance(data, (pa.Table, pa.RecordBatch)):
+            return frozenset({"negative_decimal_partition_values"})
+        if not all(name in data.schema.names for name in risky):
+            return frozenset({"negative_decimal_partition_values"})
+        for name in risky:
+            col = data.column(name)
+            negative = pc.less(col, pa.scalar(0, col.type)).fill_null(False)
+            if pc.any(negative).as_py():
+                return frozenset({"negative_decimal_partition_values"})
+        return frozenset()
+
+    def _update_needs(self, targets: Any, literal: bool) -> frozenset[str]:
+        """`_data_needs` for UPDATE's SET list.
+
+        Setting a fractional-decimal partition column moves rows into a new
+        partition, whose value delta-rs would format as ``-1.-50``. A literal is
+        judged by its sign; a SQL expression could be anything, so it counts.
+        """
+        if not targets or not isinstance(targets, dict):
+            return frozenset()
+        try:
+            import pyarrow as pa
+
+            parts = {p.lower() for p in self._enrich().partition_columns}
+            schema = self.schema() if parts else None
+        except (ImportError, DeltaSwampError):
+            return frozenset()
+        if not parts or schema is None:
+            return frozenset()
+        risky = {
+            f.name.lower()
+            for f in schema
+            if f.name.lower() in parts and pa.types.is_decimal(f.type) and f.type.scale > 0
+        }
+        for key, value in targets.items():
+            if not isinstance(key, str):
+                continue  # _update_targets refuses it
+            bare = key[1:-1] if len(key) > 1 and key[0] == key[-1] == "`" else key
+            if bare.lower() not in risky:
+                continue
+            if not literal:
+                return frozenset({"negative_decimal_partition_values"})
+            try:
+                negative = value is not None and float(value) < 0
+            except (TypeError, ValueError):
+                negative = True
+            if negative:
+                return frozenset({"negative_decimal_partition_values"})
+        return frozenset()
 
     def append(
         self,
@@ -2130,21 +2606,81 @@ class Table:
         data = _write_data(data)
         if txn is not None and self._already_committed(txn):
             return
-        data = self._align(data, schema_mode)
-        needs = self._write_needs(schema_mode, commit_metadata, txn, writer_properties, "static")
-        op = Operation.MERGE_SCHEMA if schema_mode == "merge" else Operation.APPEND
-        self._engine(op, needs).append(
-            self._resolved,
-            data,
-            schema_mode=schema_mode,
-            partition_by=partition_by,
-            target_file_size=target_file_size,
-            writer_properties=writer_properties,
-            commit_metadata=commit_metadata,
-            txn=txn,
-            max_commit_retries=max_commit_retries,
-        )
+        raw = data
+        for attempt in range(_REALIGN_ATTEMPTS):
+            data = self._align(raw, schema_mode)
+            needs = self._write_needs(
+                schema_mode, commit_metadata, txn, writer_properties, "static"
+            )
+            needs |= self._data_needs(data, partition_by)
+            op = Operation.MERGE_SCHEMA if schema_mode == "merge" else Operation.APPEND
+            try:
+                self._raced_append(
+                    lambda data=data, op=op, needs=needs: self._engine(op, needs).append(
+                        self._resolved,
+                        data,
+                        schema_mode=schema_mode,
+                        partition_by=partition_by,
+                        target_file_size=target_file_size,
+                        writer_properties=writer_properties,
+                        commit_metadata=commit_metadata,
+                        txn=txn,
+                        max_commit_retries=max_commit_retries,
+                    ),
+                    data,
+                    txn,
+                    max_commit_retries,
+                )
+                break
+            except Exception as exc:
+                # A column added by another writer between lining the batch up
+                # and delta-rs opening the table fails with "number of fields
+                # does not match": nothing was committed, so line it up with
+                # the new schema and write again. So does a blind append that
+                # delta-rs refused because a concurrent commit changed the
+                # metadata: it does not rebase over one, where the kernel does.
+                if attempt + 1 >= _REALIGN_ATTEMPTS or not (
+                    _lost_to_metadata_change(exc, raw)
+                    or self._schema_moved(exc, raw, data, schema_mode)
+                ):
+                    raise
         self._invalidate()
+
+    def _raced_append(
+        self, write: Any, data: Any, txn: tuple[str, int] | None, retries: int | None
+    ) -> None:
+        """An append to a catalog-managed table, re-staged when it loses a race.
+
+        A blind append commutes with any concurrent commit, and the engine
+        re-stages one on a path table -- but it cannot re-read a catalog tail,
+        so a catalog-managed append that lost the race by a millisecond failed
+        outright. Here the tail is re-read and the append tried again.
+        """
+        from .errors import CommitConflictError
+
+        attempts = 1 + max(0, 5 if retries is None else int(retries))
+        for attempt in range(attempts):
+            try:
+                self._backfilled(write, data)
+                return
+            except CommitConflictError:
+                if (
+                    txn is not None
+                    and not self._resolved.is_catalog_managed
+                    and self._txn_landed(txn)
+                ):
+                    # The race was lost to this very batch: exactly-once is met,
+                    # just as when the check before the write finds it.
+                    return
+                if (
+                    not self._resolved.is_catalog_managed
+                    or attempt + 1 >= attempts
+                    or _consumable(data)
+                ):
+                    raise
+                self._refresh_commit_tail(before_write=True)
+                if txn is not None and self._already_committed(txn):
+                    return  # the winner was this very batch
 
     def overwrite(
         self,
@@ -2186,28 +2722,80 @@ class Table:
             # data; an empty batch names none, so it changes nothing. It used
             # to raise, failing any pipeline whose batch happened to be empty.
             return
-        data = self._align(data, schema_mode)
+        raw = data
+        data = self._align(raw, schema_mode)
         needs = self._write_needs(
             schema_mode, commit_metadata, txn, writer_properties, partition_overwrite
         )
+        needs |= self._data_needs(data)
         op = (
             Operation.REPLACE_WHERE
             if (predicate is not None or partition_overwrite == "dynamic")
             else Operation.OVERWRITE
         )
-        self._engine(op, needs).overwrite(
-            self._resolved,
-            data,
-            predicate=predicate,
-            partition_overwrite=partition_overwrite,
-            schema_mode=schema_mode,
-            target_file_size=target_file_size,
-            writer_properties=writer_properties,
-            commit_metadata=commit_metadata,
-            txn=txn,
-            max_commit_retries=max_commit_retries,
-        )
+        from .errors import CommitConflictError
+
+        for attempt in range(_REALIGN_ATTEMPTS):
+            try:
+                self._backfilled(
+                    lambda data=data: self._engine(op, needs).overwrite(
+                        self._resolved,
+                        data,
+                        predicate=predicate,
+                        partition_overwrite=partition_overwrite,
+                        schema_mode=schema_mode,
+                        target_file_size=target_file_size,
+                        writer_properties=writer_properties,
+                        commit_metadata=commit_metadata,
+                        txn=txn,
+                        max_commit_retries=max_commit_retries,
+                    ),
+                    data,
+                )
+                break
+            except CommitConflictError:
+                # Lost to a writer that committed this very txn: already done.
+                if txn is None or not self._txn_landed(txn):
+                    raise
+                break
+            except Exception as exc:
+                # A concurrent ADD COLUMN between aligning and writing: nothing
+                # was committed, so align with the new schema and go again.
+                if attempt + 1 >= _REALIGN_ATTEMPTS or not self._schema_moved(
+                    exc, raw, data, schema_mode
+                ):
+                    raise
+                data = self._align(raw, schema_mode)
         self._invalidate()
+
+    def _backfilled(self, write: Any, data: Any = None) -> Any:
+        """Run a commit; on a catalog's backfill demand, publish and retry once.
+
+        The 429 is not a rate limit: the catalog holds no more unpublished
+        commits until someone publishes, and every write through this library
+        failed there until the caller found `publish()` for themselves. The
+        refused commit changed nothing, so publishing and committing again is
+        safe -- when the data can be read a second time. A stream cannot, so
+        the table is still published and the error says to write again.
+        """
+        from .errors import BackfillRequiredError
+
+        try:
+            return write()
+        except BackfillRequiredError as exc:
+            if not self._resolved.is_catalog_managed:
+                raise
+            try:
+                self._engine(Operation.PUBLISH).publish(self._resolved)
+            except DeltaSwampError:
+                raise exc from None
+            self._refresh_commit_tail()
+            if data is not None and _consumable(data):
+                raise BackfillRequiredError(
+                    f"{exc}. The table's commits have now been published; the data was a "
+                    "stream this call has consumed, so write it again"
+                ) from exc
+            return write()
 
     def replace(self, data: Any, **kwargs: Any) -> None:
         """Replace the table's contents and schema. REPLACE TABLE / RTAS."""
@@ -2226,6 +2814,27 @@ class Table:
         # dropped the dedup and let a replayed batch append twice.
         last = self.txn_version(app_id)
         return last is not None and version <= last
+
+    def _schema_moved(self, exc: Exception, raw: Any, aligned: Any, schema_mode: Any) -> bool:
+        """Whether `exc` is a schema mismatch caused by a concurrent schema change."""
+        if type(exc).__name__ != "SchemaMismatchError":
+            return False
+        before = getattr(aligned, "schema", None)
+        if before is None:
+            return False
+        self._invalidate()
+        try:
+            again = self._align(raw, schema_mode)
+        except Exception:
+            return False
+        return bool(getattr(again, "schema", None) != before)
+
+    def _txn_landed(self, txn: tuple[str, int]) -> bool:
+        """After a lost race: whether the winner committed this txn. False if unknown."""
+        try:
+            return self._already_committed(txn)
+        except DeltaSwampError:
+            return False
 
     def txn_version(self, app_id: str) -> int | None:
         """The last version committed under `app_id`, or None if never.
@@ -2260,9 +2869,12 @@ class Table:
     def delete(self, predicate: str | None = None, **kwargs: Any) -> dict[str, Any]:
         """DELETE rows matching a SQL predicate (every row when None)."""
         self._check_writable("delete")
+        _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
-        result: dict[str, Any] = self._engine(Operation.DELETE).delete(
-            self._resolved, predicate, **_given(kwargs)
+        result: dict[str, Any] = self._backfilled(
+            lambda: self._engine(Operation.DELETE).delete(
+                self._resolved, predicate, **_given(kwargs)
+            )
         )
         self._invalidate()
         return result
@@ -2278,12 +2890,14 @@ class Table:
         """UPDATE. `updates` maps columns to SQL expressions; `new_values` to
         plain Python values, which need no quoting."""
         self._check_writable("update")
+        _check_options("update", kwargs, _DML_OPTIONS | {"error_on_type_mismatch"})
         _check_predicate(predicate, "update")
         if updates is not None and new_values is not None:
             raise InvalidArgumentError("pass updates (SQL expressions) or new_values, not both")
         if not updates and not new_values:
             raise InvalidArgumentError("update needs at least one column to set")
-        engine = self._engine(Operation.UPDATE)
+        needs = self._update_needs(updates, False) | self._update_needs(new_values, True)
+        engine = self._engine(Operation.UPDATE, needs)
         # delta-rs skips a SET target it cannot find -- an unknown name, a
         # different case, a nested field -- and still rewrites every matched
         # file, reporting the rows as updated while changing nothing.
@@ -2292,8 +2906,10 @@ class Table:
             updates = self._update_targets(updates, strict)
         if new_values is not None:
             kwargs["new_values"] = self._update_targets(new_values, strict)
-        result: dict[str, Any] = engine.update(
-            self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
+        result: dict[str, Any] = self._backfilled(
+            lambda: engine.update(
+                self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
+            )
         )
         self._invalidate()
         return result
@@ -2346,7 +2962,10 @@ class Table:
             raise InvalidArgumentError("merge needs a join predicate")
         _check_predicate(predicate, "merge")
         source = _write_data(source)
-        builder = self._engine(Operation.MERGE).merge(self._resolved, source, predicate, **kwargs)
+        needs = self._data_needs(source)
+        builder = self._engine(Operation.MERGE, needs).merge(
+            self._resolved, source, predicate, **kwargs
+        )
         return _InvalidatingMerger(builder, self._invalidate)
 
     # ------------------------------------------------------------ maintenance
@@ -2526,19 +3145,15 @@ class Table:
             )
         if column in names and not rest:
             raise InvalidArgumentError(f"cannot drop {column!r}: it is the table's only column")
-        result: dict[str, Any] = self._engine(Operation.DROP_COLUMN).drop_column(
-            self._resolved, column
-        )
+        result = self._engine(Operation.DROP_COLUMN).drop_column(self._resolved, column)
         self._invalidate()
-        return result
+        return _metrics(result)
 
     def rename_column(self, old: str, new: str) -> dict[str, Any]:
         self._check_writable("rename a column")
-        result: dict[str, Any] = self._engine(Operation.RENAME_COLUMN).rename_column(
-            self._resolved, old, new
-        )
+        result = self._engine(Operation.RENAME_COLUMN).rename_column(self._resolved, old, new)
         self._invalidate()
-        return result
+        return _metrics(result)
 
     def set_properties(self, properties: dict[str, str], **kwargs: Any) -> None:
         self._check_writable("set properties")
@@ -2894,6 +3509,153 @@ class Table:
             )
         op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
         return provider.credentials(op)
+
+
+def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
+    """The kernel's file listing in delta-rs's flattened, logical-name layout."""
+    import json
+
+    names = set(files.column_names)
+    if not {"path", "size", "stats", "partition_values"} <= names:
+        return files
+    leaves: list[tuple[tuple[str, ...], str, Any]] = []  # physical path, logical name, type
+    top: dict[str, tuple[str, Any]] = {}
+
+    def walk(fields: Any, physical: tuple[str, ...], logical: tuple[str, ...]) -> None:
+        for field in fields:
+            meta = field.metadata or {}
+            name = meta.get(b"delta.columnMapping.physicalName", field.name.encode()).decode()
+            p, lg = (*physical, name), (*logical, field.name)
+            if not physical:
+                top[name] = (field.name, field.type)
+            if pa.types.is_struct(field.type):
+                walk(list(field.type), p, lg)
+            else:
+                leaves.append((p, ".".join(lg), field.type))
+
+    walk(list(schema), (), ())
+    stats = [json.loads(s) if s else {} for s in files.column("stats").to_pylist()]
+    missing = object()
+
+    def lookup(entry: Any, path: tuple[str, ...]) -> Any:
+        for part in path:
+            if not isinstance(entry, dict) or part not in entry:
+                return missing
+            entry = entry[part]
+        return entry
+
+    def typed(values: list[Any], wanted: Any) -> Any:
+        try:
+            return pa.array(values).cast(wanted)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+            try:
+                return pa.array(values)
+            except (pa.ArrowInvalid, pa.ArrowTypeError):
+                return pa.array([None if v is None else str(v) for v in values], pa.string())
+
+    columns: dict[str, Any] = {
+        "path": files.column("path"),
+        "size_bytes": files.column("size"),
+        "modification_time": files.column("modification_time"),
+        "num_records": files.column("num_records"),
+    }
+    for prefix, key in (("null_count", "nullCount"), ("min", "minValues"), ("max", "maxValues")):
+        for physical, logical, wanted in leaves:
+            found = [lookup(s.get(key), physical) for s in stats]
+            if all(v is missing for v in found):
+                continue
+            values = [None if v is missing else v for v in found]
+            columns[f"{prefix}.{logical}"] = typed(
+                values, pa.int64() if prefix == "null_count" else wanted
+            )
+    partition_maps = [dict(m or ()) for m in files.column("partition_values").to_pylist()]
+    order = list(top)
+    keys = sorted(
+        {k for m in partition_maps for k in m},
+        key=lambda k: order.index(k) if k in top else len(order),
+    )
+    for key in keys:
+        logical, wanted = top.get(key, (key, pa.string()))
+        raw = [m.get(key) for m in partition_maps]
+        columns[f"partition.{logical}"] = typed(raw, wanted)
+    consumed = ("path", "size", "modification_time", "num_records", "stats", "partition_values")
+    for extra in files.column_names:
+        if extra not in consumed:
+            columns[extra] = files.column(extra)
+    return pa.table(columns)
+
+
+#: The tuning options DELETE and UPDATE pass to the engine.
+_DML_OPTIONS = frozenset({"commit_metadata", "writer_properties", "max_commit_retries"})
+
+
+def _check_options(what: str, given: dict[str, Any], known: frozenset[str]) -> None:
+    """Refuse an option no engine takes (a typo, usually).
+
+    delta-rs raised a bare TypeError for one, while the kernel and the
+    warehouse refused it as "cannot be served": three answers to one mistake.
+    """
+    unknown = sorted(set(given) - known)
+    if unknown:
+        raise InvalidArgumentError(
+            f"{what}() got unexpected option(s) {unknown}; it takes {sorted(known)}"
+        )
+
+
+#: What `Table.cdf` takes, across every engine that serves it.
+_CDF_OPTIONS = frozenset(
+    {
+        "starting_version",
+        "ending_version",
+        "starting_timestamp",
+        "ending_timestamp",
+        "columns",
+        "predicate",
+        "allow_out_of_range",
+    }
+)
+_CDF_META = ("_change_type", "_commit_version", "_commit_timestamp")
+
+
+def _cdf_types(stream: Any) -> Any:
+    """The change feed with its metadata columns typed the same on every engine.
+
+    delta-rs reports ``_commit_version`` as uint64, ``_change_type`` as a
+    string view and ``_commit_timestamp`` as naive milliseconds; the kernel
+    as int64, string and UTC microseconds (Delta's long and timestamp). A
+    consumer unioning feeds from two tables, or comparing a version with an
+    int64 column, failed on one engine only.
+    """
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return stream
+    wanted = {
+        "_change_type": pa.string(),
+        "_commit_version": pa.int64(),
+        "_commit_timestamp": pa.timestamp("us", tz="UTC"),
+    }
+    reader = pa.RecordBatchReader.from_stream(stream)
+    fields = [
+        f.with_type(wanted[f.name]) if f.name in wanted and f.type != wanted[f.name] else f
+        for f in reader.schema
+    ]
+    target = pa.schema(fields, metadata=reader.schema.metadata)
+    return reader if target.equals(reader.schema) else reader.cast(target)
+
+
+def _metrics(result: Any) -> dict[str, Any]:
+    """An engine's result as the dict the Table API promises.
+
+    The kernel's metadata commits return the committed version (an int) where
+    the warehouse returns a status dict, so `rename_column()` handed back 22 on
+    one table and ``{"status": "ok"}`` on another.
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, int) and not isinstance(result, bool):
+        return {"version": result}
+    return {} if result is None else {"result": result}
 
 
 def _governed(catalog: Any, protocol_name: str, what: str) -> Any:

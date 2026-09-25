@@ -120,3 +120,19 @@ class TransientCommitError(DeltaSwampError):
 
 class CorruptTableError(DeltaSwampError):
     """On-disk state failed a correctness check (e.g. DV cardinality mismatch)."""
+
+
+class MissingDataFileError(CorruptTableError):
+    """A data or deletion-vector file the snapshot references is gone from storage.
+
+    `path` is the missing object, as storage reported it.
+    """
+
+    def __init__(self, path: str, message: str) -> None:
+        super().__init__(message)
+        self.path = path
+
+    def __reduce__(self) -> tuple[type[MissingDataFileError], tuple[str, str]]:
+        # Raised on Ray workers too: the default reduce re-calls __init__ with
+        # the message alone, which fails to unpickle.
+        return (type(self), (self.path, str(self)))

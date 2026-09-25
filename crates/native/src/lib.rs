@@ -22,7 +22,10 @@ pub use error::{NativeError, Result};
 use pyo3::prelude::*;
 
 use commit::UcCommitConfig;
-use error::{BackfillRequiredError, CommitConflictError, RetryableError};
+use error::{
+    BackfillRequiredError, CatalogCommitError, CatalogNotFoundError, CatalogPermissionError,
+    CommitConflictError, InvalidInputError, RetryableError,
+};
 use snapshot::{create_table, PySnapshot};
 
 /// The delta_kernel version this extension is pinned to.
@@ -90,6 +93,19 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<BackfillRequiredError>(),
     )?;
     m.add("RetryableError", m.py().get_type::<RetryableError>())?;
+    m.add("InvalidInputError", m.py().get_type::<InvalidInputError>())?;
+    m.add(
+        "CatalogCommitError",
+        m.py().get_type::<CatalogCommitError>(),
+    )?;
+    m.add(
+        "CatalogPermissionError",
+        m.py().get_type::<CatalogPermissionError>(),
+    )?;
+    m.add(
+        "CatalogNotFoundError",
+        m.py().get_type::<CatalogNotFoundError>(),
+    )?;
     m.add_function(wrap_pyfunction!(create_table, m)?)?;
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;

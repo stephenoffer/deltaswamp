@@ -23,6 +23,7 @@ from .errors import (
     IgnoredPropertyWarning,
     InvalidArgumentError,
     InvalidReferenceError,
+    MissingDataFileError,
     PreflightError,
     PropertyNotSupportedError,
     TransientCommitError,
@@ -39,6 +40,30 @@ __version__ = "0.1.0"
 # against the compiled module by `check_native()`, so a kernel bump cannot slip
 # through silently -- it breaks loudly at import instead of at runtime.
 EXPECTED_KERNEL_VERSION = "0.28.0"
+
+
+def _importable_native_exceptions() -> None:
+    """Make the extension's exception types picklable.
+
+    They are created under the bare module name ``_native``, which no process
+    can import, so pickling one failed ("import of module '_native' failed"):
+    an error raised in a Ray worker (a refused fragment, a lost commit) reached
+    the driver as an unpicklable-exception system error instead of itself.
+    """
+    import contextlib
+
+    try:
+        from . import _native
+    except Exception:  # absent or unloadable: pure-Python paths still work
+        return
+    for name in dir(_native):
+        obj = getattr(_native, name)
+        if isinstance(obj, type) and issubclass(obj, BaseException) and obj.__module__ == "_native":
+            with contextlib.suppress(AttributeError, TypeError):  # an immutable type
+                obj.__module__ = "deltaswamp._native"
+
+
+_importable_native_exceptions()
 
 __all__ = [
     "EXPECTED_KERNEL_VERSION",
@@ -59,6 +84,7 @@ __all__ = [
     "IgnoredPropertyWarning",
     "InvalidArgumentError",
     "InvalidReferenceError",
+    "MissingDataFileError",
     "Operation",
     "PredicateError",
     "PreflightError",

@@ -697,3 +697,40 @@ def test_merge_except_cols_without_the_private_schema_hook_passes_through() -> N
     checked = deltars._CheckedMerger(merger)
     checked.when_matched_update_all(except_cols="a")
     assert merger.seen == ["a"]
+
+
+def test_cdf_commit_timestamp_is_the_commit_file_time_not_commit_info(tmp_path: Any) -> None:
+    import json
+    import os
+
+    import deltaswamp as ds
+    import pyarrow as pa
+    from deltalake import DeltaTable, write_deltalake
+    from deltaswamp.capability import Engine
+
+    path = str(tmp_path / "t")
+    write_deltalake(
+        path, pa.table({"id": [1, 2]}), configuration={"delta.enableChangeDataFeed": "true"}
+    )
+    DeltaTable(path).delete("id = 1")
+    commit = os.path.join(path, "_delta_log", "00000000000000000001.json")
+    with open(commit) as log:
+        actions = [json.loads(line) for line in log]
+    for action in actions:
+        if "commitInfo" in action:
+            action["commitInfo"]["timestamp"] = 1_000_000_000_000
+    st = os.stat(commit)
+    with open(commit, "w") as out:
+        out.write("\n".join(json.dumps(a) for a in actions) + "\n")
+    os.utime(commit, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+    conn = ds.connect()
+    via_deltars = pa.table(conn.table(path).cdf(starting_version=1))
+    saved = conn.router.engines.pop(Engine.DELTARS)
+    try:
+        via_kernel = pa.table(conn.table(path).cdf(starting_version=1))
+    finally:
+        conn.router.engines[Engine.DELTARS] = saved
+    got = via_deltars.column("_commit_timestamp").to_pylist()[0]
+    assert got == via_kernel.column("_commit_timestamp").to_pylist()[0]
+    assert abs(got.timestamp() - st.st_mtime) < 0.002

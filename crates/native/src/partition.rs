@@ -329,6 +329,19 @@ fn conform_fields(
     prefix: &str,
 ) -> Result<(Vec<arrow::datatypes::Field>, Vec<ArrayRef>)> {
     use arrow::datatypes::Field;
+    // Delta names are case-insensitive. A second `region` (or `REGION`) was
+    // reported as a column "not in the table schema", which it plainly is.
+    let mut names = std::collections::HashSet::new();
+    if let Some(dup) = input
+        .iter()
+        .find(|f| !names.insert(f.name().to_lowercase()))
+    {
+        return Err(NativeError::Invalid(format!(
+            "the data has column {:?} more than once (Delta column names are \
+             case-insensitive); drop or rename the duplicate",
+            format!("{prefix}{}", dup.name())
+        )));
+    }
     let mut used = vec![false; input.len()];
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();

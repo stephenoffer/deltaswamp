@@ -560,9 +560,28 @@ impl PySnapshot {
         let reader = data.into_reader()?;
         let batches: std::result::Result<Vec<_>, _> = reader.collect();
         let batches = batches.map_err(NativeError::from)?;
-        let bytes = py
-            .detach(|| commit::write_files(self.inner.clone(), self.engine.clone(), batches, uc))?;
-        Ok(bytes)
+        let result =
+            py.detach(|| commit::write_files(self.inner.clone(), self.engine.clone(), batches, uc));
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(failure) => {
+                if !failure.not_removed.is_empty() {
+                    // Logged, never raised: the write's own error is the one
+                    // the caller must see.
+                    let message = format!(
+                        "write_files failed and {} data file(s) it wrote could not be removed \
+                         (VACUUM will): {}",
+                        failure.not_removed.len(),
+                        failure.not_removed.join("; ")
+                    );
+                    let _ = py
+                        .import("logging")
+                        .and_then(|m| m.call_method1("getLogger", ("deltaswamp",)))
+                        .and_then(|l| l.call_method1("warning", (message,)));
+                }
+                Err(failure.error.into())
+            }
+        }
     }
 
     /// Commit fragments produced by `write_files`, wherever they were written.

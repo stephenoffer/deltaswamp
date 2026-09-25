@@ -146,8 +146,38 @@ pub fn classify_commit_error(message: &str) -> NativeError {
         return match status {
             429 => NativeError::BackfillRequired(message.to_string()),
             409 => NativeError::CommitConflict(message.to_string()),
-            _ => NativeError::Invalid(message.to_string()),
+            // The Python layer words these for the caller; the type is what
+            // it needs, so the message stays the catalog's own.
+            401 | 403 => NativeError::CatalogPermission(message.to_string()),
+            404 => NativeError::CatalogNotFound(message.to_string()),
+            // The version is positional: re-sending the same commit cannot land
+            // twice, which is what makes these retryable.
+            500..=599 => NativeError::Retryable(format!(
+                "the catalog failed before confirming the commit, which may or may not have \
+                 been ratified; re-read the table before committing again: {message}"
+            )),
+            _ => NativeError::CatalogRejected(message.to_string()),
         };
+    }
+    // The UC client renders some statuses without one: a 401 is its
+    // `AuthenticationFailed` ("Authentication failed"), and its API errors
+    // name a missing table or the unpublished-commit cap in words.
+    if lowered.contains("uc update_table error") {
+        if lowered.contains("authentication failed") {
+            return NativeError::CatalogPermission(message.to_string());
+        }
+        if lowered.contains("table not found") {
+            return NativeError::CatalogNotFound(message.to_string());
+        }
+        if lowered.contains("max unpublished commits") {
+            return NativeError::BackfillRequired(message.to_string());
+        }
+    }
+    if lowered.contains("timed out") || lowered.contains("timeout") {
+        return NativeError::Retryable(format!(
+            "the commit timed out before it was confirmed, and may or may not have landed; \
+             re-read the table before committing again: {message}"
+        ));
     }
     // Otherwise look for the codes as whole numbers only: a staged-commit
     // UUID or a version like `...00429.json` must not read as a status.
@@ -670,7 +700,16 @@ fn ipc_to_batches(
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+    // Junk bytes surfaced as "arrow error: Ipc error: Expected schema
+    // message", which says nothing about where they came from.
+    let not_a_fragment = |e: arrow::error::ArrowError| {
+        NativeError::Invalid(format!(
+            "this is not a fragment produced by write_files (it does not decode: {e}); \
+             pass the bytes plan.write() returned, unchanged"
+        ))
+    };
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(not_a_fragment)?;
     let schema = reader.schema();
     let metadata = schema.metadata();
 
@@ -699,7 +738,7 @@ fn ipc_to_batches(
 
     let mut out = Vec::new();
     for batch in reader {
-        out.push(batch?);
+        out.push(batch.map_err(not_a_fragment)?);
     }
     Ok(out)
 }
@@ -722,6 +761,35 @@ pub fn write_files(
     engine: SharedEngine,
     batches: Vec<arrow::array::RecordBatch>,
     uc: Option<UcCommitConfig>,
+) -> std::result::Result<Vec<u8>, Box<WriteFilesError>> {
+    let root = snapshot.table_root().clone();
+    let mut written = Vec::new();
+    match write_files_tracked(snapshot, &engine, batches, uc, &mut written) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => {
+            // The files this attempt already wrote belong to no fragment, so
+            // nobody would ever commit or find them: an orphan per failed
+            // task. Remove them, best effort, and keep the original error.
+            let not_removed = remove_written(&engine, &root, &written);
+            Err(Box::new(WriteFilesError { error, not_removed }))
+        }
+    }
+}
+
+/// A failed [`write_files`]: the original error, and any data files it wrote
+/// that could not be removed again (with why), for the caller to report.
+#[derive(Debug)]
+pub struct WriteFilesError {
+    pub error: NativeError,
+    pub not_removed: Vec<String>,
+}
+
+fn write_files_tracked(
+    snapshot: SnapshotRef,
+    engine: &SharedEngine,
+    batches: Vec<arrow::array::RecordBatch>,
+    uc: Option<UcCommitConfig>,
+    written: &mut Vec<String>,
 ) -> Result<Vec<u8>> {
     let partition_columns = snapshot
         .table_configuration()
@@ -739,17 +807,22 @@ pub fn write_files(
         .map(|b| partition::conform_to_table(b, table_schema.as_ref(), &partition_columns))
         .collect::<Result<Vec<_>>>()?;
     let batches = partition::coalesce(batches)?;
-    let txn = begin_transaction(snapshot, &engine, &uc, None, None, None, None)?;
+    let txn = begin_transaction(snapshot, engine, &uc, None, None, None, None)?;
     let write_state = txn.write_state()?;
 
     let mut metadata_batches = Vec::new();
+    let mut record = |batch: arrow::array::RecordBatch| -> Result<()> {
+        written.extend(batch_paths(&batch)?);
+        metadata_batches.push(batch);
+        Ok(())
+    };
     if partition_columns.is_empty() {
         let write_context = write_state.unpartitioned_write_context()?;
         for batch in batches {
             let data = ArrowEngineData::new(batch);
             let metadata =
                 runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
-            metadata_batches.push(add_metadata_batch(metadata)?);
+            record(add_metadata_batch(metadata)?)?;
         }
     } else {
         for batch in batches {
@@ -760,12 +833,61 @@ pub fn write_files(
                 let data = ArrowEngineData::new(group.data);
                 let metadata =
                     runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
-                metadata_batches.push(add_metadata_batch(metadata)?);
+                record(add_metadata_batch(metadata)?)?;
             }
         }
     }
 
     batches_to_ipc(&metadata_batches, &table_root, &metadata_id)
+}
+
+/// The `path` column of an add-metadata batch.
+fn batch_paths(batch: &arrow::array::RecordBatch) -> Result<Vec<String>> {
+    use arrow::array::{Array, StringArray};
+
+    let Some(column) = batch.column_by_name("path") else {
+        return Ok(Vec::new());
+    };
+    let column = arrow::compute::cast(column, &arrow::datatypes::DataType::Utf8)?;
+    let Some(paths) = column.as_any().downcast_ref::<StringArray>() else {
+        return Ok(Vec::new());
+    };
+    Ok((0..paths.len())
+        .filter(|i| !paths.is_null(*i))
+        .map(|i| paths.value(i).to_string())
+        .collect())
+}
+
+/// Delete data files named relative to `root`; returns the ones that failed.
+fn remove_written(engine: &SharedEngine, root: &url::Url, written: &[String]) -> Vec<String> {
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStoreExt;
+
+    if written.is_empty() {
+        return Vec::new();
+    }
+    let Some(store) = engine.get_object_store_for_url(root) else {
+        return written.to_vec();
+    };
+    let mut failed = Vec::new();
+    for relative in written {
+        let location = url::Url::parse(relative)
+            .or_else(|_| root.join(relative))
+            .map_err(|e| e.to_string())
+            .and_then(|url| Path::from_url_path(url.path()).map_err(|e| e.to_string()));
+        let outcome = match location {
+            Ok(path) => {
+                runtime::block_on(async { store.delete(&path).await }).map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(()) => {}
+            Err(e) if e.contains("not found") || e.contains("NotFound") => {}
+            Err(e) => failed.push(format!("{relative}: {e}")),
+        }
+    }
+    failed
 }
 
 /// Commit add-action metadata produced by [`write_files`], possibly elsewhere.
@@ -807,13 +929,63 @@ pub fn commit_files(
         }
     }
 
+    // Decode and check every fragment before adding any, so a bad one cannot
+    // leave a half-built transaction behind.
+    let mut seen = std::collections::HashSet::new();
+    let mut decoded = Vec::new();
     for fragment in &fragments {
         for batch in ipc_to_batches(fragment, &table_root, &metadata_id)? {
-            transaction.add_files(Box::new(ArrowEngineData::new(batch)));
+            refuse_duplicate_paths(&batch, &mut seen)?;
+            decoded.push(batch);
         }
+    }
+    for batch in decoded {
+        transaction.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
     finish_commit(transaction, &engine)
+}
+
+/// Refuse a data file that is added twice in one commit.
+///
+/// The same fragment passed twice (a retried task whose first result was also
+/// kept, or a list concatenated with itself) produced two `add` actions for one
+/// path in one commit. The protocol forbids that; readers that replay the log
+/// file-by-file count the rows twice, and the change feed reports them twice.
+fn refuse_duplicate_paths(
+    batch: &arrow::array::RecordBatch,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    use arrow::array::{Array, StringArray};
+
+    let Some(column) = batch.column_by_name("path") else {
+        return Err(NativeError::Invalid(
+            "this fragment's add-file metadata has no path column; it was not produced by \
+             write_files"
+                .to_string(),
+        ));
+    };
+    let column = arrow::compute::cast(column, &arrow::datatypes::DataType::Utf8)?;
+    let paths = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| NativeError::Invalid("fragment paths are not strings".to_string()))?;
+    for i in 0..paths.len() {
+        if paths.is_null(i) {
+            return Err(NativeError::Invalid(
+                "a fragment names a data file with a null path".to_string(),
+            ));
+        }
+        let path = paths.value(i);
+        if !seen.insert(path.to_string()) {
+            return Err(NativeError::Invalid(format!(
+                "data file {path:?} appears in more than one fragment (or twice in one). \
+                 Committing it twice would add the same file twice in one version; pass each \
+                 worker's fragment exactly once"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Run a prepared transaction's commit and classify the outcome.
@@ -901,12 +1073,12 @@ mod raw_commit_tests {
                    _delta_log/_staged_commits/00000000000000000429.a429b-409c.json";
         assert!(matches!(
             classify_commit_error(msg),
-            NativeError::Invalid(_)
+            NativeError::CatalogRejected(_)
         ));
         let msg = "HTTP error (status 400): conflicting table properties";
         assert!(matches!(
             classify_commit_error(msg),
-            NativeError::Invalid(_)
+            NativeError::CatalogRejected(_)
         ));
         let msg = "UC update_table error: HTTP error (status 409): version exists";
         assert!(matches!(
@@ -930,6 +1102,63 @@ mod raw_commit_tests {
         assert!(matches!(
             classify_commit_error("max unbackfilled commits reached"),
             NativeError::BackfillRequired(_)
+        ));
+    }
+
+    #[test]
+    fn a_file_added_twice_in_one_commit_is_refused() {
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("path", DataType::Utf8, true)]));
+        let batch = |paths: Vec<&str>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(paths))]).unwrap()
+        };
+        let mut seen = std::collections::HashSet::new();
+        refuse_duplicate_paths(&batch(vec!["a.parquet", "b.parquet"]), &mut seen).unwrap();
+        let err =
+            refuse_duplicate_paths(&batch(vec!["c.parquet", "a.parquet"]), &mut seen).unwrap_err();
+        assert!(err.to_string().contains("a.parquet"), "{err}");
+        let mut fresh = std::collections::HashSet::new();
+        assert!(refuse_duplicate_paths(&batch(vec!["x", "x"]), &mut fresh).is_err());
+    }
+
+    #[test]
+    fn every_catalog_status_is_classified() {
+        let status = |code: u16| {
+            classify_commit_error(&format!(
+                "UC update_table error: HTTP error (status {code}): nope"
+            ))
+        };
+        assert!(matches!(status(401), NativeError::CatalogPermission(_)));
+        assert!(matches!(status(403), NativeError::CatalogPermission(_)));
+        assert!(matches!(status(404), NativeError::CatalogNotFound(_)));
+        assert!(matches!(status(500), NativeError::Retryable(_)));
+        assert!(matches!(status(503), NativeError::Retryable(_)));
+        assert!(matches!(status(400), NativeError::CatalogRejected(_)));
+        assert!(matches!(status(409), NativeError::CommitConflict(_)));
+        assert!(matches!(status(429), NativeError::BackfillRequired(_)));
+        let words = |text: &str| classify_commit_error(&format!("UC update_table error: {text}"));
+        assert!(matches!(
+            words("Authentication failed"),
+            NativeError::CatalogPermission(_)
+        ));
+        assert!(matches!(
+            words("Table not found: t1"),
+            NativeError::CatalogNotFound(_)
+        ));
+        assert!(matches!(
+            words("Max unpublished commits exceeded (max: 50)"),
+            NativeError::BackfillRequired(_)
+        ));
+        assert!(matches!(
+            classify_commit_error("error sending request: operation timed out"),
+            NativeError::Retryable(_)
+        ));
+        // A kernel refusal with no status is still plain invalid input.
+        assert!(matches!(
+            classify_commit_error("Invalid transaction state: append-only"),
+            NativeError::Invalid(_)
         ));
     }
 

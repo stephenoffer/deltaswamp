@@ -40,7 +40,7 @@ from typing import Any
 from ..capability import Capability, Operation
 from ..capability import Engine as EngineKind
 from ..catalog import ResolvedTable
-from ..errors import UnreachableTableError
+from ..errors import InvalidArgumentError, UnreachableTableError
 from .base import missing_method
 from .sharing import filter_arrow_exact
 
@@ -144,7 +144,7 @@ def _snapshot_properties(commit_metadata: dict[str, Any] | None) -> dict[str, st
         k for k in out if k in _RESERVED_SUMMARY_KEYS or k.startswith(_RESERVED_SUMMARY_PREFIXES)
     )
     if reserved:
-        raise ValueError(
+        raise InvalidArgumentError(
             f"commit_metadata keys {reserved} are Iceberg snapshot-summary fields that "
             "PyIceberg computes itself; use other key names"
         )
@@ -193,7 +193,7 @@ def _uuid_bytes(column: Any, pa: Any) -> Any:
         try:
             values.append(uuid.UUID(str(value)).bytes)
         except ValueError as exc:
-            raise ValueError(f"{value!r} is not a UUID") from exc
+            raise InvalidArgumentError(f"{value!r} is not a UUID") from exc
     return pa.array(values, pa.binary(16))
 
 
@@ -244,7 +244,7 @@ def _conform(rows: Any, schema: Any) -> Any:
             try:
                 columns.append(column.cast(wanted_decimal, safe=True))
             except pa.lib.ArrowInvalid as exc:
-                raise ValueError(
+                raise InvalidArgumentError(
                     f"column {name!r}: a value does not fit the table's "
                     f"decimal({target.field_type.precision}, {target.field_type.scale}): {exc}"
                 ) from exc
@@ -654,7 +654,7 @@ class IcebergEngine:
     ) -> int | None:
         if version is not None and timestamp is not None:
             # Used to read `version` and silently ignore the timestamp.
-            raise ValueError("time travel takes a version or a timestamp, not both")
+            raise InvalidArgumentError("time travel takes a version or a timestamp, not both")
         if version is not None:
             if isinstance(version, bool):
                 raise TypeError("version must be an int, not bool")
@@ -746,7 +746,7 @@ class IcebergEngine:
             except TypeError:
                 raise TypeError(f"limit must be an int, not {type(limit).__name__}") from None
         if limit is not None and limit < 0:
-            raise ValueError(f"limit must be >= 0, got {limit}")
+            raise InvalidArgumentError(f"limit must be >= 0, got {limit}")
         if columns is not None and len(columns) == 0:
             # No columns still has rows. PyIceberg's scan of `()` returned an
             # empty table with 0 rows; read the narrowest thing (one column)
@@ -966,7 +966,7 @@ class IcebergEngine:
         mode = str(partition_overwrite or "static").lower()
         if mode not in ("static", "dynamic"):
             # Anything else used to fall through to a whole-table overwrite.
-            raise ValueError(
+            raise InvalidArgumentError(
                 f"partition_overwrite must be 'static' or 'dynamic', got {partition_overwrite!r}"
             )
         properties = _snapshot_properties(commit_metadata)

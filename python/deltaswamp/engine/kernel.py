@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -31,6 +32,7 @@ from ..credentials import Operation as CredentialOperation
 from ..errors import (
     BackfillRequiredError,
     CommitConflictError,
+    DeltaSwampError,
     TransientCommitError,
     UnreachableTableError,
 )
@@ -138,6 +140,39 @@ _METADATA_BLOCKERS: frozenset[TableFeature] = frozenset(
 )
 
 
+#: The process that first called into the native runtime (its pid, once set).
+_RUNTIME_OWNER: list[int] = []
+
+
+def _forked_on_macos() -> bool:
+    """A macOS child forked from a process whose native runtime had started.
+
+    macOS kills such a child with SIGTRAP on its first native call (the
+    runtime's thread machinery does not survive fork there) -- an
+    uncatchable crash of the worker, where Linux gets a fresh runtime.
+    """
+    import os
+    import sys
+
+    return sys.platform == "darwin" and bool(_RUNTIME_OWNER) and _RUNTIME_OWNER[0] != os.getpid()
+
+
+def _enter_native(what: str) -> None:
+    """Record the runtime's owner, or refuse a call that would crash the process."""
+    import os
+
+    if not _RUNTIME_OWNER:
+        _RUNTIME_OWNER.append(os.getpid())
+    elif _forked_on_macos():
+        raise UnreachableTableError(
+            what,
+            "the kernel cannot run in a process forked on macOS from one that had already "
+            "used it: the child would crash (SIGTRAP) on its first native call",
+            "start worker processes with multiprocessing's 'spawn' (the macOS default) "
+            "or 'forkserver' method",
+        )
+
+
 def _native_has(*features: str) -> bool:
     """Whether the compiled extension advertises every one of `features`.
 
@@ -191,6 +226,8 @@ class KernelEngine:
     supports_commit_metadata = True
     supports_writer_properties = False
     supports_dynamic_overwrite = False
+    #: Negative fractional decimal partition values are serialized correctly.
+    supports_negative_decimal_partition_values = True
     #: history_manager resolves a timestamp to the latest recreatable version,
     #: honouring in-commit timestamps.
     supports_timestamp_travel = True
@@ -207,6 +244,15 @@ class KernelEngine:
                 ok=False,
                 reason="the deltaswamp native extension is not installed",
                 remedy="pip install deltaswamp (a wheel with the compiled kernel binding)",
+            )
+        if _forked_on_macos():
+            return Capability(
+                operation,
+                ok=False,
+                reason="the kernel cannot run in this process: it was forked on macOS from "
+                "one that had already used it, and would crash on its first call",
+                remedy="start worker processes with multiprocessing's 'spawn' or 'forkserver' "
+                "method",
             )
 
         # Structural guard: never claim an operation with no method behind it.
@@ -428,6 +474,7 @@ class KernelEngine:
         """Resolve a kernel snapshot, supplying the catalog tail when needed."""
         from deltaswamp._native import Snapshot
 
+        _enter_native("open the table with the kernel")
         if table.location is None:
             raise UnreachableTableError("open", "the table has no storage location", None)
         if version is not None and timestamp is not None:
@@ -456,23 +503,72 @@ class KernelEngine:
             for entry in table.log_tail
         ] or None
 
-        try:
+        location: str = table.location
+
+        def resolve() -> Any:
             return Snapshot.resolve(
-                table.location,
+                location,
                 options=self._options(table, write=write),
                 version=version,
                 log_tail=log_tail,
                 max_catalog_version=table.max_catalog_version,
                 timestamp_ms=_timestamp_ms(timestamp) if timestamp is not None else None,
             )
+
+        try:
+            try:
+                return resolve()
+            except Exception as exc:
+                from ..errors import DeltaSwampError
+
+                provider = table.credential_provider
+                if (
+                    provider is None
+                    # Vending itself failed: re-vending at once would only
+                    # repeat it (the SDK has already retried).
+                    or isinstance(exc, DeltaSwampError)
+                    or not _rejected_credential(str(exc))
+                ):
+                    raise
+                # Storage refused a credential the cache still thought valid
+                # (revoked, clocks disagreeing, expired early). Nothing called
+                # the provider's invalidate(), so the dead credential kept
+                # being served -- every call failing -- until its stated
+                # expiry. Re-vend once and try again.
+                provider.invalidate()
+                return resolve()
         except ValueError as exc:
             if "earliest recreatable" in str(exc):
                 raise UnreachableTableError(f"read the table as of {timestamp}", str(exc)) from exc
-            if version is not None and "not the same as the specified end version" in str(exc):
+            if version is not None and (
+                "not the same as the specified end version" in str(exc)
+                # A catalog-managed table past its ratified version: this
+                # escaped as a bare ValueError, not a library error.
+                or "exceeds max catalog version" in str(exc)
+            ):
                 raise UnreachableTableError(
                     f"read version {version}",
                     f"the table has no such version ({exc})",
                     "time travel to a committed version, or omit it for the latest",
+                ) from exc
+            if version is not None and "No files in log segment" in str(exc):
+                # The commits up to `version` may be gone while the table is
+                # not; that escaped as a bare ValueError. Tell the two apart.
+                try:
+                    Snapshot.resolve(
+                        table.location,
+                        options=self._options(table, write=write),
+                        log_tail=log_tail,
+                        max_catalog_version=table.max_catalog_version,
+                    )
+                except Exception:
+                    raise exc from None
+                raise UnreachableTableError(
+                    f"read version {version}",
+                    "the table exists, but its log no longer holds the commits or checkpoint "
+                    "to reconstruct this version: they were removed by log retention or "
+                    "metadata cleanup",
+                    "time travel to a version at or after the table's oldest checkpoint",
                 ) from exc
             raise
 
@@ -509,8 +605,13 @@ class KernelEngine:
         """
         from .. import predicate as sqlpred
 
-        skipping = sqlpred.to_kernel_json(sqlpred.parse(predicate)) if predicate else None
-        return self.snapshot(table, version=version).files(predicate=skipping)
+        snapshot = self.snapshot(table, version=version)
+        skipping = (
+            sqlpred.to_kernel_json(sqlpred.parse(predicate), _arrow_schema(snapshot))
+            if predicate
+            else None
+        )
+        return snapshot.files(predicate=skipping)
 
     def cdf(
         self,
@@ -581,20 +682,79 @@ class KernelEngine:
                 read_columns = [c for c in read_columns if c not in meta]
                 read_columns = _with_data_column(snapshot, read_columns)
         assert table.location is not None  # supports() refused otherwise
-        stream = _native.table_changes(
-            table.location,
-            options=self._options(table, write=False) or None,
-            start_version=starting_version,
-            end_version=ending_version,
-            columns=read_columns,
-            predicate=sqlpred.to_kernel_json(node) if node is not None else None,
-            start_timestamp_ms=(
-                _timestamp_ms(starting_timestamp) if starting_timestamp is not None else None
-            ),
-            end_timestamp_ms=(
-                _timestamp_ms(ending_timestamp) if ending_timestamp is not None else None
-            ),
+        kernel_predicate = (
+            sqlpred.to_kernel_json(node, _arrow_schema(snapshot)) if node is not None else None
         )
+
+        location = table.location
+
+        def changes(start: int | None) -> Any:
+            return _native.table_changes(
+                location,
+                options=self._options(table, write=False) or None,
+                start_version=start,
+                end_version=ending_version,
+                columns=read_columns,
+                predicate=kernel_predicate,
+                start_timestamp_ms=(
+                    _timestamp_ms(starting_timestamp) if starting_timestamp is not None else None
+                ),
+                end_timestamp_ms=(
+                    _timestamp_ms(ending_timestamp) if ending_timestamp is not None else None
+                ),
+            )
+
+        start = starting_version
+        while True:
+            try:
+                stream = changes(start)
+                break
+            except ValueError as exc:
+                message = str(exc)
+                off = re.search(r"feed is unsupported for the table at version (\d+)", message)
+                if off is not None and starting_version is None and starting_timestamp is None:
+                    # No start was given and the feed was switched on after
+                    # that version: start where it is on, as delta-rs does,
+                    # rather than failing on the default start of 0.
+                    after = int(off.group(1)) + 1
+                    # Only while it is off at the start (enabled later); a gap
+                    # after the feed was on is refused, not silently skipped.
+                    if after == (start or 0) + 1 and (
+                        ending_version is None or after <= ending_version
+                    ):
+                        start = after
+                        continue
+                if off is not None:
+                    raise UnreachableTableError(
+                        "read the change data feed",
+                        f"the change data feed was not enabled at version {off.group(1)}, "
+                        "which the requested range includes",
+                        "start the range after the feed was enabled",
+                    ) from exc
+                if "Start and end version schemas are different" in message:
+                    raise UnreachableTableError(
+                        "read the change data feed",
+                        "the table's schema changed within the requested range, and the "
+                        "kernel reads a change feed across one schema only",
+                        "read the ranges before and after the schema change separately",
+                    ) from exc
+                gone = re.search(
+                    r"Expected the first commit to have version (\d+), got Some\((\d+)\)", message
+                )
+                if gone is not None and int(gone.group(2)) > int(gone.group(1)):
+                    earliest = int(gone.group(2))
+                    if starting_version is None and starting_timestamp is None and start is None:
+                        # No start given: the readable feed begins at the
+                        # oldest commit log retention has kept.
+                        start = earliest
+                        continue
+                    raise UnreachableTableError(
+                        "read the change data feed",
+                        f"version {gone.group(1)} is no longer in the log (log retention "
+                        f"removed it); the oldest commit still there is {earliest}",
+                        f"pass starting_version={earliest} or later",
+                    ) from exc
+                raise
         if node is not None:
             stream = sqlpred.filter_stream(stream, node)
         if keep is not None:
@@ -637,7 +797,7 @@ class KernelEngine:
 
     # ------------------------------------------------------------------ write
 
-    def _uc_commit_config(self, table: ResolvedTable) -> Any:
+    def _uc_commit_config(self, table: ResolvedTable, *, staging: bool = False) -> Any:
         """Build the UC committer config, or None for a path-based table.
 
         A catalog-managed table *must* commit through the catalog: staging a
@@ -651,6 +811,11 @@ class KernelEngine:
 
         provider = table.credential_provider
         auth = getattr(provider, "workspace_auth", None)
+        if auth is None and staging:
+            # A worker holding a plan's shipped storage credential: the write
+            # context needs a committer to exist, never to commit, so the
+            # workspace URL without a token is enough -- and all it gets.
+            auth = getattr(provider, "staging_auth", None)
         if provider is None or auth is None:
             raise UnreachableTableError(
                 "commit to a catalog-managed table",
@@ -692,6 +857,9 @@ class KernelEngine:
         # A bare **_ here used to swallow schema_mode, writer_properties and the
         # rest, so they silently did nothing on a catalog-managed table.
         retries = unsupported.pop("max_commit_retries", None)
+        # The binding extracts only a tuple; txn=["job", 1] passed every check
+        # and then failed with TypeError at the commit, after the files.
+        txn = (txn[0], int(txn[1])) if txn is not None else None
         given = {k: v for k, v in unsupported.items() if v is not None}
         if given:
             raise UnreachableTableError(
@@ -715,8 +883,20 @@ class KernelEngine:
         attempts = attempts if replayable else 1
         with _library_commit_errors():
             for attempt in range(attempts):
-                reader = _as_record_batch_reader(data)
                 snapshot = self.snapshot(table, write=True)
+                if txn is not None and hasattr(snapshot, "app_id_version"):
+                    # The caller's txn check read an older snapshot: a writer that
+                    # committed this batch in between left it in the one we are
+                    # about to commit on, and committing anyway appended it twice.
+                    last = snapshot.app_id_version(txn[0])
+                    if last is not None and int(last) >= int(txn[1]):
+                        raise CommitConflictError(
+                            int(snapshot.version),
+                            f"transaction {txn[0]!r} version {txn[1]} was committed by a "
+                            f"concurrent writer (the table records version {last}); "
+                            "this batch is already in the table",
+                        )
+                reader = _as_record_batch_reader(data)
                 try:
                     version: int = snapshot.append(
                         reader,
@@ -789,6 +969,7 @@ class KernelEngine:
         """
         from deltaswamp._native import create_table
 
+        _enter_native("create the table with the kernel")
         if table.location is None:
             raise UnreachableTableError("create", "no storage location was given for the new table")
         if mode not in ("error", "create"):
@@ -936,6 +1117,18 @@ class KernelEngine:
         Row tracking is handled before this, since it rules out every commit
         that stages a remove, not only the rewrites.
         """
+        if table.is_shallow_clone:
+            # A rewrite reads every live file, and a shallow clone's are the
+            # source table's, by absolute path: the very read SCAN refuses.
+            # Claiming it sent the rewrite into a storage 403 on borrowed files.
+            return Capability(
+                operation,
+                ok=False,
+                reason=f"the kernel serves {operation.value} by rewriting the table, and a "
+                "shallow clone's data files belong to the source table (referenced by "
+                "absolute path), which cannot be credential-scoped reliably",
+                remedy="ds.connect(..., allow_sql_fallback=True) runs it on Databricks",
+            )
         if table.location is None:
             return None
         try:
@@ -1274,11 +1467,13 @@ class KernelEngine:
                 last_error = exc
                 continue
             return version
-        raise UnreachableTableError(
-            "commit a metadata change",
-            f"another writer committed first on each of {self.metadata_commit_attempts} "
-            f"attempts ({last_error})",
-            "retry when the table is less busy",
+        # A lost race is a conflict, not an unreachable table: callers that
+        # catch CommitConflictError to retry never saw this one.
+        raise CommitConflictError(
+            _conflict_version(str(last_error)),
+            f"cannot commit a metadata change: another writer committed first on each "
+            f"of {self.metadata_commit_attempts} attempts ({last_error}); retry when the "
+            "table is less busy",
         )
 
     #: Warn when a scan starts with less than this much credential life left.
@@ -1459,7 +1654,15 @@ class KernelEngine:
                 "the installed native extension cannot restrict a scan to planned files"
             )
         snapshot = self.snapshot(table, version=version, timestamp=timestamp)
-        skipping = sqlpred.to_kernel_json(sqlpred.parse(predicate)) if predicate else None
+        # Settle on the driver what every worker would otherwise fail on
+        # separately: an unknown column, or a predicate that cannot be
+        # evaluated against this schema.
+        _check_planned_read(snapshot, columns, predicate)
+        skipping = (
+            sqlpred.to_kernel_json(sqlpred.parse(predicate), _arrow_schema(snapshot))
+            if predicate
+            else None
+        )
         files = pa.table(snapshot.files(predicate=skipping)).to_pylist()
         # The log keys partition values by *physical* name, which under column
         # mapping is a `col-<uuid>`; splits report the logical column name.
@@ -1509,7 +1712,7 @@ class KernelEngine:
             )
         snapshot = self.snapshot(table, write=True)
         result: bytes = snapshot.write_files(
-            _as_record_batch_reader(data), uc=self._uc_commit_config(table)
+            _as_record_batch_reader(data), uc=self._uc_commit_config(table, staging=True)
         )
         return result
 
@@ -1523,29 +1726,54 @@ class KernelEngine:
         operation: str = "WRITE",
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, Any] | None = None,
+        version: int | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
 
         Every fragment lands at a single version, so a distributed write is
-        atomic: a reader sees all of it or none of it.
+        atomic: a reader sees all of it or none of it. With `version`, the
+        commit is built on that snapshot, so it conflicts if the table has
+        moved past it -- what a guarded overwrite needs.
         """
         if not self.supports_distributed_write:
             raise NotImplementedError(
                 "the installed native extension cannot commit externally written files"
             )
-        snapshot = self.snapshot(table, write=True)
-        with _library_commit_errors():
-            version: int = snapshot.commit_files(
-                list(fragments),
-                uc=self._uc_commit_config(table),
-                engine_info=engine_info or f"deltaswamp/{_version()}",
-                operation=operation,
-                overwrite=overwrite,
-                txn=txn,
-                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-            )
-        self._maybe_checkpoint(table, version)
-        return version
+        snapshot = self.snapshot(table, version=version, write=True)
+        if txn is not None and hasattr(snapshot, "app_id_version"):
+            # Checked on the very snapshot the commit is built on: a writer
+            # that records the txn after this makes the commit conflict, and
+            # the retry re-checks. Checking only at plan time let two runs of
+            # the same job both commit, and the rows landed twice.
+            last = snapshot.app_id_version(txn[0])
+            if last is not None and int(last) >= int(txn[1]):
+                raise UnreachableTableError(
+                    f"commit the idempotent write for {txn[0]!r} at version {txn[1]}",
+                    f"that transaction is already committed (the table records {last}), so "
+                    "committing these fragments would duplicate rows already in the table",
+                    "drop the fragments; their files are unreferenced and VACUUM removes them",
+                )
+        try:
+            with _library_commit_errors():
+                committed: int = snapshot.commit_files(
+                    list(fragments),
+                    uc=self._uc_commit_config(table),
+                    engine_info=engine_info or f"deltaswamp/{_version()}",
+                    operation=operation,
+                    overwrite=overwrite,
+                    txn=txn,
+                    commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+                )
+        except ValueError as exc:
+            # A refused fragment is the caller's input, and reached callers as
+            # a bare ValueError that `except DeltaSwampError` did not catch.
+            from ..errors import DeltaSwampError, InvalidArgumentError
+
+            if isinstance(exc, DeltaSwampError) or "fragment" not in str(exc):
+                raise
+            raise InvalidArgumentError(str(exc)) from exc
+        self._maybe_checkpoint(table, committed, snapshot)
+        return committed
 
     def execute_scan(
         self,
@@ -1554,12 +1782,14 @@ class KernelEngine:
         *,
         columns: list[str] | None = None,
         predicate: str | None = None,
+        version: int | None = None,
     ) -> Any:
         """Read planned splits: same semantics as `scan`, restricted to their files.
 
         Deletion vectors, column mapping and partition values are handled by
         the kernel exactly as in a full scan; the predicate is applied exactly
-        afterwards.
+        afterwards. `version` pins the snapshot when there are no splits to
+        carry it, so an empty plan reads the planned schema, not the latest.
         """
         versions = {s.commit_version for s in splits}
         if len(versions) > 1:
@@ -1570,7 +1800,8 @@ class KernelEngine:
                 f"the splits were planned against different versions ({sorted(versions, key=str)})",
                 "plan once and distribute that plan",
             )
-        version = next(iter(versions)) if versions else None
+        if versions:
+            version = next(iter(versions))
         snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
         return _planned_read(snapshot, columns, predicate, files=paths)
@@ -1603,6 +1834,25 @@ def _canonical_path(schema: Any, path: tuple[str, ...]) -> tuple[str, ...]:
         out.append(match.name)
         current = match.type
     return tuple(out)
+
+
+def _check_planned_read(snapshot: Any, columns: list[str] | None, predicate: str | None) -> None:
+    """Raise now for a projection or predicate the snapshot cannot serve."""
+    import pyarrow as pa
+
+    from .. import predicate as sqlpred
+    from ..errors import InvalidArgumentError
+
+    schema = pa.schema(snapshot.schema())
+    if columns:
+        known = {name.lower() for name in schema.names}
+        missing = [c for c in columns if isinstance(c, str) and c.lower() not in known]
+        if missing:
+            raise InvalidArgumentError(
+                f"column {missing[0]!r} is not in the table schema; columns are {schema.names}"
+            )
+    if predicate is not None:
+        sqlpred.to_arrow(_canonical_node(sqlpred.parse(predicate), schema), schema)
 
 
 def _canonical_node(node: Any, schema: Any) -> Any:
@@ -1650,6 +1900,13 @@ def _read_plan(
     return node, read, (wanted if read != wanted else None)
 
 
+def _arrow_schema(snapshot: Any) -> Any:
+    """The snapshot's schema as a pyarrow Schema (skipping needs column types)."""
+    import pyarrow as pa
+
+    return pa.schema(snapshot.schema())
+
+
 def _with_data_column(snapshot: Any, read: list[str]) -> list[str]:
     """`read`, plus one data-file column when it has none.
 
@@ -1694,7 +1951,7 @@ def _planned_read(
         if exact and data & set(columns):
             return snapshot.scan(columns=columns, **extra)
     node, read, keep = _read_plan(snapshot, columns, predicate)
-    skipping = sqlpred.to_kernel_json(node) if node is not None else None
+    skipping = sqlpred.to_kernel_json(node, _arrow_schema(snapshot)) if node is not None else None
     stream = snapshot.scan(columns=read, predicate=skipping, **extra)
     if node is not None:
         stream = sqlpred.filter_stream(stream, node)
@@ -1721,6 +1978,109 @@ def _library_commit_errors() -> Iterator[None]:
         raise CommitConflictError(_conflict_version(str(exc)), str(exc)) from exc
     except _native.RetryableError as exc:
         raise TransientCommitError(str(exc)) from exc
+    except ValueError as exc:
+        if isinstance(exc, DeltaSwampError):
+            raise
+        translated = _uc_commit_http_error(str(exc))
+        if translated is None and any(m in str(exc) for m in _BAD_DATA_MARKERS):
+            # The data does not fit the table: the caller's input, reported as
+            # a bare ValueError that `except DeltaSwampError` did not catch.
+            # InvalidArgumentError is still a ValueError.
+            from ..errors import InvalidArgumentError
+
+            translated = InvalidArgumentError(str(exc))
+        if translated is None and isinstance(exc, getattr(_native, "CatalogCommitError", ())):
+            from ..errors import CredentialError, InvalidReferenceError, PreflightError
+
+            # The extension types what the UC client words without a status
+            # (a 401 is "Authentication failed"); anything else -- a 400, say
+            # -- is still the catalog's refusal, with nothing committed.
+            if isinstance(exc, getattr(_native, "CatalogNotFoundError", ())):
+                translated = InvalidReferenceError(
+                    "the catalog no longer has this table: it was dropped (or renamed) "
+                    f"after it was opened, and the commit was refused. Re-resolve it. ({exc})"
+                )
+            elif isinstance(exc, getattr(_native, "CatalogPermissionError", ())):
+                if "authentication failed" in str(exc).lower() or "401" in str(exc):
+                    translated = CredentialError(
+                        "the catalog rejected the commit's credentials (expired or invalid "
+                        f"token); nothing was committed. ({exc})"
+                    )
+                else:
+                    translated = PreflightError(
+                        "the catalog refused the commit: the principal may not modify this "
+                        f"table; nothing was committed. ({exc})"
+                    )
+            else:
+                translated = UnreachableTableError(
+                    "commit to the catalog", f"the catalog refused the commit ({exc})"
+                )
+        if translated is None:
+            raise
+        raise translated from exc
+
+
+#: Messages the extension raises (as ValueError) for data that does not fit.
+_BAD_DATA_MARKERS = (
+    "that are not in the table schema",
+    "cannot be written as the table's type",
+)
+
+
+_REJECTED_CREDENTIAL_MARKERS = (
+    "expiredtoken",
+    "token has expired",
+    "invalidaccesskeyid",
+    "signaturedoesnotmatch",
+    "authenticationfailed",
+    "invalidauthenticationinfo",
+    "accessdenied",
+    "access denied",
+    "forbidden",
+    "403",
+)
+
+
+def _rejected_credential(message: str) -> bool:
+    """Whether a storage error reads as a credential the store refused."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _REJECTED_CREDENTIAL_MARKERS)
+
+
+def _uc_commit_http_error(message: str) -> Exception | None:
+    """A catalog refusal of a commit, as this library's error type.
+
+    The extension classifies only 409 and 429; any other status from the UC
+    commit API (the table dropped under the writer, an expired token, a lost
+    privilege) reached callers as a bare ValueError that `except
+    DeltaSwampError` did not catch, after the data files were written.
+    """
+    import re
+
+    from ..errors import CredentialError, InvalidReferenceError, PreflightError
+
+    if "UC update_table error" not in message:
+        return None
+    found = re.search(r"status\D{0,3}(\d{3})", message)
+    status = int(found.group(1)) if found else None
+    if status == 404:
+        return InvalidReferenceError(
+            "the catalog no longer has this table: it was dropped (or renamed) after it was "
+            f"opened, and the commit was refused. Re-resolve it. ({message})"
+        )
+    if status == 401:
+        return CredentialError(
+            "the catalog rejected the commit's credentials (expired or invalid token); "
+            f"nothing was committed. ({message})"
+        )
+    if status == 403:
+        return PreflightError(
+            "the catalog refused the commit: the principal may not modify this table "
+            f"(MODIFY, plus USE SCHEMA and USE CATALOG); nothing was committed. ({message})"
+        )
+    # A 5xx is left alone: the catalog may have ratified the commit before
+    # failing, so "unchanged, retry" (TransientCommitError) would be a guess.
+    return None
 
 
 def _conflict_version(message: str) -> int:

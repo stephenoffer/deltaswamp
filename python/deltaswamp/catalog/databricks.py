@@ -1584,7 +1584,16 @@ class DatabricksUnityCatalog:
             securable_type="SCHEMA",
             held_on=f"{ref.catalog}.{ref.schema}",
         )
-        return StagingTable.from_api(name, body or {})
+        staged = StagingTable.from_api(name, body or {})
+        options = staged.storage_options
+        if "aws_access_key_id" in options and "aws_region" not in options:
+            # Staging vends S3 keys without a region, as table vending does, and
+            # version 0 then went to us-east-1: a bucket anywhere else answered
+            # the Location-less redirect, and every managed create failed.
+            region = self._metastore_region()
+            if region:
+                options["aws_region"] = region
+        return staged
 
     def finalize_managed_table(
         self, ref: TableRef, request_body: Mapping[str, Any]

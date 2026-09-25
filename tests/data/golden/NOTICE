@@ -1,0 +1,8 @@
+Tables in this directory are copied unmodified from the delta-kernel-rs test
+corpus (https://github.com/delta-io/delta-kernel-rs), licensed under the
+Apache License, Version 2.0:
+
+  table-with-dv-small, table-with-cdf   kernel/tests/data/
+  hive-case-insensitive                 kernel/tests/golden_data/hive.tar.zst
+                                        (hive/delta/deltatbl-column-names-case-insensitive;
+                                        Hadoop .crc sidecar files omitted)

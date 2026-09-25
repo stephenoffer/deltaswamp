@@ -54,6 +54,22 @@ _CATALOG_MANAGED_ALTER_OPS: frozenset[Operation] = METADATA_OPERATIONS | {
     Operation.MERGE_SCHEMA,
 }
 
+#: Data writes a view, materialized view or metric view can never take: each is
+#: a query over other tables, with no data of its own.
+_QUERY_DEFINED = (TableType.VIEW, TableType.MATERIALIZED_VIEW, TableType.METRIC_VIEW)
+_DATA_WRITES: frozenset[Operation] = frozenset(
+    {
+        Operation.APPEND,
+        Operation.OVERWRITE,
+        Operation.REPLACE_WHERE,
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.MERGE,
+        Operation.MERGE_SCHEMA,
+        Operation.RESTORE,
+    }
+)
+
 
 def _is_uc_hive_metastore(table: ResolvedTable) -> bool:
     """Whether this is Databricks' legacy `hive_metastore` catalog.
@@ -103,6 +119,13 @@ _UNFIXABLE_OPEN_ERRORS: tuple[str, ...] = (
     "invalid json",
     "failed to parse",
     "has no such version",
+    # A log missing or mangling what every reader needs: the warehouse reads
+    # the same files, so enabling the fallback would fail the same way.
+    "expected contiguous commit files",
+    "no table metadata found",
+    "no protocol found",
+    "invalid protocol action",
+    "unmasked nulls",
 )
 
 
@@ -500,6 +523,22 @@ class Router:
         # Databricks returns no storage_location for these, and without one no
         # direct engine can do anything, so saying "the kernel found no
         # location" five times is worse than naming the real cause once.
+        if table.table_type in _QUERY_DEFINED and operation in _DATA_WRITES:
+            # Named the SQL fallback as the remedy, and with it enabled sent
+            # the write to a warehouse that refuses DML on a view -- or, for a
+            # materialized view whose manifest says readable, to a direct
+            # engine that would write into the view's own storage.
+            kind = table.table_type.value
+            refresh = table.table_type is TableType.MATERIALIZED_VIEW
+            return Capability(
+                operation,
+                ok=False,
+                reason=f"the table is a {kind}: it is defined by a query over other "
+                f"tables and holds no data of its own, so there is nothing to "
+                f"{operation.value} anywhere",
+                remedy="write to the tables it reads from"
+                + ("; then refresh() it" if refresh else ""),
+            )
         if table.is_view_like and not (manifest_says_readable and table.location):
             kind = table.table_type.value if table.table_type else "view"
             if sql_fallback:
