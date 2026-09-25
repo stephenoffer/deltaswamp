@@ -656,7 +656,15 @@ class Table:
         return (r.min_reader_version, r.min_writer_version)
 
     def features(self) -> frozenset[str]:
-        return self._enrich().features
+        """Every table feature in force, including those a legacy protocol implies.
+
+        A protocol below reader 3 / writer 7 names no features: its version
+        number is the feature set. Databricks' DESCRIBE DETAIL reports the
+        implied ones (a (1, 2) table lists appendOnly and invariants), and so
+        does this, so the two agree on every table.
+        """
+        r = self._enrich()
+        return r.effective_reader_features | r.effective_writer_features
 
     def properties(self) -> dict[str, str]:
         return dict(self._enrich().properties)

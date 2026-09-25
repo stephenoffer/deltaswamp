@@ -476,11 +476,8 @@ class TestReads:
         )
         want = set(json.loads(detail["tableFeatures"] or "[]"))
         got = set(fallback.table(name).features())
-        # A legacy protocol implies its features rather than listing them.
-        if int(detail["minWriterVersion"]) < 7:
-            assert got <= want
-        else:
-            assert got == want
+        # Legacy protocols included: features() reports what the version implies.
+        assert got == want
 
     def test_change_data_feed_agrees(self, built: Any, fallback: Any, warehouse: Warehouse) -> None:
         name = _table_for(built, BY_NAME["change_data_feed"])

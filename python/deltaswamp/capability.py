@@ -649,7 +649,9 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             (_K, _D, _SH, _S),
             "the kernel's TableChanges comes first: delta-rs cannot decode the CDF files "
             "Databricks writes (arrow-rs fails with 'cannot skip miniblock' on their "
-            "DELTA_BINARY_PACKED pages), and refuses column-mapped tables outright. "
+            "DELTA_BINARY_PACKED pages), double-encodes a partition path containing '%' "
+            "(a value 'a b' is looked up as k=a%2520b), and refuses column-mapped "
+            "tables outright. "
             "Catalog-managed tables have no CDF outside Databricks",
         ),
         _op(
