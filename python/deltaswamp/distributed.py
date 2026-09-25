@@ -128,13 +128,15 @@ class WritePlan:
         from .errors import CommitConflictError, UnreachableTableError
 
         collected = list(fragments)
-        if self.overwrite and not allow_concurrent_overwrite:
-            self._refuse_if_the_table_moved()
-
         attempts = max(0, retries) + 1
         last: Exception | None = None
         conflict_version = -1
         for _ in range(attempts):
+            # Re-checked every attempt, not once: losing a race means the table
+            # moved by definition, so a retry is exactly when an overwrite is
+            # most likely to be discarding someone.
+            if self.overwrite and not allow_concurrent_overwrite:
+                self._refuse_if_the_table_moved()
             try:
                 version: int = self.engine.commit_files(
                     self.table,
@@ -147,6 +149,12 @@ class WritePlan:
             except CommitConflictError as exc:
                 last = exc
                 conflict_version = exc.version
+                if attempts == 1:
+                    # No retry was asked for, so the conflict is the answer.
+                    # Diverting to a different error type here would hide it
+                    # from a caller catching CommitConflictError, which is what
+                    # every other write path raises.
+                    raise
                 if self.table.is_catalog_managed:
                     # The ratified tail and the version ceiling were captured
                     # when the table was resolved, so re-committing here would

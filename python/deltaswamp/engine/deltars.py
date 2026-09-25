@@ -19,6 +19,7 @@ Two habits this module keeps deliberately:
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import Iterator
 from typing import Any, Literal
 
@@ -636,7 +637,7 @@ class DeltaRsEngine:
     # ---------------------------------------------------------------- schema
 
     def add_columns(self, table: ResolvedTable, fields: Any, **kwargs: Any) -> None:
-        self._open(table, write=True).alter.add_columns(fields, **kwargs)
+        self._open(table, write=True).alter.add_columns(_deltars_fields(fields), **kwargs)
 
     def set_properties(
         self, table: ResolvedTable, properties: dict[str, str], **kwargs: Any
@@ -800,3 +801,43 @@ def _duration_days(value: str) -> float:
             total += number * units[part]
             number = None
     return total
+
+
+def _deltars_fields(fields: Any) -> list[Any]:
+    """Normalise column definitions into the `deltalake.Field`s delta-rs wants.
+
+    The kernel path accepts pyarrow fields, delta-rs fields or a
+    ``{name: type}`` mapping; delta-rs accepts only its own `Field`. Passing
+    them straight through made `add_column` succeed or fail on the same
+    argument depending on which engine the router happened to pick, which is
+    exactly the kind of difference a caller cannot see.
+    """
+    from deltalake import Field, Schema
+
+    if isinstance(fields, dict):
+        return [
+            Field.from_json(
+                json.dumps({"name": name, "type": str(dtype), "nullable": True, "metadata": {}})
+            )
+            for name, dtype in fields.items()
+        ]
+
+    items = (
+        list(fields) if isinstance(fields, (list, tuple)) or hasattr(fields, "names") else [fields]
+    )
+    out: list[Any] = []
+    for item in items:
+        if isinstance(item, Field):
+            out.append(item)
+        elif hasattr(item, "type") and hasattr(item, "nullable"):
+            # A pyarrow Field: a one-field Arrow schema converts cleanly.
+            import pyarrow as pa
+
+            out.append(Schema.from_arrow(pa.schema([item])).fields[0])
+        else:
+            raise UnreachableTableError(
+                "add columns",
+                f"cannot interpret {type(item).__name__} as a column definition",
+                "pass pyarrow fields, deltalake Fields, or a {name: type} mapping",
+            )
+    return out

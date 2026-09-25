@@ -508,24 +508,75 @@ fn add_metadata_batch(
 /// and gains columns under row tracking. Round-tripping the Arrow data keeps
 /// whatever kernel produced byte-exact, instead of re-deriving a schema here
 /// that would silently drift from `Transaction::add_files_schema`.
-fn batches_to_ipc(batches: &[arrow::array::RecordBatch]) -> Result<Vec<u8>> {
+/// Schema-metadata keys identifying the table a fragment was written for.
+///
+/// A fragment names data files by a path relative to its table root, so
+/// committing one into a different table writes an add action pointing at a
+/// file that is not there: the commit succeeds and the table is unreadable from
+/// then on. Nothing in the add action itself records which table it came from,
+/// so the binding is carried here and checked before the commit.
+const FRAGMENT_TABLE_ROOT: &str = "deltaswamp.table_root";
+const FRAGMENT_METADATA_ID: &str = "deltaswamp.metadata_id";
+
+fn batches_to_ipc(
+    batches: &[arrow::array::RecordBatch],
+    table_root: &str,
+    metadata_id: &str,
+) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     if let Some(first) = batches.first() {
-        let mut writer =
-            arrow::ipc::writer::StreamWriter::try_new(&mut buffer, first.schema().as_ref())?;
+        let mut metadata = first.schema().metadata().clone();
+        metadata.insert(FRAGMENT_TABLE_ROOT.to_string(), table_root.to_string());
+        metadata.insert(FRAGMENT_METADATA_ID.to_string(), metadata_id.to_string());
+        let schema = Arc::new(first.schema().as_ref().clone().with_metadata(metadata));
+
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, schema.as_ref())?;
         for batch in batches {
-            writer.write(batch)?;
+            let stamped =
+                arrow::array::RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+            writer.write(&stamped)?;
         }
         writer.finish()?;
     }
     Ok(buffer)
 }
 
-fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<arrow::array::RecordBatch>> {
+/// Decode a fragment, refusing one written for a different table.
+fn ipc_to_batches(
+    bytes: &[u8],
+    table_root: &str,
+    metadata_id: &str,
+) -> Result<Vec<arrow::array::RecordBatch>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+    let schema = reader.schema();
+    let metadata = schema.metadata();
+
+    let fragment_root = metadata.get(FRAGMENT_TABLE_ROOT).map(String::as_str);
+    let fragment_id = metadata.get(FRAGMENT_METADATA_ID).map(String::as_str);
+    match (fragment_root, fragment_id) {
+        (Some(root), Some(id)) => {
+            if root != table_root || id != metadata_id {
+                return Err(NativeError::Invalid(format!(
+                    "this fragment was written for a different table ({root}, metadata id \
+                     {id}) and is being committed to {table_root} (metadata id \
+                     {metadata_id}). Its files are named relative to the table they were \
+                     written under, so committing it here would add files that are not \
+                     there and leave this table unreadable."
+                )));
+            }
+        }
+        _ => {
+            return Err(NativeError::Invalid(
+                "this fragment carries no table identity, so it cannot be checked against \
+                 the table being committed to. It was not produced by write_files."
+                    .to_string(),
+            ));
+        }
+    }
+
     let mut out = Vec::new();
     for batch in reader {
         out.push(batch?);
@@ -557,6 +608,8 @@ pub fn write_files(
         .logical_partition_columns()
         .to_vec();
     let table_schema = snapshot.schema();
+    let table_root = snapshot.table_root().to_string();
+    let metadata_id = snapshot.table_configuration().metadata().id().to_string();
     // Built with the same committer the coordinator will use: a catalog-managed
     // table validates differently, and a worker must not discover that late.
     let txn = begin_transaction(snapshot, &engine, &uc, None, None, None, None)?;
@@ -585,7 +638,7 @@ pub fn write_files(
         }
     }
 
-    batches_to_ipc(&metadata_batches)
+    batches_to_ipc(&metadata_batches, &table_root, &metadata_id)
 }
 
 /// Commit add-action metadata produced by [`write_files`], possibly elsewhere.
@@ -607,6 +660,8 @@ pub fn commit_files(
     commit_metadata: Option<std::collections::HashMap<String, String>>,
 ) -> Result<u64> {
     let scan_source = snapshot.clone();
+    let table_root = snapshot.table_root().to_string();
+    let metadata_id = snapshot.table_configuration().metadata().id().to_string();
     let mut transaction = begin_transaction(
         snapshot,
         &engine,
@@ -626,7 +681,7 @@ pub fn commit_files(
     }
 
     for fragment in &fragments {
-        for batch in ipc_to_batches(fragment)? {
+        for batch in ipc_to_batches(fragment, &table_root, &metadata_id)? {
             transaction.add_files(Box::new(ArrowEngineData::new(batch)));
         }
     }

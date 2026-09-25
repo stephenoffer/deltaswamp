@@ -9,6 +9,8 @@ it is a ReaderWriter feature, anything carrying `vacuumProtocolCheck`.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
 from typing import Any
 
 from ..capability import (
@@ -25,7 +27,12 @@ from ..capability import (
 )
 from ..catalog import ResolvedTable
 from ..credentials import Operation as CredentialOperation
-from ..errors import UnreachableTableError
+from ..errors import (
+    BackfillRequiredError,
+    CommitConflictError,
+    TransientCommitError,
+    UnreachableTableError,
+)
 from ..properties import effect_for
 from .base import missing_method
 
@@ -582,15 +589,16 @@ class KernelEngine:
         reader = _as_record_batch_reader(data)
         snapshot = self.snapshot(table, write=True)
 
-        version: int = snapshot.append(
-            reader,
-            uc=self._uc_commit_config(table),
-            engine_info=engine_info or f"deltaswamp/{_version()}",
-            operation=operation,
-            overwrite=overwrite,
-            txn=txn,
-            commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-        )
+        with _library_commit_errors():
+            version: int = snapshot.append(
+                reader,
+                uc=self._uc_commit_config(table),
+                engine_info=engine_info or f"deltaswamp/{_version()}",
+                operation=operation,
+                overwrite=overwrite,
+                txn=txn,
+                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+            )
         self._maybe_checkpoint(table, version)
         return version
 
@@ -775,13 +783,14 @@ class KernelEngine:
         touched = int(pc.sum(matched).as_py() or 0)
         if touched == 0 and replacement.num_rows == current.num_rows:
             return {"version": int(snapshot.version), "num_affected_rows": 0}
-        version = snapshot.append(
-            replacement.to_reader(),
-            uc=self._uc_commit_config(table),
-            engine_info=f"deltaswamp/{_version()}",
-            operation=operation,
-            overwrite=True,
-        )
+        with _library_commit_errors():
+            version = snapshot.append(
+                replacement.to_reader(),
+                uc=self._uc_commit_config(table),
+                engine_info=f"deltaswamp/{_version()}",
+                operation=operation,
+                overwrite=True,
+            )
         self._maybe_checkpoint(table, version)
         return {"version": int(version), "num_affected_rows": touched}
 
@@ -848,7 +857,8 @@ class KernelEngine:
     def publish(self, table: ResolvedTable) -> int:
         """Publish ratified-but-unpublished commits into the Delta log."""
         snapshot = self.snapshot(table, write=True)
-        version: int = snapshot.publish(uc=self._uc_commit_config(table))
+        with _library_commit_errors():
+            version: int = snapshot.publish(uc=self._uc_commit_config(table))
         return version
 
     # ---------------------------------------------------- metadata-only DDL
@@ -1188,15 +1198,16 @@ class KernelEngine:
                 "the installed native extension cannot commit externally written files"
             )
         snapshot = self.snapshot(table, write=True)
-        version: int = snapshot.commit_files(
-            list(fragments),
-            uc=self._uc_commit_config(table),
-            engine_info=engine_info or f"deltaswamp/{_version()}",
-            operation=operation,
-            overwrite=overwrite,
-            txn=txn,
-            commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-        )
+        with _library_commit_errors():
+            version: int = snapshot.commit_files(
+                list(fragments),
+                uc=self._uc_commit_config(table),
+                engine_info=engine_info or f"deltaswamp/{_version()}",
+                operation=operation,
+                overwrite=overwrite,
+                txn=txn,
+                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+            )
         self._maybe_checkpoint(table, version)
         return version
 
@@ -1237,6 +1248,36 @@ class KernelEngine:
             columns=read_columns, predicate=sqlpred.to_kernel_json(node), files=paths
         )
         return sqlpred.filter_stream(stream, node, keep=list(columns) if columns else None)
+
+
+@contextlib.contextmanager
+def _library_commit_errors() -> Iterator[None]:
+    """Raise this library's error types instead of the extension's.
+
+    `errors.py` defines `CommitConflictError` and `BackfillRequiredError` so a
+    caller can catch `DeltaSwampError` and tell a lost race from backpressure.
+    The native ones are plain `RuntimeError`s, and they were reaching callers
+    untranslated -- so `except DeltaSwampError` around a commit caught nothing,
+    which is precisely the case it exists for.
+    """
+    from deltaswamp import _native
+
+    try:
+        yield
+    except _native.BackfillRequiredError as exc:
+        raise BackfillRequiredError(str(exc)) from exc
+    except _native.CommitConflictError as exc:
+        raise CommitConflictError(_conflict_version(str(exc)), str(exc)) from exc
+    except _native.RetryableError as exc:
+        raise TransientCommitError(str(exc)) from exc
+
+
+def _conflict_version(message: str) -> int:
+    """The version someone else won, if the message names one; -1 otherwise."""
+    import re
+
+    found = re.search(r"version (\d+)", message)
+    return int(found.group(1)) if found else -1
 
 
 def _delta_fields(fields: Any) -> list[dict[str, Any]]:

@@ -119,6 +119,29 @@ Databricks and the rest of the Delta ecosystem that drove this.
   front. `ResolvedTable.effective_reader_features` /
   `effective_writer_features` expose the merged view, and both engines use them.
 
+### Fixed by adversarial review of the distributed-write surface
+
+- **A fragment could be committed to the wrong table, corrupting it silently.**
+  A fragment names its data files relative to the table they were written
+  under, so committing one into another table wrote an add action pointing at a
+  file that is not there: the commit *succeeded* and the table was unreadable
+  from then on, with nothing in the log to say which write broke it. Fragments
+  now carry the table root and metadata id in their Arrow schema metadata, and
+  the commit refuses a mismatch. This also catches the subtler case of a table
+  dropped and re-created at the same path while a job was in flight.
+- **Commit failures reached callers as plain `RuntimeError`s from the
+  extension**, not as the `CommitConflictError` / `BackfillRequiredError` that
+  `errors.py` defines. `except DeltaSwampError` around a commit therefore
+  caught nothing, which is exactly the case those types exist for -- and the
+  429-means-publish distinction, carefully recovered in Rust, was lost before
+  it reached anyone. Every kernel commit path now translates, and a transient
+  failure raises the new `TransientCommitError`.
+- **`add_column` had a different input contract per engine.** It took pyarrow
+  fields on the kernel path and only `deltalake.Field`s on the delta-rs path,
+  so the identical call worked or raised depending on which engine the router
+  picked -- a difference a caller cannot see. Both now accept pyarrow fields and
+  schemas, delta-rs fields, or a `{name: type}` mapping.
+
 ### Fixed
 
 - Catalog-managed appends never reached the catalog: the UC commit ran outside

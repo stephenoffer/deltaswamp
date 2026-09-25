@@ -408,3 +408,84 @@ class TestDistributedWrite:
 
         verdict = writable_catalog_managed.table("main.sales.cm").can(Operation.SET_PROPERTIES)
         assert not verdict.ok
+
+
+class TestCommitFailuresReachCallersAsLibraryErrors:
+    """`errors.py` defines CommitConflictError and BackfillRequiredError so a
+    caller can catch DeltaSwampError and tell a lost race from backpressure.
+    The extension raises plain RuntimeErrors, and they were reaching callers
+    untranslated -- so `except DeltaSwampError` around a commit caught nothing,
+    which is exactly the case it exists for."""
+
+    @pytest.fixture
+    def uc_and_conn(self, tmp_path: Any) -> Any:
+        from deltaswamp.capability import Engine
+        from deltaswamp.catalog.ossuc import OSSUnityCatalog
+        from deltaswamp.engine.deltars import DeltaRsEngine
+        from deltaswamp.engine.kernel import KernelEngine
+        from deltaswamp.router import Router
+        from deltaswamp.table import Connection
+
+        with FakeUnityCatalog(staging_root=str(tmp_path)) as uc:
+            conn = Connection(
+                catalog=OSSUnityCatalog(uc.url),
+                router=Router(
+                    engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}
+                ),
+            )
+            conn.create_catalog("main")
+            conn.create_schema("main.sales")
+            conn.create_table("main.sales.cm", pa.schema([("id", pa.int64())]))
+            yield uc, conn
+
+    def test_a_409_is_a_commit_conflict(self, uc_and_conn: Any) -> None:
+        from deltaswamp.errors import CommitConflictError, DeltaSwampError
+
+        uc, conn = uc_and_conn
+        uc.next_commit_status = 409
+        with pytest.raises(CommitConflictError) as caught:
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}))
+        assert isinstance(caught.value, DeltaSwampError)
+
+    def test_a_429_is_backfill_pressure_not_a_conflict(self, uc_and_conn: Any) -> None:
+        """Retrying a 429 with backoff instead of publishing wedges the table."""
+        from deltaswamp.errors import BackfillRequiredError, CommitConflictError
+
+        uc, conn = uc_and_conn
+        uc.next_commit_status = 429
+        with pytest.raises(BackfillRequiredError) as caught:
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}))
+        assert not isinstance(caught.value, CommitConflictError)
+
+    def test_a_distributed_commit_conflict_is_the_same_error(self, uc_and_conn: Any) -> None:
+        """The distributed path must not raise a different type from append."""
+        from deltaswamp.errors import CommitConflictError
+
+        uc, conn = uc_and_conn
+        plan = conn.table("main.sales.cm").plan_write()
+        fragment = plan.write(pa.table({"id": [1]}))
+        uc.next_commit_status = 409
+        with pytest.raises(CommitConflictError):
+            plan.commit([fragment])
+
+    def test_retrying_a_catalog_managed_commit_says_to_re_open(self, uc_and_conn: Any) -> None:
+        """Retrying here would race against the commit tail captured at resolve."""
+        from deltaswamp.errors import UnreachableTableError
+
+        uc, conn = uc_and_conn
+        plan = conn.table("main.sales.cm").plan_write()
+        fragment = plan.write(pa.table({"id": [1]}))
+        uc.next_commit_status = 409
+        with pytest.raises(UnreachableTableError, match="re-open"):
+            plan.commit([fragment], retries=3)
+
+    def test_the_table_still_works_after_a_refused_commit(self, uc_and_conn: Any) -> None:
+        from deltaswamp.errors import CommitConflictError
+
+        uc, conn = uc_and_conn
+        uc.next_commit_status = 409
+        with pytest.raises(CommitConflictError):
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}))
+
+        conn.table("main.sales.cm").append(pa.table({"id": [2]}))
+        assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [2]

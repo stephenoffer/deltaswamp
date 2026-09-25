@@ -643,3 +643,113 @@ class TestDistributedWrite:
             conn.open_table(path).plan_write()
         after = len(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
         assert after == before, "a refused plan must not have written anything"
+
+
+class TestFragmentIdentity:
+    """A fragment names its files relative to the table it was written under.
+
+    Committing one into a different table therefore writes an add action
+    pointing at a file that is not there. The commit succeeds and the table is
+    unreadable from then on, with nothing to say which write broke it -- so the
+    fragment carries the identity of its table and the commit checks it.
+    """
+
+    @staticmethod
+    def _table(conn: Any, schema: Any = None) -> str:
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        conn.create_table(
+            location, schema or pa.schema([("id", pa.int64()), ("region", pa.string())])
+        )
+        return location
+
+    def test_a_fragment_cannot_be_committed_to_another_table(self, conn: Any) -> None:
+        a, b = self._table(conn), self._table(conn)
+        plan_a = conn.open_table(a).plan_write()
+        fragment = plan_a.write(pa.table({"id": [1], "region": ["us"]}))
+
+        plan_b = conn.open_table(b).plan_write()
+        with pytest.raises(ValueError, match="written for a different table"):
+            plan_b.commit([fragment])
+        assert conn.open_table(b).to_arrow().num_rows == 0, "b must be untouched"
+        assert conn.open_table(b).to_arrow().num_rows == 0
+
+    def test_a_fragment_cannot_survive_the_table_being_recreated(self, conn: Any) -> None:
+        """Same path, new table: the metadata id is what distinguishes them."""
+        import shutil
+
+        location = self._table(conn)
+        plan = conn.open_table(location).plan_write()
+        fragment = plan.write(pa.table({"id": [1], "region": ["us"]}))
+
+        shutil.rmtree(location)
+        conn.create_table(location, pa.schema([("id", pa.int64()), ("region", pa.string())]))
+        with pytest.raises(ValueError, match="written for a different table"):
+            plan.commit([fragment])
+
+    def test_a_fragment_that_is_not_ours_is_refused(self, conn: Any) -> None:
+        location = self._table(conn)
+        plan = conn.open_table(location).plan_write()
+        for junk in (b"not-arrow-ipc", b"\x00\x01\x02"):
+            with pytest.raises(ValueError):
+                plan.commit([junk])
+
+    def test_an_empty_fragment_is_a_no_op(self, conn: Any) -> None:
+        """A worker that received no rows still returns something committable."""
+        location = self._table(conn)
+        plan = conn.open_table(location).plan_write()
+        empty = plan.write(
+            pa.table({"id": pa.array([], pa.int64()), "region": pa.array([], pa.string())})
+        )
+        plan.commit([empty])
+        assert conn.open_table(location).to_arrow().num_rows == 0
+
+    def test_a_column_added_mid_flight_reads_null(self, conn: Any) -> None:
+        """The fragment predates the column, which is ordinary Delta behaviour."""
+        location = self._table(conn)
+        plan = conn.open_table(location).plan_write()
+        fragment = plan.write(pa.table({"id": [1], "region": ["us"]}))
+        conn.open_table(location).add_column(pa.field("amt", pa.float64()))
+
+        plan.commit([fragment])
+        assert conn.open_table(location).to_arrow().to_pydict()["amt"] == [None]
+
+
+class TestAddColumnAcceptsTheSameFormsOnEveryEngine:
+    """`add_column` took pyarrow fields on the kernel path and only delta-rs
+    `Field`s on the delta-rs path, so the identical call worked or raised
+    depending on which engine the router picked -- a difference the caller
+    cannot see."""
+
+    @staticmethod
+    def _table(conn: Any, properties: dict[str, str]) -> str:
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        conn.create_table(location, pa.schema([("id", pa.int64())]), properties=properties)
+        return location
+
+    @pytest.mark.parametrize(
+        "properties",
+        [{}, {"delta.enableTypeWidening": "true"}],
+        ids=["deltars", "kernel"],
+    )
+    @pytest.mark.parametrize(
+        "definition",
+        [
+            pa.field("a", pa.float64()),
+            [pa.field("a", pa.float64())],
+            {"a": "double"},
+            pa.schema([("a", pa.float64())]),
+        ],
+        ids=["field", "list", "mapping", "schema"],
+    )
+    def test_every_form_is_accepted(
+        self, conn: Any, properties: dict[str, str], definition: Any
+    ) -> None:
+        location = self._table(conn, properties)
+        conn.open_table(location).add_column(definition)
+        assert "a" in [f.name for f in conn.open_table(location).schema()]

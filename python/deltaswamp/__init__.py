@@ -24,6 +24,7 @@ from .errors import (
     InvalidReferenceError,
     PreflightError,
     PropertyNotSupportedError,
+    TransientCommitError,
     UnreachableTableError,
 )
 from .identity import RefKind, TableRef, parse_ref
@@ -66,6 +67,7 @@ __all__ = [
     "Table",
     "TableFeature",
     "TableRef",
+    "TransientCommitError",
     "UnreachableTableError",
     "WritePlan",
     "__version__",
