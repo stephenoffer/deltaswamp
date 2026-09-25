@@ -1023,3 +1023,83 @@ class TestDistributedWriteOutputIsPortable:
         theirs = DeltaTable(location).to_pyarrow_table().to_pydict()
         assert sorted(theirs["id"]) == [1, 2, 3]
         assert sorted(theirs["region"]) == ["eu", "us", "us"]
+
+
+class TestConcurrentDistributedJobs:
+    """Several jobs committing to one table at once, which is the normal case.
+
+    Each still has to win the race for its version, and they genuinely collide:
+    four committing at once leaves one winner and three conflicts unless the
+    losers rebase. Rebasing an append is always correct, so it happens by
+    default -- a connector should not have to discover this and write the loop.
+    """
+
+    @staticmethod
+    def _table(conn: Any) -> str:
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        conn.create_table(location, pa.schema([("id", pa.int64())]))
+        return location
+
+    @staticmethod
+    def _run(conn: Any, location: str, bases: tuple[int, ...], **commit: Any) -> list[Any]:
+        import concurrent.futures as futures
+
+        def job(base: int) -> Any:
+            plan = conn.open_table(location).plan_write()
+            fragments = [plan.write(pa.table({"id": [base + i]})) for i in range(3)]
+            try:
+                return plan.commit(fragments, **commit)
+            except Exception as exc:  # returning it is the point: which jobs fail
+                return exc
+
+        with futures.ThreadPoolExecutor(len(bases)) as pool:
+            return list(pool.map(job, bases))
+
+    def test_concurrent_appends_all_land_by_default(self, conn: Any) -> None:
+        location = self._table(conn)
+        bases = (100, 200, 300, 400)
+        results = self._run(conn, location, bases)
+
+        assert all(isinstance(r, int) for r in results), (
+            f"a concurrent append was lost: {[r for r in results if not isinstance(r, int)]}"
+        )
+        assert sorted(results) == [1, 2, 3, 4], "each job should take the next version"
+
+        got = sorted(conn.open_table(location).to_arrow().to_pydict()["id"])
+        assert len(got) == len(bases) * 3
+        assert len(got) == len(set(got)), "no row written twice"
+        for base in bases:
+            assert len([i for i in got if base <= i < base + 3]) == 3, (
+                f"job {base} landed partially"
+            )
+
+    def test_without_retries_the_losers_say_so(self, conn: Any) -> None:
+        """The conflict is still reportable for a caller who wants to see it."""
+        from deltaswamp.errors import CommitConflictError
+
+        location = self._table(conn)
+        results = self._run(conn, location, (100, 200, 300, 400), retries=0)
+
+        committed = [r for r in results if isinstance(r, int)]
+        refused = [r for r in results if isinstance(r, CommitConflictError)]
+        assert len(committed) >= 1
+        assert len(committed) + len(refused) == 4, f"unexpected failure: {results}"
+
+        got = sorted(conn.open_table(location).to_arrow().to_pydict()["id"])
+        assert len(got) == len(committed) * 3, "a refused job must leave nothing behind"
+
+    def test_an_overwrite_does_not_retry_by_default(self, conn: Any) -> None:
+        """Retrying an overwrite means overwriting whoever just won."""
+        location = self._table(conn)
+        conn.open_table(location).append(pa.table({"id": [1]}))
+
+        plan = conn.open_table(location).plan_write(mode="overwrite")
+        fragment = plan.write(pa.table({"id": [9]}))
+        conn.open_table(location).append(pa.table({"id": [99]}))
+
+        with pytest.raises(UnreachableTableError, match="discard"):
+            plan.commit([fragment])
+        assert 99 in conn.open_table(location).to_arrow().to_pydict()["id"]

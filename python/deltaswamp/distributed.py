@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 __all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance"]
 
@@ -84,6 +84,14 @@ class WritePlan:
     txn: tuple[str, int] | None = None
     commit_metadata: dict[str, Any] | None = None
 
+    #: Retries an ordinary append gets when `retries` is not given. Concurrent
+    #: jobs really do collide -- four committing at once leaves one winner and
+    #: three `CommitConflictError`s -- and rebasing an append is always correct,
+    #: so the default matches `KernelEngine.metadata_commit_attempts` rather
+    #: than leaving every connector to write the same loop. An overwrite gets
+    #: none, and so does a catalog-managed table, which cannot rebase here.
+    default_append_retries: ClassVar[int] = 5
+
     @property
     def overwrite(self) -> bool:
         return self.mode == "overwrite"
@@ -102,15 +110,20 @@ class WritePlan:
         fragments: Iterable[bytes],
         *,
         operation: str = "WRITE",
-        retries: int = 0,
+        retries: int | None = None,
         allow_concurrent_overwrite: bool = False,
     ) -> int:
         """Driver side: commit every fragment as one transaction.
 
         Returns the committed version. The commit resolves the table again, so
         an append lands on top of whatever else has been written since the plan
-        was made rather than failing on it -- which is what an append means, and
-        why one rarely conflicts here at all.
+        was made rather than failing on it, which is what an append means.
+
+        It still has to win the race for its version, and concurrent jobs
+        genuinely collide: four committing at once leaves one winner and three
+        conflicts. Rebasing an append is always correct, so `retries` defaults
+        to `default_append_retries` and the losers simply commit at the next
+        version. Pass `retries=0` to see the conflict instead.
 
         An overwrite is the opposite: it removes what it finds, so committing
         against a table that has moved on would discard a writer that arrived
@@ -123,11 +136,24 @@ class WritePlan:
         so the same fragments can be committed again against a fresh snapshot.
         `retries` re-attempts that here for tables this library commits itself;
         a catalog-managed table has to be re-opened through its catalog first,
-        and says so rather than spinning against a stale commit tail.
+        and says so rather than spinning against a stale commit tail. An
+        overwrite defaults to no retries, because retrying one means overwriting
+        the writer that just won.
         """
         from .errors import CommitConflictError, UnreachableTableError
 
         collected = list(fragments)
+        if retries is None:
+            # Only an ordinary append gets them. Retrying an overwrite means
+            # overwriting the writer that just won, and a catalog-managed table
+            # cannot rebase here at all -- it would spin against the commit tail
+            # captured when it was resolved, so defaulting to a retry that
+            # cannot work would only change which error the caller sees.
+            retries = (
+                0
+                if (self.overwrite or self.table.is_catalog_managed)
+                else self.default_append_retries
+            )
         attempts = max(0, retries) + 1
         last: Exception | None = None
         conflict_version = -1
