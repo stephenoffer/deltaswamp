@@ -13,8 +13,8 @@ from typing import Any
 
 import deltaswamp as ds
 import pytest
-from deltaswamp.capability import PROPERTY_SUPPORT, Engine, PropertyEffect, property_support
-from deltaswamp.properties import effect_for
+from deltaswamp.capability import Engine
+from deltaswamp.properties import PROPERTY_SUPPORT, PropertyEffect, effect_for, property_support
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")

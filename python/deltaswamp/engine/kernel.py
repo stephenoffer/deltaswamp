@@ -1,10 +1,9 @@
 """The delta-kernel engine: the default read path.
 
-Kernel earns that position because it evaluates feature support *per operation*
-and ignores writer-only features when reading. delta-rs does a flat
-set-difference against a hardcoded list and refuses to open 19 features kernel
-reads without complaint -- including every `catalogManaged` table and, because
-it is a ReaderWriter feature, anything carrying `vacuumProtocolCheck`.
+The kernel checks feature support per operation and ignores writer-only
+features when reading, so it opens tables delta-rs refuses: every
+`catalogManaged` table, and anything with type widening, shredded variants or
+`vacuumProtocolCheck`.
 """
 
 from __future__ import annotations
@@ -15,6 +14,9 @@ import json
 from collections.abc import Iterator
 from typing import Any
 
+from .. import predicate as sqlpred
+from .._sdk import PRODUCT, sdk_version
+from .._util import timestamp_ms
 from ..capability import (
     FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
@@ -38,15 +40,16 @@ from ..errors import (
     UnreachableTableError,
 )
 from ..properties import effect_for
+from . import metadata as meta
 from .base import missing_method
+from .metadata import CLUSTERING_DOMAIN, TableState, arrow_to_delta_field, build_actions
 
 __all__ = ["KernelEngine"]
 
 
-def _version() -> str:
-    from .. import __version__
-
-    return __version__
+def _engine_info() -> str:
+    """The `engineInfo` recorded in every commit this library writes."""
+    return f"{PRODUCT}/{sdk_version()}"
 
 
 def _as_record_batch_reader(data: Any) -> Any:
@@ -201,7 +204,7 @@ class KernelEngine:
     supports_writer_properties = False
     supports_dynamic_overwrite = False
     #: history_manager resolves a timestamp to the latest recreatable version,
-    #: honouring in-commit timestamps.
+    #: honoring in-commit timestamps.
     supports_timestamp_travel = True
 
     def __init__(self, *, storage_options: dict[str, str] | None = None) -> None:
@@ -246,7 +249,7 @@ class KernelEngine:
         for name in table.effective_reader_features:
             feature = feature_from_wire(name)
             if feature is None:
-                blockers.append(f"{name} (unrecognised reader feature)")
+                blockers.append(f"{name} (unrecognized reader feature)")
             elif FEATURE_SUPPORT[feature].kernel_read is Support.NO:
                 blockers.append(name)
 
@@ -369,6 +372,24 @@ class KernelEngine:
                 remedy="ds.connect(..., allow_sql_fallback=True) reads it with table_changes()",
             )
 
+        if (
+            operation is Operation.CDF
+            and table.properties.get("delta.enableChangeDataFeed", "false").lower() != "true"
+        ):
+            # Decided here, not in cdf(). A table without a change feed has
+            # nothing for any engine to read, and reporting it only when the
+            # call is made makes capabilities() claim a feed that is not there
+            # -- which is the whole reason to ask before calling.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "delta.enableChangeDataFeed is not enabled on this table, so there is "
+                    "no change feed to read. Enabling it is not retroactive: only changes "
+                    "after enablement are recorded"
+                ),
+            )
+
         if operation is Operation.SCAN and table.is_shallow_clone:
             # Its add actions point at the source table's files by absolute path.
             # Kernel resolves those before we see them, so we cannot scope
@@ -442,7 +463,7 @@ class KernelEngine:
                 version=version,
                 log_tail=log_tail,
                 max_catalog_version=table.max_catalog_version,
-                timestamp_ms=_timestamp_ms(timestamp) if timestamp is not None else None,
+                timestamp_ms=timestamp_ms(timestamp) if timestamp is not None else None,
             )
         except ValueError as exc:
             if "earliest recreatable" in str(exc):
@@ -491,8 +512,6 @@ class KernelEngine:
         if predicate is None:
             return snapshot.scan(columns=columns)
 
-        from .. import predicate as sqlpred
-
         node = sqlpred.parse(predicate)
         read_columns = columns
         if columns is not None:
@@ -516,8 +535,6 @@ class KernelEngine:
 
         `num_records` counts rows before deletion vectors are applied.
         """
-        from .. import predicate as sqlpred
-
         skipping = sqlpred.to_kernel_json(sqlpred.parse(predicate)) if predicate else None
         return self.snapshot(table, version=version).files(predicate=skipping)
 
@@ -564,8 +581,6 @@ class KernelEngine:
             raise UnreachableTableError(
                 "read the change data feed", "pass a starting version or timestamp, not both"
             )
-        from .. import predicate as sqlpred
-
         node = sqlpred.parse(predicate) if predicate else None
         read_columns = columns
         if columns is not None and node is not None:
@@ -580,10 +595,10 @@ class KernelEngine:
             columns=read_columns,
             predicate=sqlpred.to_kernel_json(node) if node is not None else None,
             start_timestamp_ms=(
-                _timestamp_ms(starting_timestamp) if starting_timestamp is not None else None
+                timestamp_ms(starting_timestamp) if starting_timestamp is not None else None
             ),
             end_timestamp_ms=(
-                _timestamp_ms(ending_timestamp) if ending_timestamp is not None else None
+                timestamp_ms(ending_timestamp) if ending_timestamp is not None else None
             ),
         )
         if node is None:
@@ -697,7 +712,7 @@ class KernelEngine:
             version: int = snapshot.append(
                 reader,
                 uc=self._uc_commit_config(table),
-                engine_info=engine_info or f"deltaswamp/{_version()}",
+                engine_info=engine_info or _engine_info(),
                 operation=operation,
                 overwrite=overwrite,
                 txn=txn,
@@ -743,7 +758,7 @@ class KernelEngine:
             partition_by=partition_by or None,
             cluster_by=cluster_by or None,
             uc=self._uc_commit_config(table),
-            engine_info=engine_info or f"deltaswamp/{_version()}",
+            engine_info=engine_info or _engine_info(),
         )
         return version
 
@@ -864,8 +879,6 @@ class KernelEngine:
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        from .. import predicate as sqlpred
-
         refusal = self._rewrite_refusal(Operation.DELETE, table)
         if refusal is not None:
             raise UnreachableTableError(
@@ -888,7 +901,7 @@ class KernelEngine:
             version = snapshot.append(
                 replacement.to_reader(),
                 uc=self._uc_commit_config(table),
-                engine_info=f"deltaswamp/{_version()}",
+                engine_info=_engine_info(),
                 operation=operation,
                 overwrite=True,
             )
@@ -925,8 +938,6 @@ class KernelEngine:
         """
         import pyarrow as pa
         import pyarrow.compute as pc
-
-        from .. import predicate as sqlpred
 
         _refuse_options("update", unsupported)
         assignments: dict[str, Any] = dict(new_values or {})
@@ -1012,6 +1023,29 @@ class KernelEngine:
                 "here would leave its Iceberg metadata stale",
                 remedy="perform this change from Databricks, or enable the SQL fallback",
             )
+        if operation in (Operation.DROP_COLUMN, Operation.RENAME_COLUMN) and table.properties.get(
+            "delta.columnMapping.mode", "none"
+        ).lower() not in ("name", "id"):
+            # Decided here rather than inside the commit. Without column mapping
+            # a column's name is also its name in every Parquet file, so the
+            # change would need the data rewritten -- which this path does not
+            # do. The mode is a table property, so saying so costs nothing.
+            return Capability(
+                operation,
+                ok=False,
+                # The remedy is carried in the reason as well: the router keeps
+                # only its own remedy when it aggregates engine verdicts, and
+                # turning column mapping on is far more use here than being
+                # told a SQL warehouse could do it.
+                reason=(
+                    "renaming or dropping a column without rewriting data needs column "
+                    "mapping, and this table does not use it: the column's name is also "
+                    "its name in every Parquet file. Set "
+                    "delta.columnMapping.mode='name' first"
+                ),
+                remedy="t.set_properties({'delta.columnMapping.mode': 'name'}) first",
+            )
+
         if operation is Operation.CLUSTER_BY and table.partition_columns:
             return Capability(
                 operation,
@@ -1022,10 +1056,6 @@ class KernelEngine:
 
     def _state(self, table: ResolvedTable) -> tuple[Any, Any]:
         """(snapshot, TableState) for the latest version."""
-        import json
-
-        from .metadata import CLUSTERING_DOMAIN, TableState
-
         snapshot = self.snapshot(table, write=True)
         clustering_raw = snapshot.domain_metadata(CLUSTERING_DOMAIN)
         state = TableState(
@@ -1057,8 +1087,6 @@ class KernelEngine:
         """
         from deltaswamp import _native
 
-        from .metadata import build_actions
-
         last_error: Exception | None = None
         for _ in range(self.metadata_commit_attempts):
             snapshot, state = self._state(table)
@@ -1067,7 +1095,7 @@ class KernelEngine:
             change = mutate(state)
             if change.protocol is None and change.metadata is None and not change.domains:
                 return int(state.version)
-            actions = build_actions(state, change, engine_info=f"deltaswamp/{_version()}")
+            actions = build_actions(state, change, engine_info=_engine_info())
             try:
                 assert table.location is not None  # supports() refused otherwise
                 version: int = _native.commit_raw(
@@ -1127,38 +1155,26 @@ class KernelEngine:
         )
 
     def add_columns(self, table: ResolvedTable, fields: Any, **_: Any) -> int:
-        from . import metadata as m
-
         new_fields = _delta_fields(fields)
-        return self._commit_metadata(table, lambda s: m.add_columns(s, new_fields))
+        return self._commit_metadata(table, lambda s: meta.add_columns(s, new_fields))
 
     def drop_column(self, table: ResolvedTable, column: str) -> int:
-        from . import metadata as m
-
-        return self._commit_metadata(table, lambda s: m.drop_column(s, column))
+        return self._commit_metadata(table, lambda s: meta.drop_column(s, column))
 
     def rename_column(self, table: ResolvedTable, old: str, new: str) -> int:
-        from . import metadata as m
-
-        return self._commit_metadata(table, lambda s: m.rename_column(s, old, new))
+        return self._commit_metadata(table, lambda s: meta.rename_column(s, old, new))
 
     def set_properties(self, table: ResolvedTable, properties: dict[str, str], **_: Any) -> int:
-        from . import metadata as m
-
-        return self._commit_metadata(table, lambda s: m.set_properties(s, properties))
+        return self._commit_metadata(table, lambda s: meta.set_properties(s, properties))
 
     def unset_properties(
         self, table: ResolvedTable, keys: list[str], *, if_exists: bool = True
     ) -> int:
-        from . import metadata as m
-
         return self._commit_metadata(
-            table, lambda s: m.unset_properties(s, keys, if_exists=if_exists)
+            table, lambda s: meta.unset_properties(s, keys, if_exists=if_exists)
         )
 
     def add_feature(self, table: ResolvedTable, feature: Any, **_: Any) -> int:
-        from . import metadata as m
-
         names = feature if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
         wires = {str(getattr(n, "value", n)) for n in names}
         # A feature arrives with what it depends on (rowTracking needs
@@ -1173,36 +1189,26 @@ class KernelEngine:
 
         def mutate(state: Any) -> Any:
             props = {f"delta.feature.{n}": "supported" for n in sorted(wires)}
-            return m.set_properties(state, props)
+            return meta.set_properties(state, props)
 
         return self._commit_metadata(table, mutate)
 
     def drop_constraint(self, table: ResolvedTable, name: str, *, if_exists: bool = False) -> int:
-        from . import metadata as m
-
         return self._commit_metadata(
-            table, lambda s: m.drop_constraint(s, name, if_exists=if_exists)
+            table, lambda s: meta.drop_constraint(s, name, if_exists=if_exists)
         )
 
     def set_comment(self, table: ResolvedTable, comment: str | None) -> int:
-        from . import metadata as m
-
-        return self._commit_metadata(table, lambda s: m.set_comment(s, comment))
+        return self._commit_metadata(table, lambda s: meta.set_comment(s, comment))
 
     def set_column_comment(self, table: ResolvedTable, column: str, comment: str | None) -> int:
-        from . import metadata as m
-
-        return self._commit_metadata(table, lambda s: m.set_column_comment(s, column, comment))
+        return self._commit_metadata(table, lambda s: meta.set_column_comment(s, column, comment))
 
     def alter_column_type(self, table: ResolvedTable, column: str, new_type: str) -> int:
-        from . import metadata as m
-
-        return self._commit_metadata(table, lambda s: m.alter_column_type(s, column, new_type))
+        return self._commit_metadata(table, lambda s: meta.alter_column_type(s, column, new_type))
 
     def drop_not_null(self, table: ResolvedTable, column: str) -> int:
-        from . import metadata as m
-
-        return self._commit_metadata(table, lambda s: m.set_nullability(s, column, True))
+        return self._commit_metadata(table, lambda s: meta.set_nullability(s, column, True))
 
     def set_not_null(self, table: ResolvedTable, column: str) -> int:
         """SET NOT NULL, after proving no existing row is null.
@@ -1211,7 +1217,6 @@ class KernelEngine:
         and the put-if-absent commit fails if anything was written since -- so
         a null cannot slip in between the check and the change.
         """
-        from . import metadata as m
 
         def precheck(snapshot: Any, state: Any) -> None:
             import pyarrow as pa
@@ -1227,12 +1232,10 @@ class KernelEngine:
                 )
 
         return self._commit_metadata(
-            table, lambda s: m.set_nullability(s, column, False), precheck=precheck
+            table, lambda s: meta.set_nullability(s, column, False), precheck=precheck
         )
 
     def cluster_by(self, table: ResolvedTable, columns: Any) -> int:
-        from . import metadata as m
-
         if isinstance(columns, str):
             if columns.lower() == "auto":
                 raise UnreachableTableError(
@@ -1242,7 +1245,7 @@ class KernelEngine:
                     SQL_FALLBACK_REMEDY,
                 )
             columns = [columns]
-        return self._commit_metadata(table, lambda s: m.cluster_by(s, list(columns or [])))
+        return self._commit_metadata(table, lambda s: meta.cluster_by(s, list(columns or [])))
 
     def plan_scan(
         self,
@@ -1260,11 +1263,8 @@ class KernelEngine:
         if it has been written to since. Files the predicate's statistics rule
         out are not planned at all.
         """
-        import json
-
         import pyarrow as pa
 
-        from .. import predicate as sqlpred
         from .base import DeletionVectorDescriptor, ScanSplit
 
         if not self.supports_distributed_scan:
@@ -1344,7 +1344,7 @@ class KernelEngine:
             version: int = snapshot.commit_files(
                 list(fragments),
                 uc=self._uc_commit_config(table),
-                engine_info=engine_info or f"deltaswamp/{_version()}",
+                engine_info=engine_info or _engine_info(),
                 operation=operation,
                 overwrite=overwrite,
                 txn=txn,
@@ -1367,8 +1367,6 @@ class KernelEngine:
         the kernel exactly as in a full scan; the predicate is applied exactly
         afterwards.
         """
-        from .. import predicate as sqlpred
-
         versions = {s.commit_version for s in splits}
         if len(versions) > 1:
             raise UnreachableTableError(
@@ -1436,18 +1434,12 @@ def _feature_usage(snapshot: Any) -> dict[str, bool]:
         "has_check_constraints": False,
         "has_generated_columns": False,
     }
-    try:
-        properties = snapshot.table_properties() or {}
-    except Exception:
-        properties = {}
+    properties = snapshot.table_properties() or {}
     usage["has_check_constraints"] = any(
         key.lower().startswith("delta.constraints.") for key in properties
     )
 
-    try:
-        metadata = json.loads(snapshot.metadata_json())
-    except Exception:
-        return usage
+    metadata = json.loads(snapshot.metadata_json())
     schema = metadata.get("schemaString") or metadata.get("schema_string")
     if isinstance(schema, str):
         try:
@@ -1487,10 +1479,6 @@ def _delta_fields(fields: Any) -> list[dict[str, Any]]:
     Takes a pyarrow Schema or Field (or a list of them), delta-rs `Field`
     objects, or a `{name: delta_type}` mapping of primitive types.
     """
-    import json
-
-    from .metadata import arrow_to_delta_field
-
     if isinstance(fields, dict):
         return [
             {"name": name, "type": str(dtype), "nullable": True, "metadata": {}}
@@ -1524,34 +1512,6 @@ def _require_pyarrow(what: str) -> None:
             "pyarrow is needed to evaluate the row filter",
             "pip install 'deltaswamp[pyarrow]'",
         ) from exc
-
-
-def _timestamp_ms(value: Any) -> int:
-    """Epoch milliseconds from a datetime, an ISO-8601 string, or a number.
-
-    A naive datetime or zoneless string is read as UTC, the only defensible
-    choice without a session time zone.
-    """
-    import datetime as dt
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            value = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise UnreachableTableError(
-                f"time travel to {value!r}", "not an ISO-8601 timestamp"
-            ) from exc
-    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
-        value = dt.datetime(value.year, value.month, value.day)
-    if isinstance(value, dt.datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=dt.UTC)
-        return int(value.timestamp() * 1000)
-    raise UnreachableTableError(
-        f"time travel to {value!r}", "expected a datetime, an ISO-8601 string or epoch millis"
-    )
 
 
 def _evaluate(table: Any, expr: Any) -> Any:

@@ -28,6 +28,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .._util import http_error_text
 from ..errors import InvalidReferenceError, UnreachableTableError
 from ..identity import RefKind, TableRef
 from .base import ResolvedTable
@@ -107,13 +108,6 @@ def load_profile(profile: str | Path | dict[str, Any]) -> Any:
             "shareCredentialsVersion and endpoint, plus bearerToken (version 1) or a "
             "'type' with its credentials (version 2)"
         ) from exc
-
-
-def _http_error_text(exc: BaseException) -> str:
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
-    message = str(exc).strip()
-    return f"HTTP {status}: {message}" if status is not None else message
 
 
 class SharingCatalog:
@@ -219,11 +213,11 @@ class SharingCatalog:
             if status in (403, 404):
                 raise InvalidReferenceError(
                     f"{ref.full_name} is not visible through this share "
-                    f"({_http_error_text(exc)}). Recipients see only the tables the provider "
+                    f"({http_error_text(exc)}). Recipients see only the tables the provider "
                     "added to the share"
                 ) from exc
             raise UnreachableTableError(
-                f"resolve the shared table {ref.full_name}", _http_error_text(exc)
+                f"resolve the shared table {ref.full_name}", http_error_text(exc)
             ) from exc
         finally:
             client.close()

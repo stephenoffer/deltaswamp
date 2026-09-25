@@ -56,6 +56,10 @@ class EngineFallbackWarning(UserWarning):
     """An engine failed on a read it claimed, and the next engine is serving it."""
 
 
+class SqlFallbackWarning(UserWarning):
+    """An operation was served by a Databricks SQL warehouse rather than directly."""
+
+
 class IgnoredPropertyWarning(UserWarning):
     """A property will be stored but nothing here acts on it."""
 

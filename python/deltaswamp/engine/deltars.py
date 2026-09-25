@@ -1,19 +1,12 @@
 """The delta-rs engine: the default DML and maintenance path.
 
-delta-rs is far ahead of the kernel on *doing* things -- MERGE with all six
-clause types, UPDATE/DELETE by predicate, `replaceWhere`, schema evolution,
-OPTIMIZE, Z-ORDER, VACUUM, RESTORE, FSCK, CONVERT, manifest generation,
-`history()` -- none of which the kernel implements.
+delta-rs has MERGE, UPDATE and DELETE by predicate, `replaceWhere`, schema
+evolution, OPTIMIZE, Z-ORDER, VACUUM, RESTORE, FSCK, CONVERT, manifest
+generation and `history()`, none of which the kernel implements.
 
-Two habits this module keeps deliberately:
-
-* **A fresh `DeltaTable` per operation.** delta-rs bakes `storage_options` into
-  the object store at construction and offers no credential-provider hook, so a
-  long-lived handle dies when its vended credential expires. Re-resolving is the
-  only available refresh mechanism.
-* **Refusing rather than diverging.** A write to an Iceberg-reads table needs
-  `MSCK REPAIR TABLE ... SYNC METADATA` afterwards, which only Databricks can
-  run. Writing anyway leaves the Iceberg view silently stale, so we decline.
+Every operation opens a fresh `DeltaTable`. delta-rs bakes `storage_options`
+into the object store at construction and has no credential-provider hook, so
+re-opening is the only way to pick up a re-vended credential.
 """
 
 from __future__ import annotations
@@ -847,7 +840,7 @@ def _vends_gcs_bearer_token(table: ResolvedTable) -> bool:
     if isinstance(provider, StaticCredentialProvider):
         # Held, not minted, so reading it costs nothing -- and an expired one
         # must not turn a routing question into a raise.
-        return "google_bearer_token" in provider._credentials.secrets
+        return "google_bearer_token" in provider.peek().secrets
     return True
 
 

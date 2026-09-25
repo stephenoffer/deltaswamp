@@ -56,7 +56,7 @@ fn gcs_bearer_token(options: &HashMap<String, String>) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
-/// Build an object store for `url`, honouring vended credentials.
+/// Build an object store for `url`, honoring vended credentials.
 pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
     if is_azure(url) && !options.contains_key("azure_endpoint") && !options.contains_key("endpoint")
     {

@@ -1,17 +1,10 @@
-"""Parsing table references into a single normalised form.
+"""Parsing table references into a single normalized form.
 
-One entry point (`parse_ref`) accepts every shape a user might reasonably hand
-us -- a Databricks three-level name, a `uc://` URI, an `hms://` or `glue://`
-locator, or a raw object-store path -- and yields a `TableRef`.
-
-Two deliberate behaviours:
-
-* Backtick-quoted identifiers are supported, because Databricks names can
-  legally contain dots and spaces. ``main.`my.schema`.tbl`` is three parts,
-  not four.
-* ``dbfs:/`` and ``/mnt/`` are parsed successfully and then refused with a
-  specific message. They are never reachable from outside Databricks, and a
-  vague "file not found" would send people hunting in the wrong place.
+`parse_ref` accepts a Databricks three-level name, a `uc://` URI, an `hms://` or
+`glue://` locator, or a raw object-store path, and returns a `TableRef`.
+Backtick-quoted identifiers may contain dots and spaces, so
+``main.`my.schema`.tbl`` is three parts. ``dbfs:/`` and ``/mnt/`` paths parse and
+are then refused, since they are unreachable from outside Databricks.
 """
 
 from __future__ import annotations
@@ -58,7 +51,7 @@ class RefKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class TableRef:
-    """A normalised table reference.
+    """A normalized table reference.
 
     Exactly one of (catalog, schema, table) or (path,) is populated, per `kind`.
     """
@@ -91,7 +84,7 @@ def _quote(part: str) -> str:
 
 
 def split_identifier(name: str) -> list[str]:
-    """Split a dotted identifier, honouring backtick quoting.
+    """Split a dotted identifier, honoring backtick quoting.
 
     ``main.`my.schema`.tbl`` -> ``["main", "my.schema", "tbl"]``.
     A doubled backtick inside a quoted part is a literal backtick.

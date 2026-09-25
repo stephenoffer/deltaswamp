@@ -23,9 +23,10 @@ import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from .._sdk import PRODUCT
-from ..credentials.base import Credentials, Operation
-from ..credentials.databricks import DatabricksCredentialProvider
+from .._sdk import PRODUCT, workspace_client
+from .._util import enum_value
+from ..credentials.base import Credentials
+from ..credentials.databricks import DatabricksCredentialProvider, credentials_from_response
 from ..errors import DeltaSwampError, InvalidReferenceError, PreflightError
 from ..governance import (
     ColumnLineage,
@@ -58,7 +59,7 @@ __all__ = ["UC_DELTA_API_BASE", "DatabricksUnityCatalog"]
 UC_DELTA_API_BASE = "/api/2.1/unity-catalog/delta/v1"
 
 # Capability flags from the securable-kind manifest. Treated as an open world:
-# Databricks does not publish the full enum, so an unrecognised flag is ignored
+# Databricks does not publish the full enum, so an unrecognized flag is ignored
 # rather than fatal.
 CAP_EXTERNAL_READ = "HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT"
 CAP_EXTERNAL_WRITE = "HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT"
@@ -129,7 +130,7 @@ def _three_part(name: TableRef | str, what: str) -> tuple[str, str, str]:
 class _RawPrivilege:
     """A privilege name this SDK's enum does not know yet.
 
-    The SDK serialises privileges with ``.value``, so this is all it needs;
+    The SDK serializes privileges with ``.value``, so this is all it needs;
     refusing an unknown name would make every new privilege ungrantable until
     the SDK caught up.
     """
@@ -212,23 +213,13 @@ class DatabricksUnityCatalog:
     @property
     def workspace(self) -> Any:
         if self._client is None:
-            try:
-                from .._sdk import workspace_client
-            except ImportError as exc:  # pragma: no cover
-                raise PreflightError(
-                    "the databricks-sdk package is required for Unity Catalog access"
-                ) from exc
-            if self._explicit_config is not None:
-                self._client = workspace_client(config=self._explicit_config)
-            else:
-                kwargs = dict(self._config_kwargs)
-                if self._profile:
-                    kwargs["profile"] = self._profile
-                if self._host:
-                    kwargs["host"] = self._host
-                if self._token:
-                    kwargs["token"] = self._token
-                self._client = workspace_client(**kwargs)
+            self._client = workspace_client(
+                config=self._explicit_config,
+                profile=self._profile,
+                host=self._host,
+                token=self._token,
+                **self._config_kwargs,
+            )
         return self._client
 
     def _metastore_region(self) -> str | None:
@@ -290,10 +281,10 @@ class DatabricksUnityCatalog:
             ref=ref,
             location=getattr(info, "storage_location", None),
             table_type=table_type,
-            data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
+            data_source_format=enum_value(getattr(info, "data_source_format", None)),
             securable_kind=self._securable_kind(info),
             table_id=getattr(info, "table_id", None),
-            # table_uuid is deliberately unset. It means the Delta log's
+            # table_uuid is left unset. It means the Delta log's
             # Metadata.id, and Databricks' table_id is a different thing: the UC
             # securable's own UUID, which names the storage directory. Setting
             # it here made the identity check compare two unrelated namespaces,
@@ -429,13 +420,10 @@ class DatabricksUnityCatalog:
         # in the caller's setup rather than a Databricks-side gate.
         if "User-Agent" in text and "insufficient" in text:
             return PreflightError(
-                f"cannot {action}: Databricks restricts writes through the Unity Catalog "
-                "Delta API to connectors it has allowlisted, and it does not recognise "
-                f"{PRODUCT!r}. This is a Databricks-side registration, not a "
-                "misconfiguration here: reads of catalog-managed tables go through the "
-                "same API and are unaffected. Ask Databricks support to allowlist the "
-                "connector, or use ds.connect(..., allow_sql_fallback=True) to create "
-                f"and write managed tables through a SQL warehouse. Underlying error: {exc}"
+                f"cannot {action}: Databricks allows writes through the Unity Catalog "
+                f"Delta API only from allowlisted connectors, and {PRODUCT!r} is not one "
+                "yet. Reads are unaffected. Use ds.connect(..., allow_sql_fallback=True) "
+                f"to write through a SQL warehouse. Underlying error: {exc}"
             )
         if (
             kind in ("NotFound", "ResourceDoesNotExist")
@@ -507,7 +495,7 @@ class DatabricksUnityCatalog:
                     ref=ref,
                     location=getattr(info, "storage_location", None),
                     table_type=self._table_type(info),
-                    data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
+                    data_source_format=enum_value(getattr(info, "data_source_format", None)),
                     securable_kind=self._securable_kind(info),
                     table_id=getattr(info, "table_id", None),
                     external_read_supported=_external(caps, CAP_EXTERNAL_READ, policy),
@@ -592,21 +580,15 @@ class DatabricksUnityCatalog:
             return None
         return frozenset(str(c) for c in caps)
 
-    @staticmethod
-    def _enum_value(value: Any) -> str | None:
-        if value is None:
-            return None
-        return getattr(value, "value", None) or str(value)
-
     @classmethod
     def _table_type(cls, info: Any) -> TableType | None:
-        raw = cls._enum_value(getattr(info, "table_type", None))
+        raw = enum_value(getattr(info, "table_type", None))
         if raw is None:
             return None
         try:
             return TableType(raw)
         except ValueError:
-            # Forward compatibility: an unrecognised table_type must not crash
+            # Forward compatibility: an unrecognized table_type must not crash
             # resolution. The router refuses it by name instead.
             return None
 
@@ -614,10 +596,10 @@ class DatabricksUnityCatalog:
     def _securable_kind(cls, info: Any) -> str | None:
         manifest = getattr(info, "securable_kind_manifest", None)
         if manifest is not None:
-            kind = cls._enum_value(getattr(manifest, "securable_kind", None))
+            kind = enum_value(getattr(manifest, "securable_kind", None))
             if kind:
                 return kind
-        return cls._enum_value(getattr(info, "securable_kind", None))
+        return enum_value(getattr(info, "securable_kind", None))
 
     # ---------------------------------------------------------------- preflight
 
@@ -1210,13 +1192,8 @@ class DatabricksUnityCatalog:
             ),
             securable_type="EXTERNAL_LOCATION",
         )
-        # Same response shape as table vending; reuse its parsing, including
-        # the explicit Azure endpoint.
-        parser = DatabricksCredentialProvider(table_id="", table_url=url)
-        creds = parser._to_credentials(
-            response, Operation.READ if op == "PATH_READ" else Operation.READ_WRITE
-        )
-        return dataclasses.replace(creds, table_id=None, scope_prefix=creds.url or url)
+        creds = credentials_from_response(response, url=url, aws_region=self._metastore_region())
+        return dataclasses.replace(creds, scope_prefix=creds.url or url)
 
     def _delta_api_tables_path(self, ref: TableRef, leaf: str) -> str:
         assert ref.catalog and ref.schema

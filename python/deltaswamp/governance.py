@@ -7,7 +7,7 @@ versus JSON, underscores versus spaces in privilege names), and a caller should
 not care which server answered. And an SDK object keeps a reference to live
 client state, which is exactly what must not travel into logs or task payloads.
 
-The normalisers here work on the REST JSON shape. A Databricks SDK object is
+The normalizers here work on the REST JSON shape. A Databricks SDK object is
 first turned into that shape with its own ``as_dict()``, so one code path serves
 both catalogs and the tests exercise the same parsing either way.
 
@@ -148,7 +148,7 @@ class Constraint:
 
 @dataclass(frozen=True, slots=True)
 class TableInfo:
-    """What the catalog says about one table, normalised across servers.
+    """What the catalog says about one table, normalized across servers.
 
     Timestamps are epoch milliseconds, as the catalog reports them.
     """
@@ -603,7 +603,7 @@ class Volume:
     """Files in one Unity Catalog volume, through the Databricks Files API.
 
     Paths are relative to the volume root. ``..`` is refused rather than
-    normalised, so a path can never climb out of the volume it was opened on.
+    normalized, so a path can never climb out of the volume it was opened on.
     `on_error` turns an SDK error into one that names the missing privilege.
     """
 
@@ -705,7 +705,7 @@ class StagingTable:
     ``metaData.id`` set to `table_id`, the `required_protocol` features, and
     every `required_properties` entry in ``metaData.configuration`` (a None
     value means "any value, but present"; ``delta.feature.*`` entries are met
-    by the protocol, not written as properties). Then finalise through the
+    by the protocol, not written as properties). Then finalize through the
     catalog. `storage_options` holds live secrets and
     is kept out of the repr.
     """
@@ -830,7 +830,7 @@ def _type_text(dtype: Any) -> str:
             return _PRIMITIVES[dtype][1]
         if dtype.startswith("decimal"):
             return dtype.replace(" ", "")
-        raise DeltaSwampError(f"unrecognised Delta type {dtype!r} in the table schema")
+        raise DeltaSwampError(f"unrecognized Delta type {dtype!r} in the table schema")
     kind = dtype.get("type")
     if kind == "struct":
         inner = ",".join(f"{f['name']}:{_type_text(f['type'])}" for f in dtype.get("fields", []))
@@ -839,7 +839,7 @@ def _type_text(dtype: Any) -> str:
         return f"array<{_type_text(dtype['elementType'])}>"
     if kind == "map":
         return f"map<{_type_text(dtype['keyType'])},{_type_text(dtype['valueType'])}>"
-    raise DeltaSwampError(f"unrecognised Delta type {dtype!r} in the table schema")
+    raise DeltaSwampError(f"unrecognized Delta type {dtype!r} in the table schema")
 
 
 def delta_schema_to_columns(

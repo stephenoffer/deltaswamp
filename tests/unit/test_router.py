@@ -8,34 +8,14 @@ library exists to remove.
 from __future__ import annotations
 
 import pytest
-from deltaswamp.capability import OPERATION_ENGINES, Capability, Engine, Operation
+from deltaswamp.capability import OPERATION_ENGINES, Engine, Operation
 from deltaswamp.catalog import ResolvedTable, TableType
 from deltaswamp.errors import FallbackRequiredError, UnreachableTableError
-from deltaswamp.identity import parse_ref
+from deltaswamp.identity import RefKind, TableRef, parse_ref
 from deltaswamp.router import Router
 
-
-class FakeEngine:
-    """An engine that says yes to a fixed set of operations."""
-
-    supports_distributed_scan = False
-
-    def __init__(self, kind: Engine, yes: set[Operation] | None = None) -> None:
-        self.kind = kind
-        self._yes = yes if yes is not None else set(Operation)
-
-    def supports(self, operation: Operation, table: ResolvedTable) -> Capability:
-        if operation in self._yes:
-            return Capability(operation, ok=True, engine=self.kind)
-        return Capability(operation, ok=False, reason=f"{self.kind.value} declines")
-
-    def available(self) -> bool:
-        return True
-
-
-def table(**kwargs: object) -> ResolvedTable:
-    kwargs.setdefault("location", "s3://bucket/t")
-    return ResolvedTable(ref=parse_ref("main.sales.orders"), **kwargs)  # type: ignore[arg-type]
+from tests.helpers import FakeEngine, accepting_router
+from tests.helpers import resolved_table as table
 
 
 def router(*, fallback: bool = False, sql: bool = False) -> Router:
@@ -142,13 +122,7 @@ class TestCapabilitiesReport:
 
 
 class TestCapabilityImpliesCallable:
-    """Structural guard: a yes must be backed by a real method.
-
-    The gap analysis found several operations where `capabilities()` returned ok
-    and the call then failed with an AttributeError or a late refusal. That is
-    the exact failure this library exists to prevent, so it is asserted rather
-    than reviewed.
-    """
+    """A yes from `capabilities()` is backed by a real, publicly reachable method."""
 
     def test_engines_that_claim_an_operation_implement_it(self) -> None:
         from deltaswamp.capability import ENGINE_METHODS
@@ -168,10 +142,9 @@ class TestCapabilityImpliesCallable:
                     )
         assert not missing, "\n".join(missing)
 
-    def test_every_routed_operation_is_reachable_from_the_public_api(self) -> None:
+    def test_every_operation_has_a_public_method(self) -> None:
         """An operation nobody can invoke is a matrix entry, not a feature."""
-        from deltaswamp.table import Connection as Conn
-        from deltaswamp.table import Table as Tbl
+        from deltaswamp import Connection, Table
 
         # Operations surfaced under a different public name, or via kwargs.
         aliases = {
@@ -188,7 +161,7 @@ class TestCapabilityImpliesCallable:
         unreachable = []
         for operation in Operation:
             name = aliases.get(operation, operation.value)
-            if not (hasattr(Tbl, name) or hasattr(Conn, name)):
+            if not (hasattr(Table, name) or hasattr(Connection, name)):
                 unreachable.append(operation.value)
         assert not unreachable, f"no public method for: {sorted(unreachable)}"
 
@@ -203,9 +176,9 @@ class TestCatalogCreateDoesNotOrphan:
 
     def test_catalog_name_with_location_is_refused(self) -> None:
         pa = pytest.importorskip("pyarrow")
+        from deltaswamp import Connection
         from deltaswamp.catalog.filesystem import FilesystemCatalog
         from deltaswamp.errors import UnreachableTableError
-        from deltaswamp.table import Connection
 
         conn = Connection(catalog=FilesystemCatalog(), router=router())
         with pytest.raises(UnreachableTableError, match="orphaned"):
@@ -217,9 +190,9 @@ class TestCatalogCreateDoesNotOrphan:
 
     def test_catalog_name_without_location_is_refused(self) -> None:
         pa = pytest.importorskip("pyarrow")
+        from deltaswamp import Connection
         from deltaswamp.catalog.filesystem import FilesystemCatalog
         from deltaswamp.errors import UnreachableTableError
-        from deltaswamp.table import Connection
 
         conn = Connection(catalog=FilesystemCatalog(), router=router())
         with pytest.raises(UnreachableTableError, match="cannot register"):
@@ -264,8 +237,6 @@ class TestUnityCatalogPreflight:
         assert "file surface" in got.reason
 
     def test_hive_metastore_catalog_is_sql_only(self) -> None:
-        from deltaswamp.identity import parse_ref
-
         legacy = ResolvedTable(
             ref=parse_ref("hive_metastore.analytics.events"), location="s3://bucket/t"
         )
@@ -294,3 +265,69 @@ class TestUnityCatalogPreflight:
     def test_catalog_managed_reads_and_appends_are_unaffected(self) -> None:
         managed = table(reader_features=frozenset({"catalogManaged"}))
         assert router().capability(Operation.SCAN, managed).ok
+
+
+class TestWarehouseOnlyShapes:
+    """Shapes no direct engine may serve go to the warehouse when the fallback is on."""
+
+    def test_access_policy(self) -> None:
+        t = table(external_read_supported=False, access_policy="row filter main.s.rf")
+        assert accepting_router(fallback=True).capability(Operation.SCAN, t).engine is Engine.SQL
+        refused = accepting_router(fallback=False).capability(Operation.SCAN, t)
+        assert not refused.ok
+        assert "row filter main.s.rf" in refused.reason
+
+    def test_unreadable_log(self) -> None:
+        t = table(open_error="Unsupported Delta table type: 'geometry(OGC:CRS84)'")
+        assert accepting_router(fallback=True).capability(Operation.SCAN, t).engine is Engine.SQL
+
+    def test_catalog_managed_alter(self) -> None:
+        t = table(
+            reader_features=frozenset({"catalogManaged"}),
+            writer_features=frozenset({"catalogManaged", "inCommitTimestamp"}),
+        )
+        got = accepting_router(fallback=True).capability(Operation.ADD_COLUMN, t)
+        assert got.engine is Engine.SQL
+        assert not accepting_router(fallback=False).capability(Operation.ADD_COLUMN, t).ok
+
+    def test_foreign_and_hive_metastore(self) -> None:
+        foreign = table(table_type=TableType.FOREIGN)
+        got = accepting_router(fallback=True).capability(Operation.SCAN, foreign)
+        assert got.engine is Engine.SQL
+        hive = table(
+            TableRef(kind=RefKind.CATALOG, catalog="hive_metastore", schema="s", table="t"),
+            data_source_format="DELTA",
+        )
+        assert accepting_router(fallback=True).capability(Operation.SCAN, hive).engine is Engine.SQL
+        assert not accepting_router(fallback=False).capability(Operation.SCAN, hive).ok
+
+
+class TestCollatedTables:
+    def test_predicated_scans_go_to_the_warehouse(self) -> None:
+        """Only the warehouse evaluates a predicate under the column's collation."""
+        t = table(writer_features=frozenset({"collations"}))
+        r = accepting_router(fallback=True)
+        predicated = r.capability(Operation.SCAN, t, needs=frozenset({"predicates"}))
+        assert predicated.engine is Engine.SQL
+        assert r.capability(Operation.SCAN, t).engine is Engine.KERNEL
+
+
+class TestTableLevelProhibitions:
+    """Operations the table itself forbids, so no engine may claim them."""
+
+    @pytest.mark.parametrize(
+        "operation",
+        [Operation.DELETE, Operation.UPDATE, Operation.OVERWRITE, Operation.REPLACE_WHERE],
+    )
+    def test_append_only(self, operation: Operation) -> None:
+        t = table(properties={"delta.appendOnly": "true"})
+        verdict = accepting_router(fallback=True).capability(operation, t)
+        assert not verdict.ok
+        assert "append-only" in verdict.reason
+        assert accepting_router(fallback=True).capability(Operation.APPEND, t).ok
+
+    @pytest.mark.parametrize("operation", [Operation.TIME_TRAVEL, Operation.CDF, Operation.RESTORE])
+    def test_access_policy_blocks_old_versions_but_not_history(self, operation: Operation) -> None:
+        t = table(external_read_supported=False, access_policy="row filter main.s.rf")
+        assert not accepting_router(fallback=True).capability(operation, t).ok
+        assert accepting_router(fallback=True).capability(Operation.HISTORY, t).ok

@@ -10,18 +10,18 @@ from __future__ import annotations
 import pytest
 from deltaswamp.capability import (
     DATABRICKS_ONLY_OPERATIONS,
-    FEATURE_CONFLICTS,
     FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
     OPERATION_ENGINES,
-    PROPERTY_SUPPORT,
     READ_OPERATIONS,
     Engine,
+    FeatureKind,
     Operation,
     Support,
     TableFeature,
     feature_from_wire,
 )
+from deltaswamp.properties import PROPERTY_SUPPORT
 
 
 class TestMatrixCompleteness:
@@ -42,16 +42,6 @@ class TestMatrixCompleteness:
             assert feature in FEATURE_SUPPORT
             for dep in deps:
                 assert dep in FEATURE_SUPPORT
-
-    def test_conflicts_are_symmetric(self) -> None:
-        """If A forbids B, B must forbid A -- an asymmetry would let us build
-        a table one engine accepts and another rejects."""
-        for feature, conflicts in FEATURE_CONFLICTS.items():
-            for other in conflicts:
-                if other in FEATURE_CONFLICTS:
-                    assert feature in FEATURE_CONFLICTS[other], (
-                        f"{feature.value} forbids {other.value} but not vice versa"
-                    )
 
 
 class TestEnginesFailInOppositeDirections:
@@ -92,6 +82,10 @@ class TestEnginesFailInOppositeDirections:
 
     def test_scan_prefers_kernel(self) -> None:
         assert OPERATION_ENGINES[Operation.SCAN].primary is Engine.KERNEL
+
+    def test_cdf_prefers_kernel(self) -> None:
+        """delta-rs cannot decode the CDF files Databricks writes."""
+        assert OPERATION_ENGINES[Operation.CDF].primary is Engine.KERNEL
 
     def test_merge_never_routes_to_kernel(self) -> None:
         """delta_kernel 0.28 has no MERGE implementation at all."""
@@ -161,6 +155,12 @@ class TestEasilyMissedFacts:
         assert row.kernel_write is Support.NO
         assert row.deltars_write is Support.NO
 
+    def test_collations_are_writer_only(self) -> None:
+        assert FEATURE_SUPPORT[TableFeature.COLLATIONS].kind is FeatureKind.WRITER
+
+    def test_geospatial_is_not_kernel_readable(self) -> None:
+        assert FEATURE_SUPPORT[TableFeature.GEOSPATIAL].kernel_read is Support.NO
+
     def test_checkconstraints_deltars_ahead_of_kernel(self) -> None:
         """A case where delta-rs is the more capable engine, so routing must not
         assume kernel is always better."""
@@ -202,7 +202,7 @@ class TestDatabricksOnlyOperations:
     @pytest.mark.parametrize("op", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN])
     def test_column_mapping_ddl_has_a_direct_path(self, op: Operation) -> None:
         """Rename and drop are metadata-only under column mapping, which the
-        kernel path writes itself, so they are no longer Databricks-only."""
+        kernel path writes itself, so they are not Databricks-only."""
         assert op not in DATABRICKS_ONLY_OPERATIONS
         assert Engine.KERNEL in OPERATION_ENGINES[op].engines
 

@@ -2,8 +2,8 @@
 
 Exercised here against a path-based table with `FileSystemCommitter`, which is
 the same `Transaction` machinery a catalog-managed commit uses -- only the
-committer differs. The UC-specific half needs a live catalog and lives in
-`test_live_uc.py`.
+committer differs. The UC-specific half runs against `tests/fake_uc.py` in
+`test_catalog_managed.py`.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ pytest.importorskip("deltalake")
 
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
 
+from tests import helpers  # noqa: E402
+
 
 @pytest.fixture
 def path(tmp_path: Any) -> str:
@@ -28,27 +30,23 @@ def path(tmp_path: Any) -> str:
     return p
 
 
-def _snapshot(path: str, **kwargs: Any) -> Any:
-    from deltaswamp._native import Snapshot
-
-    return Snapshot.resolve(path, **kwargs)
-
-
 class TestAppend:
     def test_returns_the_committed_version(self, path: str) -> None:
-        version = _snapshot(path).append(pa.table({"id": [4], "city": ["dakar"]}).to_reader())
+        version = helpers.snapshot(path).append(
+            pa.table({"id": [4], "city": ["dakar"]}).to_reader()
+        )
         assert version == 1
 
     def test_rows_are_visible_afterwards(self, path: str) -> None:
-        _snapshot(path).append(pa.table({"id": [4], "city": ["dakar"]}).to_reader())
-        assert pa.table(_snapshot(path).scan()).num_rows == 4
+        helpers.snapshot(path).append(pa.table({"id": [4], "city": ["dakar"]}).to_reader())
+        assert pa.table(helpers.snapshot(path).scan()).num_rows == 4
 
     def test_delta_rs_agrees(self, path: str) -> None:
         """The commit must be readable by an independent implementation, not
         just by the one that wrote it."""
         from deltalake import DeltaTable
 
-        _snapshot(path).append(pa.table({"id": [4], "city": ["dakar"]}).to_reader())
+        helpers.snapshot(path).append(pa.table({"id": [4], "city": ["dakar"]}).to_reader())
         dt = DeltaTable(path)
         assert dt.version() == 1
         assert set(dt.to_pyarrow_table().to_pydict()["city"]) == {
@@ -61,7 +59,7 @@ class TestAppend:
     def test_operation_and_engine_info_reach_the_log(self, path: str) -> None:
         from deltalake import DeltaTable
 
-        _snapshot(path).append(
+        helpers.snapshot(path).append(
             pa.table({"id": [4], "city": ["dakar"]}).to_reader(),
             engine_info="test-engine",
             operation="CUSTOM_WRITE",
@@ -71,8 +69,8 @@ class TestAppend:
         assert entry.get("engineInfo") == "test-engine"
 
     def test_successive_appends_increment_version(self, path: str) -> None:
-        assert _snapshot(path).append(pa.table({"id": [4], "city": ["a"]}).to_reader()) == 1
-        assert _snapshot(path).append(pa.table({"id": [5], "city": ["b"]}).to_reader()) == 2
+        assert helpers.snapshot(path).append(pa.table({"id": [4], "city": ["a"]}).to_reader()) == 1
+        assert helpers.snapshot(path).append(pa.table({"id": [5], "city": ["b"]}).to_reader()) == 2
 
 
 class TestPartitionGuard:
@@ -81,10 +79,10 @@ class TestPartitionGuard:
 
         p = str(tmp_path / "part")
         write_deltalake(p, pa.table({"id": [1], "region": ["eu"]}), partition_by=["region"])
-        assert _snapshot(p).partition_columns == ["region"]
+        assert helpers.snapshot(p).partition_columns == ["region"]
 
     def test_unpartitioned_table_reports_none(self, path: str) -> None:
-        assert _snapshot(path).partition_columns == []
+        assert helpers.snapshot(path).partition_columns == []
 
     def test_engine_appends_to_a_partitioned_table(self, tmp_path: Any) -> None:
         """Rows must land in their partition with the right values, which an
@@ -109,7 +107,7 @@ class TestPublish:
     def test_publish_is_a_no_op_on_a_path_based_table(self, path: str) -> None:
         """A path-based table has no staged commits, so publish should return
         the current version rather than failing."""
-        assert _snapshot(path).publish() == 0
+        assert helpers.snapshot(path).publish() == 0
 
 
 class TestExceptionsAreDistinguishable:

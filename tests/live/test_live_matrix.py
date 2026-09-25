@@ -15,7 +15,7 @@ Two kinds of assertion, and the second matters more:
 
 Opt-in on top of the live suite, because it creates ~35 tables:
 
-    DELTASWAMP_TEST_MATRIX=1 pytest tests/integration/test_live_matrix.py -v
+    DELTASWAMP_TEST_MATRIX=1 pytest tests/live/test_live_matrix.py -v
 
 It needs DELTASWAMP_TEST_WAREHOUSE_ID (the fixtures are built through it) and
 creates a staging volume in the target schema for the write tests.
@@ -39,7 +39,7 @@ pa = pytest.importorskip("pyarrow")
 import deltaswamp as ds  # noqa: E402
 from deltaswamp.capability import Engine, Operation  # noqa: E402
 
-pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
+pytestmark = [pytest.mark.databricks, pytest.mark.filterwarnings("ignore::UserWarning")]
 
 _BASE = "(id BIGINT, city STRING, amount DOUBLE, ts TIMESTAMP, d DATE)"
 _CITIES = ["oslo", "lima", "cairo", "pune", "rome", "kyiv", "baku", "doha"] * 3

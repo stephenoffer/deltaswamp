@@ -10,7 +10,7 @@ Run it with::
     export DELTASWAMP_TEST_WAREHOUSE_ID=abc123         # optional but unlocks most tests
     export DELTASWAMP_TEST_EXTERNAL_LOCATION=s3://...  # optional, for external tables
 
-    pytest tests/integration/test_live_databricks.py -v
+    pytest tests/live/test_live_databricks.py -v
 
 Ordered so the cheapest checks fail first: a PAT that cannot authenticate, or a
 metastore without external data access, should not be diagnosed by watching a
@@ -129,8 +129,7 @@ class TestResolution:
         `table_uuid` means the Delta log's `Metadata.id`. Databricks exposes no
         such field -- its `table_id` is the UC securable's own UUID, which names
         the storage directory -- so the catalog leaves `table_uuid` unset and
-        the check is skipped. It used to be populated from `table_id`, which
-        made every managed table raise CorruptTableError on first use.
+        the check is skipped.
         """
         name, _run = scratch_sql
         table = live_connection.table(name)

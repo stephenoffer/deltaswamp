@@ -715,7 +715,7 @@ _ENABLING: dict[str, str] = {
     "delta.enableInCommitTimestamps": "inCommitTimestamp",
 }
 
-#: Keys the kernel recognises; anything else under `delta.` is refused.
+#: Keys the kernel recognizes; anything else under `delta.` is refused.
 _KNOWN_KEYS = frozenset(
     {
         "delta.appendOnly",

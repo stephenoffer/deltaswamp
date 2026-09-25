@@ -31,9 +31,9 @@ import importlib
 import json
 import threading
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
 from typing import Any
 
+from .._util import timestamp_ms
 from ..capability import Capability, Operation
 from ..capability import Engine as EngineKind
 from ..catalog import ResolvedTable
@@ -71,22 +71,6 @@ def iceberg_rest_uri(base_url: str, *, databricks: bool) -> str:
 def _default_factory(name: str, properties: dict[str, str]) -> Any:
     # Looked up at call time, so `pyiceberg.catalog.load_catalog` can be patched.
     return importlib.import_module("pyiceberg.catalog").load_catalog(name, **properties)
-
-
-def _timestamp_ms(timestamp: str) -> int:
-    text = timestamp.strip()
-    if text.lstrip("-").isdigit():
-        return int(text)
-    try:
-        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise UnreachableTableError(
-            "time travel by timestamp",
-            f"{timestamp!r} is not an ISO-8601 timestamp or epoch milliseconds",
-        ) from exc
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return int(moment.timestamp() * 1000)
 
 
 def _to_arrow_table(data: Any) -> Any:
@@ -348,7 +332,7 @@ class IcebergEngine:
                 )
             return version
         if timestamp is not None:
-            snapshot = iceberg.snapshot_as_of_timestamp(_timestamp_ms(timestamp))
+            snapshot = iceberg.snapshot_as_of_timestamp(timestamp_ms(timestamp))
             if snapshot is None:
                 raise UnreachableTableError(
                     f"read the table as of {timestamp}",

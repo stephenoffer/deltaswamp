@@ -30,15 +30,7 @@ pytestmark = pytest.mark.skipif(
 pa = pytest.importorskip("pyarrow")
 deltalake = pytest.importorskip("deltalake")
 
-
-def _native() -> Any:
-    from deltaswamp import _native
-
-    return _native
-
-
-def _snapshot(path: str) -> Any:
-    return _native().Snapshot.resolve(path)
+from tests import helpers  # noqa: E402
 
 
 def _read(snapshot: Any, **kwargs: Any) -> Any:
@@ -57,13 +49,13 @@ def _files(snapshot: Any, **kwargs: Any) -> list[dict[str, Any]]:
 
 
 def _append(path: str, table: Any) -> None:
-    snapshot = _snapshot(path)
+    snapshot = helpers.snapshot(path)
     snapshot.append(pa.RecordBatchReader.from_batches(table.schema, table.to_batches()))
 
 
 def _assert_split_equals_full(path: str, **scan_kwargs: Any) -> list[dict[str, Any]]:
     """Per-file scans union to the full scan; each keeps the full scan's schema."""
-    snapshot = _snapshot(path)
+    snapshot = helpers.snapshot(path)
     full = _read(snapshot, **scan_kwargs)
     files = _files(snapshot)
     assert len(files) > 1, "test table should span several files"
@@ -123,7 +115,7 @@ def _inline_dv(deleted: list[int]) -> dict[str, Any]:
 
 
 def _attach_dv(path: str, file: dict[str, Any], deleted: list[int]) -> None:
-    snapshot = _snapshot(path)
+    snapshot = helpers.snapshot(path)
     common = {"path": file["path"], "partitionValues": {}, "size": file["size"]}
     remove = {**common, "deletionTimestamp": 1, "dataChange": True, "extendedFileMetadata": True}
     add = {
@@ -133,7 +125,7 @@ def _attach_dv(path: str, file: dict[str, Any], deleted: list[int]) -> None:
         "stats": file["stats"],
         "deletionVector": _inline_dv(deleted),
     }
-    _native().commit_raw(
+    helpers.native().commit_raw(
         path, snapshot.version + 1, [json.dumps({"remove": remove}), json.dumps({"add": add})]
     )
 
@@ -184,7 +176,7 @@ def partitioned(tmp_path: Any) -> str:
 def column_mapped(tmp_path: Any) -> str:
     path = str(tmp_path / "cm")
     schema = pa.schema([("id", pa.int64()), ("Odd Name", pa.string()), ("p", pa.string())])
-    _native().create_table(
+    helpers.native().create_table(
         path,
         schema,
         properties={"delta.columnMapping.mode": "name"},
@@ -207,12 +199,12 @@ def with_dvs(tmp_path: Any) -> tuple[str, set[int]]:
     """Three files; the 5000-row one gets a DV spanning several read batches."""
     path = str(tmp_path / "dv")
     schema = pa.schema([("id", pa.int64()), ("s", pa.string())])
-    _native().create_table(path, schema, properties={"delta.enableDeletionVectors": "true"})
+    helpers.native().create_table(path, schema, properties={"delta.enableDeletionVectors": "true"})
     for start, count in ((0, 5000), (10_000, 10), (20_000, 10)):
         ids = list(range(start, start + count))
         _append(path, pa.table({"id": ids, "s": [f"r{i}" for i in ids]}, schema=schema))
 
-    files = _files(_snapshot(path))
+    files = _files(helpers.snapshot(path))
     big = next(f for f in files if f["num_records"] == 5000)
     small = next(f for f in files if f["num_records"] == 10)
     # Row positions == ids for the big file, whose rows were written 0..4999.
@@ -230,12 +222,12 @@ def with_dvs(tmp_path: Any) -> tuple[str, set[int]]:
 
 
 def test_feature_is_advertised() -> None:
-    assert "file_restricted_scan" in _native().FEATURES
+    assert "file_restricted_scan" in helpers.native().FEATURES
 
 
 def test_split_union_equals_full_scan(multi_file: str) -> None:
     files = _assert_split_equals_full(multi_file)
-    snapshot = _snapshot(multi_file)
+    snapshot = helpers.snapshot(multi_file)
     for f in files:
         assert _read(snapshot, files=[f["path"]]).num_rows == f["num_records"]
 
@@ -245,7 +237,7 @@ def test_split_union_with_projection(multi_file: str) -> None:
 
 
 def test_restricting_to_every_file_is_the_full_scan(multi_file: str) -> None:
-    snapshot = _snapshot(multi_file)
+    snapshot = helpers.snapshot(multi_file)
     paths = [f["path"] for f in _files(snapshot)]
     assert _read(snapshot, files=paths) == _read(snapshot)
     # Duplicates in the request do not read a file twice.
@@ -254,7 +246,7 @@ def test_restricting_to_every_file_is_the_full_scan(multi_file: str) -> None:
 
 def test_partitioned_values_are_materialised(partitioned: str) -> None:
     files = _assert_split_equals_full(partitioned)
-    snapshot = _snapshot(partitioned)
+    snapshot = helpers.snapshot(partitioned)
     assert any("%" in f["path"] for f in files), "expected URL-encoded partition paths"
     for f in files:
         part = _read(snapshot, files=[f["path"]])
@@ -264,7 +256,7 @@ def test_partitioned_values_are_materialised(partitioned: str) -> None:
 
 
 def test_column_mapping_resolves_logical_names(column_mapped: str) -> None:
-    snapshot = _snapshot(column_mapped)
+    snapshot = helpers.snapshot(column_mapped)
     assert snapshot.table_properties()["delta.columnMapping.mode"] == "name"
     files = _assert_split_equals_full(column_mapped)
     for f in files:
@@ -278,7 +270,7 @@ def test_column_mapping_resolves_logical_names(column_mapped: str) -> None:
 
 def test_deletion_vectors_applied_per_file(with_dvs: tuple[str, set[int]]) -> None:
     path, deleted = with_dvs
-    snapshot = _snapshot(path)
+    snapshot = helpers.snapshot(path)
     files = _assert_split_equals_full(path)
     assert sum(f["deletion_vector"] is not None for f in files) == 2
 
@@ -300,7 +292,7 @@ def test_deletion_vectors_applied_per_file(with_dvs: tuple[str, set[int]]) -> No
 
 
 def test_predicate_composes_with_files(multi_file: str) -> None:
-    snapshot = _snapshot(multi_file)
+    snapshot = helpers.snapshot(multi_file)
     predicate = json.dumps(
         {"op": "ge", "args": [{"column": ["id"]}, {"literal": 10, "type": "long"}]}
     )
@@ -323,7 +315,7 @@ def test_predicate_composes_with_files(multi_file: str) -> None:
 
 
 def test_empty_list_gives_empty_stream_with_schema(column_mapped: str) -> None:
-    snapshot = _snapshot(column_mapped)
+    snapshot = helpers.snapshot(column_mapped)
     for columns in (None, ["Odd Name"]):
         full = _read(snapshot, columns=columns)
         empty = _read(snapshot, files=[], columns=columns)
@@ -332,7 +324,7 @@ def test_empty_list_gives_empty_stream_with_schema(column_mapped: str) -> None:
 
 
 def test_unknown_paths_are_ignored(multi_file: str) -> None:
-    snapshot = _snapshot(multi_file)
+    snapshot = helpers.snapshot(multi_file)
     first = _files(snapshot)[0]
     assert _read(snapshot, files=["does-not-exist.parquet"]).num_rows == 0
     got = _read(snapshot, files=["does-not-exist.parquet", first["path"]])

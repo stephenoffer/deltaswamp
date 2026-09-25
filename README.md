@@ -15,8 +15,7 @@ t = conn.table("main.sales.orders")
 
 t.to_arrow(predicate="region = 'eu'")    # read, whatever the table is
 t.append(df)                             # write, routed to an engine that can
-t.merge(src, "t.id = s.id", source_alias="s", target_alias="t") \
- .when_matched_update_all().when_not_matched_insert_all().execute()
+t.delete("status = 'void'")              # DML, even on catalog-managed tables
 ```
 
 ## Why
@@ -26,9 +25,9 @@ warehouse handles managed tables, Spark handles anything catalog-managed,
 Thrift handles Hive and boto3 handles Glue. Each has its own auth, its own
 credential lifetime and its own opaque "unsupported table feature" error.
 
-deltaswamp puts all of that behind `conn.table(name)`. It is the only Python
-library that opens `catalogManaged` tables, because it ships the first Python
-binding to delta-kernel-rs.
+deltaswamp puts all of that behind `conn.table(name)`. Through its own binding
+to delta-kernel-rs, it also opens `catalogManaged` tables, which no other Python
+library can.
 
 ## How
 
@@ -98,7 +97,7 @@ kernel can write rewrites the whole table (up to a size bound). The
 - [Usage guide](docs/usage.md): the whole API
 - [Architecture](docs/architecture.md): how it works and why
 - [Conformance](docs/conformance.md): which engine serves which feature and operation
-- [Feature map](docs/features.md): coverage against Databricks and the ecosystem
+- [Feature map](docs/features.md): every Databricks and open-source feature, and how it is reached
 - [Testing](docs/testing.md) and [Contributing](CONTRIBUTING.md)
 
 ## License

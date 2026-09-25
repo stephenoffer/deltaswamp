@@ -4,7 +4,7 @@ delta-rs takes a predicate as a SQL string and evaluates it with DataFusion. The
 kernel takes a structured `Predicate` and uses it only to *skip files*: it never
 promises to drop a non-matching row. So a predicate on the kernel path needs
 both halves -- a structure the kernel can skip with, and an exact row filter
-applied afterwards -- and both have to mean the same thing as the SQL string.
+applied afterward -- and both have to mean the same thing as the SQL string.
 
 This module parses the boolean subset of Spark SQL that people actually write in
 a `WHERE` clause into a small AST, then renders it:
@@ -18,7 +18,7 @@ a `WHERE` clause into a small AST, then renders it:
   three-valued logic: a row is kept only when the predicate is TRUE, so NULL
   comparisons drop the row just as a `WHERE` clause does.
 
-What is deliberately out of scope: arithmetic, function calls other than the
+Out of scope: arithmetic, function calls other than the
 comparisons below, and subqueries. Those raise `PredicateError` naming the
 token, rather than being half-understood.
 """

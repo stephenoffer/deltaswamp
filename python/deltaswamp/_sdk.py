@@ -37,11 +37,19 @@ def _has_product(config: Any) -> bool:
     return bool(name) and name != "unknown"
 
 
-def workspace_client(*, config: Any = None, **kwargs: Any) -> Any:
+def workspace_client(
+    *,
+    config: Any = None,
+    profile: str | None = None,
+    host: str | None = None,
+    token: str | None = None,
+    **kwargs: Any,
+) -> Any:
     """A `WorkspaceClient` carrying this library's product identity.
 
-    `config` is an explicit `databricks.sdk.core.Config`; anything else is
-    passed through as connection keyword arguments.
+    `config` is an explicit `databricks.sdk.core.Config`. Otherwise `profile`,
+    `host`, `token` and any other connection arguments are passed through,
+    skipping the ones left as None.
     """
     from databricks.sdk import WorkspaceClient
 
@@ -52,4 +60,6 @@ def workspace_client(*, config: Any = None, **kwargs: Any) -> Any:
             config._product_info = (PRODUCT, sdk_version())
         return WorkspaceClient(config=config)
 
+    given = {"profile": profile, "host": host, "token": token}
+    kwargs.update({k: v for k, v in given.items() if v})
     return WorkspaceClient(**{**product_kwargs(), **kwargs})

@@ -45,14 +45,14 @@ impl PySnapshot {
     /// Normalise a table root: kernel requires a trailing slash and rejects
     /// paths without one, with an error that is hard to act on.
     pub(crate) fn table_root_url(table_root: &str) -> Result<Url> {
-        let normalised = if table_root.ends_with('/') {
+        let normalized = if table_root.ends_with('/') {
             table_root.to_string()
         } else {
             format!("{table_root}/")
         };
-        Url::parse(&normalised).or_else(|_| {
+        Url::parse(&normalized).or_else(|_| {
             // Bare filesystem paths are a convenience users expect.
-            Url::from_directory_path(&normalised).map_err(|_| {
+            Url::from_directory_path(&normalized).map_err(|_| {
                 NativeError::Invalid(format!("cannot interpret {table_root:?} as a table root"))
             })
         })
@@ -221,7 +221,7 @@ impl PySnapshot {
     /// `(min_reader_version, min_writer_version, reader_features, writer_features)`.
     ///
     /// Feature names are returned verbatim, including ones this build does not
-    /// recognise -- the Python layer decides what to do with them, because an
+    /// recognize -- the Python layer decides what to do with them, because an
     /// unknown writer-only feature must not block a read.
     fn protocol(&self) -> (i32, i32, Vec<String>, Vec<String>) {
         let protocol = self.inner.table_configuration().protocol();
@@ -335,16 +335,16 @@ impl PySnapshot {
     /// The current `metaData` action, as Delta-protocol JSON.
     fn metadata_json(&self) -> PyResult<String> {
         serde_json::to_string(self.inner.table_configuration().metadata())
-            .map_err(|e| NativeError::Invalid(format!("could not serialise metadata: {e}")).into())
+            .map_err(|e| NativeError::Invalid(format!("could not serialize metadata: {e}")).into())
     }
 
     /// The current `protocol` action, as Delta-protocol JSON.
     ///
     /// Feature lists appear only when the versions call for them (reader 3,
-    /// writer 7); the kernel serialiser omits them otherwise.
+    /// writer 7); the kernel serializer omits them otherwise.
     fn protocol_json(&self) -> PyResult<String> {
         serde_json::to_string(self.inner.table_configuration().protocol())
-            .map_err(|e| NativeError::Invalid(format!("could not serialise protocol: {e}")).into())
+            .map_err(|e| NativeError::Invalid(format!("could not serialize protocol: {e}")).into())
     }
 
     /// The configuration string of `domain`, or None if it has no live entry.

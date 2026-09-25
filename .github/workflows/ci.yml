@@ -26,8 +26,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.11
-      # Pinned deliberately: unpinned, an upstream ruff/mypy release turns CI
-      # red with no change here. Keep in step with .pre-commit-config.yaml.
+      # Pinned so an upstream release cannot break CI. Keep in step with
+      # .pre-commit-config.yaml.
       - run: uv pip install --system pytest 'mypy==2.3.1' 'ruff==0.14.2'
       - run: ruff check .
       - run: ruff format --check .

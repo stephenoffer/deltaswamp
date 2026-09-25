@@ -36,8 +36,7 @@ class TestEntryPoints:
         """The built-in catalogs must not depend on the entry-point index.
 
         A source checkout, a vendored copy, a zipapp and several freezers all
-        lose that metadata. Losing it used to unregister every catalog and make
-        the library unusable, so this pins the fallback down.
+        lose that metadata; without the fallback every catalog would vanish.
         """
         from deltaswamp.catalog import registry
 
@@ -128,9 +127,7 @@ class TestNoCredentialShapedLiterals:
     """No tracked file may contain something shaped like a real credential.
 
     A fake token that matches a provider's pattern is still rejected by GitHub
-    push protection, and a scanner cannot know it is fake. This caught a
-    hard-coded `dapi` + 32 hex test token that blocked a push, so it is asserted
-    rather than left to reviewer attention.
+    push protection, and a scanner cannot know it is fake.
     """
 
     PATTERNS: ClassVar[tuple[tuple[str, str], ...]] = (

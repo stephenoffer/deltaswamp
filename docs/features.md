@@ -1,7 +1,7 @@
 # Feature map
 
-Every Delta Lake and Unity Catalog feature across Databricks and the open
-ecosystem, and how deltaswamp reaches it. Where a library already does the job,
+Every Delta Lake and Unity Catalog feature, on Databricks and in open source,
+and how deltaswamp reaches it. Where a library already does the job,
 deltaswamp calls it. Its own code covers the gaps: the kernel binding,
 metadata-only commits, exact filtering for kernel predicates, staging flows,
 credential lifetimes, GCS bearer tokens and Azure endpoints.
@@ -51,7 +51,7 @@ Several values in one cell are a routing chain, tried in order.
 | Column projection | all | kernel, delta-rs, warehouse | |
 | Predicate filtering | all | kernel (native), delta-rs, warehouse | kernel skips files; the exact row filter is applied here, from one parsed predicate |
 | Time travel by version | all | kernel, delta-rs, warehouse | |
-| Time travel by timestamp | all | kernel, delta-rs, warehouse | kernel honours in-commit timestamps |
+| Time travel by timestamp | all | kernel, delta-rs, warehouse | kernel honors in-commit timestamps |
 | Change data feed | DBR, Spark, delta-rs, kernel | delta-rs, kernel, sharing, warehouse | kernel covers path tables delta-rs cannot open; by version or timestamp |
 | CDF on catalog-managed tables | DBR | warehouse | the kernel's TableChanges takes no catalog tail |
 | History | all | delta-rs, iceberg, warehouse | |
@@ -144,7 +144,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | CONVERT TO DELTA | DBR, Spark, delta-rs | delta-rs | |
 | Symlink manifests | Spark, delta-rs | delta-rs | |
 | Predictive optimization | DBR | — | server-side scheduling; `Table.info()` reports whether it is on |
-| Auto optimize / auto compaction | DBR | — | writer-side behaviour of Databricks; stored as properties only |
+| Auto optimize / auto compaction | DBR | — | writer-side behavior of Databricks; stored as properties only |
 
 ## Unity Catalog
 
@@ -196,35 +196,17 @@ variant; all three are writer-only, so both engines read and neither writes.
 
 ## Out of reach
 
-Each item names its blocker.
+| Gap | Blocker |
+|---|---|
+| Deletion-vector authoring | kernel 0.28 has `update_deletion_vectors` only as an internal API, not bound yet. DML on kernel-only tables is a bounded whole-table rewrite; MERGE and row-tracked tables need the warehouse |
+| CDF on catalog-managed tables outside Databricks | the kernel's `TableChanges` takes no catalog commit tail |
+| Incremental reads without a change feed | the kernel's `incremental_scan` is not bound yet; `Table.changes()` covers tables with CDF |
+| Databricks server-side behavior (predictive optimization, auto compaction, row-level concurrency, Photon, CLUSTER BY AUTO) | these are things a Databricks cluster does, not table formats; the warehouse fallback is the only way in |
+| UniForm metadata generation outside Databricks | Databricks-only |
+| Managed-table creation and catalog-managed commits on Databricks | Databricks allowlists which connectors may write through the UC Delta API, by User-Agent |
+| Writes to UC managed tables without `HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT` | a per-table decision by the catalog; the warehouse fallback serves them |
 
-- **Deletion-vector authoring**: delta-kernel-rs 0.28 has
-  `update_deletion_vectors` only as an internal API, and it is not bound yet.
-  DML on kernel-only tables is therefore a bounded whole-table rewrite, and
-  MERGE and row-tracked tables need the warehouse.
-- **CDF on catalog-managed tables** outside Databricks: the kernel's
-  `TableChanges` takes no catalog commit tail.
-- **Incremental reads without a change feed**: `incremental_scan` exists in
-  the kernel and is not yet bound. `Table.changes()` covers tables with CDF.
-- **Databricks server-side behaviour**: predictive optimization, auto
-  compaction, row-level concurrency, Photon and CLUSTER BY AUTO. These are not
-  table formats; they are things a Databricks cluster does. The warehouse
-  fallback is the only way in.
-- **UniForm metadata generation** outside Databricks.
-- **Writes through the Unity Catalog Delta API on Databricks**, which covers
-  managed-table creation and catalog-managed commits. Databricks allowlists
-  which connectors may call those endpoints, keyed on the product User-Agent,
-  and refuses anything it does not recognise:
-
-  > The UC Delta API requires clients to identify the calling application in the
-  > User-Agent header. The provided User-Agent '...' is insufficient.
-
-  deltaswamp sends `deltaswamp/<version>` (see `deltaswamp._sdk`), which is a
-  precondition, not a solution: the name has to be registered with Databricks.
-  Until it is, `create_table` for a managed table and any catalog-managed write
-  need `allow_sql_fallback=True`. Reads are unaffected: the commit tail for a
-  catalog-managed table comes from the same API and is served normally.
-- **Writing to a Unity Catalog managed table from outside Databricks at all**,
-  where the metastore withholds `HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT`. This
-  is a per-table decision by the catalog, not a protocol limit; the warehouse
-  fallback serves those writes and the refusal says so.
+deltaswamp identifies itself as `deltaswamp/<version>` (see `deltaswamp._sdk`),
+but the name still has to be registered with Databricks. Until then, managed
+`create_table` and catalog-managed writes need `allow_sql_fallback=True`. Reads
+are unaffected: the commit tail comes from the same API and is served normally.

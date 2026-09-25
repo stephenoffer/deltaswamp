@@ -1,28 +1,23 @@
 # Conformance matrix
 
-`python/deltaswamp/capability.py` is the machine-readable source of truth, and
-`tests/unit/test_capability.py` asserts the code agrees with it. This document
-explains what the tables mean and why the rows say what they say.
+Which engine serves which table feature, operation and property. The source
+of truth is `python/deltaswamp/capability.py` (features and operations) and
+`python/deltaswamp/properties.py` (properties), and
+`tests/unit/test_capability.py` fails if this page drifts from them.
 
-## Why coverage is data, not prose
-
-A support matrix written in a README drifts from the code within a release.
-Here every claim is a row in a dict, and every load-bearing claim has a test
-that names the source it came from, so anyone can re-check it.
-
-## The three tables
+## The tables in code
 
 | Table | Contents |
 |---|---|
-| `FEATURE_SUPPORT` | all 36 table features x {kernel, delta-rs} x {read, write} |
-| `OPERATION_ENGINES` | all 46 operations -> engines in preference order |
-| `FEATURE_DEPENDENCIES` / `FEATURE_CONFLICTS` | what kernel enforces before a write |
+| `FEATURE_SUPPORT` | 36 table features x {kernel, delta-rs} x {read, write} |
+| `OPERATION_ENGINES` | 46 operations -> engines in preference order |
+| `PROPERTY_SUPPORT` | 30 table properties x {create, set} x engine |
+| `FEATURE_DEPENDENCIES` | what the kernel enforces before a write |
 
-## Facts worth re-reading before you change routing
+## Read this before changing routing
 
-`vacuumProtocolCheck` is a ReaderWriter feature. That one word costs delta-rs
-the whole table: it blocks *reads*, not merely VACUUM, which is easy to miss
-when the name so plainly suggests otherwise.
+`vacuumProtocolCheck` is a ReaderWriter feature, so it blocks delta-rs from
+*reading* the table, not only from running VACUUM.
 
 delta-rs has no write support for `domainMetadata`. Row tracking and liquid
 clustering both depend on it, so every row-tracked and every liquid-clustered
@@ -62,14 +57,13 @@ Two features run the other way. `checkConstraints` and `generatedColumns` are
 cases where delta-rs is the more capable engine, so routing must never assume
 kernel wins by default.
 
-Unknown feature names must not raise. Kernel tolerates unknown writer-only
-features on the read path and so must we, or the first table to adopt a feature
-newer than this release becomes unreadable for no good reason.
+Unknown feature names must not raise. The kernel tolerates unknown writer-only
+features when reading, and so must deltaswamp, or the first table to adopt a
+newer feature becomes unreadable.
 
 ## Write modes
 
-Every mode, and which engine serves it. `deltaswamp` fills three gaps the
-engines leave: dynamic partition overwrite is emulated with a generated
+Which engine serves each mode. deltaswamp fills three gaps the engines leave: dynamic partition overwrite is emulated with a generated
 `replaceWhere`, idempotent writes are enforced here because neither engine
 deduplicates, and save modes come from `Connection.write_table`.
 
@@ -190,7 +184,7 @@ to the kernel automatically.
 
 Keys with no row follow three rules. A `delta.feature.<name>` signal is
 rejected by delta-rs and accepted by the kernel for the sixteen features in
-`KERNEL_CREATE_FEATURES`; `clustering` is deliberately not one of them, because
+`KERNEL_CREATE_FEATURES`; `clustering` is not one of them, because
 the kernel wants clustering columns through `cluster_by`. Any other unknown
 `delta.*` key is rejected by both. A custom key outside the `delta.` namespace
 is rejected by delta-rs and stored verbatim by the kernel.

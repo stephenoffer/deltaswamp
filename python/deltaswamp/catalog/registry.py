@@ -155,7 +155,7 @@ def catalog_for_uri(uri: str | None, **kwargs: Any) -> Catalog:
     if name is None:
         known = ", ".join(sorted(k for k in scheme_to_catalog if k))
         raise InvalidReferenceError(
-            f"unrecognised connection URI {uri!r}. Known schemes: {known}. "
+            f"unrecognized connection URI {uri!r}. Known schemes: {known}. "
             "Pass catalog=... to supply a catalog object directly."
         )
 

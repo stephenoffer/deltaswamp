@@ -3,17 +3,13 @@
 Every operation is asserted on the exact SQL and parameters it produces, because
 the two ways this engine can go wrong are both silent: a value spliced into
 statement text (injection, or just a broken quote) and an identifier that is not
-quoted (a column called ``a.b`` becoming a struct access). The statement backend
-is exercised against a fake `WorkspaceClient` and real Arrow IPC bytes served
-through a stub opener, so no test touches the network.
+quoted (a column called ``a.b`` becoming a struct access).
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import io
-import urllib.request
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,125 +24,32 @@ from deltaswamp.capability import (
     Engine,
     Operation,
 )
-from deltaswamp.catalog import ResolvedTable, TableType
+from deltaswamp.catalog import TableType
 from deltaswamp.engine.sql import SqlEngine, SqlFallbackWarning, SqlMerger
-from deltaswamp.engine.sql_backend import (
-    ParameterBinder,
-    SdkStatementBackend,
-    SqlParameter,
-    SqlStatementError,
-)
+from deltaswamp.engine.sql_backend import SqlStatementError
 from deltaswamp.errors import UnreachableTableError
-from deltaswamp.identity import RefKind, TableRef, parse_ref
+from deltaswamp.identity import RefKind, TableRef
+
+from tests.helpers import resolved_table as table
+from tests.unit.sql_fakes import (
+    FakeClient,
+    FakeStatements,
+    RecordingBackend,
+    engine,
+    succeeded,
+    warehouse,
+)
 
 NAME = "`main`.`sales`.`orders`"
-
-# ------------------------------------------------------------------ fakes
-
-
-class RecordingBackend:
-    """Records every statement; answers with canned Arrow tables."""
-
-    def __init__(self, results: dict[str, pa.Table] | None = None) -> None:
-        self.calls: list[tuple[str, list[SqlParameter], bool]] = []
-        self.results = results or {}
-        self.fail_on: str | None = None
-
-    def execute(
-        self, statement: str, parameters: Any = (), *, fetch: bool = True
-    ) -> pa.Table | None:
-        self.calls.append((statement, list(parameters), fetch))
-        if self.fail_on is not None and self.fail_on in statement:
-            raise SqlStatementError("boom from the server", state="FAILED")
-        if not fetch:
-            return None
-        for prefix, table in self.results.items():
-            if statement.startswith(prefix):
-                return table
-        return pa.table({"x": pa.array([], pa.int64())})
-
-    @property
-    def sql(self) -> list[str]:
-        return [c[0] for c in self.calls]
-
-    @property
-    def last(self) -> str:
-        return self.calls[-1][0]
-
-    @property
-    def params(self) -> dict[str, tuple[str | None, str]]:
-        return {p.name: (p.value, p.type) for p in self.calls[-1][1]}
-
-
-class FakeFiles:
-    def __init__(self) -> None:
-        self.uploaded: dict[str, bytes] = {}
-        self.deleted: list[str] = []
-        self.events: list[str] = []
-
-    def upload(self, path: str, contents: Any, *, overwrite: bool | None = None) -> None:
-        self.uploaded[path] = contents.read()
-        self.events.append(f"upload {path}")
-
-    def delete(self, path: str) -> None:
-        self.deleted.append(path)
-        self.events.append(f"delete {path}")
-
-
-class FakeWarehouses:
-    def __init__(self, warehouses: list[Any]) -> None:
-        self._warehouses = warehouses
-        self.calls = 0
-
-    def list(self) -> list[Any]:
-        self.calls += 1
-        return list(self._warehouses)
-
-
-def warehouse(wid: str, state: str, *, serverless: bool = False, name: str = "") -> Any:
-    return SimpleNamespace(
-        id=wid,
-        name=name or wid,
-        state=SimpleNamespace(value=state),
-        enable_serverless_compute=serverless,
-    )
-
-
-class FakeClient:
-    def __init__(self, warehouses: list[Any] | None = None, statements: Any = None) -> None:
-        self.files = FakeFiles()
-        self.warehouses = FakeWarehouses(warehouses or [])
-        self.statement_execution = statements
-
-
-def table(
-    catalog: str = "main",
-    schema: str = "sales",
-    name: str = "orders",
-    **kwargs: Any,
-) -> ResolvedTable:
-    ref = TableRef(kind=RefKind.CATALOG, catalog=catalog, schema=schema, table=name)
-    kwargs.setdefault("location", "s3://bucket/t")
-    return ResolvedTable(ref=ref, **kwargs)
-
-
-def engine(
-    backend: RecordingBackend | None = None, **kwargs: Any
-) -> tuple[SqlEngine, RecordingBackend, FakeClient]:
-    rec = backend or RecordingBackend()
-    client = kwargs.pop("client", None) or FakeClient()
-    kwargs.setdefault("staging_volume", "cat.sch.vol")
-    kwargs.setdefault("warn_on_use", False)
-    return SqlEngine(backend=rec, client=client, **kwargs), rec, client
-
 
 # ------------------------------------------------------------ quoting
 
 
 class TestIdentifiers:
-    def test_hostile_table_and_column_names_are_one_identifier_each(self) -> None:
+    def test_hostile_names_are_one_identifier_each(self) -> None:
         eng, rec, _ = engine()
-        eng.scan(table("my cat", "sch.ema", "t`x"), columns=["a.b", "odd`col", "my col"])
+        hostile = TableRef(kind=RefKind.CATALOG, catalog="my cat", schema="sch.ema", table="t`x")
+        eng.scan(table(hostile), columns=["a.b", "odd`col", "my col"])
         assert rec.last == "SELECT `a.b`, `odd``col`, `my col` FROM `my cat`.`sch.ema`.`t``x`"
 
     def test_nested_column_paths_are_quoted_per_part(self) -> None:
@@ -156,7 +59,7 @@ class TestIdentifiers:
 
     def test_path_references_are_refused(self) -> None:
         eng, _, _ = engine()
-        path = ResolvedTable(ref=parse_ref("s3://bucket/t"), location="s3://bucket/t")
+        path = table("s3://bucket/t")
         got = eng.supports(Operation.SCAN, path)
         assert not got.ok and "path reference" in got.reason
 
@@ -174,8 +77,7 @@ class TestReads:
         """The warehouse computes the whole result before streaming any of it.
 
         Without a real LIMIT, `head(3)` on a large table is a full scan billed
-        to the warehouse, and slow enough to hit the statement timeout -- which
-        is how this was found, on a table that took over five minutes.
+        to the warehouse, and slow enough to hit the statement timeout.
         """
         eng, rec, _ = engine()
         eng.scan(table(), limit=3)
@@ -603,7 +505,7 @@ class TestStagedWrites:
         )
         assert client.files.deleted == [path]
 
-    def test_the_staged_file_is_deleted_even_when_the_statement_fails(self) -> None:
+    def test_staged_file_is_deleted_when_the_statement_fails(self) -> None:
         eng, rec, client = engine()
         rec.fail_on = "INSERT"
         with pytest.raises(SqlStatementError, match="boom"):
@@ -838,208 +740,77 @@ class TestWarehouseSelection:
         assert statements.executed[0]["warehouse_id"] == "w1"
 
 
-# ------------------------------------------------------------ statement backend
+class TestTableShapeRefusals:
+    """Statements the warehouse would reject for this table, refused before sending."""
+
+    def test_zorder_on_a_clustered_table(self) -> None:
+        t = table(writer_features=frozenset({"clustering", "domainMetadata"}))
+        verdict = SqlEngine._table_type_refusal(Operation.ZORDER, t)
+        assert verdict is not None
+        assert not verdict.ok
+
+    @pytest.mark.parametrize("kind", [TableType.VIEW, TableType.MATERIALIZED_VIEW])
+    @pytest.mark.parametrize("operation", [Operation.HISTORY, Operation.DETAIL])
+    def test_log_reads_on_views(self, kind: TableType, operation: Operation) -> None:
+        verdict = SqlEngine._table_type_refusal(operation, table(table_type=kind))
+        assert verdict is not None
+        assert not verdict.ok
+
+    def test_type_change_needs_type_widening(self) -> None:
+        t = table(writer_features=frozenset({"appendOnly"}))
+        verdict = SqlEngine._table_type_refusal(Operation.ALTER_COLUMN_TYPE, t)
+        assert verdict is not None
+        assert "enableTypeWidening" in verdict.remedy
+
+    def test_type_change_with_type_widening(self) -> None:
+        on = table(
+            writer_features=frozenset({"typeWidening"}), reader_features=frozenset({"typeWidening"})
+        )
+        assert SqlEngine._table_type_refusal(Operation.ALTER_COLUMN_TYPE, on) is None
+        by_property = table(
+            writer_features=frozenset({"appendOnly"}),
+            properties={"delta.enableTypeWidening": "true"},
+        )
+        assert SqlEngine._table_type_refusal(Operation.ALTER_COLUMN_TYPE, by_property) is None
+
+    @pytest.mark.parametrize("operation", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN])
+    def test_drops_and_renames_need_column_mapping(self, operation: Operation) -> None:
+        plain = table(writer_features=frozenset({"appendOnly"}))
+        verdict = SqlEngine._table_type_refusal(operation, plain)
+        assert verdict is not None
+        assert "columnMapping" in verdict.remedy
+        mapped = table(
+            writer_features=frozenset({"columnMapping"}),
+            reader_features=frozenset({"columnMapping"}),
+            properties={"delta.columnMapping.mode": "name"},
+        )
+        assert SqlEngine._table_type_refusal(operation, mapped) is None
 
 
-def arrow_ipc(table: pa.Table) -> bytes:
-    sink = io.BytesIO()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    return sink.getvalue()
+class TestCreateManaged:
+    """Managed tables are created with a warehouse CREATE TABLE statement."""
 
-
-def status(state: str, message: str | None = None) -> Any:
-    error = SimpleNamespace(message=message, error_code="BAD_REQUEST") if message else None
-    return SimpleNamespace(state=SimpleNamespace(value=state), error=error, sql_state=None)
-
-
-def succeeded(sid: str, result: Any = None, manifest: Any = None) -> Any:
-    return SimpleNamespace(
-        statement_id=sid, status=status("SUCCEEDED"), result=result, manifest=manifest
-    )
-
-
-def link(
-    url: str, chunk: int, next_chunk: int | None, headers: dict[str, str] | None = None
-) -> Any:
-    return SimpleNamespace(
-        external_link=url,
-        chunk_index=chunk,
-        next_chunk_index=next_chunk,
-        http_headers=headers,
-    )
-
-
-class FakeStatements:
-    """`WorkspaceClient.statement_execution`, scripted."""
-
-    def __init__(
-        self,
-        responses: list[Any],
-        polls: list[Any] | None = None,
-        chunks: dict[int, Any] | None = None,
-    ) -> None:
-        self._responses = list(responses)
-        self._polls = list(polls or [])
-        self._chunks = chunks or {}
-        self.executed: list[dict[str, Any]] = []
-        self.cancelled: list[str] = []
-        self.chunk_requests: list[int] = []
-
-    def execute_statement(self, **kwargs: Any) -> Any:
-        self.executed.append(kwargs)
-        return self._responses.pop(0)
-
-    def get_statement(self, statement_id: str) -> Any:
-        return self._polls.pop(0)
-
-    def get_statement_result_chunk_n(self, statement_id: str, chunk_index: int) -> Any:
-        self.chunk_requests.append(chunk_index)
-        return self._chunks[chunk_index]
-
-    def cancel_execution(self, statement_id: str) -> None:
-        self.cancelled.append(statement_id)
-
-
-class StubOpener:
-    def __init__(self, bodies: dict[str, bytes]) -> None:
-        self.bodies = bodies
-        self.requests: list[urllib.request.Request] = []
-
-    def __call__(self, request: urllib.request.Request, timeout: float) -> Any:
-        self.requests.append(request)
-        return io.BytesIO(self.bodies[request.full_url])
-
-
-def backend(statements: FakeStatements, **kwargs: Any) -> SdkStatementBackend:
-    kwargs.setdefault("sleep", lambda _s: None)
-    return SdkStatementBackend(SimpleNamespace(statement_execution=statements), "wh", **kwargs)
-
-
-class TestStatementBackend:
-    def test_request_shape_and_parameters(self) -> None:
-        from databricks.sdk.service.sql import (
-            Disposition,
-            ExecuteStatementRequestOnWaitTimeout,
-            Format,
-            StatementParameterListItem,
+    def test_ddl(self) -> None:
+        eng, rec, _ = engine()
+        schema = pa.schema(
+            [pa.field("id", pa.int64(), nullable=False), pa.field("weird col", pa.string())]
+        )
+        eng.create_managed(
+            "main.s.t",
+            schema,
+            cluster_by=["id"],
+            properties={"delta.enableChangeDataFeed": "true"},
+            comment="it's here",
+        )
+        assert rec.last == (
+            "CREATE TABLE `main`.`s`.`t` (`id` BIGINT NOT NULL, `weird col` STRING) USING DELTA"
+            " CLUSTER BY (`id`) COMMENT 'it\\'s here'"
+            " TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')"
         )
 
-        statements = FakeStatements([succeeded("s1")])
-        binder = ParameterBinder()
-        marker = binder.bind("O'Hare")
-        backend(statements, wait_timeout="10s").execute(
-            f"SELECT {marker}", binder.parameters, fetch=False
-        )
-        (call,) = statements.executed
-        assert call["statement"] == "SELECT :p0"
-        assert call["warehouse_id"] == "wh"
-        assert call["format"] is Format.ARROW_STREAM
-        assert call["disposition"] is Disposition.EXTERNAL_LINKS
-        assert call["wait_timeout"] == "10s"
-        assert call["on_wait_timeout"] is ExecuteStatementRequestOnWaitTimeout.CONTINUE
-        assert call["parameters"] == [
-            StatementParameterListItem(name="p0", value="O'Hare", type="STRING")
-        ]
-
-    def test_external_links_are_downloaded_without_databricks_auth(self) -> None:
-        first = pa.table({"id": [1, 2], "s": ["a", "b"]})
-        second = pa.table({"id": [3], "s": ["c"]})
-        result = SimpleNamespace(
-            external_links=[link("https://bucket/c0", 0, 1, {"x-amz-sse": "AES256"})],
-            next_chunk_index=1,
-            chunk_index=0,
-        )
-        chunk1 = SimpleNamespace(
-            external_links=[link("https://bucket/c1", 1, None)],
-            next_chunk_index=None,
-            chunk_index=1,
-        )
-        statements = FakeStatements([succeeded("s1", result=result)], chunks={1: chunk1})
-        opener = StubOpener(
-            {"https://bucket/c0": arrow_ipc(first), "https://bucket/c1": arrow_ipc(second)}
-        )
-        got = backend(statements, opener=opener).execute("SELECT 1")
-        assert got.to_pydict() == {"id": [1, 2, 3], "s": ["a", "b", "c"]}
-        assert statements.chunk_requests == [1]
-        assert [r.full_url for r in opener.requests] == ["https://bucket/c0", "https://bucket/c1"]
-        for request in opener.requests:
-            assert not any(k.lower() == "authorization" for k, _ in request.header_items())
-        assert opener.requests[0].get_header("X-amz-sse") == "AES256"
-
-    def test_non_https_links_are_refused(self) -> None:
-        result = SimpleNamespace(
-            external_links=[link("file:///etc/passwd", 0, None)],
-            next_chunk_index=None,
-            chunk_index=0,
-        )
-        statements = FakeStatements([succeeded("s1", result=result)])
-        with pytest.raises(SqlStatementError, match="not https"):
-            backend(statements, opener=StubOpener({})).execute("SELECT 1")
-
-    def test_empty_result_keeps_its_columns(self) -> None:
-        manifest = SimpleNamespace(
-            schema=SimpleNamespace(
-                columns=[
-                    SimpleNamespace(name="id", position=0, type_name=SimpleNamespace(value="LONG")),
-                    SimpleNamespace(
-                        name="s", position=1, type_name=SimpleNamespace(value="STRING")
-                    ),
-                ]
+    def test_partitioned_and_clustered_is_refused(self) -> None:
+        eng, _, _ = engine()
+        with pytest.raises(UnreachableTableError):
+            eng.create_managed(
+                "main.s.t", pa.schema([("id", pa.int64())]), partition_by=["id"], cluster_by=["id"]
             )
-        )
-        statements = FakeStatements([succeeded("s1", manifest=manifest)])
-        got = backend(statements).execute("SELECT * FROM t LIMIT 0")
-        assert got.num_rows == 0
-        assert got.schema == pa.schema([("id", pa.int64()), ("s", pa.string())])
-
-    def test_polls_until_terminal(self) -> None:
-        pending = SimpleNamespace(statement_id="s1", status=status("PENDING"))
-        running = SimpleNamespace(statement_id="s1", status=status("RUNNING"))
-        sleeps: list[float] = []
-        statements = FakeStatements([pending], polls=[running, succeeded("s1")])
-        backend(statements, sleep=sleeps.append).execute("OPTIMIZE t", fetch=False)
-        assert sleeps == [1.0, 2.0]
-
-    def test_failure_carries_the_server_message(self) -> None:
-        failed = SimpleNamespace(
-            statement_id="s1", status=status("FAILED", "[TABLE_OR_VIEW_NOT_FOUND] nope")
-        )
-        with pytest.raises(SqlStatementError, match="TABLE_OR_VIEW_NOT_FOUND") as info:
-            backend(FakeStatements([failed])).execute("SELECT 1")
-        assert info.value.statement_id == "s1"
-        assert info.value.state == "FAILED"
-
-    def test_timeout_cancels(self) -> None:
-        pending = SimpleNamespace(statement_id="s1", status=status("PENDING"))
-        statements = FakeStatements([pending], polls=[pending] * 10)
-        clock = iter(float(i) for i in range(100))
-        with pytest.raises(SqlStatementError, match="did not finish"):
-            backend(statements, timeout=3, clock=lambda: next(clock)).execute("SELECT 1")
-        assert statements.cancelled == ["s1"]
-
-    def test_ctrl_c_cancels(self) -> None:
-        pending = SimpleNamespace(statement_id="s1", status=status("PENDING"))
-
-        def interrupt(_s: float) -> None:
-            raise KeyboardInterrupt
-
-        statements = FakeStatements([pending])
-        with pytest.raises(KeyboardInterrupt):
-            backend(statements, sleep=interrupt).execute("SELECT 1")
-        assert statements.cancelled == ["s1"]
-
-    def test_wait_timeout_is_validated(self) -> None:
-        with pytest.raises(ValueError):
-            backend(FakeStatements([]), wait_timeout="60s")
-
-    def test_parameter_types(self) -> None:
-        binder = ParameterBinder()
-        for value in (None, 1.5, dt.datetime(2024, 1, 1), __import__("decimal").Decimal("12.345")):
-            binder.bind(value)
-        assert [(p.value, p.type) for p in binder.parameters] == [
-            (None, "STRING"),
-            ("1.5", "DOUBLE"),
-            ("2024-01-01T00:00:00", "TIMESTAMP_NTZ"),
-            ("12.345", "DECIMAL(5,3)"),
-        ]

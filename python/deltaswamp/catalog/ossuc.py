@@ -20,8 +20,9 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NoReturn, TypeVar
 
-from ..credentials.base import Cloud, Credentials, Operation
-from ..errors import CredentialError, InvalidReferenceError, PreflightError
+from ..credentials.base import Credentials, Operation
+from ..credentials.databricks import credentials_from_response
+from ..errors import InvalidReferenceError, PreflightError
 from ..governance import (
     ColumnLineage,
     FunctionSummary,
@@ -141,59 +142,13 @@ def _request(
     return json.loads(text) if text else {}
 
 
-def _parse_vended(body: dict[str, Any]) -> Credentials:
-    """Parse a UC temporary-credentials response (table or path)."""
-    url = body.get("url") or ""
-    expiry = body.get("expiration_time") or body.get("expirationTime")
-    expires_at = float(expiry) / 1000.0 if expiry else None
-
-    if "aws_temp_credentials" in body:
-        c = body["aws_temp_credentials"]
-        return Credentials(
-            cloud=Cloud.AWS,
-            url=url,
-            expires_at=expires_at,
-            secrets={
-                "aws_access_key_id": c["access_key_id"],
-                "aws_secret_access_key": c["secret_access_key"],
-                "aws_session_token": c["session_token"],
-            },
-            scope_prefix=url or None,
-        )
-    if "gcp_oauth_token" in body:
-        return Credentials(
-            cloud=Cloud.GCP,
-            url=url,
-            expires_at=expires_at,
-            secrets={"google_bearer_token": body["gcp_oauth_token"]["oauth_token"]},
-            scope_prefix=url or None,
-        )
-    if "azure_user_delegation_sas" in body:
-        from ..credentials.databricks import azure_endpoint_for
-
-        endpoint = azure_endpoint_for(url)
-        secrets = {"azure_storage_sas_key": body["azure_user_delegation_sas"]["sas_token"]}
-        if endpoint:
-            secrets["azure_endpoint"] = endpoint
-        return Credentials(
-            cloud=Cloud.AZURE,
-            url=url,
-            expires_at=expires_at,
-            secrets=secrets,
-            scope_prefix=url or None,
-        )
-    raise CredentialError(
-        f"OSS Unity Catalog returned no recognised credential block: {sorted(body)}"
-    )
-
-
 class OSSUnityCredentialProvider:
     """Vends credentials from the OSS UC Delta API.
 
     OSS UC omits `expirationTime` from its load-table response and has no
     `loadCredentials` endpoint (unitycatalog#1885), so there is often no expiry
-    to honour. We treat a missing expiry as "no stated deadline" rather than
-    inventing one, and re-vend on demand via `invalidate()`.
+    to honor. A missing expiry means no stated deadline; `invalidate()` forces a
+    re-vend.
     """
 
     def __init__(
@@ -203,11 +158,12 @@ class OSSUnityCredentialProvider:
         token: str | None = None,
         table_id: str | None = None,
     ) -> None:
+        assert ref.catalog and ref.schema and ref.table
         self._table_id = table_id
         self._base_url = base_url
-        self._catalog = ref.catalog
-        self._schema = ref.schema
-        self._table = ref.table
+        self._catalog: str = ref.catalog
+        self._schema: str = ref.schema
+        self._table: str = ref.table
         self._token = token
         self._cache: dict[Operation, Credentials] = {}
 
@@ -221,12 +177,7 @@ class OSSUnityCredentialProvider:
         return self._table_id
 
     def workspace_auth(self) -> tuple[str, str]:
-        """`(base_url, token)` for the commit API.
-
-        Without this, every catalog-managed write against an open-source Unity
-        Catalog server failed: the kernel committer asks the provider for the
-        endpoint and bearer token, and this class had no way to answer.
-        """
+        """`(base_url, token)` for the commit API."""
         return self._base_url.rstrip("/"), self._token or ""
 
     def invalidate(self) -> None:
@@ -237,8 +188,8 @@ class OSSUnityCredentialProvider:
         if cached is not None and not cached.expires_within():
             return cached
         path = (
-            f"{UC_DELTA_API}/catalogs/{self._catalog}/schemas/{self._schema}"
-            f"/tables/{self._table}/credentials?operation={operation.value}"
+            f"{UC_DELTA_API}/catalogs/{_q(self._catalog)}/schemas/{_q(self._schema)}"
+            f"/tables/{_q(self._table)}/credentials?operation={operation.value}"
         )
         body = _request(self._base_url, path, self._token)
         creds = self._parse(body)
@@ -246,7 +197,7 @@ class OSSUnityCredentialProvider:
         return creds
 
     def _parse(self, body: dict[str, Any]) -> Credentials:
-        return _parse_vended(body)
+        return credentials_from_response(body)
 
 
 class OSSUnityCatalog:
@@ -430,7 +381,7 @@ class OSSUnityCatalog:
 
     @staticmethod
     def _from_wire(body: Any) -> list[Grant]:
-        # Grant.list_from_api normalises OSS's "USE SCHEMA" to "USE_SCHEMA".
+        # Grant.list_from_api normalizes OSS's "USE SCHEMA" to "USE_SCHEMA".
         return Grant.list_from_api(body)
 
     def grants(
@@ -759,7 +710,7 @@ class OSSUnityCatalog:
             ),
         )
         body.setdefault("url", url)
-        return _parse_vended(body)
+        return credentials_from_response(body)
 
     def _delta_tables_path(self, ref: TableRef, leaf: str) -> str:
         assert ref.catalog and ref.schema

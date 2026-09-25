@@ -30,7 +30,7 @@ use snapshot::{create_table, PySnapshot};
 /// delta_kernel exports no VERSION constant of its own, so we record the pin
 /// here and assert it against Cargo.lock in a test. Python asserts against the
 /// same string, so a kernel bump fails loudly at three layers rather than
-/// silently changing behaviour.
+/// silently changing behavior.
 pub const KERNEL_VERSION: &str = "0.28.0";
 
 /// Capabilities this build provides, by stable name.

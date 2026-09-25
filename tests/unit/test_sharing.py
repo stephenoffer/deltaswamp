@@ -826,9 +826,9 @@ class TestDetail:
 
 class TestRouted:
     def test_table_reads_route_to_sharing(self, catalog: SharingCatalog) -> None:
+        from deltaswamp import Connection
         from deltaswamp.engine.deltars import DeltaRsEngine
         from deltaswamp.router import Router
-        from deltaswamp.table import Connection
 
         router = Router(
             engines={

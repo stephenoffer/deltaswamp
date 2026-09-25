@@ -15,20 +15,6 @@ pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension no
 
 
 @pytest.fixture
-def conn() -> Any:
-    from deltaswamp.catalog.filesystem import FilesystemCatalog
-    from deltaswamp.engine.deltars import DeltaRsEngine
-    from deltaswamp.engine.kernel import KernelEngine
-    from deltaswamp.router import Router
-    from deltaswamp.table import Connection
-
-    return Connection(
-        catalog=FilesystemCatalog(),
-        router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
-    )
-
-
-@pytest.fixture
 def partitioned(conn: Any, tmp_path: Any) -> Any:
     """Three regions, one row each."""
     from deltalake import write_deltalake
@@ -124,8 +110,8 @@ class TestSchemaEvolution:
         assert "note" in plain.to_arrow().column_names
 
     def test_merge_routes_as_merge_schema_not_append(self, plain: Any) -> None:
-        """It is a distinct operation, and routing it as a plain append is how
-        the request shape used to get lost."""
+        """It is a distinct operation; routing it as a plain append would lose
+        the request shape."""
         assert plain.can(Operation.MERGE_SCHEMA).ok
 
     def test_replace_swaps_the_schema(self, plain: Any) -> None:
@@ -191,7 +177,7 @@ class TestConfigurationOnWriteIsRefused:
 
 
 class TestKernelRefusesWhatItCannotHonor:
-    """The kernel append path used to swallow every unknown kwarg."""
+    """The kernel append path refuses keyword arguments it does not implement."""
 
     def test_unsupported_options_raise_rather_than_no_op(self, plain: Any) -> None:
         from deltaswamp.engine.kernel import KernelEngine

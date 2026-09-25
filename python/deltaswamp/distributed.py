@@ -1,23 +1,14 @@
 """Distributed reads and writes: plan on the driver, do the work on workers.
 
-A plan is a list of `ScanSplit`s pinned to one snapshot version. What travels
-to a worker is the engine, the resolved table (with its *credential provider*,
-never a credential) and the splits. The worker re-resolves that exact version
--- including a catalog-managed table's commit tail, which was captured at
-resolution -- and reads only its files, vending its own storage credentials.
-So a long job does not die on a token frozen at submission time, and no secret
-appears in a task payload.
+A scan plan is a list of `ScanSplit`s pinned to one snapshot version. A worker
+receives the engine, the resolved table (with its credential provider, never a
+credential) and its splits, re-resolves that exact version and vends its own
+storage credentials. The Ray Data datasource makes one read task per
+byte-balanced group of splits.
 
-The Ray Data datasource is a thin layer over that: one read task per group of
-splits, balanced by bytes.
-
-Writes run the same shape in reverse. `WritePlan` settles on the driver whether
-the commit can succeed *before* any worker runs, each worker writes data files
-and returns an opaque fragment, and the driver commits every fragment as one
-transaction. That ordering is the point: the common failure in distributed Delta
-writers is discovering at commit time that the table refuses the write, after an
-hour of compute, leaving orphaned Parquet behind. Here the refusal arrives
-before the first byte is written, carrying the reason.
+Writes run in reverse. `WritePlan` checks on the driver that the commit can
+succeed before any worker runs, workers write data files and return opaque
+fragments, and the driver commits every fragment in one transaction.
 """
 
 from __future__ import annotations
@@ -212,10 +203,7 @@ class WritePlan:
 
         if self.version is None:
             return
-        try:
-            current = self.engine.detail(self.table).get("version")
-        except Exception:
-            return  # cannot tell; the commit itself will still be atomic
+        current = self.engine.detail(self.table).get("version")
         if current is not None and current != self.version:
             raise UnreachableTableError(
                 "commit this overwrite",
@@ -231,7 +219,7 @@ def balance(splits: Iterable[Any], n: int) -> list[tuple[Any, ...]]:
     """Group splits into at most `n` bins of roughly equal bytes.
 
     Largest-first greedy assignment: good enough to keep one huge file from
-    serialising the job, and deterministic, so a retried task reads the same
+    serializing the job, and deterministic, so a retried task reads the same
     files.
     """
     items = sorted(splits, key=lambda s: (-s.size, s.path))

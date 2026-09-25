@@ -1,16 +1,14 @@
-"""The catalog abstraction: name -> everything an engine needs to open a table.
+"""The catalog abstraction: a table name in, everything an engine needs out.
 
-`ResolvedTable` is deliberately fat. The router must decide an engine *before*
-touching the Delta log, because several decisions cannot be made afterwards:
+`ResolvedTable` carries more than a location because the router must choose an
+engine before touching the Delta log. Some facts are only visible to the
+catalog:
 
-* A shallow clone must be detected from catalog metadata first. Its `add` actions
-  carry absolute paths into the source table, and kernel resolves those to
-  absolute URLs before a connector sees them -- so by log-read time you can no
-  longer tell borrowed files from owned ones (kernel#2411).
-* Row filters and column masks make UC credential vending refuse outright. You
-  learn this from the capability manifest, not from a failed read.
-* A `catalogManaged` table needs its commit tail and ratified version supplied at
-  snapshot-construction time; there is no retrofitting it.
+* A shallow clone's `add` actions hold absolute paths into the source table,
+  and once the log is open borrowed files look like owned ones (kernel#2411).
+* Row filters and column masks make UC credential vending refuse the table.
+* A `catalogManaged` table needs its commit tail and ratified version when the
+  snapshot is built.
 """
 
 from __future__ import annotations
@@ -151,7 +149,7 @@ class ResolvedTable:
     securable_kind: str | None = None
     table_id: str | None = None
 
-    # Protocol state. Unrecognised names are kept verbatim so we can report them
+    # Protocol state. Unrecognized names are kept verbatim so we can report them
     # precisely instead of dropping them.
     min_reader_version: int | None = None
     min_writer_version: int | None = None
@@ -241,7 +239,7 @@ class ResolvedTable:
 
     @property
     def unknown_features(self) -> frozenset[str]:
-        """Feature names this release does not recognise.
+        """Feature names this release does not recognize.
 
         Tolerated on reads when writer-only; they block writes.
         """

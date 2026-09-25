@@ -19,9 +19,8 @@ classifiers = [
     "Topic :: Database",
 ]
 
-# Core stays deliberately small. Arrow crosses our boundary via the PyCapsule
-# interface, so pyarrow is NOT required -- Polars/DuckDB/pandas can consume a
-# scan without it.
+# Arrow leaves through the PyCapsule interface, so pyarrow is optional: Polars,
+# DuckDB and pandas can consume a scan without it.
 dependencies = [
     "deltalake>=1.6.5",     # the DML / maintenance engine
     "databricks-sdk>=0.141.0",  # unified Databricks auth; do not reimplement
@@ -43,14 +42,13 @@ all = [
     "pyarrow>=17", "pandas>=2", "polars>=1.39", "duckdb>=1.1",
     "pyiceberg>=0.12.0", "delta-sharing>=1.4.1", "boto3>=1.35", "pymetastore>=0.4.0",
 ]
-# NOTE: databricks-connect is deliberately absent. It pins requires-python
-# ==3.12.* and conflicts with pyspark; it must never enter the dependency set.
+# databricks-connect is never a dependency: it pins requires-python ==3.12.*
+# and conflicts with pyspark.
 dev = [
     "pytest>=8",
     "pytest-cov",
     "mypy>=1.11",
     "ruff>=0.8",
-    "testcontainers>=4.8",
 ]
 
 [project.urls]
@@ -95,6 +93,4 @@ testpaths = ["tests"]
 pythonpath = ["python"]
 markers = [
     "databricks: requires a live Databricks workspace (set DELTASWAMP_TEST_DATABRICKS=1)",
-    "ossuc: requires an OSS Unity Catalog container",
-    "minio: requires a MinIO container",
 ]
