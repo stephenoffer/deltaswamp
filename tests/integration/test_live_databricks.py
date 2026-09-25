@@ -121,12 +121,23 @@ class TestResolution:
             pytest.skip("this workspace returned no capability manifest")
         assert resolved.external_read_supported is True
 
-    def test_table_uuid_matches_the_log(self, live_connection: Any, scratch_sql: Any) -> None:
-        """A mismatch means a dropped-and-recreated table; it must be caught."""
+    def test_the_identity_check_does_not_fire_on_a_healthy_table(
+        self, live_connection: Any, scratch_sql: Any
+    ) -> None:
+        """Opening a perfectly ordinary managed table must not look corrupt.
+
+        `table_uuid` means the Delta log's `Metadata.id`. Databricks exposes no
+        such field -- its `table_id` is the UC securable's own UUID, which names
+        the storage directory -- so the catalog leaves `table_uuid` unset and
+        the check is skipped. It used to be populated from `table_id`, which
+        made every managed table raise CorruptTableError on first use.
+        """
         name, _run = scratch_sql
         table = live_connection.table(name)
         table.features()  # forces the identity check
-        assert table.resolved.table_uuid
+        assert table.resolved.table_id, "the UC securable id should still be recorded"
+        assert table.resolved.table_uuid is None
+        assert table.to_arrow().num_rows == 3
 
     def test_a_missing_table_says_so(self, live_connection: Any, live_config: Any) -> None:
         with pytest.raises(DeltaSwampError, match="does not exist"):
@@ -181,8 +192,16 @@ class TestCredentialVending:
         except (CredentialError, PreflightError) as exc:
             pytest.skip(f"vending unavailable: {exc}")
         payload = pickle.dumps(provider)
-        for value in creds.secrets.values():
-            assert value.encode() not in payload, "a vended secret was pickled"
+        # `secrets` carries the storage options object_store needs, and not all
+        # of them are secret: the AWS region and endpoint are derived
+        # configuration a worker must have to address the bucket at all, and
+        # they are pickled deliberately. Only the vended credential material
+        # must not survive pickling.
+        not_secret = {"aws_region", "aws_endpoint_url", "azure_endpoint"}
+        for key, value in creds.secrets.items():
+            if key in not_secret:
+                continue
+            assert value.encode() not in payload, f"the vended secret {key!r} was pickled"
 
 
 # ---------------------------------------------------------------- 5. reading

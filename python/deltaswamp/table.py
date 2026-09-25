@@ -1095,7 +1095,35 @@ class Table:
         return dataset.dataset(self.to_arrow(**kwargs))
 
     def head(self, n: int = 5, **kwargs: Any) -> Any:
-        return self.to_arrow(**kwargs).slice(0, n)
+        """The first `n` rows.
+
+        Consumes the scan stream batch by batch and stops as soon as `n` rows
+        are in hand, so this costs one batch on a table of any size. It used to
+        materialise the whole table and slice it, which on a multi-terabyte
+        table never returned.
+
+        The stream is the engine's output, so deletion vectors, column mapping
+        and partition values are already applied; stopping early here is not the
+        limit pushdown the scan layer deliberately refuses, which would break
+        the positional mapping a deletion vector depends on.
+        """
+        pa = _require("pyarrow", "pyarrow")
+        reader = pa.RecordBatchReader.from_stream(self.scan(**kwargs))
+        batches, taken = [], 0
+        if n > 0:
+            for batch in reader:
+                if batch.num_rows == 0:
+                    continue
+                batches.append(batch)
+                taken += batch.num_rows
+                if taken >= n:
+                    break
+        table = (
+            pa.Table.from_batches(batches, reader.schema)
+            if batches
+            else reader.schema.empty_table()
+        )
+        return table.slice(0, n)
 
     def count(self, *, predicate: str | None = None) -> int:
         """Exact row count.

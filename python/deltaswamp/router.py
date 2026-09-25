@@ -41,6 +41,11 @@ _CATALOG_MANAGED_ALTER_OPS: frozenset[Operation] = METADATA_OPERATIONS | {
 }
 
 
+#: Engines that read and write storage directly, with a vended credential. The
+#: SQL warehouse is not one: it runs inside Databricks.
+_DIRECT_ENGINES: frozenset[EngineKind] = frozenset({EngineKind.KERNEL, EngineKind.DELTARS})
+
+
 @dataclass
 class Router:
     """Routes operations to engines for one connection."""
@@ -93,6 +98,18 @@ class Router:
                 )
                 continue
 
+            # A direct engine reaches the files with a vended credential, and
+            # the manifest has already said vending will refuse this table. The
+            # engine cannot know that -- it would accept the call and fail
+            # mid-flight on a CredentialError -- so it is skipped here and the
+            # warehouse, which needs no vending, serves instead.
+            if kind in _DIRECT_ENGINES and not self._vendable(operation, table):
+                reasons.append(
+                    f"{kind.value}: Unity Catalog withdraws this table from credential "
+                    "vending, and a direct engine cannot reach the files without it"
+                )
+                continue
+
             missing = [need for need in needs if not getattr(engine, f"supports_{need}", False)]
             if missing:
                 reasons.append(f"{kind.value}: does not support {', '.join(missing)}")
@@ -142,6 +159,16 @@ class Router:
 
     # ------------------------------------------------------------- pre-flight
 
+    @staticmethod
+    def _vendable(operation: Operation, table: ResolvedTable) -> bool:
+        """Whether credential vending will serve `operation` on this table.
+
+        `None` means the catalog was never asked, which is not a refusal.
+        """
+        if table.external_read_supported is False:
+            return False
+        return not (operation not in READ_OPERATIONS and table.external_write_supported is False)
+
     def _catalog_level_block(self, operation: Operation, table: ResolvedTable) -> Capability | None:
         """Refusals decidable from catalog metadata alone, before any log read."""
 
@@ -150,6 +177,8 @@ class Router:
         # streaming table externally readable (pipelines.externalMetadata), and
         # refusing on table_type first would contradict the manifest.
         manifest_says_readable = table.external_read_supported is True
+        #: Whether a SQL warehouse is actually reachable for this connection.
+        sql_fallback = self.allow_sql_fallback and EngineKind.SQL in self.engines
 
         # A shared table is served by the Delta Sharing engine or not at all:
         # its files are presigned URLs, so nothing else has a way in.
@@ -192,17 +221,30 @@ class Router:
                 remedy="ds.connect(..., allow_sql_fallback=True) can still query it",
             )
 
-        if table.is_view_like and not manifest_says_readable:
+        # The manifest can say a materialized view or streaming table is
+        # externally readable (pipelines.externalMetadata), so it overrides the
+        # type -- but only when there is actually somewhere to read from.
+        # Databricks returns no storage_location for these, and without one no
+        # direct engine can do anything, so saying "the kernel found no
+        # location" five times is worse than naming the real cause once.
+        if table.is_view_like and not (manifest_says_readable and table.location):
             kind = table.table_type.value if table.table_type else "view"
-            if self.allow_sql_fallback and EngineKind.SQL in self.engines:
+            if sql_fallback:
                 return None  # SQL can query it; let the normal path handle it.
+            detail = (
+                "Credential vending refuses views, materialized views, metric views "
+                "and streaming tables"
+            )
+            if manifest_says_readable:
+                detail = (
+                    "Unity Catalog reports external read support for it but exposes no "
+                    "storage location, so there are no files any direct engine can open"
+                )
             return Capability(
                 operation,
                 ok=False,
                 reason=(
-                    f"the table is a {kind}, which has no directly readable file surface. "
-                    "Credential vending refuses views, materialized views, metric views "
-                    "and streaming tables"
+                    f"the table is a {kind}, which has no directly readable file surface. {detail}"
                 ),
                 remedy="ds.connect(..., allow_sql_fallback=True)",
             )
@@ -246,7 +288,14 @@ class Router:
                 remedy="ds.connect(..., allow_sql_fallback=True)",
             )
 
-        if table.external_read_supported is False:
+        # Both manifest flags describe DIRECT EXTERNAL ENGINE access: vending a
+        # credential and touching the files yourself. A SQL warehouse is neither
+        # -- it runs inside Databricks, where the row filter or mask that
+        # withdrew the table from vending is simply evaluated. So these refusals
+        # are conditional on the fallback being unavailable. They used to fire
+        # unconditionally while naming `allow_sql_fallback=True` as the remedy,
+        # which meant following the advice changed nothing.
+        if table.external_read_supported is False and not sql_fallback:
             return Capability(
                 operation,
                 ok=False,
@@ -260,7 +309,7 @@ class Router:
             )
 
         writing = operation not in READ_OPERATIONS
-        if writing and table.external_write_supported is False:
+        if writing and table.external_write_supported is False and not sql_fallback:
             return Capability(
                 operation,
                 ok=False,
@@ -273,8 +322,7 @@ class Router:
 
         # A table we could not open is not a table we can route. CREATE is
         # exempt: there is nothing to open yet.
-        sql_available = self.allow_sql_fallback and EngineKind.SQL in self.engines
-        if table.open_error is not None and operation is not Operation.CREATE and not sql_available:
+        if table.open_error is not None and operation is not Operation.CREATE and not sql_fallback:
             return Capability(
                 operation,
                 ok=False,

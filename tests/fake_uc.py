@@ -194,14 +194,22 @@ class FakeUnityCatalog:
                     table = catalog.tables.get(full)
                     if table is None:
                         return self._send(404, {"message": f"{full} does not exist"})
+                    # Kebab-case, with location nested under `metadata`: this
+                    # is the shape a real Databricks metastore returns, and the
+                    # create-table response below already models it. This one
+                    # used to answer in snake_case, so the parser could read
+                    # `latest_table_version` here and silently read nothing at
+                    # all in production.
                     return self._send(
                         200,
                         {
-                            "table_id": table.table_id,
-                            "location": table.location,
+                            "metadata": {
+                                "table-uuid": table.table_id,
+                                "location": table.location,
+                                "properties": table.properties,
+                            },
                             "commits": table.commits,
-                            "latest_table_version": table.latest_version,
-                            "metadata": {"properties": table.properties},
+                            "latest-table-version": table.latest_version,
                         },
                     )
                 return self._send(404, {"message": f"no route for {path}"})
@@ -268,9 +276,9 @@ class FakeUnityCatalog:
                     {
                         "version": commit["version"],
                         "timestamp": commit["timestamp"],
-                        "file_name": commit["file-name"],
-                        "file_size": commit["file-size"],
-                        "file_modification_timestamp": commit["file-modification-timestamp"],
+                        "file-name": commit["file-name"],
+                        "file-size": commit["file-size"],
+                        "file-modification-timestamp": commit["file-modification-timestamp"],
                     }
                 )
                 table.latest_version = max(table.latest_version, int(commit["version"]))

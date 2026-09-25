@@ -46,6 +46,7 @@ __all__ = [
     "ResolvedTable",
     "TableLifecycleCatalog",
     "TableType",
+    "parse_commit_tail",
 ]
 
 
@@ -79,6 +80,64 @@ class LogTailEntry:
     path: str
     size: int
     timestamp: int | None = None
+
+
+def _first(mapping: Mapping[str, Any], *names: str) -> Any:
+    """The first present key among `names`.
+
+    The UC Delta API spells its JSON in kebab-case (`latest-table-version`,
+    `file-name`), which is what a real Databricks metastore returns. Some
+    servers and older drafts use snake_case or camelCase for the same fields, so
+    every spelling is accepted rather than guessed at.
+    """
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return mapping[name]
+    return None
+
+
+def parse_commit_tail(
+    body: Mapping[str, Any], fallback_location: str | None = None
+) -> tuple[tuple[LogTailEntry, ...], int | None, str | None]:
+    """Read a `/delta/v1` table response into (log tail, max version, location).
+
+    Shared by both Unity Catalog backends so one spelling fix covers both.
+    Reading `latest-table-version` under the wrong spelling leaves the maximum
+    ratified version unset, and the kernel then refuses the table outright with
+    "Max catalog version is required when loading a catalog-managed table" --
+    which is every catalog-managed table, the one thing no other Python library
+    can open.
+    """
+    commits = body.get("commits") or []
+    entries = tuple(
+        LogTailEntry(
+            version=int(_first(c, "version", "commit-version", "commitVersion")),
+            path=_first(c, "file-name", "file_name", "fileName") or "",
+            size=int(_first(c, "file-size", "file_size", "fileSize") or 0),
+            timestamp=(
+                int(ts)
+                if (
+                    ts := _first(
+                        c,
+                        "file-modification-timestamp",
+                        "timestamp",
+                        "file_modification_timestamp",
+                    )
+                )
+                is not None
+                else None
+            ),
+        )
+        for c in commits
+    )
+    latest = _first(body, "latest-table-version", "latest_table_version", "latestTableVersion")
+    metadata = body.get("metadata") or {}
+    location = (
+        body.get("location")
+        or (metadata.get("location") if metadata else None)
+        or fallback_location
+    )
+    return entries, (int(latest) if latest is not None else None), location
 
 
 @dataclass(frozen=True, slots=True)

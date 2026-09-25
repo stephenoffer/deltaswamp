@@ -37,7 +37,7 @@ from ..governance import (
     path_operation,
 )
 from ..identity import RefKind, TableRef
-from .base import LogTailEntry, ResolvedTable, TableType
+from .base import ResolvedTable, TableType, parse_commit_tail
 
 __all__ = ["OSSUnityCatalog", "OSSUnityCredentialProvider", "UnityCatalogHTTPError"]
 
@@ -312,22 +312,12 @@ class OSSUnityCatalog:
 
         path = f"{UC_DELTA_API}/catalogs/{ref.catalog}/schemas/{ref.schema}/tables/{ref.table}"
         body = _request(self._base_url, path, self._token)
-        commits = body.get("commits") or []
-        entries = tuple(
-            LogTailEntry(
-                version=int(c["version"]),
-                path=c.get("file_name") or c.get("fileName") or "",
-                size=int(c.get("file_size") or c.get("fileSize") or 0),
-                timestamp=int(c["timestamp"]) if c.get("timestamp") is not None else None,
-            )
-            for c in commits
-        )
-        latest = body.get("latest_table_version", body.get("latestTableVersion"))
+        entries, latest, location = parse_commit_tail(body, resolved.location)
         return dataclasses.replace(
             resolved,
             log_tail=entries,
-            max_catalog_version=int(latest) if latest is not None else None,
-            location=body.get("location") or resolved.location,
+            max_catalog_version=latest,
+            location=location,
         )
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
@@ -368,7 +358,10 @@ class OSSUnityCatalog:
         return [s["name"] for s in body.get("schemas", []) if s.get("name")]
 
     def drop_table(self, ref: TableRef) -> None:
-        full = urllib.parse.quote(f"{ref.catalog}.{ref.schema}.{ref.table}", safe="")
+        # _dotted, not an f-string: it rejects a reference that is not
+        # catalog.schema.table. Interpolating directly turned a path reference
+        # into a DELETE of a table literally named "None.None.None".
+        full = _q(_dotted(ref))
         _request(self._base_url, f"{UC_API}/tables/{full}", self._token, method="DELETE")
 
     @staticmethod

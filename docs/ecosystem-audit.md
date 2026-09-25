@@ -226,6 +226,24 @@ unblock it.
   table formats; they are things a Databricks cluster does. The warehouse
   fallback is the only way in.
 - **UniForm metadata generation** outside Databricks.
+- **Writes through the Unity Catalog Delta API on Databricks**, which covers
+  managed-table creation and catalog-managed commits. Databricks allowlists
+  which connectors may call those endpoints, keyed on the product User-Agent,
+  and refuses anything it does not recognise:
+
+  > The UC Delta API requires clients to identify the calling application in the
+  > User-Agent header. The provided User-Agent '...' is insufficient.
+
+  deltaswamp sends `deltaswamp/<version>` (see `deltaswamp._sdk`), which is a
+  precondition, not a solution: the name has to be registered with Databricks.
+  Until it is, `create_table` for a managed table and any catalog-managed write
+  need `allow_sql_fallback=True`. **Reads are unaffected** — the commit tail for
+  a catalog-managed table comes from the same API and is served normally, which
+  is verified against a live workspace.
+- **Writing to a Unity Catalog managed table from outside Databricks at all**,
+  where the metastore withholds `HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT`. This
+  is a per-table decision by the catalog, not a protocol limit; the warehouse
+  fallback serves those writes and the refusal says so.
 
 ## What this pass found and fixed
 

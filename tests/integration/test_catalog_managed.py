@@ -275,3 +275,16 @@ class TestLifecycle:
         conn.drop_table("main.sales.cm")
         with pytest.raises(DeltaSwampError):
             conn.table("main.sales.cm")
+
+    def test_dropping_a_path_is_refused_before_any_request(self, conn: Any) -> None:
+        """A path is not a registration, and must not reach the server as one.
+
+        drop_table built the name by interpolation instead of validating it, so
+        a path reference became a DELETE of a table literally named
+        "None.None.None".
+        """
+        from deltaswamp.errors import InvalidReferenceError
+
+        with pytest.raises(InvalidReferenceError, match=r"catalog\.schema\.table"):
+            conn.drop_table("s3://bucket/some/path")
+        assert [t.ref.table for t in conn.list_tables("main", "sales")] == ["cm"]
