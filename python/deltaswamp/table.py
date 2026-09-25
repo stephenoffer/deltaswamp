@@ -1328,9 +1328,86 @@ class Table:
             if key in kwargs:
                 kwargs[key] = _timestamp_arg(kwargs[key], key)
         given = _given(kwargs)
-        return _cdf_types(
-            self._read(Operation.CDF, lambda engine: engine.cdf(self._resolved, **given))
+        # A file VACUUM removed, or rows written under a schema a later commit
+        # replaced, failed as a raw ArrowInvalid (with a Python traceback
+        # embedded in its message) where a scan names the missing file.
+        where = self._resolved.location or str(self._resolved.ref)
+
+        def translate(exc: BaseException) -> Exception | None:
+            return self._feed_schema_change(exc, start, end)
+
+        try:
+            stream = _cdf_types(
+                self._read(Operation.CDF, lambda engine: engine.cdf(self._resolved, **given))
+            )
+        except Exception as exc:
+            from .engine.base import missing_file_error
+
+            translated = missing_file_error(exc, f"the change data feed of {where}")
+            translated = translated or translate(exc)
+            if translated is None:
+                raise
+            raise translated from exc
+        return translating_stream(stream, f"the change data feed of {where}", translate)
+
+    #: How many versions back `_feed_schema_change` looks for the change.
+    _FEED_SCHEMA_SEARCH = 200
+
+    def _feed_schema_change(
+        self, exc: BaseException, start: int | None, end: int | None
+    ) -> Exception | None:
+        """`exc` as a ChangeFeedSchemaChangeError when a schema change caused it, else None.
+
+        Spark refuses a feed that spans an incompatible schema change
+        (DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE) and names the
+        version, so a streaming consumer can restart after it. Only a failure
+        that reads like a type or shape mismatch, in a range that really does
+        contain a schema change, is translated.
+        """
+        import json
+        import re
+
+        from .errors import ChangeFeedSchemaChangeError
+
+        if isinstance(exc, DeltaSwampError) or not re.search(
+            r"cast|datatype|data type|number of fields|schema", str(exc), re.IGNORECASE
+        ):
+            return None
+        try:
+            snapshot = getattr(self._engine(Operation.TIME_TRAVEL), "snapshot", None)
+            if snapshot is None:
+                return None
+            high = end if end is not None else int(snapshot(self._resolved).version)
+            low = max(1, start if start is not None else high - self._FEED_SCHEMA_SEARCH)
+            low = max(low, high - self._FEED_SCHEMA_SEARCH)
+
+            def schema_at(version: int) -> Any:
+                metadata = json.loads(snapshot(self._resolved, version=version).metadata_json())
+                return json.loads(metadata.get("schemaString") or "{}")
+
+            changed = None
+            later = schema_at(high)
+            for version in range(high, low - 1, -1):
+                earlier = schema_at(version - 1)
+                if earlier != later:
+                    changed = version
+                    break
+                later = earlier
+        except Exception:
+            return None
+        if changed is None:
+            return None
+        # The first line, without the Python traceback the C stream embeds.
+        detail = (str(exc).strip().splitlines() or [""])[0].split(" Detail: Python")[0][:200]
+        error = ChangeFeedSchemaChangeError(
+            "read the change data feed",
+            f"the table's schema changed at version {changed}, and rows the feed returns "
+            f"were written under the schema before it, which they cannot be read as "
+            f"({type(exc).__name__}: {detail})",
+            f"read the feed from version {changed + 1} on, or up to version {changed - 1}",
         )
+        error.version = changed
+        return error
 
     def changes(
         self,
@@ -1371,14 +1448,14 @@ class Table:
             current = self._connection._reresolve(self)
             latest = current.version
             if latest is not None and latest >= next_version:
-                changes = pa.table(
-                    current.cdf(
-                        starting_version=next_version,
-                        ending_version=latest,
-                        columns=projection,
-                        predicate=predicate,
-                    )
+                feed = current.cdf(
+                    starting_version=next_version,
+                    ending_version=latest,
+                    columns=projection,
+                    predicate=predicate,
                 )
+                # read_all() keeps the typed error pa.table() would flatten.
+                changes = feed.read_all() if isinstance(feed, TranslatingStream) else pa.table(feed)
                 if changes.num_rows:
                     changes = _plain_views(changes).sort_by("_commit_version")
                     versions = changes.column("_commit_version").to_pylist()

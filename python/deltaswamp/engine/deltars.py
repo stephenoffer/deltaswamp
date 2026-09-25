@@ -23,6 +23,7 @@ from decimal import Decimal
 from numbers import Integral
 from typing import Any, Literal
 
+from .._util import commit_backoff
 from ..capability import (
     FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
@@ -764,9 +765,28 @@ class DeltaRsEngine:
             # there next to the new ones. Committed on its own snapshot, the
             # overwrite conflicts instead (CommitConflictError).
             common["commit_properties"] = _commit_properties(commit_metadata, txn, 0)
+        replayable = hasattr(data, "to_reader") or type(data).__name__ == "RecordBatch"
         if txn is None:
-            with _no_panics(f"{mode} to the table"):
-                write_deltalake(table.location, data, mode=mode, **common, **extra)
+            # delta-rs's conflict checker fails a blind append that races a
+            # DELETE ("a concurrent transaction deleted data this operation
+            # read") and does not retry it -- but an append reads nothing, so
+            # it commutes with the delete. Nothing was committed (the new files
+            # are unreferenced), so writing it again cannot duplicate a row.
+            # A concurrent metadata change is left to Table.append, which lines
+            # the batch up with the new schema first.
+            blind = mode == "append" and schema_mode is None and replayable
+            retries = 15 if max_commit_retries is None else max(0, int(max_commit_retries))
+            attempts = 1 + retries if blind else 1
+            for attempt in range(attempts):
+                try:
+                    with _no_panics(f"{mode} to the table"):
+                        write_deltalake(table.location, data, mode=mode, **common, **extra)
+                except CommitConflictError as exc:
+                    if attempt + 1 >= attempts or "changed since last commit" in str(exc):
+                        raise
+                    commit_backoff(attempt)
+                    continue
+                return
             return
         # delta-rs's own commit retry does not look at transaction ids: a writer
         # that lost the race to one committing the same (app_id, version)
@@ -774,7 +794,6 @@ class DeltaRsEngine:
         # each attempt commits against the snapshot its txn check read, with
         # delta-rs retries off, and a lost race is re-checked here.
         retries = 15 if max_commit_retries is None else max(0, int(max_commit_retries))
-        replayable = hasattr(data, "to_reader") or type(data).__name__ == "RecordBatch"
         # Only an append is re-run: an overwrite re-run on a newer snapshot would
         # silently remove whatever the writer that beat it just committed.
         attempts = 1 + retries if replayable and mode == "append" else 1
@@ -796,6 +815,7 @@ class DeltaRsEngine:
             except CommitConflictError:
                 if attempt + 1 >= attempts:
                     raise
+                commit_backoff(attempt)
                 continue
             return
 

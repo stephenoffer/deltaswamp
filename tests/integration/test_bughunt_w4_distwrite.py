@@ -444,7 +444,8 @@ def test_commit_operation_is_never_blank_or_unknown(conn: Any) -> None:
     for bad in ("", "  ", 5):
         with pytest.raises(InvalidArgumentError, match="operation"):
             plan.commit([], operation=bad)
-    plan.commit([], operation=None)
+    # With data: committing no fragments is a no-op that writes no history.
+    plan.commit([plan.write(_rows())], operation=None)
     assert conn.open_table(loc).history()[0]["operation"] == "WRITE"
 
 

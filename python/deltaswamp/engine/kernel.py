@@ -17,7 +17,7 @@ from typing import Any
 
 from .. import predicate as sqlpred
 from .._sdk import PRODUCT, sdk_version
-from .._util import timestamp_ms
+from .._util import commit_backoff, timestamp_ms
 from ..capability import (
     FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
@@ -1032,6 +1032,9 @@ class KernelEngine:
                         # A concurrent commit that recorded this txn (or a later
                         # one) already wrote this batch: re-staging would append it twice.
                         raise
+                    # Re-staged on the next attempt's snapshot, so the batch is
+                    # conformed to whatever schema a concurrent commit left.
+                    commit_backoff(attempt)
                     continue
                 break
         self._maybe_checkpoint(table, version, snapshot)
@@ -1065,7 +1068,9 @@ class KernelEngine:
         return None if version is None else int(version)
 
     #: Re-stagings of a blind append that lost a commit race, by default.
-    append_commit_retries = 5
+    #: delta-rs's default: five, with no pause between them, left eight
+    #: threads appending at once with conflicts after every retry was spent.
+    append_commit_retries = 15
 
     def create(
         self,
@@ -2095,7 +2100,10 @@ class KernelEngine:
         result: bytes = snapshot.write_files(
             _as_record_batch_reader(data), uc=self._uc_commit_config(table, staging=True)
         )
-        return result
+        # Record the layout these files were written under, from the very
+        # snapshot that wrote them, so the commit can tell whether the table
+        # still has it.
+        return _stamp_fragment(result, _write_layout(snapshot))
 
     def commit_files(
         self,
@@ -2121,6 +2129,10 @@ class KernelEngine:
                 "the installed native extension cannot commit externally written files"
             )
         snapshot = self.snapshot(table, version=version, write=True)
+        # On the snapshot the commit is built on, like the txn check below: a
+        # schema change that lands after it makes the commit conflict, and the
+        # retry checks again.
+        _refuse_changed_layout(snapshot, fragments)
         if txn is not None and hasattr(snapshot, "app_id_version"):
             # Checked on the very snapshot the commit is built on: a writer
             # that records the txn after this makes the commit conflict, and
@@ -2186,6 +2198,150 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
         return _planned_read(snapshot, columns, predicate, files=paths)
+
+
+#: Fragment schema-metadata key: the table layout its files were written
+#: under, as JSON. Added here, beside the native table-identity keys.
+_FRAGMENT_LAYOUT = "deltaswamp.write_layout"
+
+
+def _write_layout(snapshot: Any) -> str | None:
+    """What a data file written on `snapshot` depends on, as canonical JSON.
+
+    The schema (with column-mapping ids and physical names), the partition
+    columns and the configuration that governs how files are written and
+    read. A column comment and an identity column's high-water mark change on
+    their own and do not affect a single file, so they are left out -- as is
+    every other property, so an unrelated SET TBLPROPERTIES does not fail a
+    job. None when the binding cannot report the metadata.
+    """
+    try:
+        metadata = json.loads(snapshot.metadata_json())
+        schema = json.loads(metadata.get("schemaString") or "{}")
+    except Exception:
+        return None
+
+    def strip(node: Any) -> Any:
+        if isinstance(node, dict):
+            out = {k: strip(v) for k, v in node.items()}
+            field_meta = out.get("metadata")
+            if isinstance(field_meta, dict):
+                out["metadata"] = {
+                    k: v
+                    for k, v in field_meta.items()
+                    if k not in ("comment", "delta.identity.highWaterMark")
+                }
+            return out
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        return node
+
+    configuration = metadata.get("configuration") or {}
+    kept = {
+        k: v
+        for k, v in configuration.items()
+        if k == "delta.columnMapping.mode" or k.startswith("delta.constraints.")
+    }
+    return json.dumps(
+        {
+            "fields": strip(schema).get("fields") or [],
+            "partitionColumns": list(metadata.get("partitionColumns") or []),
+            "configuration": kept,
+        },
+        sort_keys=True,
+    )
+
+
+def _layout_still_fits(written: str, current: str) -> bool:
+    """Whether files written under layout `written` are valid in `current`.
+
+    The same layout, or one that only added nullable top-level columns: a
+    file without a column reads it as null, which is what Delta does for
+    every file written before an ADD COLUMN. A generated or identity column
+    is not a plain null, so adding one counts as a change.
+    """
+    if written == current:
+        return True
+    try:
+        old, new = json.loads(written), json.loads(current)
+    except ValueError:
+        return False
+    if (old["partitionColumns"], old["configuration"]) != (
+        new["partitionColumns"],
+        new["configuration"],
+    ):
+        return False
+    before, after = old["fields"], new["fields"]
+    if after[: len(before)] != before:
+        return False
+    for field in after[len(before) :]:
+        extra = field.get("metadata") or {}
+        if not field.get("nullable", True) or any(
+            k.startswith(("delta.generationExpression", "delta.identity")) for k in extra
+        ):
+            return False
+    return True
+
+
+def _stamp_fragment(fragment: bytes, layout: str | None) -> bytes:
+    """`fragment` with `layout` added to its schema metadata."""
+    if not fragment or layout is None:
+        return fragment  # no files, or nothing to record
+    import pyarrow as pa
+
+    reader = pa.ipc.open_stream(fragment)
+    schema = reader.schema.with_metadata(
+        {**(reader.schema.metadata or {}), _FRAGMENT_LAYOUT.encode(): layout.encode()}
+    )
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, schema) as writer:
+        for batch in reader:
+            writer.write_batch(pa.RecordBatch.from_arrays(batch.columns, schema=schema))
+    return bytes(sink.getvalue().to_pybytes())
+
+
+def _refuse_changed_layout(snapshot: Any, fragments: list[bytes]) -> None:
+    """Refuse fragments written under a layout `snapshot` no longer has.
+
+    A commit rebases onto the latest snapshot, which is right for an append --
+    but not across a concurrent metaData action. Files written with the old
+    types made the whole table unreadable (Expected Utf8, got Int64), and on a
+    column-mapping table a dropped and re-added column's values were silently
+    read as null: the files carry the old physical name. Spark conflicts here
+    (MetadataChangedException). Adding a nullable column is the one change
+    let through: the files simply lack it, as every older file does. A
+    fragment from a release that did not stamp its layout cannot be checked,
+    and commits as before.
+    """
+    from ..errors import MetadataChangedError
+
+    current: str | None = None
+    for fragment in fragments:
+        if not fragment:
+            continue
+        try:
+            import pyarrow as pa
+
+            metadata = pa.ipc.open_stream(fragment).schema.metadata or {}
+        except Exception:
+            continue  # the binding names a malformed fragment itself
+        written = metadata.get(_FRAGMENT_LAYOUT.encode())
+        if written is None:
+            continue
+        if current is None:
+            current = _write_layout(snapshot)
+            if current is None:
+                return
+        if not _layout_still_fits(written.decode(), current):
+            raise MetadataChangedError(
+                int(snapshot.version),
+                "the table's schema, partitioning or column mapping changed after these "
+                f"fragments were written (it is at version {snapshot.version} now), so "
+                "their files no longer match it: committing them would leave the table "
+                "unreadable or put values in the wrong columns. Re-plan the write and "
+                "write the data again; the old fragments' files are unreferenced and "
+                "VACUUM removes them",
+            )
 
 
 def _rewrite_unsized_files(
