@@ -110,5 +110,13 @@ class BackfillRequiredError(DeltaSwampError):
     """
 
 
+class TransientCommitError(DeltaSwampError):
+    """A commit failed for a transient reason; the table is unchanged.
+
+    Distinct from a conflict: nobody else won the version, so the very same
+    transaction can simply be tried again.
+    """
+
+
 class CorruptTableError(DeltaSwampError):
     """On-disk state failed a correctness check (e.g. DV cardinality mismatch)."""

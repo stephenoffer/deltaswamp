@@ -176,12 +176,12 @@ class DeltaRsEngine:
 
         # Reader features gate everything; writer features gate only writes.
         blockers: list[str] = []
-        for name in table.reader_features:
+        for name in table.effective_reader_features:
             feature = feature_from_wire(name)
             if feature is None or FEATURE_SUPPORT[feature].deltars_read is Support.NO:
                 blockers.append(name)
         if writing:
-            for name in table.writer_features:
+            for name in table.effective_writer_features:
                 feature = feature_from_wire(name)
                 if feature is None or FEATURE_SUPPORT[feature].deltars_write is Support.NO:
                     blockers.append(name)
@@ -822,18 +822,7 @@ class DeltaRsEngine:
     # ---------------------------------------------------------------- schema
 
     def add_columns(self, table: ResolvedTable, fields: Any, **kwargs: Any) -> None:
-        from deltalake import Field
-
-        # delta-rs takes only its own Field; an Arrow field or schema (what
-        # Table.add_column documents) failed with "'Field' is not a 'Field'".
-        if isinstance(fields, (list, tuple)):
-            items = list(fields)
-        elif not isinstance(fields, Field) and type(fields).__name__ == "Schema":
-            # pyarrow's Schema iterates fields; delta-rs's exposes `.fields`.
-            items = list(getattr(fields, "fields", None) or fields)
-        else:
-            items = [fields]
-        converted = [f if isinstance(f, Field) else Field.from_arrow(f) for f in items]
+        converted = _deltars_fields(fields)
         required = [f.name for f in converted if not f.nullable]
         if required:
             # delta-rs accepts this, and every existing file then lacks a
@@ -1440,3 +1429,43 @@ def _duration_days(value: str) -> float | None:
     if number is not None or not seen:
         return None
     return total
+
+
+def _deltars_fields(fields: Any) -> list[Any]:
+    """Normalise column definitions into the `deltalake.Field`s delta-rs wants.
+
+    The kernel path accepts pyarrow fields, delta-rs fields or a
+    ``{name: type}`` mapping; delta-rs accepts only its own `Field`. Passing
+    them straight through made `add_column` succeed or fail on the same
+    argument depending on which engine the router happened to pick, which is
+    exactly the kind of difference a caller cannot see.
+    """
+    from deltalake import Field, Schema
+
+    if isinstance(fields, dict):
+        return [
+            Field.from_json(
+                json.dumps({"name": name, "type": str(dtype), "nullable": True, "metadata": {}})
+            )
+            for name, dtype in fields.items()
+        ]
+
+    items = (
+        list(fields) if isinstance(fields, (list, tuple)) or hasattr(fields, "names") else [fields]
+    )
+    out: list[Any] = []
+    for item in items:
+        if isinstance(item, Field):
+            out.append(item)
+        elif hasattr(item, "type") and hasattr(item, "nullable"):
+            # A pyarrow Field: a one-field Arrow schema converts cleanly.
+            import pyarrow as pa
+
+            out.append(Schema.from_arrow(pa.schema([item])).fields[0])
+        else:
+            raise UnreachableTableError(
+                "add columns",
+                f"cannot interpret {type(item).__name__} as a column definition",
+                "pass pyarrow fields, deltalake Fields, or a {name: type} mapping",
+            )
+    return out

@@ -91,6 +91,110 @@ Databricks and the rest of the Delta ecosystem that drove this.
 - **Hand-offs**: `to_duckdb`, `to_polars(lazy=True)`, `to_ray_dataset`,
   `to_daft`, and `Connection.sql` for cross-catalog SQL on DuckDB or Polars.
 
+### Added for distributed connectors
+
+- **Distributed writes.** `Table.plan_write()` returns a picklable `WritePlan`;
+  workers call `plan.write(batch)` to produce data files and an opaque
+  fragment, and the driver calls `plan.commit(fragments)` to land every
+  fragment in one transaction at a single version. Catalog-managed tables are
+  included, so this reaches tables nothing else in Python can write. New native
+  primitives `Snapshot.write_files` / `Snapshot.commit_files` carry the
+  add-action metadata as Arrow IPC, which keeps kernel's own schema byte-exact
+  instead of re-deriving one that would drift.
+- Concurrency on a distributed commit follows the mode: an append lands on top
+  of a writer that arrived while the job ran, while an overwrite against a table
+  that has since moved is refused rather than silently discarding it, with
+  `allow_concurrent_overwrite=True` to ask for last-writer-wins. `retries=`
+  rebases a rejected commit, and a catalog-managed table says to re-open rather
+  than spinning against the commit tail it captured at resolution.
+- The refusal now happens on the driver, before any worker runs. The usual way
+  a distributed Delta write fails is to discover at commit time that the table
+  rejects it, after the compute is spent, leaving orphaned Parquet; `plan_write`
+  raises there and then with the reason.
+- **Legacy protocol versions are expanded to the features they imply.** Below
+  reader 3 / writer 7 a protocol lists no features -- the version number is the
+  feature set. Reading only the named list made such a table look featureless,
+  so an engine accepted a write it could not perform and failed at commit. A
+  `(2, 5)` table now correctly reports `checkConstraints` and is refused up
+  front. `ResolvedTable.effective_reader_features` /
+  `effective_writer_features` expose the merged view, and both engines use them.
+
+### Found while auditing: what a distributed write can actually serve
+
+- A distributed write is ruled in or out by the table's protocol **version**,
+  not by the feature anyone is thinking about. Writer version 3 and above imply
+  `checkConstraints`, which the kernel refuses whether or not a constraint
+  exists, and enabling change data feed alone reaches version 4. The same
+  features write fine at version 7, where only what the protocol names applies.
+  `docs/usage.md` now states this, and a parametrised test pins both sides.
+- A refusal now says when a blocking feature is merely implied by the version
+  and the table neither names nor uses it, so the owner of a change-data-feed
+  table is not sent looking for constraints they never wrote. It names only the
+  features genuinely unused, so a table that does have one is not told it does
+  not.
+- Verified that a distributed write is portable: delta-rs reads back exactly
+  what was written, for every table it can open at all. The three it refuses
+  (deletion vectors, column mapping, type widening) it refused before the write
+  too -- those are the tables this library exists to serve.
+
+### Fixed: enforcement the kernel path could have skipped
+
+Two features delta-rs evaluates itself, where letting the kernel take the write
+would not raise an error -- it would write data that breaks the table's own
+rules, which is worse.
+
+- **CHECK constraints on a legacy-protocol table.** Such a table names no
+  features at all: `minWriterVersion` 3 is the only evidence it has them.
+  Reading the named list alone made it look featureless, so the kernel accepted
+  the write and the constraint was never evaluated. The legacy expansion added
+  in this release is what closes it, and a test now pins the whole chain: the
+  named set is empty, `checkConstraints` is implied, writes route to delta-rs,
+  and violating rows are rejected.
+- **Features behind a kernel cargo flag this build does not enable.**
+  `adaptiveMetadata-preview` and `geospatial` were recorded as partially
+  supported, which is what kernel can do behind `adaptive-metadata-in-dev` and
+  `geo-type-in-dev` -- flags `crates/native/Cargo.toml` deliberately leaves off.
+  Partial is not `no`, so they passed the write check and failed at commit. The
+  matrix now records what *this binary* can do, and both are refused up front.
+- **Overwriting a row-tracked table.** A kernel overwrite removes every visible
+  file in the same commit, and kernel 0.28 refuses a commit that stages removes
+  on a row-tracked table because it cannot preserve the ids of what it removes.
+  The guard existed but only covered the rewrite operations, so `overwrite`
+  passed preflight and failed at commit -- after the data files were written,
+  which in a distributed job means every worker had already done its work. Row
+  tracking is now checked for every remove-staging operation. Appends are
+  unaffected: they stage no removes and the kernel assigns fresh ids.
+- **Tables that really carry a Delta invariant.** `invariants` is Supported in
+  name only: the kernel refuses any write once a column has one, and it refuses
+  *after* writing the data files -- so in a distributed job every worker does
+  its work before anything says no. Routing on the feature name is far too
+  blunt, since writer version 2 implies it for nearly every legacy table, so
+  `ResolvedTable.has_invariants` now records whether the schema actually uses
+  one and the kernel declines those writes up front. Reads are untouched.
+
+### Fixed by adversarial review of the distributed-write surface
+
+- **A fragment could be committed to the wrong table, corrupting it silently.**
+  A fragment names its data files relative to the table they were written
+  under, so committing one into another table wrote an add action pointing at a
+  file that is not there: the commit *succeeded* and the table was unreadable
+  from then on, with nothing in the log to say which write broke it. Fragments
+  now carry the table root and metadata id in their Arrow schema metadata, and
+  the commit refuses a mismatch. This also catches the subtler case of a table
+  dropped and re-created at the same path while a job was in flight.
+- **Commit failures reached callers as plain `RuntimeError`s from the
+  extension**, not as the `CommitConflictError` / `BackfillRequiredError` that
+  `errors.py` defines. `except DeltaSwampError` around a commit therefore
+  caught nothing, which is exactly the case those types exist for -- and the
+  429-means-publish distinction, carefully recovered in Rust, was lost before
+  it reached anyone. Every kernel commit path now translates, and a transient
+  failure raises the new `TransientCommitError`.
+- **`add_column` had a different input contract per engine.** It took pyarrow
+  fields on the kernel path and only `deltalake.Field`s on the delta-rs path,
+  so the identical call worked or raised depending on which engine the router
+  picked -- a difference a caller cannot see. Both now accept pyarrow fields and
+  schemas, delta-rs fields, or a `{name: type}` mapping.
+
 ### Fixed
 
 - Catalog-managed appends never reached the catalog: the UC commit ran outside

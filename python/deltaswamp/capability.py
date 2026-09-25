@@ -22,6 +22,8 @@ __all__ = [
     "FEATURE_SIGNAL_PREFIX",
     "FEATURE_SUPPORT",
     "KERNEL_CREATE_FEATURES",
+    "LEGACY_READER_FEATURES",
+    "LEGACY_WRITER_FEATURES",
     "METADATA_OPERATIONS",
     "PROPERTY_SUPPORT",
     "Capability",
@@ -34,6 +36,7 @@ __all__ = [
     "Support",
     "TableFeature",
     "feature_from_wire",
+    "implied_features",
     "property_support",
 ]
 
@@ -170,6 +173,78 @@ class TableFeature(StrEnum):
     CHECKPOINT_PROTECTION = "checkpointProtection"
     # delta-rs-only, non-standard extension.
     TIMESTAMP_NANOS = "timestampNanos"
+
+
+#: Reader features a legacy `minReaderVersion` implies, cumulatively.
+#:
+#: Before version 3 a protocol has no `readerFeatures` list at all: the version
+#: number alone says what the table uses. A connector that only reads the named
+#: list sees an empty set and concludes the table is plain, which is how an
+#: engine ends up accepting a write it cannot perform.
+LEGACY_READER_FEATURES: dict[int, frozenset[TableFeature]] = {
+    1: frozenset(),
+    2: frozenset({TableFeature.COLUMN_MAPPING}),
+}
+
+#: Writer features a legacy `minWriterVersion` implies, cumulatively.
+LEGACY_WRITER_FEATURES: dict[int, frozenset[TableFeature]] = {
+    1: frozenset(),
+    2: frozenset({TableFeature.APPEND_ONLY, TableFeature.INVARIANTS}),
+    3: frozenset(
+        {TableFeature.APPEND_ONLY, TableFeature.INVARIANTS, TableFeature.CHECK_CONSTRAINTS}
+    ),
+    4: frozenset(
+        {
+            TableFeature.APPEND_ONLY,
+            TableFeature.INVARIANTS,
+            TableFeature.CHECK_CONSTRAINTS,
+            TableFeature.CHANGE_DATA_FEED,
+            TableFeature.GENERATED_COLUMNS,
+        }
+    ),
+    5: frozenset(
+        {
+            TableFeature.APPEND_ONLY,
+            TableFeature.INVARIANTS,
+            TableFeature.CHECK_CONSTRAINTS,
+            TableFeature.CHANGE_DATA_FEED,
+            TableFeature.GENERATED_COLUMNS,
+            TableFeature.COLUMN_MAPPING,
+        }
+    ),
+    6: frozenset(
+        {
+            TableFeature.APPEND_ONLY,
+            TableFeature.INVARIANTS,
+            TableFeature.CHECK_CONSTRAINTS,
+            TableFeature.CHANGE_DATA_FEED,
+            TableFeature.GENERATED_COLUMNS,
+            TableFeature.COLUMN_MAPPING,
+            TableFeature.IDENTITY_COLUMNS,
+        }
+    ),
+}
+
+
+def implied_features(
+    min_reader: int | None, min_writer: int | None
+) -> tuple[frozenset[str], frozenset[str]]:
+    """The (reader, writer) features a legacy protocol version implies.
+
+    Reader version 3 and writer version 7 are the feature-based protocols,
+    where the named lists are authoritative and nothing is implied. Below
+    those, the version number *is* the feature list.
+
+    An unrecognised version is taken as the highest one we model rather than as
+    "nothing": a table from a newer writer should not read as featureless.
+    """
+    readers: frozenset[TableFeature] = frozenset()
+    if min_reader is not None and min_reader < 3:
+        readers = LEGACY_READER_FEATURES.get(min_reader, LEGACY_READER_FEATURES[2])
+    writers: frozenset[TableFeature] = frozenset()
+    if min_writer is not None and min_writer < 7:
+        writers = LEGACY_WRITER_FEATURES.get(min_writer, LEGACY_WRITER_FEATURES[6])
+    return frozenset(f.value for f in readers), frozenset(f.value for f in writers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,9 +453,11 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
         _row(TableFeature.VARIANT_TYPE_PREVIEW, _RW, _Y, _Y, _Y, _Y),
         _row(TableFeature.VARIANT_SHREDDING, _RW, _Y, _Y, _N, _N),
         _row(TableFeature.VARIANT_SHREDDING_PREVIEW, _RW, _Y, _Y, _N, _N),
-        # Both rows are NO, not PARTIAL: the native crate does not enable the
-        # dev-only cargo features, so the compiled kernel reports these
-        # NotSupported and, being ReaderWriter, refuses to even scan them.
+        # Both sit behind a kernel cargo feature this build deliberately does not
+        # enable (see crates/native/Cargo.toml), so for *this* binary they are
+        # unsupported in both directions. Recording what kernel could do behind
+        # a flag we do not compile made these pass the write check and fail at
+        # commit instead -- after the data was written.
         _row(
             TableFeature.ADAPTIVE_METADATA_PREVIEW,
             _RW,
@@ -388,8 +465,8 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             _N,
             _N,
-            "kernel supports this only behind the adaptive-metadata-in-dev cargo "
-            "feature, which this build does not enable",
+            "kernel gates this behind the adaptive-metadata-in-dev cargo feature, which "
+            "this build does not enable; not production-ready",
         ),
         _row(
             TableFeature.GEOSPATIAL,
@@ -398,8 +475,9 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             _N,
             _N,
-            "kernel reads it only behind the geo-type-in-dev cargo feature, which this "
-            "build does not enable. One feature covers both geometry and geography.",
+            "kernel gates reads behind geo-type-in-dev, which this build does not "
+            "enable, and errors on writes regardless. One feature covers both "
+            "geometry and geography.",
         ),
         # --- no kernel variant at all
         _row(

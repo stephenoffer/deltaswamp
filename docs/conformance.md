@@ -61,6 +61,7 @@ deduplicates, and save modes come from `Connection.write_table`.
 | save modes | `conn.write_table(name, data, mode=...)` | both | `error`, `ignore`, `append`, `overwrite` |
 | idempotent write | `t.append(data, txn=(app_id, version))` | enforced here | neither engine deduplicates; verified against delta-rs 1.6.5 |
 | commit metadata | `t.append(data, commit_metadata={...})` | delta-rs | shows up in `history()` |
+| distributed write | `t.plan_write()` / `plan.write()` / `plan.commit()` | kernel | workers write files, the driver commits them as one version; refused at plan time, before any file is written |
 | DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | delta-rs, sql, kernel | copy-on-write on delta-rs; the kernel rewrites the whole table (bounded) for tables only it can write; MERGE on those needs the warehouse |
 
 ## Where every operation routes

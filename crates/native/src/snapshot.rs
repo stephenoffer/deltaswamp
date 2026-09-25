@@ -543,6 +543,69 @@ impl PySnapshot {
         Ok(version)
     }
 
+    /// Write data files without committing; returns opaque fragment bytes.
+    ///
+    /// The worker half of a distributed write. The files are durable when this
+    /// returns, but nothing is in the log until `commit_files` runs, so a
+    /// coordinator that gives up leaves them as garbage. Decide whether the
+    /// commit can succeed *before* the first worker runs -- that is what
+    /// `Table.can(...)` is for.
+    #[pyo3(signature = (data, uc = None))]
+    fn write_files(
+        &self,
+        py: Python<'_>,
+        data: PyRecordBatchReader,
+        uc: Option<UcCommitConfig>,
+    ) -> PyResult<Vec<u8>> {
+        let reader = data.into_reader()?;
+        let batches: std::result::Result<Vec<_>, _> = reader.collect();
+        let batches = batches.map_err(NativeError::from)?;
+        let bytes = py
+            .detach(|| commit::write_files(self.inner.clone(), self.engine.clone(), batches, uc))?;
+        Ok(bytes)
+    }
+
+    /// Commit fragments produced by `write_files`, wherever they were written.
+    ///
+    /// Every fragment lands in one transaction, so a distributed write appears
+    /// at a single version and a reader never sees half a job.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        fragments,
+        uc = None,
+        engine_info = None,
+        operation = None,
+        overwrite = false,
+        txn = None,
+        commit_metadata = None,
+    ))]
+    fn commit_files(
+        &self,
+        py: Python<'_>,
+        fragments: Vec<Vec<u8>>,
+        uc: Option<UcCommitConfig>,
+        engine_info: Option<String>,
+        operation: Option<String>,
+        overwrite: bool,
+        txn: Option<(String, i64)>,
+        commit_metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<u64> {
+        let version = py.detach(|| {
+            commit::commit_files(
+                self.inner.clone(),
+                self.engine.clone(),
+                fragments,
+                uc,
+                engine_info,
+                operation,
+                overwrite,
+                txn,
+                commit_metadata,
+            )
+        })?;
+        Ok(version)
+    }
+
     /// Publish ratified-but-unpublished commits into `_delta_log/`.
     ///
     /// Not optional housekeeping on a catalog-managed table: the catalog caps how

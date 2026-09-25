@@ -9,6 +9,9 @@ it is a ReaderWriter feature, anything carrying `vacuumProtocolCheck`.
 
 from __future__ import annotations
 
+import contextlib
+import json
+from collections.abc import Iterator
 from typing import Any
 
 from ..capability import (
@@ -25,7 +28,12 @@ from ..capability import (
 )
 from ..catalog import ResolvedTable
 from ..credentials import Operation as CredentialOperation
-from ..errors import UnreachableTableError
+from ..errors import (
+    BackfillRequiredError,
+    CommitConflictError,
+    TransientCommitError,
+    UnreachableTableError,
+)
 from ..properties import effect_for
 from .base import missing_method
 
@@ -78,6 +86,29 @@ _WRITE_OPS: frozenset[Operation] = frozenset(
 _REWRITE_OPS: frozenset[Operation] = frozenset(
     {Operation.REPLACE_WHERE, Operation.DELETE, Operation.UPDATE}
 )
+
+#: Operations whose commit stages remove actions. Kernel 0.28 refuses those on
+#: a row-tracked table: it cannot preserve the row ids of what it removes, and
+#: it refuses at commit -- after the data files are already written.
+_REMOVE_OPS: frozenset[Operation] = _REWRITE_OPS | {Operation.OVERWRITE}
+
+#: Features that block a write only when the table really uses them.
+#:
+#: Just one qualifies, and the distinction is the kernel's, not ours. Writer
+#: version 2 implies `invariants` for nearly every legacy table and the kernel
+#: writes those happily: it inspects the schema and fails only where one really
+#: exists. `checkConstraints` is the opposite -- the kernel refuses any table
+#: whose protocol carries it, used or not, so a table at writer version 3 or
+#: above cannot take a kernel write at all even with no constraint defined.
+#: Verified rather than assumed: a version 4 change-data-feed table with no
+#: constraints is still refused by the kernel, so gating that one on usage
+#: would put the refusal back after the data was written.
+_USAGE_GATED: dict[TableFeature, tuple[str, str]] = {
+    TableFeature.INVARIANTS: (
+        "has_invariants",
+        "a column of this table carries a Delta invariant, which the kernel cannot evaluate",
+    ),
+}
 
 _IMPLEMENTED: frozenset[Operation] = frozenset(
     {
@@ -144,6 +175,11 @@ class KernelEngine:
         """Workers can each read a planned subset of a snapshot's files."""
         return _native_has("file_restricted_scan", "files")
 
+    @property
+    def supports_distributed_write(self) -> bool:
+        """Workers can write data files that a coordinator commits together."""
+        return _native_has("distributed_write")
+
     #: SQL predicates are parsed here: the kernel skips files with the
     #: structured form, and the exact row filter is applied afterwards.
     supports_predicates = True
@@ -208,7 +244,7 @@ class KernelEngine:
         # Writer-only features never block a read; only reader and
         # reader-writer features can. This asymmetry is the whole point.
         blockers: list[str] = []
-        for name in table.reader_features:
+        for name in table.effective_reader_features:
             feature = feature_from_wire(name)
             if feature is None:
                 blockers.append(f"{name} (unrecognised reader feature)")
@@ -230,6 +266,20 @@ class KernelEngine:
             if refusal is not None:
                 return refusal
 
+        if operation in _REMOVE_OPS and "rowTracking" in table.effective_writer_features:
+            # Checked for every remove-staging operation, not just the rewrites:
+            # a kernel overwrite removes every visible file in the same commit,
+            # and the commit is refused after the data is written.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table tracks row ids, and this commit would remove rows whose "
+                    "ids delta-kernel 0.28 cannot preserve"
+                ),
+                remedy="ds.connect(..., allow_sql_fallback=True)",
+            )
+
         if operation in _REWRITE_OPS:
             refusal = self._rewrite_refusal(operation, table)
             if refusal is not None:
@@ -237,8 +287,9 @@ class KernelEngine:
 
         if operation in _WRITE_OPS or operation in METADATA_OPERATIONS:
             write_blockers: list[str] = []
+            usage_blockers: list[str] = []
             metadata_only = operation in METADATA_OPERATIONS
-            for name in table.writer_features:
+            for name in table.effective_writer_features:
                 feature = feature_from_wire(name)
                 if feature is None:
                     write_blockers.append(f"{name} (unrecognized writer feature)")
@@ -261,6 +312,10 @@ class KernelEngine:
                     )
                     if feature in _METADATA_BLOCKERS or unmodelled:
                         write_blockers.append(name)
+                elif feature in _USAGE_GATED:
+                    flag, why = _USAGE_GATED[feature]
+                    if getattr(table, flag, False):
+                        usage_blockers.append(why)
                 elif FEATURE_SUPPORT[feature].kernel_write is Support.NO:
                     write_blockers.append(name)
             if write_blockers:
@@ -270,7 +325,19 @@ class KernelEngine:
                     reason=(
                         "the kernel cannot write these table features: "
                         + ", ".join(sorted(write_blockers))
+                        + self._implied_only_note(table, write_blockers)
                     ),
+                    remedy="write through delta-rs, which serves this table",
+                )
+            if usage_blockers and not metadata_only:
+                # These refuse at commit, after the data files are written, or
+                # worse write data the feature should have checked. delta-rs
+                # evaluates them, so it serves these tables.
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason="; ".join(sorted(usage_blockers)),
+                    remedy="write through delta-rs, which evaluates these",
                 )
             if operation in _WRITE_OPS and operation is not Operation.CREATE:
                 refusal = self._data_write_refusal(operation, table)
@@ -565,6 +632,7 @@ class KernelEngine:
             "properties": snap.table_properties(),
             "partition_columns": list(snap.partition_columns),
             "metadata_id": snap.metadata_id,
+            **_feature_usage(snap),
         }
 
     # ------------------------------------------------------------------ write
@@ -645,26 +713,28 @@ class KernelEngine:
         replayable = hasattr(data, "to_reader") and not overwrite and not table.is_catalog_managed
         attempts = 1 + max(0, self.append_commit_retries if retries is None else int(retries))
         attempts = attempts if replayable else 1
-        for attempt in range(attempts):
-            reader = _as_record_batch_reader(data)
-            snapshot = self.snapshot(table, write=True)
-            try:
-                version: int = snapshot.append(
-                    reader,
-                    uc=self._uc_commit_config(table),
-                    engine_info=engine_info or f"deltaswamp/{_version()}",
-                    operation=operation,
-                    overwrite=overwrite,
-                    txn=txn,
-                    commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-                )
-            except _native.CommitConflictError:
-                if attempt + 1 >= attempts or self._txn_won_race(snapshot, table, txn):
-                    # A concurrent commit that recorded this txn (or a later
-                    # one) already wrote this batch: re-staging would append it twice.
-                    raise
-                continue
-            break
+        with _library_commit_errors():
+            for attempt in range(attempts):
+                reader = _as_record_batch_reader(data)
+                snapshot = self.snapshot(table, write=True)
+                try:
+                    version: int = snapshot.append(
+                        reader,
+                        uc=self._uc_commit_config(table),
+                        engine_info=engine_info or f"deltaswamp/{_version()}",
+                        operation=operation,
+                        overwrite=overwrite,
+                        txn=txn,
+                        commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
+                        or None,
+                    )
+                except _native.CommitConflictError:
+                    if attempt + 1 >= attempts or self._txn_won_race(snapshot, table, txn):
+                        # A concurrent commit that recorded this txn (or a later
+                        # one) already wrote this batch: re-staging would append it twice.
+                        raise
+                    continue
+                break
         self._maybe_checkpoint(table, version, snapshot)
         return version
 
@@ -861,14 +931,11 @@ class KernelEngine:
     rewrite_max_bytes = 1 << 30
 
     def _rewrite_refusal(self, operation: Operation, table: ResolvedTable) -> Capability | None:
-        """Whether a whole-table rewrite may serve DELETE/UPDATE/replaceWhere."""
-        if "rowTracking" in table.writer_features:
-            return Capability(
-                operation,
-                ok=False,
-                reason="the table tracks row ids, and a rewrite through the kernel would have "
-                "to preserve them, which delta-kernel 0.28 cannot do",
-            )
+        """Whether a whole-table rewrite may serve DELETE/UPDATE/replaceWhere.
+
+        Row tracking is handled before this, since it rules out every commit
+        that stages a remove, not only the rewrites.
+        """
         if table.location is None:
             return None
         try:
@@ -996,15 +1063,16 @@ class KernelEngine:
         touched = int(pc.sum(matched).as_py() or 0)
         if touched == 0 and replacement.num_rows == current.num_rows:
             return {"version": int(snapshot.version), "num_affected_rows": 0}
-        version = snapshot.append(
-            replacement.to_reader(),
-            uc=self._uc_commit_config(table),
-            engine_info=engine_info or f"deltaswamp/{_version()}",
-            operation=operation,
-            overwrite=True,
-            txn=txn,
-            commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-        )
+        with _library_commit_errors():
+            version = snapshot.append(
+                replacement.to_reader(),
+                uc=self._uc_commit_config(table),
+                engine_info=engine_info or f"deltaswamp/{_version()}",
+                operation=operation,
+                overwrite=True,
+                txn=txn,
+                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+            )
         self._maybe_checkpoint(table, version, snapshot)
         return {"version": int(version), "num_affected_rows": touched}
 
@@ -1084,10 +1152,42 @@ class KernelEngine:
     def publish(self, table: ResolvedTable) -> int:
         """Publish ratified-but-unpublished commits into the Delta log."""
         snapshot = self.snapshot(table, write=True)
-        version: int = snapshot.publish(uc=self._uc_commit_config(table))
+        with _library_commit_errors():
+            version: int = snapshot.publish(uc=self._uc_commit_config(table))
         return version
 
     # ---------------------------------------------------- metadata-only DDL
+
+    @staticmethod
+    def _implied_only_note(table: ResolvedTable, blockers: list[str]) -> str:
+        """Explain any blocker the table never named and does not actually use.
+
+        A legacy writer version implies a whole set of features. Version 4 is
+        reached by enabling change data feed alone, and it implies
+        `checkConstraints`, which the kernel refuses whether or not a single
+        constraint exists. Reporting only the feature name leaves the owner of a
+        CDF table with no constraints hunting for constraints they never wrote.
+
+        Only the features that are genuinely implied *and* unused are named, so
+        a table that really does have a constraint is not told otherwise.
+        """
+        in_use = {
+            "checkConstraints": table.has_check_constraints,
+            "generatedColumns": table.has_generated_columns,
+            "invariants": table.has_invariants,
+        }
+        implied_only = sorted(
+            name for name in set(blockers) - set(table.writer_features) if in_use.get(name) is False
+        )
+        if not implied_only:
+            return ""
+        which = ", ".join(implied_only)
+        it = "them" if len(implied_only) > 1 else "it"
+        return (
+            f". The table neither names nor uses {which}: writer version "
+            f"{table.min_writer_version} implies {it}, and the kernel refuses the table "
+            "on that alone"
+        )
 
     def _metadata_refusal(self, operation: Operation, table: ResolvedTable) -> Capability | None:
         """Refusals specific to the commits this engine writes itself."""
@@ -1395,6 +1495,58 @@ class KernelEngine:
             )
         return splits
 
+    def write_files(self, table: ResolvedTable, data: Any) -> bytes:
+        """Write data files for `table` without committing them.
+
+        Returns opaque fragment bytes describing what was written. The files
+        exist and are durable once this returns; they belong to no version
+        until `commit_files` accepts them, so a coordinator that abandons the
+        write leaves them behind.
+        """
+        if not self.supports_distributed_write:
+            raise NotImplementedError(
+                "the installed native extension cannot write files without committing"
+            )
+        snapshot = self.snapshot(table, write=True)
+        result: bytes = snapshot.write_files(
+            _as_record_batch_reader(data), uc=self._uc_commit_config(table)
+        )
+        return result
+
+    def commit_files(
+        self,
+        table: ResolvedTable,
+        fragments: list[bytes],
+        *,
+        overwrite: bool = False,
+        engine_info: str | None = None,
+        operation: str = "WRITE",
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Commit fragments from `write_files` as one transaction.
+
+        Every fragment lands at a single version, so a distributed write is
+        atomic: a reader sees all of it or none of it.
+        """
+        if not self.supports_distributed_write:
+            raise NotImplementedError(
+                "the installed native extension cannot commit externally written files"
+            )
+        snapshot = self.snapshot(table, write=True)
+        with _library_commit_errors():
+            version: int = snapshot.commit_files(
+                list(fragments),
+                uc=self._uc_commit_config(table),
+                engine_info=engine_info or f"deltaswamp/{_version()}",
+                operation=operation,
+                overwrite=overwrite,
+                txn=txn,
+                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+            )
+        self._maybe_checkpoint(table, version)
+        return version
+
     def execute_scan(
         self,
         table: ResolvedTable,
@@ -1547,6 +1699,95 @@ def _planned_read(
     if node is not None:
         stream = sqlpred.filter_stream(stream, node)
     return stream if keep is None else _project(stream, keep)
+
+
+@contextlib.contextmanager
+def _library_commit_errors() -> Iterator[None]:
+    """Raise this library's error types instead of the extension's.
+
+    `errors.py` defines `CommitConflictError` and `BackfillRequiredError` so a
+    caller can catch `DeltaSwampError` and tell a lost race from backpressure.
+    The native ones are plain `RuntimeError`s, and they were reaching callers
+    untranslated -- so `except DeltaSwampError` around a commit caught nothing,
+    which is precisely the case it exists for.
+    """
+    from deltaswamp import _native
+
+    try:
+        yield
+    except _native.BackfillRequiredError as exc:
+        raise BackfillRequiredError(str(exc)) from exc
+    except _native.CommitConflictError as exc:
+        raise CommitConflictError(_conflict_version(str(exc)), str(exc)) from exc
+    except _native.RetryableError as exc:
+        raise TransientCommitError(str(exc)) from exc
+
+
+def _conflict_version(message: str) -> int:
+    """The version someone else won, if the message names one; -1 otherwise."""
+    import re
+
+    found = re.search(r"version (\d+)", message)
+    return int(found.group(1)) if found else -1
+
+
+def _feature_usage(snapshot: Any) -> dict[str, bool]:
+    """Which version-implied features the table actually uses.
+
+    A legacy writer version implies a whole set whether or not any is used:
+    version 2 implies `invariants`, version 4 implies `checkConstraints` and
+    `generatedColumns`. Enabling change data feed alone puts a table at version
+    4, so refusing on the implied name would push every CDF table off the kernel
+    write path. These look at the schema and configuration instead.
+    """
+    usage = {
+        "has_invariants": False,
+        "has_check_constraints": False,
+        "has_generated_columns": False,
+    }
+    try:
+        properties = snapshot.table_properties() or {}
+    except Exception:
+        properties = {}
+    usage["has_check_constraints"] = any(
+        key.lower().startswith("delta.constraints.") for key in properties
+    )
+
+    try:
+        metadata = json.loads(snapshot.metadata_json())
+    except Exception:
+        return usage
+    schema = metadata.get("schemaString") or metadata.get("schema_string")
+    if isinstance(schema, str):
+        try:
+            schema = json.loads(schema)
+        except ValueError:
+            return usage
+    if not isinstance(schema, dict):
+        return usage
+    found = _field_metadata_keys(schema.get("fields") or [])
+    usage["has_invariants"] = "delta.invariants" in found
+    usage["has_generated_columns"] = "delta.generationExpression" in found
+    return usage
+
+
+def _field_metadata_keys(fields: Any) -> set[str]:
+    """Every field-metadata key in a Delta schema, nested types included."""
+    keys: set[str] = set()
+    if isinstance(fields, dict):
+        fields = [fields]
+    for field in fields or []:
+        if not isinstance(field, dict):
+            continue
+        keys.update((field.get("metadata") or {}).keys())
+        dtype = field.get("type")
+        if isinstance(dtype, dict):
+            keys |= _field_metadata_keys(dtype.get("fields") or [])
+            for nested in ("elementType", "valueType", "keyType"):
+                inner = dtype.get(nested)
+                if isinstance(inner, dict):
+                    keys |= _field_metadata_keys(inner.get("fields") or [])
+    return keys
 
 
 def _delta_fields(fields: Any) -> list[dict[str, Any]]:

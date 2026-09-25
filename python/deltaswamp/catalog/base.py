@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from ..capability import TableFeature, feature_from_wire
+from ..capability import TableFeature, feature_from_wire, implied_features
 from ..credentials import CredentialProvider
 from ..identity import TableRef
 
@@ -188,6 +188,17 @@ class ResolvedTable:
     properties: dict[str, str] = field(default_factory=dict)
     # Empty for an unpartitioned table, or before the log has been read.
     partition_columns: tuple[str, ...] = ()
+    #: Whether the table really uses the features its protocol version implies.
+    #:
+    #: A legacy writer version implies a whole set of features whether or not a
+    #: single one is used: version 2 implies `invariants`, version 4 implies
+    #: `checkConstraints` and `generatedColumns`. Enabling change data feed
+    #: alone puts a table at version 4, so routing on the implied name would
+    #: push every CDF table off the kernel write path. These record what the
+    #: table actually does, so only the tables that need delta-rs go there.
+    has_invariants: bool = False
+    has_check_constraints: bool = False
+    has_generated_columns: bool = False
 
     # Set when reading the log failed on every engine. The router then refuses
     # direct-storage operations with this as the reason, instead of routing on
@@ -225,6 +236,24 @@ class ResolvedTable:
     @property
     def features(self) -> frozenset[str]:
         return self.reader_features | self.writer_features
+
+    @property
+    def effective_reader_features(self) -> frozenset[str]:
+        """Reader features named in the protocol, plus those its version implies."""
+        implied, _ = implied_features(self.min_reader_version, self.min_writer_version)
+        return self.reader_features | implied
+
+    @property
+    def effective_writer_features(self) -> frozenset[str]:
+        """Writer features named in the protocol, plus those its version implies.
+
+        A legacy protocol (writer version below 7) lists nothing: the version
+        number is the feature set. Checking only the named list makes such a
+        table look featureless, so an engine accepts a write it cannot perform
+        and fails at commit -- after the data is written.
+        """
+        _, implied = implied_features(self.min_reader_version, self.min_writer_version)
+        return self.writer_features | implied
 
     @property
     def known_features(self) -> frozenset[TableFeature]:

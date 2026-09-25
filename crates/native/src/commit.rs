@@ -211,11 +211,6 @@ pub fn write(
     txn: Option<(String, i64)>,
     commit_metadata: Option<std::collections::HashMap<String, String>>,
 ) -> Result<u64> {
-    let committer: Box<dyn Committer> = match &uc {
-        Some(config) => config.committer()?,
-        None => Box::new(FileSystemCommitter::new()),
-    };
-
     // Clone before the transaction consumes it; the overwrite path needs to
     // scan the same snapshot to learn which files to remove.
     let scan_source = snapshot.clone();
@@ -229,19 +224,15 @@ pub fn write(
         .map(|b| partition::conform_to_table(b, table_schema.as_ref(), &partition_columns))
         .collect::<Result<Vec<_>>>()?;
     let batches = partition::coalesce(batches)?;
-    let mut transaction = snapshot.transaction(committer, engine.as_ref())?;
-    if let Some(info) = engine_info {
-        transaction = transaction.with_engine_info(info);
-    }
-    if let Some(op) = operation {
-        transaction = transaction.with_operation(op);
-    }
-    if let Some((app_id, version)) = txn {
-        transaction = transaction.with_transaction_id(app_id, version);
-    }
-    if let Some(metadata) = commit_metadata {
-        transaction = apply_commit_metadata(transaction, metadata)?;
-    }
+    let mut transaction = begin_transaction(
+        snapshot,
+        &engine,
+        &uc,
+        engine_info,
+        operation,
+        txn,
+        commit_metadata,
+    )?;
 
     if overwrite {
         // Remove everything the snapshot can see, in this same commit.
@@ -580,6 +571,270 @@ fn raw_commit_body(actions: &[String]) -> Result<String> {
         body.push('\n');
     }
     Ok(body)
+}
+
+// ---------------------------------------------------------------- distributed
+
+/// Build a transaction with the commit-level metadata applied.
+///
+/// Shared by the single-shot path and the distributed one so the two cannot
+/// drift on which committer a catalog-managed table gets.
+#[allow(clippy::too_many_arguments)]
+fn begin_transaction(
+    snapshot: SnapshotRef,
+    engine: &SharedEngine,
+    uc: &Option<UcCommitConfig>,
+    engine_info: Option<String>,
+    operation: Option<String>,
+    txn: Option<(String, i64)>,
+    commit_metadata: Option<std::collections::HashMap<String, String>>,
+) -> Result<Transaction> {
+    let committer: Box<dyn Committer> = match uc {
+        Some(config) => config.committer()?,
+        None => Box::new(FileSystemCommitter::new()),
+    };
+    let mut transaction = snapshot.transaction(committer, engine.as_ref())?;
+    if let Some(info) = engine_info {
+        transaction = transaction.with_engine_info(info);
+    }
+    if let Some(op) = operation {
+        transaction = transaction.with_operation(op);
+    }
+    if let Some((app_id, version)) = txn {
+        transaction = transaction.with_transaction_id(app_id, version);
+    }
+    if let Some(metadata) = commit_metadata {
+        transaction = apply_commit_metadata(transaction, metadata)?;
+    }
+    Ok(transaction)
+}
+
+/// The add-action metadata the engine produced, as an Arrow `RecordBatch`.
+fn add_metadata_batch(
+    data: Box<dyn delta_kernel::EngineData>,
+) -> Result<arrow::array::RecordBatch> {
+    let arrow = data.into_any().downcast::<ArrowEngineData>().map_err(|_| {
+        NativeError::Invalid(
+            "the engine returned add-file metadata that is not Arrow-backed".to_string(),
+        )
+    })?;
+    Ok((*arrow).into())
+}
+
+/// Serialise add-action metadata as Arrow IPC.
+///
+/// IPC rather than JSON because the schema kernel expects from `add_files` is
+/// nested, partly table-dependent (the stats struct follows the data schema)
+/// and gains columns under row tracking. Round-tripping the Arrow data keeps
+/// whatever kernel produced byte-exact, instead of re-deriving a schema here
+/// that would silently drift from `Transaction::add_files_schema`.
+/// Schema-metadata keys identifying the table a fragment was written for.
+///
+/// A fragment names data files by a path relative to its table root, so
+/// committing one into a different table writes an add action pointing at a
+/// file that is not there: the commit succeeds and the table is unreadable from
+/// then on. Nothing in the add action itself records which table it came from,
+/// so the binding is carried here and checked before the commit.
+const FRAGMENT_TABLE_ROOT: &str = "deltaswamp.table_root";
+const FRAGMENT_METADATA_ID: &str = "deltaswamp.metadata_id";
+
+fn batches_to_ipc(
+    batches: &[arrow::array::RecordBatch],
+    table_root: &str,
+    metadata_id: &str,
+) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    if let Some(first) = batches.first() {
+        let mut metadata = first.schema().metadata().clone();
+        metadata.insert(FRAGMENT_TABLE_ROOT.to_string(), table_root.to_string());
+        metadata.insert(FRAGMENT_METADATA_ID.to_string(), metadata_id.to_string());
+        let schema = Arc::new(first.schema().as_ref().clone().with_metadata(metadata));
+
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, schema.as_ref())?;
+        for batch in batches {
+            let stamped =
+                arrow::array::RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+            writer.write(&stamped)?;
+        }
+        writer.finish()?;
+    }
+    Ok(buffer)
+}
+
+/// Decode a fragment, refusing one written for a different table.
+fn ipc_to_batches(
+    bytes: &[u8],
+    table_root: &str,
+    metadata_id: &str,
+) -> Result<Vec<arrow::array::RecordBatch>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+    let schema = reader.schema();
+    let metadata = schema.metadata();
+
+    let fragment_root = metadata.get(FRAGMENT_TABLE_ROOT).map(String::as_str);
+    let fragment_id = metadata.get(FRAGMENT_METADATA_ID).map(String::as_str);
+    match (fragment_root, fragment_id) {
+        (Some(root), Some(id)) => {
+            if root != table_root || id != metadata_id {
+                return Err(NativeError::Invalid(format!(
+                    "this fragment was written for a different table ({root}, metadata id \
+                     {id}) and is being committed to {table_root} (metadata id \
+                     {metadata_id}). Its files are named relative to the table they were \
+                     written under, so committing it here would add files that are not \
+                     there and leave this table unreadable."
+                )));
+            }
+        }
+        _ => {
+            return Err(NativeError::Invalid(
+                "this fragment carries no table identity, so it cannot be checked against \
+                 the table being committed to. It was not produced by write_files."
+                    .to_string(),
+            ));
+        }
+    }
+
+    let mut out = Vec::new();
+    for batch in reader {
+        out.push(batch?);
+    }
+    Ok(out)
+}
+
+/// Write Arrow batches as Parquet data files **without committing**.
+///
+/// This is the worker half of a distributed write: it produces data files and
+/// returns the add-action metadata describing them, which travels back to
+/// whoever is coordinating and is committed there by [`commit_files`]. The
+/// transaction built here exists only to obtain a write context and is dropped
+/// unread, so nothing is added to the log by this call.
+///
+/// The files are real and durable the moment this returns. A coordinator that
+/// never commits leaves them behind as garbage -- which is exactly what happens
+/// today when a connector writes for an hour and only then discovers the commit
+/// will be refused, so callers should settle whether the commit can succeed
+/// before the first worker runs.
+pub fn write_files(
+    snapshot: SnapshotRef,
+    engine: SharedEngine,
+    batches: Vec<arrow::array::RecordBatch>,
+    uc: Option<UcCommitConfig>,
+) -> Result<Vec<u8>> {
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
+    let table_schema = snapshot.schema();
+    let table_root = snapshot.table_root().to_string();
+    let metadata_id = snapshot.table_configuration().metadata().id().to_string();
+    // Built with the same committer the coordinator will use: a catalog-managed
+    // table validates differently, and a worker must not discover that late.
+    // Same preprocessing as `write`: align columns by name, conform physical
+    // types, validate partition values, and coalesce tiny batches.
+    let batches = batches
+        .iter()
+        .map(|b| partition::conform_to_table(b, table_schema.as_ref(), &partition_columns))
+        .collect::<Result<Vec<_>>>()?;
+    let batches = partition::coalesce(batches)?;
+    let txn = begin_transaction(snapshot, &engine, &uc, None, None, None, None)?;
+    let write_state = txn.write_state()?;
+
+    let mut metadata_batches = Vec::new();
+    if partition_columns.is_empty() {
+        let write_context = write_state.unpartitioned_write_context()?;
+        for batch in batches {
+            let data = ArrowEngineData::new(batch);
+            let metadata =
+                runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+            metadata_batches.push(add_metadata_batch(metadata)?);
+        }
+    } else {
+        for batch in batches {
+            for group in
+                partition::split_by_partition(&batch, &partition_columns, table_schema.as_ref())?
+            {
+                let write_context = write_state.partitioned_write_context(group.values)?;
+                let data = ArrowEngineData::new(group.data);
+                let metadata =
+                    runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+                metadata_batches.push(add_metadata_batch(metadata)?);
+            }
+        }
+    }
+
+    batches_to_ipc(&metadata_batches, &table_root, &metadata_id)
+}
+
+/// Commit add-action metadata produced by [`write_files`], possibly elsewhere.
+///
+/// This is the coordinator half. Every fragment is added to one transaction, so
+/// a distributed write lands as a single atomic commit at one version -- readers
+/// never see half a job. With `overwrite`, the files visible in this snapshot
+/// are removed in that same commit.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_files(
+    snapshot: SnapshotRef,
+    engine: SharedEngine,
+    fragments: Vec<Vec<u8>>,
+    uc: Option<UcCommitConfig>,
+    engine_info: Option<String>,
+    operation: Option<String>,
+    overwrite: bool,
+    txn: Option<(String, i64)>,
+    commit_metadata: Option<std::collections::HashMap<String, String>>,
+) -> Result<u64> {
+    let scan_source = snapshot.clone();
+    let table_root = snapshot.table_root().to_string();
+    let metadata_id = snapshot.table_configuration().metadata().id().to_string();
+    let mut transaction = begin_transaction(
+        snapshot,
+        &engine,
+        &uc,
+        engine_info,
+        operation,
+        txn,
+        commit_metadata,
+    )?;
+
+    if overwrite {
+        let scan = scan_source.scan_builder().build()?;
+        let scan_metadata = runtime::block_on(async { scan.scan_metadata(engine.as_ref()) })?;
+        for filtered in Transaction::scan_metadata_to_engine_data(scan_metadata) {
+            transaction.remove_files(filtered?);
+        }
+    }
+
+    for fragment in &fragments {
+        for batch in ipc_to_batches(fragment, &table_root, &metadata_id)? {
+            transaction.add_files(Box::new(ArrowEngineData::new(batch)));
+        }
+    }
+
+    finish_commit(transaction, &engine)
+}
+
+/// Run a prepared transaction's commit and classify the outcome.
+fn finish_commit(txn: Transaction, engine: &SharedEngine) -> Result<u64> {
+    match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
+        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
+        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
+            let version = conflicted.conflict_version();
+            Err(NativeError::CommitConflict(format!(
+                "another writer committed version {version} first. Re-read the snapshot, \
+                 recompute the write, and stage a new commit -- do not reuse the staged file, \
+                 because it encodes a version-specific txnId."
+            )))
+        }
+        Ok(CommitResult::RetryableTransaction(_)) => Err(NativeError::Retryable(
+            "the commit failed with a retryable I/O error; the table state is unchanged, \
+             so the same transaction may be retried"
+                .to_string(),
+        )),
+        Err(err) => Err(classify_kernel_commit_error(err)),
+    }
 }
 
 #[cfg(test)]

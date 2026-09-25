@@ -18,7 +18,7 @@ from deltaswamp.capability import Operation  # noqa: E402
 from deltaswamp.catalog.base import ResolvedTable  # noqa: E402
 from deltaswamp.credentials.base import CredentialProvider  # noqa: E402
 from deltaswamp.engine.kernel import KernelEngine  # noqa: E402
-from deltaswamp.errors import UnreachableTableError  # noqa: E402
+from deltaswamp.errors import CommitConflictError, UnreachableTableError  # noqa: E402
 from deltaswamp.identity import parse_ref  # noqa: E402
 
 
@@ -546,7 +546,6 @@ class TestAppendRetry:
 
     def test_overwrite_conflict_is_not_retried(self, plain: str, monkeypatch: Any) -> None:
         from deltalake import write_deltalake
-        from deltaswamp import _native
 
         engine = KernelEngine()
         real = engine.snapshot
@@ -557,7 +556,7 @@ class TestAppendRetry:
             return snap
 
         monkeypatch.setattr(engine, "snapshot", racing_snapshot)
-        with pytest.raises(_native.CommitConflictError):
+        with pytest.raises(CommitConflictError):
             engine.overwrite(resolved(plain), pa.table({"id": [3], "city": ["cairo"]}))
 
 
@@ -670,7 +669,6 @@ class TestReviewFollowUps:
         # was a replay of the same batch (same app id and version), the retry
         # appended it a second time.
         from deltalake import CommitProperties, Transaction, write_deltalake
-        from deltaswamp import _native
 
         if not _native_has_app_id_version():
             pytest.skip("build lacks app_id_version")
@@ -693,7 +691,7 @@ class TestReviewFollowUps:
             return snap
 
         monkeypatch.setattr(engine, "snapshot", racing_snapshot)
-        with pytest.raises(_native.CommitConflictError):
+        with pytest.raises(CommitConflictError):
             engine.append(
                 resolved(plain),
                 pa.table({"id": [3], "city": ["cairo"]}),

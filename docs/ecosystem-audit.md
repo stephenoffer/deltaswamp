@@ -98,6 +98,7 @@ Several values in one cell are a routing chain, tried in order.
 | DML on catalog-managed tables | DBR | kernel (native rewrite), warehouse | DELETE/UPDATE/replaceWhere by rewrite; MERGE needs the warehouse; row-tracked tables need the warehouse |
 | Deletion-vector authoring | DBR, Spark | — | `Transaction::update_deletion_vectors` does not exist in kernel 0.28 |
 | Row-level concurrency | DBR | — | a Databricks conflict-detection feature |
+| Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction. Catalog-managed tables included |
 | COPY INTO / Auto Loader | DBR | warehouse (`Connection.sql(engine="warehouse")`) | ingestion, not table access |
 
 ## Schema and table DDL
