@@ -1,16 +1,14 @@
-"""The catalog abstraction: name -> everything an engine needs to open a table.
+"""The catalog abstraction: a table name in, everything an engine needs out.
 
-`ResolvedTable` is deliberately fat. The router must decide an engine *before*
-touching the Delta log, because several decisions cannot be made afterwards:
+`ResolvedTable` carries more than a location because the router must choose an
+engine before touching the Delta log. Some facts are only visible to the
+catalog:
 
-* A shallow clone must be detected from catalog metadata first. Its `add` actions
-  carry absolute paths into the source table, and kernel resolves those to
-  absolute URLs before a connector sees them -- so by log-read time you can no
-  longer tell borrowed files from owned ones (kernel#2411).
-* Row filters and column masks make UC credential vending refuse outright. You
-  learn this from the capability manifest, not from a failed read.
-* A `catalogManaged` table needs its commit tail and ratified version supplied at
-  snapshot-construction time; there is no retrofitting it.
+* A shallow clone's `add` actions hold absolute paths into the source table,
+  and once the log is open borrowed files look like owned ones (kernel#2411).
+* Row filters and column masks make UC credential vending refuse the table.
+* A `catalogManaged` table needs its commit tail and ratified version when the
+  snapshot is built.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from ..capability import TableFeature, feature_from_wire
+from ..capability import TableFeature, feature_from_wire, implied_features
 from ..credentials import CredentialProvider
 from ..identity import TableRef
 
@@ -108,7 +106,30 @@ def parse_commit_tail(
     which is every catalog-managed table, the one thing no other Python library
     can open.
     """
-    commits = body.get("commits") or []
+    commits = [c for c in (body.get("commits") or []) if isinstance(c, Mapping)]
+    for c in commits:
+        missing = [
+            what
+            for what, names in (
+                ("version", ("version", "commit-version", "commitVersion")),
+                # Without a file name the kernel is handed an empty path and
+                # fails far from the cause.
+                ("file name", ("file-name", "file_name", "fileName")),
+            )
+            if not str(_first(c, *names) or "").strip() and _first(c, *names) != 0
+        ]
+        if missing:
+            from ..errors import CorruptTableError
+
+            raise CorruptTableError(
+                f"a catalog commit carries no {' or '.join(missing)}: {dict(c)!r:.300}"
+            )
+    # Sorted and de-duplicated: kernel wants the tail ascending and contiguous,
+    # and the API does not promise an order.
+    commits = list(
+        {int(_first(c, "version", "commit-version", "commitVersion")): c for c in commits}.values()
+    )
+    commits.sort(key=lambda c: int(_first(c, "version", "commit-version", "commitVersion")))
     entries = tuple(
         LogTailEntry(
             version=int(_first(c, "version", "commit-version", "commitVersion")),
@@ -131,6 +152,11 @@ def parse_commit_tail(
         for c in commits
     )
     latest = _first(body, "latest-table-version", "latest_table_version", "latestTableVersion")
+    if latest is None and entries:
+        # Commits are published oldest-first, so the newest unpublished one is
+        # the latest ratified version. Leaving it unset made the kernel refuse
+        # the table ("Max catalog version is required").
+        latest = entries[-1].version
     metadata = body.get("metadata") or {}
     location = (
         body.get("location")
@@ -151,7 +177,7 @@ class ResolvedTable:
     securable_kind: str | None = None
     table_id: str | None = None
 
-    # Protocol state. Unrecognised names are kept verbatim so we can report them
+    # Protocol state. Unrecognized names are kept verbatim so we can report them
     # precisely instead of dropping them.
     min_reader_version: int | None = None
     min_writer_version: int | None = None
@@ -160,6 +186,17 @@ class ResolvedTable:
     properties: dict[str, str] = field(default_factory=dict)
     # Empty for an unpartitioned table, or before the log has been read.
     partition_columns: tuple[str, ...] = ()
+    #: Whether the table really uses the features its protocol version implies.
+    #:
+    #: A legacy writer version implies a whole set of features whether or not a
+    #: single one is used: version 2 implies `invariants`, version 4 implies
+    #: `checkConstraints` and `generatedColumns`. Enabling change data feed
+    #: alone puts a table at version 4, so routing on the implied name would
+    #: push every CDF table off the kernel write path. These record what the
+    #: table actually does, so only the tables that need delta-rs go there.
+    has_invariants: bool = False
+    has_check_constraints: bool = False
+    has_generated_columns: bool = False
 
     # Set when reading the log failed on every engine. The router then refuses
     # direct-storage operations with this as the reason, instead of routing on
@@ -179,6 +216,9 @@ class ResolvedTable:
     # not tell you.
     external_read_supported: bool | None = None
     external_write_supported: bool | None = None
+    #: A row filter or column mask, described. Either one makes credential
+    #: vending refuse the table while its manifest still claims direct reads.
+    access_policy: str | None = None
 
     # Catalog-managed state, supplied to SnapshotBuilder.
     log_tail: tuple[LogTailEntry, ...] = ()
@@ -199,6 +239,24 @@ class ResolvedTable:
         return self.reader_features | self.writer_features
 
     @property
+    def effective_reader_features(self) -> frozenset[str]:
+        """Reader features named in the protocol, plus those its version implies."""
+        implied, _ = implied_features(self.min_reader_version, self.min_writer_version)
+        return self.reader_features | implied
+
+    @property
+    def effective_writer_features(self) -> frozenset[str]:
+        """Writer features named in the protocol, plus those its version implies.
+
+        A legacy protocol (writer version below 7) lists nothing: the version
+        number is the feature set. Checking only the named list makes such a
+        table look featureless, so an engine accepts a write it cannot perform
+        and fails at commit -- after the data is written.
+        """
+        _, implied = implied_features(self.min_reader_version, self.min_writer_version)
+        return self.writer_features | implied
+
+    @property
     def known_features(self) -> frozenset[TableFeature]:
         out = set()
         for name in self.features:
@@ -209,7 +267,7 @@ class ResolvedTable:
 
     @property
     def unknown_features(self) -> frozenset[str]:
-        """Feature names this release does not recognise.
+        """Feature names this release does not recognize.
 
         Tolerated on reads when writer-only; they block writes.
         """
@@ -220,8 +278,12 @@ class ResolvedTable:
         return (
             TableFeature.CATALOG_MANAGED.value in self.features
             or TableFeature.CATALOG_OWNED_PREVIEW.value in self.features
-            # Databricks signals it as a table property too.
-            or self.properties.get("delta.feature.catalogManaged") == "supported"
+            # Databricks signals it as a table property too (either spelling).
+            or any(
+                str(self.properties.get(f"delta.feature.{f.value}", "")).lower()
+                in ("supported", "enabled")
+                for f in (TableFeature.CATALOG_MANAGED, TableFeature.CATALOG_OWNED_PREVIEW)
+            )
         )
 
     @property
@@ -283,7 +345,14 @@ class ResolvedTable:
                     TableFeature.ICEBERG_COMPAT_V3.value,
                 )
             )
-            or self.properties.get("delta.universalFormat.enabledFormats", "").find("iceberg") >= 0
+            or "iceberg"
+            in str(self.properties.get("delta.universalFormat.enabledFormats", "")).lower()
+            # The catalog reports the enabling properties before the log has
+            # been read, when the feature lists are still empty.
+            or any(
+                str(self.properties.get(f"delta.enableIcebergCompatV{n}", "")).lower() == "true"
+                for n in (1, 2, 3)
+            )
         )
 
     @property

@@ -64,3 +64,31 @@ def test_polling_sees_later_commits(table: Any) -> None:
     assert version == 4
     assert batch.column("id").to_pylist() == [9]
     stream.close()
+
+
+def test_cdf_with_an_escaped_partition_path_reads_through_the_kernel(tmp_path: Any) -> None:
+    """delta-rs double-encodes the path: 'a b' is stored as k=a%20b and its CDF
+    reader looks for k=a%2520b. Twelve CDF tables in the delta-kernel golden
+    corpus fail that way; the kernel reads them all."""
+    from deltalake import write_deltalake
+
+    path = str(tmp_path / "t")
+    write_deltalake(
+        path,
+        pa.table({"k": ["a b", "c"], "v": [1, 2]}),
+        partition_by=["k"],
+        configuration={"delta.enableChangeDataFeed": "true"},
+    )
+    table = ds.connect().table(path)
+    assert table.can(ds.Operation.CDF).engine is ds.Engine.KERNEL
+    changes = pa.table(table.cdf(starting_version=0))
+    assert sorted(changes.column("k").to_pylist()) == ["a b", "c"]
+
+
+def test_legacy_protocol_features_are_reported(tmp_path: Any) -> None:
+    """A (1, 2) table names no features; DESCRIBE DETAIL lists the implied ones."""
+    from deltalake import write_deltalake
+
+    path = str(tmp_path / "t")
+    write_deltalake(path, pa.table({"id": [1]}))
+    assert {"appendOnly", "invariants"} <= ds.connect().table(path).features()

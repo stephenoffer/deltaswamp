@@ -1,8 +1,3 @@
-# Catches the cheap mistakes before they reach CI.
-#
-# Note for anyone editing this project's source with scripted edits: ruff
-# reformats as it goes, so an anchor you matched a moment ago may no longer
-# exist. Verify by running the tests, not by re-reading the diff.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

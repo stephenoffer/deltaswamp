@@ -22,7 +22,10 @@ pub use error::{NativeError, Result};
 use pyo3::prelude::*;
 
 use commit::UcCommitConfig;
-use error::{BackfillRequiredError, CommitConflictError, RetryableError};
+use error::{
+    BackfillRequiredError, CatalogCommitError, CatalogNotFoundError, CatalogPermissionError,
+    CommitConflictError, InvalidInputError, RetryableError,
+};
 use snapshot::{create_table, PySnapshot};
 
 /// The delta_kernel version this extension is pinned to.
@@ -30,7 +33,7 @@ use snapshot::{create_table, PySnapshot};
 /// delta_kernel exports no VERSION constant of its own, so we record the pin
 /// here and assert it against Cargo.lock in a test. Python asserts against the
 /// same string, so a kernel bump fails loudly at three layers rather than
-/// silently changing behaviour.
+/// silently changing behavior.
 pub const KERNEL_VERSION: &str = "0.28.0";
 
 /// Capabilities this build provides, by stable name.
@@ -44,11 +47,15 @@ pub const FEATURES: &[&str] = &[
     "table_changes",
     "files",
     "metadata_json",
+    "app_id_version",
     "commit_raw",
     "partitioned_append",
     "uc_create_table_request",
     "checkpoint",
     "file_restricted_scan",
+    // Distributed writes: workers produce data files, a coordinator commits
+    // them as one transaction.
+    "distributed_write",
 ];
 
 #[pyfunction]
@@ -86,6 +93,19 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<BackfillRequiredError>(),
     )?;
     m.add("RetryableError", m.py().get_type::<RetryableError>())?;
+    m.add("InvalidInputError", m.py().get_type::<InvalidInputError>())?;
+    m.add(
+        "CatalogCommitError",
+        m.py().get_type::<CatalogCommitError>(),
+    )?;
+    m.add(
+        "CatalogPermissionError",
+        m.py().get_type::<CatalogPermissionError>(),
+    )?;
+    m.add(
+        "CatalogNotFoundError",
+        m.py().get_type::<CatalogNotFoundError>(),
+    )?;
     m.add_function(wrap_pyfunction!(create_table, m)?)?;
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;

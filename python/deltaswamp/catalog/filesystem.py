@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 from typing import Any
 
 from ..errors import InvalidReferenceError
@@ -9,6 +11,8 @@ from ..identity import RefKind, TableRef
 from .base import ResolvedTable
 
 __all__ = ["FilesystemCatalog"]
+
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 class FilesystemCatalog:
@@ -29,7 +33,19 @@ class FilesystemCatalog:
             raise InvalidReferenceError(
                 f"{ref} names a catalog entry; the filesystem catalog handles paths only"
             )
-        return ResolvedTable(ref=ref, location=ref.path)
+        location = ref.path
+        if (
+            location
+            and "://" not in location
+            and not location.startswith("~")
+            and not _WINDOWS_DRIVE.match(location)
+        ):
+            # Pin a relative local path to the directory it was named from.
+            # Engines, Ray workers and a later os.chdir() would otherwise each
+            # resolve it against their own working directory -- a different
+            # table, or none.
+            location = os.path.abspath(location)
+        return ResolvedTable(ref=ref, location=location)
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
         raise NotImplementedError(

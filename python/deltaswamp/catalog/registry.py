@@ -44,9 +44,8 @@ ENTRY_POINT_GROUP = "deltaswamp.catalogs"
 #: installed distribution metadata. Entry points are the *extension* mechanism,
 #: not the way deltaswamp finds its own modules: a source checkout, a vendored
 #: copy, a zipapp and several freezers (PyInstaller, py2app) all lose entry-point
-#: metadata, and losing it used to leave every built-in catalog unregistered and
-#: the library unusable. Entry points are layered on top of this map, so a third
-#: party can still register a new name -- or deliberately shadow a built-in one.
+#: metadata. Entry points are layered on top of this map, so a third party can
+#: still register a new name or shadow a built-in one.
 #:
 #: `tests/unit/test_registry.py` asserts this agrees with pyproject.toml.
 BUILTIN_CATALOGS: dict[str, str] = {
@@ -95,7 +94,15 @@ def load_catalog_class(name: str) -> type:
     """
     for ep in entry_points(group=ENTRY_POINT_GROUP):
         if ep.name == name:
-            loaded = ep.load()
+            try:
+                loaded = ep.load()
+            except Exception as exc:
+                # A broken plugin must fail with its name attached, not as an
+                # anonymous ImportError from deep inside importlib.
+                raise InvalidReferenceError(
+                    f"the {name!r} catalog entry point ({ep.value}) failed to load: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             if not isinstance(loaded, type):
                 raise InvalidReferenceError(
                     f"the {name!r} catalog entry point loaded a "
@@ -124,8 +131,8 @@ def load_catalog_class(name: str) -> type:
 def _import_dotted(path: str) -> type:
     import importlib
 
-    module_name, _, attribute = path.partition(":")
-    if not attribute:
+    module_name, colon, attribute = path.partition(":")
+    if not colon:
         module_name, _, attribute = path.rpartition(".")
     if not module_name or not attribute:
         raise InvalidReferenceError(f"{path!r} is not a module:Class path")
@@ -133,8 +140,11 @@ def _import_dotted(path: str) -> type:
         module = importlib.import_module(module_name)
     except ImportError as exc:
         raise InvalidReferenceError(f"cannot import {module_name!r}: {exc}") from exc
+    # `module:Outer.Inner`, as entry-point syntax allows.
+    loaded: Any = module
     try:
-        loaded = getattr(module, attribute)
+        for name in attribute.split("."):
+            loaded = getattr(loaded, name)
     except AttributeError as exc:
         raise InvalidReferenceError(f"{module_name!r} has no attribute {attribute!r}") from exc
     if not isinstance(loaded, type):
@@ -150,13 +160,22 @@ def catalog_for_uri(uri: str | None, **kwargs: Any) -> Catalog:
     """
     scheme: str | None = None
     if uri is not None:
+        if not isinstance(uri, str):
+            raise InvalidReferenceError(
+                f"a connection URI must be a string, not {type(uri).__name__}; for a "
+                "local table use conn.open_table(path) or ds.connect('file://')"
+            )
+        # An empty URI (an unset environment variable, typically) means "no
+        # URI", not a scheme named "".
+        uri = uri.strip() or None
+    if uri is not None:
         scheme = uri.split("://", 1)[0].lower() if "://" in uri else uri.lower()
 
     name = kwargs.pop("catalog_name", None) or scheme_to_catalog.get(scheme)
     if name is None:
         known = ", ".join(sorted(k for k in scheme_to_catalog if k))
         raise InvalidReferenceError(
-            f"unrecognised connection URI {uri!r}. Known schemes: {known}. "
+            f"unrecognized connection URI {uri!r}. Known schemes: {known}. "
             "Pass catalog=... to supply a catalog object directly."
         )
 

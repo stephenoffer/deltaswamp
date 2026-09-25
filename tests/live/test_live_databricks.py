@@ -10,7 +10,7 @@ Run it with::
     export DELTASWAMP_TEST_WAREHOUSE_ID=abc123         # optional but unlocks most tests
     export DELTASWAMP_TEST_EXTERNAL_LOCATION=s3://...  # optional, for external tables
 
-    pytest tests/integration/test_live_databricks.py -v
+    pytest tests/live/test_live_databricks.py -v
 
 Ordered so the cheapest checks fail first: a PAT that cannot authenticate, or a
 metastore without external data access, should not be diagnosed by watching a
@@ -129,8 +129,7 @@ class TestResolution:
         `table_uuid` means the Delta log's `Metadata.id`. Databricks exposes no
         such field -- its `table_id` is the UC securable's own UUID, which names
         the storage directory -- so the catalog leaves `table_uuid` unset and
-        the check is skipped. It used to be populated from `table_id`, which
-        made every managed table raise CorruptTableError on first use.
+        the check is skipped.
         """
         name, _run = scratch_sql
         table = live_connection.table(name)
@@ -343,10 +342,15 @@ class TestCatalogManaged:
         assert not verdict.ok
         assert "catalogManaged" in verdict.reason
 
-    def test_alter_is_refused_with_the_committer_reason(self, catalog_managed: Any) -> None:
+    def test_alter_never_goes_direct(self, catalog_managed: Any, live_config: Any) -> None:
+        """The committer refuses metadata changes, so no direct engine may claim
+        one; with the fallback on, the warehouse makes it."""
         verdict = catalog_managed.can(Operation.SET_PROPERTIES)
-        assert not verdict.ok
-        assert "catalog-managed" in verdict.reason
+        if live_config.warehouse_id:
+            assert verdict.engine is Engine.SQL
+        else:
+            assert not verdict.ok
+            assert "catalog-managed" in verdict.reason
 
     def test_append_commits_through_the_catalog(self, catalog_managed: Any) -> None:
         verdict = catalog_managed.can(Operation.APPEND)
@@ -370,9 +374,11 @@ class TestRefusalsAreHonest:
         if not views:
             pytest.skip("no view in the target schema")
         verdict = live_connection.table(views[0].ref.full_name).can(Operation.SCAN)
-        if verdict.ok:
+        if verdict.ok and verdict.engine is not Engine.SQL:
+            # A direct engine reads files, so it needs the manifest's blessing.
+            # The warehouse evaluates the view itself and needs nothing.
             assert views[0].external_read_supported is True
-        else:
+        elif not verdict.ok:
             assert verdict.reason
 
     def test_every_refusal_carries_a_reason(self, live_connection: Any, scratch_sql: Any) -> None:
@@ -481,11 +487,19 @@ class TestConformanceSweep:
             except DeltaSwampError:
                 continue
             verdict = table.can(Operation.SCAN)
-            assert verdict.ok == bool(resolved.external_read_supported), (
-                f"{resolved.ref.full_name}: manifest says external_read="
-                f"{resolved.external_read_supported}, we claim ok={verdict.ok} "
-                f"({verdict.reason})"
-            )
+            direct = verdict.ok and verdict.engine is not Engine.SQL
+            if not resolved.external_read_supported:
+                # Withdrawn from vending: never a direct engine. The warehouse
+                # may serve it, since it applies the policy itself.
+                assert not direct, (
+                    f"{resolved.ref.full_name}: withdrawn from vending "
+                    f"({resolved.access_policy or 'manifest'}), yet claimed via {verdict.engine}"
+                )
+            else:
+                assert verdict.ok, (
+                    f"{resolved.ref.full_name}: manifest allows external reads, "
+                    f"we refuse ({verdict.reason})"
+                )
             checked += 1
         if checked == 0:
             pytest.skip("no tables with capability manifests to compare")

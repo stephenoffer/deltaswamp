@@ -10,18 +10,18 @@ from __future__ import annotations
 import pytest
 from deltaswamp.capability import (
     DATABRICKS_ONLY_OPERATIONS,
-    FEATURE_CONFLICTS,
     FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
     OPERATION_ENGINES,
-    PROPERTY_SUPPORT,
     READ_OPERATIONS,
     Engine,
+    FeatureKind,
     Operation,
     Support,
     TableFeature,
     feature_from_wire,
 )
+from deltaswamp.properties import PROPERTY_SUPPORT
 
 
 class TestMatrixCompleteness:
@@ -42,16 +42,6 @@ class TestMatrixCompleteness:
             assert feature in FEATURE_SUPPORT
             for dep in deps:
                 assert dep in FEATURE_SUPPORT
-
-    def test_conflicts_are_symmetric(self) -> None:
-        """If A forbids B, B must forbid A -- an asymmetry would let us build
-        a table one engine accepts and another rejects."""
-        for feature, conflicts in FEATURE_CONFLICTS.items():
-            for other in conflicts:
-                if other in FEATURE_CONFLICTS:
-                    assert feature in FEATURE_CONFLICTS[other], (
-                        f"{feature.value} forbids {other.value} but not vice versa"
-                    )
 
 
 class TestEnginesFailInOppositeDirections:
@@ -80,10 +70,22 @@ class TestEnginesFailInOppositeDirections:
             for f, r in FEATURE_SUPPORT.items()
             if r.kernel_read is not Support.NO and r.deltars_read is Support.NO
         ]
-        assert len(kernel_only) >= 15, kernel_only
+        # Probed against deltalake 1.6.5: writer-only features such as
+        # domainMetadata and rowTracking block delta-rs *writes*, not reads, so
+        # the read gap is the reader-writer features below.
+        assert {
+            "catalogManaged",
+            "vacuumProtocolCheck",
+            "typeWidening",
+            "variantShredding",
+        } <= set(kernel_only), kernel_only
 
     def test_scan_prefers_kernel(self) -> None:
         assert OPERATION_ENGINES[Operation.SCAN].primary is Engine.KERNEL
+
+    def test_cdf_prefers_kernel(self) -> None:
+        """delta-rs cannot decode the CDF files Databricks writes."""
+        assert OPERATION_ENGINES[Operation.CDF].primary is Engine.KERNEL
 
     def test_merge_never_routes_to_kernel(self) -> None:
         """delta_kernel 0.28 has no MERGE implementation at all."""
@@ -153,6 +155,12 @@ class TestEasilyMissedFacts:
         assert row.kernel_write is Support.NO
         assert row.deltars_write is Support.NO
 
+    def test_collations_are_writer_only(self) -> None:
+        assert FEATURE_SUPPORT[TableFeature.COLLATIONS].kind is FeatureKind.WRITER
+
+    def test_geospatial_is_not_kernel_readable(self) -> None:
+        assert FEATURE_SUPPORT[TableFeature.GEOSPATIAL].kernel_read is Support.NO
+
     def test_checkconstraints_deltars_ahead_of_kernel(self) -> None:
         """A case where delta-rs is the more capable engine, so routing must not
         assume kernel is always better."""
@@ -194,7 +202,7 @@ class TestDatabricksOnlyOperations:
     @pytest.mark.parametrize("op", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN])
     def test_column_mapping_ddl_has_a_direct_path(self, op: Operation) -> None:
         """Rename and drop are metadata-only under column mapping, which the
-        kernel path writes itself, so they are no longer Databricks-only."""
+        kernel path writes itself, so they are not Databricks-only."""
         assert op not in DATABRICKS_ONLY_OPERATIONS
         assert Engine.KERNEL in OPERATION_ENGINES[op].engines
 
@@ -248,3 +256,71 @@ class TestDocsMatchTheMatrices:
     def test_the_crash_property_is_called_out(self) -> None:
         """delta.minReaderVersion panics, and a reader must not miss that."""
         assert "crashes" in self._conformance()
+
+
+class TestLegacyProtocolFeatures:
+    """A protocol below reader 3 / writer 7 names no features; the version is the list.
+
+    Reading only the named lists makes such a table look featureless, so an
+    engine accepts a write it cannot perform and fails at commit -- after the
+    data is written. That is the exact failure this exists to prevent.
+    """
+
+    def test_writer_version_implies_its_features(self) -> None:
+        from deltaswamp.capability import implied_features
+
+        _, writers = implied_features(2, 5)
+        assert "checkConstraints" in writers
+        assert "columnMapping" in writers
+        assert "identityColumns" not in writers, "identity columns arrive at writer 6"
+
+    def test_reader_version_two_implies_column_mapping(self) -> None:
+        from deltaswamp.capability import implied_features
+
+        readers, _ = implied_features(2, 5)
+        assert readers == frozenset({"columnMapping"})
+
+    def test_the_feature_based_protocol_implies_nothing(self) -> None:
+        from deltaswamp.capability import implied_features
+
+        assert implied_features(3, 7) == (frozenset(), frozenset())
+
+    def test_each_writer_version_is_cumulative(self) -> None:
+        from deltaswamp.capability import LEGACY_WRITER_FEATURES
+
+        for lower, higher in zip(
+            sorted(LEGACY_WRITER_FEATURES), sorted(LEGACY_WRITER_FEATURES)[1:], strict=False
+        ):
+            assert LEGACY_WRITER_FEATURES[lower] <= LEGACY_WRITER_FEATURES[higher], (
+                f"writer {higher} must keep everything writer {lower} implies"
+            )
+
+    def test_an_unknown_version_is_not_read_as_featureless(self) -> None:
+        """A table from a newer writer must not look like it has no features."""
+        from deltaswamp.capability import implied_features
+
+        _, writers = implied_features(2, 6)
+        assert "identityColumns" in writers
+
+    def test_effective_features_merge_named_and_implied(self) -> None:
+        from deltaswamp.catalog.base import ResolvedTable
+        from deltaswamp.identity import parse_ref
+
+        legacy = ResolvedTable(
+            ref=parse_ref("s3://b/t"),
+            location="s3://b/t",
+            min_reader_version=2,
+            min_writer_version=5,
+        )
+        assert legacy.writer_features == frozenset(), "nothing is named"
+        assert "checkConstraints" in legacy.effective_writer_features
+        assert "columnMapping" in legacy.effective_reader_features
+
+        modern = ResolvedTable(
+            ref=parse_ref("s3://b/t"),
+            location="s3://b/t",
+            min_reader_version=3,
+            min_writer_version=7,
+            writer_features=frozenset({"rowTracking"}),
+        )
+        assert modern.effective_writer_features == frozenset({"rowTracking"})

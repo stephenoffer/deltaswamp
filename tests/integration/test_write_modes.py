@@ -1,9 +1,4 @@
-"""Every write mode, on a real table.
-
-The spec has more write modes than either engine implements, and the ones that
-are missing used to be silently dropped kwargs. Each mode gets a test that
-checks the data afterwards, not just that the call returned.
-"""
+"""Every write mode, on a real table, checked by the data it leaves behind."""
 
 from __future__ import annotations
 
@@ -12,25 +7,11 @@ from typing import Any
 import deltaswamp as ds
 import pytest
 from deltaswamp.capability import Engine, Operation
-from deltaswamp.errors import DeltaSwampError, UnreachableTableError
+from deltaswamp.errors import DeltaSwampError, InvalidArgumentError, UnreachableTableError
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
-
-
-@pytest.fixture
-def conn() -> Any:
-    from deltaswamp.catalog.filesystem import FilesystemCatalog
-    from deltaswamp.engine.deltars import DeltaRsEngine
-    from deltaswamp.engine.kernel import KernelEngine
-    from deltaswamp.router import Router
-    from deltaswamp.table import Connection
-
-    return Connection(
-        catalog=FilesystemCatalog(),
-        router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
-    )
 
 
 @pytest.fixture
@@ -129,8 +110,8 @@ class TestSchemaEvolution:
         assert "note" in plain.to_arrow().column_names
 
     def test_merge_routes_as_merge_schema_not_append(self, plain: Any) -> None:
-        """It is a distinct operation, and routing it as a plain append is how
-        the request shape used to get lost."""
+        """It is a distinct operation; routing it as a plain append would lose
+        the request shape."""
         assert plain.can(Operation.MERGE_SCHEMA).ok
 
     def test_replace_swaps_the_schema(self, plain: Any) -> None:
@@ -156,6 +137,17 @@ class TestIdempotentWrites:
         assert plain.txn_version("loader") is None
         plain.append(pa.table({"id": [3], "city": ["cairo"]}), txn=("loader", 7))
         assert plain.txn_version("loader") == 7
+
+    def test_replay_is_a_no_op_on_the_kernel_path(self, conn: Any, tmp_path: Any) -> None:
+        schema = pa.schema([("id", pa.int64())])
+        t = conn.create_table(
+            str(tmp_path / "ict"), schema, properties={"delta.enableInCommitTimestamps": "true"}
+        )
+        assert t.can("append").engine == Engine.KERNEL
+        t.append(pa.table({"id": [1]}), txn=("loader", 1))
+        t.append(pa.table({"id": [1]}), txn=("loader", 1))
+        assert t.txn_version("loader") == 1
+        assert t.count() == 1
 
 
 class TestCommitMetadata:
@@ -185,7 +177,7 @@ class TestConfigurationOnWriteIsRefused:
 
 
 class TestKernelRefusesWhatItCannotHonor:
-    """The kernel append path used to swallow every unknown kwarg."""
+    """The kernel append path refuses keyword arguments it does not implement."""
 
     def test_unsupported_options_raise_rather_than_no_op(self, plain: Any) -> None:
         from deltaswamp.engine.kernel import KernelEngine
@@ -258,7 +250,7 @@ class TestWriteTableSaveModes:
         assert conn.open_table(plain.location).to_arrow().to_pydict()["id"] == [9]
 
     def test_unknown_mode_is_refused(self, conn: Any, tmp_path: Any) -> None:
-        with pytest.raises(UnreachableTableError, match="'error', 'ignore'"):
+        with pytest.raises(InvalidArgumentError, match="'error', 'ignore'"):
             conn.write_table(str(tmp_path / "x"), pa.table({"id": [1]}), mode="sideways")
 
     def test_schema_is_inferred_from_the_data(self, conn: Any, tmp_path: Any) -> None:
@@ -305,10 +297,15 @@ class TestKernelOverwrite:
         from deltaswamp.engine.kernel import KernelEngine
 
         KernelEngine().overwrite(
-            plain.resolved, pa.table({"id": [9], "city": ["q"]}), predicate="id = 1"
+            plain.resolved, pa.table({"id": [1], "city": ["q"]}), predicate="id = 1"
         )
         got = DeltaTable(plain.location).to_pyarrow_table().to_pylist()
-        assert {r["id"] for r in got} == {2, 9}
+        assert {(r["id"], r["city"]) for r in got} == {(1, "q"), (2, "lima")}
+        # A new row outside the predicate is refused, as Databricks does.
+        with pytest.raises(Exception, match="do not satisfy the predicate"):
+            KernelEngine().overwrite(
+                plain.resolved, pa.table({"id": [9], "city": ["z"]}), predicate="id = 1"
+            )
 
     def test_kernel_txn_and_commit_metadata(self, plain: Any) -> None:
         from deltaswamp.engine.kernel import KernelEngine

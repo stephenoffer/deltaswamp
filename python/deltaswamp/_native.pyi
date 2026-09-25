@@ -12,9 +12,10 @@ FEATURES: list[str]
 """Capabilities this build provides, by stable name.
 
 One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
-"metadata_json", "commit_raw", "partitioned_append", "uc_create_table_request",
-"checkpoint". Gate on this list, not `hasattr`, so a stale build refuses
-cleanly.
+"metadata_json", "app_id_version", "commit_raw", "partitioned_append",
+"uc_create_table_request", "checkpoint", "file_restricted_scan",
+"distributed_write". Gate on this
+list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -46,6 +47,22 @@ class BackfillRequiredError(RuntimeError):
 class RetryableError(RuntimeError):
     """A transient failure; the table is unchanged and a retry is safe."""
 
+class InvalidInputError(ValueError):
+    """The extension refused its input: arguments, data or fragments.
+
+    A ValueError subclass, so existing `except ValueError` clauses still work.
+    Other extension ValueErrors (kernel, Arrow, URL) stay plain ValueErrors.
+    """
+
+class CatalogCommitError(ValueError):
+    """The catalog refused a commit (a status other than 409/429/5xx)."""
+
+class CatalogPermissionError(CatalogCommitError):
+    """The catalog rejected the commit's credentials or privileges (401/403)."""
+
+class CatalogNotFoundError(CatalogCommitError):
+    """The catalog no longer has this table (404)."""
+
 class UcCommitConfig:
     """How to reach Unity Catalog to have a commit ratified."""
 
@@ -76,7 +93,13 @@ def create_table(
     all of which delta-rs rejects. Clustering is not a property: pass
     `cluster_by`, which sets it through the kernel's data layout.
 
-    `partition_by` and `cluster_by` are mutually exclusive.
+    `partition_by` and `cluster_by` are mutually exclusive, and each may name
+    a column once. The schema needs at least one column. Unsigned integer
+    columns are widened to the next signed type (uint8 -> short, uint16 ->
+    integer, uint32/uint64 -> long) so every value fits; uint64 values above
+    the long range are refused on write. `table_root` may be a URL or a path
+    (relative paths and `~/` are resolved); a URL must not contain an
+    unencoded `?` or `#`.
     """
 
 def table_changes(
@@ -144,7 +167,7 @@ def uc_create_table_request(
 
     Resolves the snapshot at version 0 of `table_root` (which must have been
     committed with `uc_required_properties`) and returns the body to POST to
-    the UC tables endpoint to finalise a managed table. It carries the schema,
+    the UC tables endpoint to finalize a managed table. It carries the schema,
     partition columns, protocol, properties (plus `delta.checkpointPolicy=v2`),
     the `delta.clustering`/`delta.rowTracking` domain metadata and the v0
     commit timestamp. `table_name` is passed through as the request's `name`.
@@ -241,7 +264,7 @@ class Snapshot:
         listed. Other files are dropped before any data or deletion-vector
         I/O. Semantics per file are those of the full scan: deletion vectors
         applied, column mapping and partition values resolved, row order within
-        a file preserved, and `predicate` skipping still honoured on top. Paths
+        a file preserved, and `predicate` skipping still honored on top. Paths
         not in this snapshot are ignored; `[]` yields an empty stream with the
         same schema. So scans over a partition of `files()` union to the full
         scan -- the building block for distributed reads.
@@ -283,6 +306,14 @@ class Snapshot:
         readable too.
         """
 
+    def app_id_version(self, app_id: str) -> int | None:
+        """The last `txn` version recorded for `app_id`, or None if none.
+
+        Pair with `append(txn=(app_id, version))` for idempotent writes: skip
+        a batch whose version is at or below this. Entries past
+        `delta.setTransactionRetentionDuration` read as None.
+        """
+
     def timestamp(self) -> int:
         """This version's commit timestamp in epoch milliseconds.
 
@@ -318,14 +349,47 @@ class Snapshot:
         Partitioned tables are supported: `data` must include every partition
         column (matched case-insensitively). Rows are grouped by their distinct
         partition-value tuple and each group is written as its own file with
-        the partition columns removed; the kernel serialises the values per the
+        the partition columns removed; the kernel serializes the values per the
         Delta protocol (NULL -> null / `__HIVE_DEFAULT_PARTITION__` directory,
         dates as YYYY-MM-DD, timestamps in UTC). A partition column that cannot
-        be cast to the table's type is a ValueError.
+        be cast to the table's type without changing a value is a ValueError.
+
+        Columns are matched to the table schema by name (case-insensitively),
+        at every struct level, never by position: a missing nullable column is
+        written as NULL, a missing NOT NULL one or an extra one is a
+        ValueError, and narrower types (int32, ms timestamps, dictionary
+        strings) are cast to the table's type when that is lossless.
 
         `overwrite` removes every file visible in this snapshot in the same
         commit. `txn` is `(app_id, version)` for idempotent writes;
-        `commit_metadata` goes into commitInfo.
+        `commit_metadata` goes into commitInfo, and may not use a key the
+        commitInfo action reserves (`operation`, `timestamp`, `txnId`, ...).
+        """
+
+    def write_files(self, data: Any, uc: UcCommitConfig | None = None) -> bytes:
+        """Write data files without committing; returns opaque fragment bytes.
+
+        The worker half of a distributed write. Partitioned tables are handled
+        exactly as in `append`. The files are durable when this returns but
+        belong to no version until `commit_files` accepts them, so a coordinator
+        that abandons the write leaves them behind as garbage.
+        """
+
+    def commit_files(
+        self,
+        fragments: list[bytes],
+        uc: UcCommitConfig | None = None,
+        engine_info: str | None = None,
+        operation: str | None = None,
+        overwrite: bool = False,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, str] | None = None,
+    ) -> int:
+        """Commit fragments from `write_files` as one transaction.
+
+        Every fragment lands at a single version, so a distributed write is
+        atomic. `overwrite` removes every file visible in this snapshot in the
+        same commit. Raises the same errors as `append`.
         """
 
     def publish(self, uc: UcCommitConfig | None = None) -> int:

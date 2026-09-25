@@ -27,6 +27,7 @@ pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
 
+from tests import helpers  # noqa: E402
 from tests.fake_uc import FakeTable, FakeUnityCatalog  # noqa: E402
 
 
@@ -158,10 +159,8 @@ class TestTheGapThisCloses:
 
     def test_kernel_reads_through_the_staged_commit(self, catalog_managed: Any) -> None:
         """With the tail, the same table reads at version 1."""
-        from deltaswamp._native import Snapshot
-
         _uc, path, commit, _id = catalog_managed
-        snapshot = Snapshot.resolve(
+        snapshot = helpers.snapshot(
             path,
             log_tail=[
                 (commit["version"], commit["file_name"], commit["timestamp"], commit["file_size"])
@@ -175,17 +174,13 @@ class TestTheGapThisCloses:
 class TestThroughThePublicAPI:
     @pytest.fixture
     def conn(self, catalog_managed: Any) -> Any:
-        from deltaswamp.capability import Engine
+        from deltaswamp import Connection
         from deltaswamp.catalog.ossuc import OSSUnityCatalog
-        from deltaswamp.engine.deltars import DeltaRsEngine
-        from deltaswamp.engine.kernel import KernelEngine
-        from deltaswamp.router import Router
-        from deltaswamp.table import Connection
 
         uc, _path, _commit, _table_id = catalog_managed
         return Connection(
             catalog=OSSUnityCatalog(uc.url),
-            router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
+            router=helpers.direct_router(),
         )
 
     def test_read_routes_to_kernel_and_sees_the_staged_rows(self, conn: Any) -> None:
@@ -238,17 +233,13 @@ class TestLifecycle:
 
     @pytest.fixture
     def conn(self, catalog_managed: Any) -> Any:
-        from deltaswamp.capability import Engine
+        from deltaswamp import Connection
         from deltaswamp.catalog.ossuc import OSSUnityCatalog
-        from deltaswamp.engine.deltars import DeltaRsEngine
-        from deltaswamp.engine.kernel import KernelEngine
-        from deltaswamp.router import Router
-        from deltaswamp.table import Connection
 
         uc, _path, _commit, _id = catalog_managed
         return Connection(
             catalog=OSSUnityCatalog(uc.url),
-            router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
+            router=helpers.direct_router(),
             default_catalog="main",
             default_schema="sales",
         )
@@ -288,3 +279,201 @@ class TestLifecycle:
         with pytest.raises(InvalidReferenceError, match=r"catalog\.schema\.table"):
             conn.drop_table("s3://bucket/some/path")
         assert [t.ref.table for t in conn.list_tables("main", "sales")] == ["cm"]
+
+
+@pytest.fixture
+def writable_catalog_managed(tmp_path: Any) -> Any:
+    """A catalog-managed table created the way the catalog intends.
+
+    The read-only `catalog_managed` fixture hand-writes a protocol onto a
+    delta-rs table, which is enough to exercise reads but leaves a staged commit
+    with no in-commit timestamp, so it cannot be appended to. This one goes
+    through the staging-table flow instead -- allocate, write version 0, finalize
+    -- which is the only supported way to bring such a table into existence, and
+    the result accepts commits.
+    """
+    from deltaswamp import Connection
+    from deltaswamp.catalog.ossuc import OSSUnityCatalog
+
+    with FakeUnityCatalog(staging_root=str(tmp_path)) as uc:
+        conn = Connection(
+            catalog=OSSUnityCatalog(uc.url),
+            router=helpers.direct_router(),
+        )
+        conn.create_catalog("main")
+        conn.create_schema("main.sales")
+        conn.create_table("main.sales.cm", pa.schema([("id", pa.int64()), ("city", pa.string())]))
+        yield conn
+
+
+class TestManagedTableCreation:
+    """Creating a table by name, which needs the catalog to allocate storage."""
+
+    def test_create_by_name_produces_a_catalog_managed_table(
+        self, writable_catalog_managed: Any
+    ) -> None:
+        table = writable_catalog_managed.table("main.sales.cm")
+        assert table.is_catalog_managed
+        assert table.location
+        assert table.to_arrow().num_rows == 0
+
+    def test_it_is_registered_in_the_catalog(self, writable_catalog_managed: Any) -> None:
+        listed = writable_catalog_managed.list_tables("main", "sales")
+        assert [t.ref.table for t in listed] == ["cm"]
+
+
+class TestDistributedWrite:
+    """The shape a distributed connector (Ray Data, Spark-like) needs.
+
+    Workers write data files and send back opaque fragments; the coordinator
+    commits every fragment as one transaction. On a catalog-managed table that
+    commit goes through the catalog's committer, which is the case no other
+    Python writer reaches at all.
+    """
+
+    def test_the_plan_is_picklable_and_carries_no_secret(
+        self, writable_catalog_managed: Any
+    ) -> None:
+        """A plan crosses a process boundary; a credential must not."""
+        import pickle
+
+        plan = writable_catalog_managed.table("main.sales.cm").plan_write()
+        payload = pickle.dumps(plan)
+        assert b"dapi" not in payload
+        assert pickle.loads(payload).mode == "append"
+
+    def test_workers_write_and_the_coordinator_commits_once(
+        self, writable_catalog_managed: Any
+    ) -> None:
+        import pickle
+
+        conn = writable_catalog_managed
+        plan = conn.table("main.sales.cm").plan_write()
+
+        # Each "worker" gets its own copy of the plan, as Ray would send it.
+        fragments = [
+            pickle.loads(pickle.dumps(plan)).write(pa.table({"id": [10], "city": ["oslo"]})),
+            pickle.loads(pickle.dumps(plan)).write(pa.table({"id": [11], "city": ["lima"]})),
+        ]
+        assert all(isinstance(f, bytes) and f for f in fragments)
+
+        # The files exist, but nothing is in the log until the coordinator commits.
+        assert conn.table("main.sales.cm").to_arrow().num_rows == 0
+
+        version = plan.commit(fragments)
+        after = conn.table("main.sales.cm").to_arrow()
+        assert after.num_rows == 2
+        assert set(after.to_pydict()["id"]) == {10, 11}
+        assert version == 1, "two fragments must land as one version, not two"
+
+    def test_the_commit_went_through_the_catalog(self, writable_catalog_managed: Any) -> None:
+        """A catalog-managed commit is ratified, not written straight to the log."""
+        conn = writable_catalog_managed
+        plan = conn.table("main.sales.cm").plan_write()
+        plan.commit([plan.write(pa.table({"id": [1], "city": ["a"]}))])
+        assert conn.table("main.sales.cm").to_arrow().num_rows == 1
+
+    def test_overwrite_replaces_in_one_commit(self, writable_catalog_managed: Any) -> None:
+        conn = writable_catalog_managed
+        first = conn.table("main.sales.cm").plan_write()
+        first.commit([first.write(pa.table({"id": [1, 2], "city": ["a", "b"]}))])
+
+        plan = conn.table("main.sales.cm").plan_write(mode="overwrite")
+        plan.commit([plan.write(pa.table({"id": [9], "city": ["z"]}))])
+        assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [9]
+
+    def test_committing_nothing_is_still_a_commit(self, writable_catalog_managed: Any) -> None:
+        """A job that produced no data advances the table rather than erroring."""
+        conn = writable_catalog_managed
+        version = conn.table("main.sales.cm").plan_write().commit([])
+        assert isinstance(version, int)
+        assert conn.table("main.sales.cm").to_arrow().num_rows == 0
+
+    def test_alter_is_still_refused(self, writable_catalog_managed: Any) -> None:
+        """Planning a write must not widen what the committer actually allows."""
+        from deltaswamp.capability import Operation
+
+        verdict = writable_catalog_managed.table("main.sales.cm").can(Operation.SET_PROPERTIES)
+        assert not verdict.ok
+
+
+class TestCommitFailuresReachCallersAsLibraryErrors:
+    """`errors.py` defines CommitConflictError and BackfillRequiredError so a
+    caller can catch DeltaSwampError and tell a lost race from backpressure.
+    The extension raises plain RuntimeErrors, and they were reaching callers
+    untranslated -- so `except DeltaSwampError` around a commit caught nothing,
+    which is exactly the case it exists for."""
+
+    @pytest.fixture
+    def uc_and_conn(self, tmp_path: Any) -> Any:
+        from deltaswamp import Connection
+        from deltaswamp.catalog.ossuc import OSSUnityCatalog
+
+        with FakeUnityCatalog(staging_root=str(tmp_path)) as uc:
+            conn = Connection(
+                catalog=OSSUnityCatalog(uc.url),
+                router=helpers.direct_router(),
+            )
+            conn.create_catalog("main")
+            conn.create_schema("main.sales")
+            conn.create_table("main.sales.cm", pa.schema([("id", pa.int64())]))
+            yield uc, conn
+
+    def test_a_409_is_a_commit_conflict(self, uc_and_conn: Any) -> None:
+        from deltaswamp.errors import CommitConflictError, DeltaSwampError
+
+        uc, conn = uc_and_conn
+        uc.next_commit_status = 409
+        # max_commit_retries=0: a lost race is now re-staged on a fresh tail
+        # by default (w4 catalog flows); without retries it surfaces.
+        with pytest.raises(CommitConflictError) as caught:
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}), max_commit_retries=0)
+        assert isinstance(caught.value, DeltaSwampError)
+
+    def test_a_429_is_backfill_pressure_not_a_conflict(self, uc_and_conn: Any) -> None:
+        """Retrying a 429 with backoff instead of publishing wedges the table."""
+        from deltaswamp.errors import BackfillRequiredError, CommitConflictError
+
+        uc, conn = uc_and_conn
+        uc.next_commit_status = 429
+        # A stream: a re-readable batch is now published-and-retried (w4
+        # catalog flows), so only a consumed stream still surfaces the 429.
+        with pytest.raises(BackfillRequiredError) as caught:
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}).to_reader())
+        assert not isinstance(caught.value, CommitConflictError)
+
+    def test_a_distributed_commit_conflict_is_the_same_error(self, uc_and_conn: Any) -> None:
+        """The distributed path must not raise a different type from append."""
+        from deltaswamp.errors import CommitConflictError
+
+        uc, conn = uc_and_conn
+        plan = conn.table("main.sales.cm").plan_write()
+        fragment = plan.write(pa.table({"id": [1]}))
+        uc.next_commit_status = 409
+        with pytest.raises(CommitConflictError):
+            plan.commit([fragment])
+
+    def test_retrying_a_catalog_managed_commit_says_to_re_open(self, uc_and_conn: Any) -> None:
+        """A retry re-reads the commit tail from the catalog, so it can succeed.
+
+        It used to refuse ("re-open the table"), because the tail captured at
+        resolve was all it had; the plan now carries its catalog (w4 catalog
+        flows), so `retries` does what it promises here too.
+        """
+        uc, conn = uc_and_conn
+        plan = conn.table("main.sales.cm").plan_write()
+        fragment = plan.write(pa.table({"id": [1]}))
+        uc.next_commit_status = 409
+        plan.commit([fragment], retries=3)
+        assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [1]
+
+    def test_the_table_still_works_after_a_refused_commit(self, uc_and_conn: Any) -> None:
+        from deltaswamp.errors import CommitConflictError
+
+        uc, conn = uc_and_conn
+        uc.next_commit_status = 409
+        with pytest.raises(CommitConflictError):
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}), max_commit_retries=0)
+
+        conn.table("main.sales.cm").append(pa.table({"id": [2]}))
+        assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [2]

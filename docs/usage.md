@@ -1,6 +1,6 @@
 # Usage guide
 
-Everything the public API does, with the limits stated where they exist.
+The whole public API, with its limits.
 
 - [Install](#install)
 - [Connecting](#connecting)
@@ -16,6 +16,7 @@ Everything the public API does, with the limits stated where they exist.
 - [Delta Sharing](#delta-sharing)
 - [Iceberg](#iceberg)
 - [Handing off to other engines](#handing-off-to-other-engines)
+- [Distributed reads and writes](#distributed-reads-and-writes)
 - [Asking what is possible](#asking-what-is-possible)
 - [Errors](#errors)
 - [Credentials](#credentials)
@@ -29,8 +30,7 @@ pip install deltaswamp
 ```
 
 The base install pulls in `deltalake` and `databricks-sdk` and nothing else.
-Arrow leaves this library through the PyCapsule interface, so pyarrow is
-optional even though Arrow is the native currency.
+Data leaves through the Arrow PyCapsule interface, so pyarrow is optional.
 
 | Extra | Adds | You need it for |
 |---|---|---|
@@ -47,17 +47,15 @@ optional even though Arrow is the native currency.
 | `glue` | boto3 | AWS Glue catalogs |
 | `all` | all of the above except Ray and Daft | |
 
-`databricks-connect` is deliberately not reachable from any extra: it pins
-`requires-python == 3.12.*` and conflicts with pyspark.
+No extra installs `databricks-connect`: it pins `requires-python == 3.12.*`
+and conflicts with pyspark.
 
 ## Connecting
 
-`connect()` with no arguments talks to Databricks and resolves authentication
-through the SDK's normal precedence: explicit arguments, then environment, then
-`~/.databrickscfg`, then cloud-native sources. This library never reimplements
-that logic. `databricks.sdk.core.Config` already handles PAT, OAuth U2M and M2M,
-Azure CLI, MSI and service principals, GCP service accounts, GitHub OIDC, and
-in-cluster notebook auth, so the arguments are passed straight through.
+`connect()` with no arguments talks to Databricks and hands authentication to
+`databricks-sdk`, with its usual precedence: explicit arguments, environment,
+`~/.databrickscfg`, then cloud-native sources. Every method the SDK supports
+works, from PATs and OAuth to Azure MSI, GCP service accounts and GitHub OIDC.
 
 ```python
 import deltaswamp as ds
@@ -119,9 +117,8 @@ Names may be backtick-quoted, so a dot inside an identifier works:
 | `share.schema.table` on a sharing connection | Delta Sharing |
 | `s3://`, `gs://`, `abfss://`, `file://`, `/local/path` | storage directly |
 
-`dbfs:/` and `/mnt/...` paths parse and are then refused with an explanation.
-They are unreachable from outside Databricks, and a vague missing-file error
-would send you hunting in the wrong place.
+`dbfs:/` and `/mnt/...` paths are refused with an explanation, since they are
+unreachable from outside Databricks.
 
 ## Reading
 
@@ -137,17 +134,15 @@ stream = t.scan(version=3)
 stream = t.scan(timestamp="2026-01-01T00:00:00Z")
 ```
 
-Predicates and timestamp travel work on every engine, including the kernel, so
-they work on catalog-managed tables too. On the kernel path a predicate is used
-twice. It is handed to the kernel to skip files by their statistics, and then
-applied exactly to the rows. Both uses come from one parse, so they cannot
-disagree. The predicate language is the boolean subset of Spark SQL:
+Predicates and timestamp travel work on every engine, catalog-managed tables
+included. On the kernel path one parse of the predicate both skips files by
+their statistics and filters the rows exactly. The predicate language is the boolean subset of Spark SQL:
 comparisons, `AND`/`OR`/`NOT`, `IN`, `BETWEEN`, `LIKE`, `IS [NOT] NULL`, `<=>`,
 nested columns (`addr.zip`) and typed literals (`DATE '2026-01-01'`).
 Arithmetic and function calls are refused with a message; delta-rs and the
 warehouse accept full SQL.
 
-Timestamps honour in-commit timestamps where a table has them, and a timestamp
+Timestamps honor in-commit timestamps where a table has them, and a timestamp
 earlier than the oldest reconstructable version is refused rather than
 silently clamped.
 
@@ -216,7 +211,7 @@ t = conn.register_table("main.sales.old", "s3://bucket/existing-delta-table")
 
 A managed table goes through the catalog's staging-table flow. The catalog
 allocates the id and the storage, deltaswamp writes version 0 there with the
-id and protocol the catalog requires, and the catalog then finalises the
+id and protocol the catalog requires, and the catalog then finalizes the
 registration. An external table is written with path credentials the catalog
 vends for creating tables, then registered, so the catalog and the log agree.
 `register_table` takes the schema, partitioning and properties from the log.
@@ -360,7 +355,7 @@ t.is_catalog_managed
 
 Metadata reflects the table as of the last call, and any write or ALTER through
 this object refreshes it. `features()` returns names exactly as the log holds
-them, including ones this release does not recognise, because an unknown
+them, including ones this release does not recognize, because an unknown
 writer-only feature must not block a read.
 
 ## Governance
@@ -425,10 +420,6 @@ t.to_polars(lazy=True)
 t.to_ray_dataset()  # parallel: a Ray Data datasource over a scan plan
 t.to_daft()
 
-plan = t.plan_scan(columns=["id"], predicate="day >= '2026-09-01'")
-for group in plan.partitions(8):  # byte-balanced; pickle and ship each
-    part = plan.read(group)  # on a worker: same version, own credentials
-
 for version, batch in t.changes(start, poll_interval=30):  # a CDF stream
     ...
 
@@ -443,6 +434,68 @@ Each hand-off reads through this library, so it works on tables the target
 engine's own Delta reader cannot open. `Connection.sql` runs on DuckDB by
 default (or `engine="polars"`), and can join tables from different catalogs.
 `engine="warehouse"` sends the query to Databricks as it stands.
+
+## Distributed reads and writes
+
+`plan_scan` and `plan_write` split the work between a driver and its workers.
+Everything is decided on the driver, so a refusal arrives before any compute
+is spent.
+
+```python
+plan = t.plan_scan(columns=["id"], predicate="day >= '2026-09-01'")
+for group in plan.partitions(8):  # byte-balanced; pickle and ship each
+    part = plan.read(group)  # on a worker: same version, own credentials
+
+plan = t.plan_write(mode="append")  # driver: raises now if the table refuses it
+fragment = plan.write(batch)  # worker: durable, uncommitted files -> bytes
+version = plan.commit(fragments)  # driver: every fragment in one commit
+```
+
+`WritePlan` and `ScanPlan` are picklable, and what crosses a process boundary
+carries the table's short-lived, table-scoped *storage* credential (vended on
+the driver when the plan is pickled) and its expiry -- never the catalog's
+credentials (a PAT, an OAuth client secret, a UC bearer token) and never the
+catalog itself. The driver's own plan object keeps full catalog access, so
+`commit()` runs on the driver; a worker's copy cannot commit. A worker whose
+shipped credential is within a minute of expiry raises `CredentialError`
+saying to re-plan on the driver. For jobs that outlive the credential, plan
+with `ship_catalog_auth=True` to ship the catalog's credential provider instead,
+so workers re-vend on their own -- at the cost of the catalog token travelling
+in every task payload. `to_ray_dataset()` is built on `plan_scan`, and
+catalog-managed tables work too: the commit goes through the catalog's committer.
+
+Concurrency follows what the mode means. An **append** commits against the table
+as it is then, so a writer that arrived while the job ran is not a conflict --
+both sets of rows survive. An **overwrite** removes what it finds, so committing
+against a table that has moved on would discard that writer silently; that is
+refused, and `allow_concurrent_overwrite=True` is how you say last-writer-wins.
+Where a catalog does arbitrate and rejects the commit, the fragments stay valid
+-- they describe data files, which carry no version -- so the same fragments can
+be committed again against a fresh snapshot, which `retries=` does for tables
+this library commits itself (an append on a path table retries by default, as
+`Table.append` does).
+
+A guarded overwrite commits against the planned snapshot itself, so a writer
+that lands between the check and the commit makes it conflict rather than
+vanish. An idempotent `txn=` is checked again at commit, so two runs of the same
+job cannot both land, and a retry refuses fragments whose files an earlier,
+seemingly failed attempt already committed. Pass each fragment exactly once: a
+data file named twice in one commit is refused.
+
+Which tables accept a distributed write depends on the protocol version. A
+legacy writer version implies a whole feature set, and versions 3 to 6 imply
+`checkConstraints`, which the kernel refuses whether or not a constraint
+exists. Enabling change data feed alone puts a table at version 4.
+
+| Table | Distributed write |
+|---|---|
+| writer version 1-2 (plain legacy) | yes |
+| writer version 3-6 (legacy CDF, legacy column mapping) | no: the version implies `checkConstraints` |
+| writer version 7 (feature-based) | yes, for the features the kernel writes |
+
+At version 7, change data feed, column mapping, row tracking, in-commit
+timestamps, deletion vectors and type widening all write fine. DELETE, UPDATE,
+MERGE and maintenance run on the driver.
 
 ## Asking what is possible
 
@@ -471,15 +524,20 @@ All inherit from `DeltaSwampError`.
 | Error | Means |
 |---|---|
 | `InvalidReferenceError` | the reference could not be parsed or resolved |
+| `InvalidArgumentError` | a call's arguments are malformed or contradict each other (also a `ValueError`) |
 | `UnreachableTableError` | no available engine can serve the request |
 | `FallbackRequiredError` | only the SQL fallback could serve it, and it is off |
 | `PropertyNotSupportedError` | a property the chosen engine cannot handle |
+| `EngineLimitError` | an `UnreachableTableError`: the engine serving a read hit a limit of its own once it read the log, so the next capable engine is tried first |
 | `CredentialError` | vending or refresh failed |
 | `PreflightError` | a workspace prerequisite is not satisfied |
 | `CommitConflictError` | another writer took that version first |
+| `TransientCommitError` | a commit failed for a transient reason; the table is unchanged, so retry it as is |
 | `BackfillRequiredError` | the catalog wants staged commits published |
 | `CorruptTableError` | on-disk state failed a correctness check |
+| `MissingDataFileError` | a `CorruptTableError`: a file the snapshot references was removed (VACUUM, manual delete); `.path` names it |
 | `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
+| `EnginePanicError` | an engine panicked across the FFI boundary |
 
 A conflict means re-read the snapshot, recompute, then stage again at the next
 version. A backfill demand is backpressure, not a rate limit: retrying it with
@@ -487,18 +545,11 @@ exponential backoff and no publish will wedge the table.
 
 ## Credentials
 
-Unity Catalog vends short-lived, per-table credentials. Two independent clocks
-are involved, and conflating them causes the classic failure where a job dies
-after an hour with authentication that still looks healthy.
-
-The catalog token, OAuth against `/oidc/v1/token`, is refreshed by the SDK. The
-vended storage credential carries its own `expiration_time` and has to be
-re-vended. Databricks publishes no TTL for it, so that field is the only
-authority and nothing here assumes an hour.
-
-Re-vending happens between operations, not during one. A *single* scan that
-streams for longer than the credential's lifetime can still fail, because the
-kernel builds its object store once when the snapshot opens.
+Unity Catalog vends short-lived, per-table storage credentials. They expire
+on their own clock, separate from the catalog token the SDK refreshes, and are
+re-vended between operations. A single scan that streams past its
+credential's lifetime can still fail; `plan_scan()` avoids that by vending per
+worker. [Architecture](architecture.md#credentials) has the details.
 
 ```python
 creds = t.credentials()  # or credentials(write=True)
@@ -507,8 +558,11 @@ creds.expires_within(300)
 creds.redacted()  # safe to log
 ```
 
-Credential *providers* are picklable; credentials are not. A distributed
-worker receives configuration and re-vends when its own copy expires. Azure
+Credential *providers* are picklable; credentials are not. Pickling a provider
+(or a `Table` or `Connection` holding one) carries its catalog configuration,
+which for a token-authenticated workspace includes the token, so a worker can
+re-vend. Distributed plans do not do this by default; see "Building a
+distributed connector" above. Azure
 user-delegation SAS is scoped to a path, so credentials are keyed by table, and
 Azure always gets an explicit endpoint.
 
@@ -531,27 +585,24 @@ Statements run through the Statement Execution API in `databricks-sdk`, with
 results fetched as Arrow. Values are sent as statement parameters and
 identifiers are quoted. `predicate` and `updates` strings are SQL expressions
 by contract. Writes stage Parquet in the volume, load it with `read_files`, and
-delete it afterwards.
+delete it afterward.
 
-Rerouting through a warehouse changes latency and cost by orders of magnitude,
-so you opt in, and a `SqlFallbackWarning` names the warehouse whenever the
-fallback runs.
+A warehouse changes latency and cost by orders of magnitude, so you opt in, and
+a `SqlFallbackWarning` names the warehouse whenever the fallback runs.
 
 ## Known limits
 
-See [conformance.md](conformance.md) for the full matrix and
-[ecosystem-audit.md](ecosystem-audit.md) for how each Databricks and ecosystem
-feature is reached.
+[Conformance](conformance.md) has the full matrix, and the
+[feature map](features.md) shows how each Databricks and open-source feature is
+reached.
 
-- Deletion vectors cannot be authored: delta-kernel 0.28 has no
-  `update_deletion_vectors`. DML on kernel-only tables is therefore a bounded
-  whole-table rewrite. MERGE on those tables needs the warehouse.
+- Deletion vectors are not authored yet, so DML on kernel-only tables is a
+  bounded whole-table rewrite, and MERGE on those tables needs the warehouse.
 - The change feed of a catalog-managed table needs the warehouse.
 - Distributed planning is kernel-only; tables served by other engines are read
-  on the driver. Following changes needs a change feed (`Table.changes()`).
-- A `Table` captures catalog-managed commit state when it resolves, so it will
-  not see later commits made elsewhere. Re-open it to pick them up.
-- On the Databricks side, external writes to UC managed Delta are Public
-  Preview, and external access to catalog-commit tables is Beta behind a
-  workspace preview an admin must enable. `preflight()` failing on a fresh
-  workspace is the expected first result, not a bug.
+  on the driver.
+- A `Table` captures catalog-managed commit state when it resolves. Re-open it
+  to see commits made elsewhere.
+- External writes to UC managed Delta are Public Preview on Databricks, and
+  external access to catalog-commit tables is Beta behind a workspace preview.
+  `preflight()` failing on a fresh workspace is expected.

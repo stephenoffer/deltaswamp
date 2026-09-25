@@ -1,5 +1,5 @@
 # The same commands CI runs, so a green `make check` means a green pipeline.
-.PHONY: help venv build check fmt lint types test test-unit test-live docs clean
+.PHONY: help venv build check fmt lint types test test-unit test-live clean
 
 PY := .venv/bin/python
 
@@ -15,7 +15,7 @@ help:
 
 venv:
 	uv venv --python 3.11 .venv
-	uv pip install --python $(PY) maturin pytest mypy ruff pyarrow
+	uv pip install --python $(PY) maturin -e ".[dev,pyarrow]"
 
 build:
 	$(PY) -m maturin develop --uv
@@ -44,8 +44,8 @@ test-unit:
 	$(PY) -m pytest tests/unit -q
 
 test-live:
-	$(PY) -m tests.live_preflight
-	$(PY) -m pytest tests/integration/test_live_databricks.py -v
+	$(PY) -m tests.live.preflight
+	$(PY) -m pytest tests/live -v
 
 clean:
 	cargo clean

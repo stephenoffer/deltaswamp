@@ -11,8 +11,7 @@ Two flows, each finishing with a read through the public `Connection`:
   real server does.
 
 Version 0 is written here with delta-rs and patched to declare
-`catalogManaged`, the same way `test_catalog_managed.py` builds its fixture;
-the library's own writer for this is the lead's native helper.
+`catalogManaged`, the same way `test_catalog_managed.py` builds its fixture.
 """
 
 from __future__ import annotations
@@ -24,12 +23,14 @@ from urllib.parse import urlparse
 
 import deltaswamp as ds
 import pytest
+from deltaswamp.identity import parse_ref
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
 
 from tests.fake_uc import FakeUnityCatalog  # noqa: E402
+from tests.helpers import direct_router  # noqa: E402
 
 
 @pytest.fixture
@@ -50,16 +51,7 @@ def catalog(uc: FakeUnityCatalog) -> Any:
 
 @pytest.fixture
 def conn(catalog: Any) -> Any:
-    from deltaswamp.capability import Engine
-    from deltaswamp.engine.deltars import DeltaRsEngine
-    from deltaswamp.engine.kernel import KernelEngine
-    from deltaswamp.router import Router
-    from deltaswamp.table import Connection
-
-    return Connection(
-        catalog=catalog,
-        router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
-    )
+    return ds.Connection(catalog=catalog, router=direct_router())
 
 
 def _log_actions(table_root: pathlib.Path) -> list[dict[str, Any]]:
@@ -71,7 +63,6 @@ class TestRegisterExternal:
     @pytest.fixture
     def registered(self, tmp_path: Any, catalog: Any) -> str:
         from deltalake import DeltaTable, write_deltalake
-        from deltaswamp.identity import parse_ref
 
         path = str(tmp_path / "ext")
         write_deltalake(
@@ -90,8 +81,6 @@ class TestRegisterExternal:
         return path
 
     def test_catalog_records_what_it_was_told(self, catalog: Any, registered: str) -> None:
-        from deltaswamp.identity import parse_ref
-
         info = catalog.table_info(parse_ref("main.sales.ext"))
         assert info.table_type == "EXTERNAL"
         assert info.storage_location == registered
@@ -159,8 +148,6 @@ class TestCreateManaged:
         }
 
     def test_stage_write_finalize_read(self, catalog: Any, conn: Any) -> None:
-        from deltaswamp.identity import parse_ref
-
         ref = parse_ref("main.sales.fresh")
         staged = catalog.create_staging_table(ref)
         assert not catalog.table_exists(ref)
@@ -181,7 +168,6 @@ class TestCreateManaged:
     def test_finalize_refuses_a_log_missing_required_properties(self, catalog: Any) -> None:
         from deltalake import write_deltalake
         from deltaswamp.errors import PreflightError
-        from deltaswamp.identity import parse_ref
 
         ref = parse_ref("main.sales.sloppy")
         staged = catalog.create_staging_table(ref)
@@ -246,12 +232,6 @@ class TestThroughTheConnection:
             conn.create_table("main.sales.x", pa.schema([("id", pa.int64())]), mode="overwrite")
 
 
-def parse_ref(name: str) -> Any:
-    from deltaswamp.identity import parse_ref as parse
-
-    return parse(name)
-
-
 class TestCatalogManagedWithoutDatabricks:
     """DML, predicate overwrite and checkpointing on a catalog-managed table,
     each committed through the catalog, with no warehouse involved."""
@@ -298,8 +278,14 @@ class TestCatalogManagedWithoutDatabricks:
 
     def test_replace_where(self, managed: Any) -> None:
         managed.table("main.sales.dml").overwrite(
-            pa.table({"id": [9], "c": ["n"]}), predicate="id IS NULL"
+            pa.table({"id": [9], "c": ["n"]}), predicate="id IS NULL OR id = 9"
         )
+        assert self.rows(managed) == [(1, "a"), (2, "b"), (3, "c"), (9, "n")]
+        # A new row outside the predicate is refused, as Databricks does.
+        with pytest.raises(Exception, match="do not satisfy the predicate"):
+            managed.table("main.sales.dml").overwrite(
+                pa.table({"id": [8], "c": ["m"]}), predicate="id IS NULL"
+            )
         assert self.rows(managed) == [(1, "a"), (2, "b"), (3, "c"), (9, "n")]
 
     def test_checkpoint_publishes_first(self, managed: Any) -> None:
