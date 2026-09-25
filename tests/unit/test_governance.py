@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
@@ -293,6 +294,160 @@ class TestTableInfo:
         )
         with pytest.raises(PreflightError, match="metastore-level"):
             dbx.resolve(REF)
+
+
+class TestLiveRegressions:
+    """Three bugs the offline suite could not see, found against a real workspace.
+
+    Each made a core claim untrue for every AWS Unity Catalog deployment, and
+    each is invisible without either a live metastore or a stub that answers the
+    way one really does.
+    """
+
+    def test_rest_lookups_use_the_unquoted_name(self, dbx: Any, ws: FakeWorkspace) -> None:
+        """Backticks are SQL syntax; in a REST path they are literal characters.
+
+        `tables.get(full_name=ref.full_name)` sent the quoted form, so any table
+        whose name needs quoting 404d on a perfectly valid lookup.
+        """
+        ref = parse_ref("main.sales.`odd-name`")
+        ws.tables.responses["get"] = _table_info(name="odd-name", full_name="main.sales.odd-name")
+        dbx.resolve(ref)
+        assert ws.called("tables.get")[0]["full_name"] == "main.sales.odd-name"
+
+    def test_drop_uses_the_unquoted_name(self, dbx: Any, ws: FakeWorkspace) -> None:
+        dbx.drop_table(parse_ref("main.sales.`odd-name`"))
+        assert ws.called("tables.delete")[0]["full_name"] == "main.sales.odd-name"
+
+    def test_table_uuid_is_not_the_uc_table_id(self, dbx: Any, ws: FakeWorkspace) -> None:
+        """UC's table_id names the securable, not the Delta log's Metadata.id.
+
+        Populating table_uuid from it made the identity check compare two
+        unrelated namespaces, so every managed table raised CorruptTableError.
+        Verified against a real metastore: 0 of 6 tables had them equal, while
+        the storage path segment matched table_id in all 6.
+        """
+        ws.tables.responses["get"] = _table_info(
+            table_id="6cf3e2d1-b087-4b25-b3fc-10615078d4a5",
+            table_type=uc.TableType.MANAGED,
+        )
+        resolved = dbx.resolve(REF)
+        assert resolved.table_id == "6cf3e2d1-b087-4b25-b3fc-10615078d4a5"
+        assert resolved.table_uuid is None, (
+            "table_uuid means the Delta log's Metadata.id; Databricks does not "
+            "expose it, so it must stay unset rather than borrow table_id"
+        )
+
+    def test_vended_aws_credentials_carry_a_region(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """UC vends keys but no region, and object_store then assumes us-east-1.
+
+        Every bucket outside that region answered a redirect with no Location
+        header, surfacing as an opaque "Generic S3 error".
+        """
+        from deltaswamp.credentials.base import Operation as CredOp
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider
+
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+        provider = DatabricksCredentialProvider(
+            table_id="tid-1",
+            table_url="s3://databricks-unitycatalog-default-uw2/x",
+            region="us-west-2",
+            host="https://example.cloud.databricks.com",
+            token="t",
+        )
+        response = SimpleNamespace(
+            url="s3://databricks-unitycatalog-default-uw2/x",
+            expiration_time=None,
+            aws_temp_credentials=SimpleNamespace(
+                access_key_id="AK",
+                secret_access_key="SK",
+                session_token="ST",
+                access_point=None,
+            ),
+        )
+        creds = provider._to_credentials(response, CredOp.READ)
+        assert creds.secrets["aws_region"] == "us-west-2"
+
+    def test_region_falls_back_to_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider
+
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
+        provider = DatabricksCredentialProvider(table_id="t", host="h", token="t")
+        assert provider._aws_region() == "eu-west-1"
+
+    def test_commit_tail_parses_the_real_kebab_case_protocol(self) -> None:
+        """The `/delta/v1` wire format, exactly as Databricks returns it.
+
+        A real response nests `location` under `metadata` and spells fields in
+        kebab-case. Reading `latest_table_version` instead of
+        `latest-table-version` left max_catalog_version None, and the kernel
+        then refused every catalog-managed table.
+        """
+        from deltaswamp.catalog.base import parse_commit_tail
+
+        body = {
+            "metadata": {
+                "table-uuid": "aca332b7-3250-465e-a9f2-05743fc27cc5",
+                "location": "s3://bucket/tables/aca332b7",
+            },
+            "commits": [
+                {
+                    "version": 3,
+                    "file-name": "00000000000000000003.uuid.json",
+                    "file-size": 1234,
+                    "file-modification-timestamp": 1790301244842,
+                }
+            ],
+            "latest-table-version": 3,
+        }
+        entries, latest, location = parse_commit_tail(body, "s3://fallback")
+        assert latest == 3
+        assert location == "s3://bucket/tables/aca332b7"
+        assert len(entries) == 1
+        assert entries[0].version == 3
+        assert entries[0].path == "00000000000000000003.uuid.json"
+        assert entries[0].size == 1234
+        assert entries[0].timestamp == 1790301244842
+
+    def test_commit_tail_still_accepts_snake_and_camel_case(self) -> None:
+        """Other servers and earlier drafts of the API use those spellings."""
+        from deltaswamp.catalog.base import parse_commit_tail
+
+        for latest_key, name_key, size_key in (
+            ("latest_table_version", "file_name", "file_size"),
+            ("latestTableVersion", "fileName", "fileSize"),
+        ):
+            body = {
+                "commits": [{"version": 1, name_key: "f.json", size_key: 10, "timestamp": 5}],
+                latest_key: 1,
+                "location": "s3://b/t",
+            }
+            entries, latest, location = parse_commit_tail(body)
+            assert latest == 1
+            assert location == "s3://b/t"
+            assert (entries[0].path, entries[0].size, entries[0].timestamp) == ("f.json", 10, 5)
+
+    def test_commit_tail_without_a_version_is_none_not_zero(self) -> None:
+        """None means "the catalog did not say"; 0 is a real version."""
+        from deltaswamp.catalog.base import parse_commit_tail
+
+        entries, latest, location = parse_commit_tail({"commits": []}, "s3://fallback")
+        assert entries == ()
+        assert latest is None
+        assert location == "s3://fallback"
+
+    def test_the_provider_stays_picklable_with_a_region(self) -> None:
+        import pickle
+
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider
+
+        provider = DatabricksCredentialProvider(
+            table_id="tid-1", region="us-west-2", host="h", token="t"
+        )
+        assert pickle.loads(pickle.dumps(provider))._region == "us-west-2"
 
 
 # ============================================================== permissions

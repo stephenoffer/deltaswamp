@@ -23,6 +23,7 @@ import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from .._sdk import PRODUCT
 from ..credentials.base import Credentials, Operation
 from ..credentials.databricks import DatabricksCredentialProvider
 from ..errors import DeltaSwampError, InvalidReferenceError, PreflightError
@@ -42,7 +43,7 @@ from ..governance import (
     path_operation,
 )
 from ..identity import RefKind, TableRef
-from .base import LogTailEntry, ResolvedTable, TableType
+from .base import ResolvedTable, TableType, parse_commit_tail
 
 if TYPE_CHECKING:  # pragma: no cover
     from databricks.sdk.core import Config
@@ -190,6 +191,11 @@ class DatabricksUnityCatalog:
         # Manifest capabilities are cached per schema: one list call is both
         # cheaper and more reliable than N per-table lookups.
         self._manifest_cache: dict[tuple[str, str], dict[str, frozenset[str]]] = {}
+        # The metastore region, fetched at most once. `_region_cached` is
+        # separate from `_region` so a workspace that answers None is not
+        # re-asked on every resolve.
+        self._region: str | None = None
+        self._region_cached = False
 
     # ------------------------------------------------------------------ client
 
@@ -197,13 +203,13 @@ class DatabricksUnityCatalog:
     def workspace(self) -> Any:
         if self._client is None:
             try:
-                from databricks.sdk import WorkspaceClient
+                from .._sdk import workspace_client
             except ImportError as exc:  # pragma: no cover
                 raise PreflightError(
                     "the databricks-sdk package is required for Unity Catalog access"
                 ) from exc
             if self._explicit_config is not None:
-                self._client = WorkspaceClient(config=self._explicit_config)
+                self._client = workspace_client(config=self._explicit_config)
             else:
                 kwargs = dict(self._config_kwargs)
                 if self._profile:
@@ -212,8 +218,30 @@ class DatabricksUnityCatalog:
                     kwargs["host"] = self._host
                 if self._token:
                     kwargs["token"] = self._token
-                self._client = WorkspaceClient(**kwargs)
+                self._client = workspace_client(**kwargs)
         return self._client
+
+    def _metastore_region(self) -> str | None:
+        """The current metastore's region, fetched once per catalog.
+
+        UC vends S3 keys without a region and object_store then assumes
+        us-east-1, so a bucket anywhere else fails with a redirect that carries
+        no Location header. The metastore is the authoritative source for a
+        UC-managed location. A workspace that cannot answer (no permission, or a
+        non-AWS deployment) leaves this None and the provider falls back to the
+        environment.
+        """
+        if self._region_cached:
+            return self._region
+        self._region_cached = True
+        try:
+            current = self.workspace.metastores.current()
+            if current is not None and current.metastore_id:
+                info = self.workspace.metastores.get(current.metastore_id)
+                self._region = getattr(info, "region", None) or None
+        except Exception:
+            self._region = None
+        return self._region
 
     def _provider_kwargs(self) -> dict[str, Any]:
         kwargs = dict(self._config_kwargs)
@@ -254,7 +282,12 @@ class DatabricksUnityCatalog:
             data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
             securable_kind=self._securable_kind(info),
             table_id=getattr(info, "table_id", None),
-            table_uuid=getattr(info, "table_id", None),
+            # table_uuid is deliberately unset. It means the Delta log's
+            # Metadata.id, and Databricks' table_id is a different thing: the UC
+            # securable's own UUID, which names the storage directory. Setting
+            # it here made the identity check compare two unrelated namespaces,
+            # so every UC managed table raised CorruptTableError. Databricks
+            # exposes no Delta metadata id, so there is nothing to compare.
             etag=getattr(info, "etag", None),
             properties=properties,
             external_read_supported=(
@@ -267,6 +300,7 @@ class DatabricksUnityCatalog:
                 DatabricksCredentialProvider(
                     table_id=info.table_id,
                     table_url=getattr(info, "storage_location", None),
+                    region=self._metastore_region(),
                     **self._provider_kwargs(),
                 )
                 if getattr(info, "table_id", None)
@@ -301,15 +335,19 @@ class DatabricksUnityCatalog:
         listing the whole schema just to learn the capability flags, which is
         slower and fails outright where list is denied but get is allowed.
         """
+        # _dotted, not ref.full_name: full_name is SQL-quoted, and a backtick in
+        # the REST path is a literal character, so any table whose name needs
+        # quoting (a hyphen, a dot, a space) 404s on an otherwise valid lookup.
+        name = _dotted(ref)
         try:
             return self.workspace.tables.get(
-                full_name=ref.full_name,
+                full_name=name,
                 include_manifest_capabilities=True,
                 include_delta_metadata=True,
             )
         except TypeError:
             # An older SDK without these parameters; degrade rather than fail.
-            return self.workspace.tables.get(full_name=ref.full_name)
+            return self.workspace.tables.get(full_name=name)
         except Exception as exc:
             raise self._classify(exc, ref) from exc
 
@@ -379,6 +417,20 @@ class DatabricksUnityCatalog:
         """Classify a failed governance call, naming what it needs when denied."""
         text = str(exc)
         kind = type(exc).__name__
+        # Databricks allowlists which connectors may WRITE through the UC Delta
+        # API, by product User-Agent. deltaswamp sets one (see _sdk.py), but an
+        # unregistered name is still refused, and the raw 400 reads like a bug
+        # in the caller's setup rather than a Databricks-side gate.
+        if "User-Agent" in text and "insufficient" in text:
+            return PreflightError(
+                f"cannot {action}: Databricks restricts writes through the Unity Catalog "
+                "Delta API to connectors it has allowlisted, and it does not recognise "
+                f"{PRODUCT!r}. This is a Databricks-side registration, not a "
+                "misconfiguration here: reads of catalog-managed tables go through the "
+                "same API and are unaffected. Ask Databricks support to allowlist the "
+                "connector, or use ds.connect(..., allow_sql_fallback=True) to create "
+                f"and write managed tables through a SQL warehouse. Underlying error: {exc}"
+            )
         if (
             kind in ("NotFound", "ResourceDoesNotExist")
             or "404" in text
@@ -421,23 +473,11 @@ class DatabricksUnityCatalog:
                 f"that an admin must enable. Underlying error: {exc}"
             ) from exc
 
-        commits = body.get("commits") or []
-        entries = tuple(
-            LogTailEntry(
-                version=int(c["version"]),
-                path=c.get("file_name") or c.get("fileName") or "",
-                size=int(c.get("file_size") or c.get("fileSize") or 0),
-                timestamp=int(c["timestamp"]) if c.get("timestamp") is not None else None,
-            )
-            for c in commits
-        )
-        latest = body.get("latest_table_version", body.get("latestTableVersion"))
-        location = body.get("location") or resolved.location
-
+        entries, latest, location = parse_commit_tail(body, resolved.location)
         return dataclasses.replace(
             resolved,
             log_tail=entries,
-            max_catalog_version=int(latest) if latest is not None else None,
+            max_catalog_version=latest,
             location=location,
         )
 
@@ -484,7 +524,8 @@ class DatabricksUnityCatalog:
         stay where they are, so the data outlives the registration.
         """
         try:
-            self.workspace.tables.delete(full_name=ref.full_name)
+            # Unquoted: see _get_table_info.
+            self.workspace.tables.delete(full_name=_dotted(ref))
         except Exception as exc:
             raise self._classify(exc, ref) from exc
 

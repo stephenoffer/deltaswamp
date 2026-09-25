@@ -121,6 +121,65 @@ Databricks and the rest of the Delta ecosystem that drove this.
   delta-rs as `str` where it declares `Literal`, and `write_deltalake` is
   overloaded on `mode` such that only the overwrite signature accepts a
   predicate.
+- `OSSUnityCatalog.drop_table` built the table name by interpolation rather
+  than through the `_dotted` validator its five sibling methods use, so a path
+  reference reached the server as `DELETE /tables/None.None.None` instead of
+  being refused locally.
+
+Found by running the live suite against a real AWS workspace for the first time.
+Each of these made a headline claim untrue against real Databricks, and none was
+reachable offline:
+
+- **No AWS region reached object_store.** Unity Catalog vends S3 keys but no
+  region, so object_store assumed `us-east-1` and every bucket outside it
+  answered a redirect with no `Location` header — an opaque "Generic S3 error"
+  on *every* S3-backed UC table. The catalog now passes its metastore's region,
+  falling back to `AWS_REGION`/`AWS_DEFAULT_REGION`.
+- **Every UC managed table raised `CorruptTableError`.** `table_uuid` is the
+  Delta log's `Metadata.id`, but the Databricks catalog populated it from UC's
+  `table_id`, which is the securable's own UUID (it names the storage
+  directory). The identity check therefore compared two unrelated namespaces:
+  0 of 6 tables in a real metastore had them equal. Databricks exposes no Delta
+  metadata id, so `table_uuid` is now left unset there and the check is skipped.
+- **Tables whose names need quoting could not be opened.** `tables.get` and
+  `tables.delete` passed `ref.full_name`, which is SQL-quoted; a backtick in a
+  REST path is a literal character, so a table with a hyphen 404d. Both now use
+  `_dotted`, as the rest of the file already did.
+- **`head(n)` materialised the whole table and sliced it**, so it never returned
+  on a large one — it hung the live suite on a 10 TiB table. It now consumes the
+  scan stream and stops once it has `n` rows: `head(3)` on that same 10 TiB
+  table returns in under four seconds.
+- **No product User-Agent was sent.** The UC Delta API rejects a request whose
+  User-Agent does not name the calling application, which is a 400 on staging
+  tables and on every `/delta/v1` commit. SDK clients are now stamped through
+  `deltaswamp._sdk`. Note this is necessary but not sufficient: Databricks
+  allowlists which connectors may *write* through that API, and the refusal now
+  says so instead of surfacing a raw 400. Reads of catalog-managed tables go
+  through the same API and are unaffected.
+- Streaming tables and materialized views whose manifest advertises external
+  read, but for which Unity Catalog exposes no storage location, were refused
+  with each engine reporting "no storage location" and no remedy. The router now
+  names the real cause once, with the SQL fallback as the remedy. In the test
+  workspace that is 220 tables.
+- **No catalog-managed table could be read on Databricks.** The `/delta/v1`
+  response spells its fields in kebab-case (`latest-table-version`, `file-name`)
+  and nests `location` under `metadata`; the parser looked for
+  `latest_table_version`. `max_catalog_version` was therefore always `None` and
+  the kernel refused every such table with "Max catalog version is required when
+  loading a catalog-managed table" — the one thing no other Python library can
+  do. `tests/fake_uc.py` answered in snake_case, which is why this passed
+  offline; it now speaks the real spelling, as its own create-table response
+  already did. Both Unity Catalog backends share one tolerant parser.
+- **The SQL fallback could not serve a table Unity Catalog had withdrawn from
+  credential vending**, which is exactly the case it exists for. The manifest
+  flags describe *direct external engine* access, and a warehouse runs inside
+  Databricks, but the refusal fired before the fallback was considered while
+  naming `allow_sql_fallback=True` as its own remedy. Those refusals are now
+  conditional on the fallback being unavailable, and direct engines are skipped
+  for a non-vendable table rather than accepting the call and failing mid-flight
+  on a `CredentialError`. On a real managed table this moves DELETE, UPDATE,
+  OPTIMIZE, ANALYZE, ADD COLUMN and the comment/property DDL from unreachable to
+  working.
 
 ### Changed
 

@@ -57,6 +57,43 @@ class TestRead:
     def test_reads_route_to_kernel(self, conn: Any, path: str) -> None:
         assert conn.open_table(path).can(Operation.SCAN).engine is Engine.KERNEL
 
+    def test_head_returns_the_first_n_rows(self, conn: Any, path: str) -> None:
+        t = conn.open_table(path)
+        assert t.head(2).num_rows == 2
+        assert t.head(0).num_rows == 0
+        # More than the table holds is not an error, just the whole table.
+        assert t.head(99).num_rows == 3
+        assert t.head(2, columns=["city"]).column_names == ["city"]
+
+    def test_head_stops_reading_once_it_has_enough(self, conn: Any, path: str) -> None:
+        """head() must not materialise the table to slice it.
+
+        It used to be `to_arrow().slice(0, n)`, which on a real multi-terabyte
+        table never returned -- it hung the live suite on a 10 TiB table until
+        this was changed to consume the stream and stop.
+        """
+        t = conn.open_table(path)
+        consumed: list[int] = []
+        original = t.scan
+
+        def counting_scan(**kwargs: Any) -> Any:
+            import pyarrow as pa
+
+            reader = pa.RecordBatchReader.from_stream(original(**kwargs))
+
+            def batches() -> Any:
+                for batch in reader:
+                    consumed.append(batch.num_rows)
+                    yield batch
+
+            return pa.RecordBatchReader.from_batches(reader.schema, batches())
+
+        t.scan = counting_scan
+        assert t.head(1).num_rows == 1
+        assert len(consumed) == 1, (
+            f"head(1) pulled {len(consumed)} batches; it must stop at the first"
+        )
+
 
 class TestWrite:
     def test_append(self, conn: Any, path: str) -> None:

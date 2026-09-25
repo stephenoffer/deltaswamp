@@ -418,11 +418,20 @@ class SqlEngine:
 
     def _workspace(self) -> Any:
         if self._client is None:
-            from databricks.sdk import WorkspaceClient
             from databricks.sdk.core import Config
 
-            cfg = self._config or Config(profile=self._profile, host=self._host, token=self._token)
-            self._client = WorkspaceClient(config=cfg)
+            from .._sdk import PRODUCT, sdk_version, workspace_client
+
+            # Named explicitly rather than splatted: Config's signature is
+            # heterogeneous, so **kwargs defeats type checking here.
+            cfg = self._config or Config(
+                profile=self._profile,
+                host=self._host,
+                token=self._token,
+                product=PRODUCT,
+                product_version=sdk_version(),
+            )
+            self._client = workspace_client(config=cfg)
         return self._client
 
     def _resolve_warehouse(self) -> str | None:

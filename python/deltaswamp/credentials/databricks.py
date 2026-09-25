@@ -12,10 +12,14 @@ Deliberate choices, each tied to a failure mode observed in the wild:
   configuration rather than a token, and each worker vends its own.
 * **Azure gets an explicit endpoint.** Account-name inference happens to work on
   `*.blob.core.windows.net` and silently breaks everywhere else.
+* **AWS gets an explicit region.** UC vends keys but no region, and object_store
+  then defaults to us-east-1, so every bucket outside it answers a redirect with
+  no Location header. The catalog supplies its metastore's region.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -59,6 +63,7 @@ class DatabricksCredentialProvider:
         table_id: str,
         *,
         table_url: str | None = None,
+        region: str | None = None,
         config: Config | None = None,
         profile: str | None = None,
         host: str | None = None,
@@ -68,6 +73,7 @@ class DatabricksCredentialProvider:
     ) -> None:
         self._table_id = table_id
         self._table_url = table_url
+        self._region = region
         self._refresh_margin = refresh_margin
         # Configuration is kept as plain data so this object stays picklable.
         self._profile = profile
@@ -81,6 +87,15 @@ class DatabricksCredentialProvider:
         self._lock = threading.Lock()
 
     # --- picklability: ship configuration, never a live client or a token ---
+
+    def _aws_region(self) -> str | None:
+        """The region for an S3 bucket: the catalog's, else the environment's.
+
+        The catalog passes its metastore region, which is authoritative for a
+        UC-managed location. The environment fallback covers a caller who
+        resolved a table some other way.
+        """
+        return self._region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -103,14 +118,14 @@ class DatabricksCredentialProvider:
     def _workspace(self) -> Any:
         if self._client is None:
             try:
-                from databricks.sdk import WorkspaceClient
+                from .._sdk import workspace_client
             except ImportError as exc:  # pragma: no cover
                 raise CredentialError(
                     "the databricks-sdk package is required for Unity Catalog access; "
                     "install deltaswamp's base dependencies"
                 ) from exc
             if self._explicit_config is not None:
-                self._client = WorkspaceClient(config=self._explicit_config)
+                self._client = workspace_client(config=self._explicit_config)
             else:
                 kwargs = dict(self._config_kwargs)
                 if self._profile:
@@ -119,7 +134,7 @@ class DatabricksCredentialProvider:
                     kwargs["host"] = self._host
                 if self._token:
                     kwargs["token"] = self._token
-                self._client = WorkspaceClient(**kwargs)
+                self._client = workspace_client(**kwargs)
         return self._client
 
     def credentials(self, operation: Operation = Operation.READ) -> Credentials:
@@ -176,6 +191,12 @@ class DatabricksCredentialProvider:
                 "aws_secret_access_key": c.secret_access_key,
                 "aws_session_token": c.session_token,
             }
+            # UC vends keys but never a region. Without one object_store falls
+            # back to us-east-1 and any other bucket answers a redirect carrying
+            # no Location header, which surfaces as an opaque "Generic S3 error".
+            region = self._aws_region()
+            if region:
+                secrets["aws_region"] = region
             if getattr(c, "access_point", None):
                 secrets["aws_endpoint_url"] = c.access_point
         elif getattr(resp, "r2_temp_credentials", None):
