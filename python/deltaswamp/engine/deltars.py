@@ -294,7 +294,9 @@ class DeltaRsEngine:
             and "deletionVectors" in table.effective_reader_features
             and not shape.get("lite")
         ):
-            return Capability(operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY)
+            return Capability(
+                operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY
+            )
         if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
             refusal = _add_feature_refusal(table, shape["features"])
             if refusal is not None:
