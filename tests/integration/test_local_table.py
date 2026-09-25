@@ -753,3 +753,151 @@ class TestAddColumnAcceptsTheSameFormsOnEveryEngine:
         location = self._table(conn, properties)
         conn.open_table(location).add_column(definition)
         assert "a" in [f.name for f in conn.open_table(location).schema()]
+
+
+class TestEnforcementIsNotBypassed:
+    """Two features the kernel cannot honour, which delta-rs evaluates itself.
+
+    Both are dangerous in the same way: the kernel nominally accepts the table,
+    so a write that should have been checked is not. The failure is semantic --
+    data that violates the table's own rules -- rather than an error, which is
+    why routing has to keep these on delta-rs.
+    """
+
+    @staticmethod
+    def _with_invariant(conn: Any, path: str) -> Any:
+        """Give `amt` a Delta invariant, the way a legacy writer would."""
+        import glob
+        import json
+        import os
+
+        conn.open_table(path).to_arrow()
+        logs = sorted(glob.glob(os.path.join(path, "_delta_log", "*.json")))
+        with open(logs[0]) as log:
+            metadata = next(json.loads(line) for line in log if "metaData" in line)
+        schema = json.loads(metadata["metaData"]["schemaString"])
+        for field in schema["fields"]:
+            if field["name"] == "amt":
+                field["metadata"] = {
+                    "delta.invariants": json.dumps({"expression": {"expression": "amt > 0"}})
+                }
+        metadata["metaData"]["schemaString"] = json.dumps(schema)
+        nxt = int(os.path.basename(logs[-1]).split(".")[0]) + 1
+        with open(os.path.join(path, "_delta_log", f"{nxt:020d}.json"), "w") as fh:
+            fh.write(
+                json.dumps({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}) + "\n"
+            )
+            fh.write(json.dumps(metadata) + "\n")
+        table = conn.open_table(path)
+        table.to_arrow()  # the protocol is read from the log on first use
+        return table
+
+    @pytest.fixture
+    def amounts(self, conn: Any) -> str:
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        table = conn.create_table(location, pa.schema([("id", pa.int64()), ("amt", pa.int64())]))
+        table.append(pa.table({"id": [1], "amt": [10]}))
+        return location
+
+    def test_a_real_invariant_keeps_writes_on_delta_rs(self, conn: Any, amounts: str) -> None:
+        """`invariants` is Supported in name only; the kernel fails once one exists.
+
+        And it fails *after* writing the data files, which in a distributed job
+        means every worker does its work before anything refuses.
+        """
+        table = self._with_invariant(conn, amounts)
+        assert table.resolved.has_invariants
+        assert table.can(Operation.APPEND).engine is Engine.DELTARS
+        assert table.can(Operation.SCAN).engine is Engine.KERNEL, "reads are unaffected"
+
+    def test_a_distributed_write_is_refused_at_plan_time(self, conn: Any, amounts: str) -> None:
+        self._with_invariant(conn, amounts)
+        with pytest.raises(UnreachableTableError, match="invariant"):
+            conn.open_table(amounts).plan_write()
+
+    def test_the_invariant_is_still_enforced(self, conn: Any, amounts: str) -> None:
+        self._with_invariant(conn, amounts)
+        conn.open_table(amounts).append(pa.table({"id": [2], "amt": [5]}))
+        assert conn.open_table(amounts).to_arrow().num_rows == 2
+        with pytest.raises(Exception, match=r"(?i)invalid data|invariant"):
+            conn.open_table(amounts).append(pa.table({"id": [3], "amt": [-1]}))
+
+    def test_the_feature_name_alone_does_not_divert_ordinary_tables(
+        self, conn: Any, path: str
+    ) -> None:
+        """Writer version 2 implies `invariants` for nearly every legacy table.
+
+        Routing on the feature name would push all of them off the kernel write
+        path, so detection keys on the schema actually carrying one.
+        """
+        table = conn.open_table(path)
+        table.to_arrow()
+        assert "invariants" in table.resolved.effective_writer_features
+        assert not table.resolved.has_invariants
+        plan = conn.open_table(path).plan_write()
+        plan.commit([plan.write(pa.table({"id": [9], "city": ["z"]}))])
+        assert conn.open_table(path).to_arrow().num_rows == 4
+
+    def test_row_tracking_refuses_an_overwrite_before_the_workers_run(self, conn: Any) -> None:
+        """A kernel overwrite removes every visible file in the same commit.
+
+        Kernel 0.28 refuses a commit that stages removes on a row-tracked table,
+        because it cannot preserve the ids of what it removes -- and it refuses
+        at commit, after the data files exist. Appends are unaffected: they
+        stage no removes, and the kernel assigns fresh ids.
+        """
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        table = conn.create_table(
+            location,
+            pa.schema([("id", pa.int64())]),
+            properties={"delta.enableRowTracking": "true"},
+        )
+
+        plan = table.plan_write()
+        plan.commit([plan.write(pa.table({"id": [1]}))])
+        assert conn.open_table(location).to_arrow().num_rows == 1, "append still works"
+
+        with pytest.raises(UnreachableTableError, match="row ids"):
+            conn.open_table(location).plan_write(mode="overwrite")
+
+    def test_deletion_vectors_do_not_block_an_overwrite(self, conn: Any) -> None:
+        """Only row tracking rules removes out; a DV table overwrites normally."""
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        table = conn.create_table(
+            location,
+            pa.schema([("id", pa.int64())]),
+            properties={"delta.enableDeletionVectors": "true"},
+        )
+        plan = table.plan_write()
+        plan.commit([plan.write(pa.table({"id": [1]}))])
+
+        replace = conn.open_table(location).plan_write(mode="overwrite")
+        replace.commit([replace.write(pa.table({"id": [9]}))])
+        assert conn.open_table(location).to_arrow().to_pydict()["id"] == [9]
+
+    def test_a_check_constraint_keeps_writes_on_delta_rs(self, conn: Any, amounts: str) -> None:
+        """A legacy protocol names no features, so only the version reveals this.
+
+        Reading just the named list made the table look featureless: the kernel
+        would have accepted the write and skipped the constraint entirely.
+        """
+        conn.open_table(amounts).add_constraint({"amt_positive": "amt > 0"})
+        table = conn.open_table(amounts)
+        table.to_arrow()
+        assert table.resolved.writer_features == frozenset(), "nothing is named"
+        assert "checkConstraints" in table.resolved.effective_writer_features
+        assert table.can(Operation.APPEND).engine is Engine.DELTARS
+
+        with pytest.raises(UnreachableTableError, match="checkConstraints"):
+            conn.open_table(amounts).plan_write()
+        with pytest.raises(Exception, match=r"(?i)invalid data|constraint"):
+            conn.open_table(amounts).append(pa.table({"id": [3], "amt": [-5]}))

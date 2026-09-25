@@ -927,6 +927,7 @@ class Table:
                 writer_features=frozenset(detail.get("writer_features") or ()),
                 properties={**self._catalog_properties, **(detail.get("properties") or {})},
                 partition_columns=tuple(detail.get("partition_columns") or ()),
+                has_invariants=bool(detail.get("has_invariants")),
             )
             self._check_identity(detail.get("metadata_id"))
             return self._resolved

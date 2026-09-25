@@ -119,6 +119,41 @@ Databricks and the rest of the Delta ecosystem that drove this.
   front. `ResolvedTable.effective_reader_features` /
   `effective_writer_features` expose the merged view, and both engines use them.
 
+### Fixed: enforcement the kernel path could have skipped
+
+Two features delta-rs evaluates itself, where letting the kernel take the write
+would not raise an error -- it would write data that breaks the table's own
+rules, which is worse.
+
+- **CHECK constraints on a legacy-protocol table.** Such a table names no
+  features at all: `minWriterVersion` 3 is the only evidence it has them.
+  Reading the named list alone made it look featureless, so the kernel accepted
+  the write and the constraint was never evaluated. The legacy expansion added
+  in this release is what closes it, and a test now pins the whole chain: the
+  named set is empty, `checkConstraints` is implied, writes route to delta-rs,
+  and violating rows are rejected.
+- **Features behind a kernel cargo flag this build does not enable.**
+  `adaptiveMetadata-preview` and `geospatial` were recorded as partially
+  supported, which is what kernel can do behind `adaptive-metadata-in-dev` and
+  `geo-type-in-dev` -- flags `crates/native/Cargo.toml` deliberately leaves off.
+  Partial is not `no`, so they passed the write check and failed at commit. The
+  matrix now records what *this binary* can do, and both are refused up front.
+- **Overwriting a row-tracked table.** A kernel overwrite removes every visible
+  file in the same commit, and kernel 0.28 refuses a commit that stages removes
+  on a row-tracked table because it cannot preserve the ids of what it removes.
+  The guard existed but only covered the rewrite operations, so `overwrite`
+  passed preflight and failed at commit -- after the data files were written,
+  which in a distributed job means every worker had already done its work. Row
+  tracking is now checked for every remove-staging operation. Appends are
+  unaffected: they stage no removes and the kernel assigns fresh ids.
+- **Tables that really carry a Delta invariant.** `invariants` is Supported in
+  name only: the kernel refuses any write once a column has one, and it refuses
+  *after* writing the data files -- so in a distributed job every worker does
+  its work before anything says no. Routing on the feature name is far too
+  blunt, since writer version 2 implies it for nearly every legacy table, so
+  `ResolvedTable.has_invariants` now records whether the schema actually uses
+  one and the kernel declines those writes up front. Reads are untouched.
+
 ### Fixed by adversarial review of the distributed-write surface
 
 - **A fragment could be committed to the wrong table, corrupting it silently.**

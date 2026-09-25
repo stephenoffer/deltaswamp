@@ -453,25 +453,31 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
         _row(TableFeature.VARIANT_TYPE_PREVIEW, _RW, _Y, _Y, _Y, _Y),
         _row(TableFeature.VARIANT_SHREDDING, _RW, _Y, _Y, _N, _N),
         _row(TableFeature.VARIANT_SHREDDING_PREVIEW, _RW, _Y, _Y, _N, _N),
+        # Both sit behind a kernel cargo feature this build deliberately does not
+        # enable (see crates/native/Cargo.toml), so for *this* binary they are
+        # unsupported in both directions. Recording what kernel could do behind
+        # a flag we do not compile made these pass the write check and fail at
+        # commit instead -- after the data was written.
         _row(
             TableFeature.ADAPTIVE_METADATA_PREVIEW,
             _RW,
-            _P,
-            _P,
             _N,
             _N,
-            "kernel gates this behind the adaptive-metadata-in-dev cargo feature; "
-            "not production-ready",
+            _N,
+            _N,
+            "kernel gates this behind the adaptive-metadata-in-dev cargo feature, which "
+            "this build does not enable; not production-ready",
         ),
         _row(
             TableFeature.GEOSPATIAL,
             _RW,
-            _P,
             _N,
             _N,
             _N,
-            "kernel gates behind geo-type-in-dev; read only, writes error. One feature "
-            "covers both geometry and geography.",
+            _N,
+            "kernel gates reads behind geo-type-in-dev, which this build does not "
+            "enable, and errors on writes regardless. One feature covers both "
+            "geometry and geography.",
         ),
         # --- no kernel variant at all
         _row(

@@ -160,6 +160,10 @@ class ResolvedTable:
     properties: dict[str, str] = field(default_factory=dict)
     # Empty for an unpartitioned table, or before the log has been read.
     partition_columns: tuple[str, ...] = ()
+    #: Whether any column really carries a Delta invariant. The `invariants`
+    #: feature is implied by writer version 2, so nearly every legacy table
+    #: lists it; only the tables that actually use one need different routing.
+    has_invariants: bool = False
 
     # Set when reading the log failed on every engine. The router then refuses
     # direct-storage operations with this as the reason, instead of routing on

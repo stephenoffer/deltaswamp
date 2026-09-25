@@ -10,6 +10,7 @@ it is a ReaderWriter feature, anything carrying `vacuumProtocolCheck`.
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -85,6 +86,11 @@ _WRITE_OPS: frozenset[Operation] = frozenset(
 _REWRITE_OPS: frozenset[Operation] = frozenset(
     {Operation.REPLACE_WHERE, Operation.DELETE, Operation.UPDATE}
 )
+
+#: Operations whose commit stages remove actions. Kernel 0.28 refuses those on
+#: a row-tracked table: it cannot preserve the row ids of what it removes, and
+#: it refuses at commit -- after the data files are already written.
+_REMOVE_OPS: frozenset[Operation] = _REWRITE_OPS | {Operation.OVERWRITE}
 
 _IMPLEMENTED: frozenset[Operation] = frozenset(
     {
@@ -232,6 +238,20 @@ class KernelEngine:
             if refusal is not None:
                 return refusal
 
+        if operation in _REMOVE_OPS and "rowTracking" in table.effective_writer_features:
+            # Checked for every remove-staging operation, not just the rewrites:
+            # a kernel overwrite removes every visible file in the same commit,
+            # and the commit is refused after the data is written.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table tracks row ids, and this commit would remove rows whose "
+                    "ids delta-kernel 0.28 cannot preserve"
+                ),
+                remedy="ds.connect(..., allow_sql_fallback=True)",
+            )
+
         if operation in _REWRITE_OPS:
             refusal = self._rewrite_refusal(operation, table)
             if refusal is not None:
@@ -273,6 +293,22 @@ class KernelEngine:
                         "the kernel cannot write these table features: "
                         + ", ".join(sorted(write_blockers))
                     ),
+                )
+            if table.has_invariants and not metadata_only:
+                # `invariants` is Supported in name only: the kernel refuses any
+                # write once a column actually carries one, and it does so after
+                # the data files are written. Routing on the feature name would
+                # be far too blunt -- writer version 2 implies it for nearly
+                # every legacy table -- so this keys on the schema itself.
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason=(
+                        "a column of this table carries a Delta invariant, and the kernel "
+                        "refuses to write a table that uses them. delta-rs evaluates "
+                        "invariants and can"
+                    ),
+                    remedy="write through delta-rs, which serves this table",
                 )
             if (
                 table.partition_columns
@@ -520,6 +556,7 @@ class KernelEngine:
             "properties": snap.table_properties(),
             "partition_columns": list(snap.partition_columns),
             "metadata_id": snap.metadata_id,
+            "has_invariants": _schema_has_invariants(snap),
         }
 
     # ------------------------------------------------------------------ write
@@ -713,14 +750,11 @@ class KernelEngine:
     rewrite_max_bytes = 1 << 30
 
     def _rewrite_refusal(self, operation: Operation, table: ResolvedTable) -> Capability | None:
-        """Whether a whole-table rewrite may serve DELETE/UPDATE/replaceWhere."""
-        if "rowTracking" in table.writer_features:
-            return Capability(
-                operation,
-                ok=False,
-                reason="the table tracks row ids, and a rewrite through the kernel would have "
-                "to preserve them, which delta-kernel 0.28 cannot do",
-            )
+        """Whether a whole-table rewrite may serve DELETE/UPDATE/replaceWhere.
+
+        Row tracking is handled before this, since it rules out every commit
+        that stages a remove, not only the rewrites.
+        """
         if table.location is None:
             return None
         try:
@@ -1278,6 +1312,50 @@ def _conflict_version(message: str) -> int:
 
     found = re.search(r"version (\d+)", message)
     return int(found.group(1)) if found else -1
+
+
+def _schema_has_invariants(snapshot: Any) -> bool:
+    """Whether any column of the schema carries a Delta invariant.
+
+    The `invariants` feature is implied by `minWriterVersion` 2, so nearly every
+    legacy table lists it whether or not a single invariant exists. The kernel
+    only fails on the ones that really have them, so the feature name alone is
+    far too blunt to route on -- it would push every legacy table off the kernel
+    write path.
+    """
+    try:
+        metadata = json.loads(snapshot.metadata_json())
+    except Exception:
+        return False
+    schema = metadata.get("schemaString") or metadata.get("schema_string")
+    if isinstance(schema, str):
+        try:
+            schema = json.loads(schema)
+        except ValueError:
+            return False
+    if not isinstance(schema, dict):
+        return False
+    return _fields_carry_invariants(schema.get("fields") or [])
+
+
+def _fields_carry_invariants(fields: Any) -> bool:
+    """Walk a Delta schema looking for `delta.invariants`, nested types included."""
+    if isinstance(fields, dict):
+        fields = [fields]
+    for field in fields or []:
+        if not isinstance(field, dict):
+            continue
+        if (field.get("metadata") or {}).get("delta.invariants"):
+            return True
+        dtype = field.get("type")
+        if isinstance(dtype, dict):
+            if _fields_carry_invariants(dtype.get("fields") or []):
+                return True
+            for nested in ("elementType", "valueType", "keyType"):
+                inner = dtype.get(nested)
+                if isinstance(inner, dict) and _fields_carry_invariants(inner.get("fields") or []):
+                    return True
+    return False
 
 
 def _delta_fields(fields: Any) -> list[dict[str, Any]]:
