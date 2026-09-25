@@ -415,12 +415,20 @@ class TestCreateRoutingAndProperties:
     def test_inert_property_warns(self, conn: Any, tmp_path: Any) -> None:
         from deltaswamp.errors import IgnoredPropertyWarning
 
-        with pytest.warns(IgnoredPropertyWarning, match="checkpointPolicy"):
+        with pytest.warns(IgnoredPropertyWarning, match="setTransactionRetentionDuration"):
             conn.create_table(
                 str(tmp_path / "inert"),
                 self._schema(),
-                properties={"delta.checkpointPolicy": "v2"},
+                properties={"delta.setTransactionRetentionDuration": "interval 7 days"},
             )
+
+    def test_v2_checkpoint_policy_adds_its_feature(self, conn: Any, tmp_path: Any) -> None:
+        # delta-rs stored the policy without the v2Checkpoint feature, which
+        # Databricks treats as an invalid protocol; the kernel creates it.
+        t = conn.create_table(
+            str(tmp_path / "v2"), self._schema(), properties={"delta.checkpointPolicy": "v2"}
+        )
+        assert "v2Checkpoint" in t.features()
 
 
 class TestTableIdentity:

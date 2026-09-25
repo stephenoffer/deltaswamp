@@ -53,6 +53,16 @@ _RESTORE_DV_REASON = (
     "changes -- it reports success and leaves the rows deleted (delta-rs#4613)"
 )
 
+_VACUUM_DV_REASON = (
+    "the table has deletion vectors, and delta-rs's full VACUUM does not count the "
+    "deletion-vector files live data files reference: it deletes them, and the table "
+    "can no longer be read"
+)
+_VACUUM_DV_REMEDY = (
+    "vacuum(lite=True) removes only files the log records as removed, or run VACUUM "
+    "from Databricks (allow_sql_fallback=True)"
+)
+
 _READ_ONLY_OPS: frozenset[Operation] = frozenset(
     {
         Operation.SCAN,
@@ -262,6 +272,29 @@ class DeltaRsEngine:
                 return Capability(operation, ok=False, reason=exc.reason, remedy=exc.remedy or "")
         if operation is Operation.RESTORE and "deletionVectors" in table.reader_features:
             return Capability(operation, ok=False, reason=_RESTORE_DV_REASON)
+        if (
+            operation is Operation.SET_PROPERTIES
+            and table.min_reader_version is not None
+            and table.min_reader_version >= 3
+        ):
+            # delta-rs 1.6.5 answers any property change on a table-features
+            # protocol by adding a variantType reader+writer feature, which
+            # blocks every reader without variant support.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "delta-rs adds a spurious variantType reader+writer feature when it "
+                    "sets properties on a table-features (reader version 3) protocol"
+                ),
+                remedy="this routes to the kernel, which commits the change itself",
+            )
+        if (
+            operation is Operation.VACUUM
+            and "deletionVectors" in table.effective_reader_features
+            and not shape.get("lite")
+        ):
+            return Capability(operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY)
         if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
             refusal = _add_feature_refusal(table, shape["features"])
             if refusal is not None:
@@ -1323,6 +1356,15 @@ def _add_feature_refusal(table: ResolvedTable, features: Any) -> str | None:
     """
     names = features if isinstance(features, (list, tuple, set, frozenset)) else [features]
     wires = {_wire_name(n) for n in names}
+    if table.min_writer_version is not None and table.min_writer_version < 7:
+        # delta-rs moves the table to writer version 7 listing only the new
+        # feature, so everything the legacy version implied (invariants,
+        # checkConstraints, changeDataFeed, columnMapping, ...) silently stops
+        # being enforced -- and a column-mapped table then reads as all NULLs.
+        return (
+            f"the table is at legacy writer version {table.min_writer_version}, and delta-rs "
+            "would replace the features that version implies with only the new one"
+        )
     present = set(table.reader_features) | set(table.writer_features) | wires
     for wire in sorted(wires):
         feature = feature_from_wire(wire)

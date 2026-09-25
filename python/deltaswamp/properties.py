@@ -118,8 +118,11 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
         # --- delta-rs stores but does not act on
         _prop(
             "delta.checkpointPolicy",
-            _ST,
-            _ST,
+            # Rejected rather than stored: delta-rs keeps the value but adds no
+            # v2Checkpoint feature, a protocol Databricks treats as invalid, and
+            # on a table-features protocol it panics. The kernel honors it.
+            _RJ,
+            _RJ,
             _H,
             False,
             "delta-rs stores it but adds no v2Checkpoint feature, so a v2 policy "

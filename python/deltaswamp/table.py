@@ -2052,8 +2052,9 @@ class Table:
         if retention_hours is not None and retention_hours < 0:
             raise InvalidArgumentError(f"retention_hours must be >= 0, got {retention_hours}")
         # The shape lets the router accept a dry run on tables a real VACUUM,
-        # which commits, cannot touch.
-        result = self._engine(Operation.VACUUM, dry_run=bool(dry_run)).vacuum(
+        # which commits, cannot touch, and refuse a full one where delta-rs
+        # would delete live deletion vectors.
+        result = self._engine(Operation.VACUUM, dry_run=bool(dry_run), lite=bool(lite)).vacuum(
             self._resolved, retention_hours=retention_hours, dry_run=dry_run, lite=lite, **kwargs
         )
         self._invalidate()

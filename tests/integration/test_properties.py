@@ -66,7 +66,7 @@ class TestMatrixIsInternallyConsistent:
 #: Keys delta-rs accepts at create but mishandles, so the matrix treats them
 #: as rejected to keep those creates on the kernel. Each is probed for the
 #: mishandling instead; if that stops, the row can go back to honored.
-_AVOIDED_ON_DELTARS = frozenset({"delta.enableDeletionVectors"})
+_AVOIDED_ON_DELTARS = frozenset({"delta.enableDeletionVectors", "delta.checkpointPolicy"})
 
 
 class TestProbesAgainstInstalledDeltaRs:
@@ -88,6 +88,18 @@ class TestProbesAgainstInstalledDeltaRs:
         assert "variantType" in protocol.get("readerFeatures", []), (
             "delta-rs no longer stamps variantType; delta.enableDeletionVectors can be "
             "honored on its create path again"
+        )
+
+    def test_deltars_still_omits_the_v2_checkpoint_feature(self, tmp_path: Any) -> None:
+        from deltalake import DeltaTable, write_deltalake
+
+        path = str(tmp_path / "t")
+        write_deltalake(
+            path, pa.table({"id": [1]}), configuration={"delta.checkpointPolicy": "v2"}
+        )
+        assert "v2Checkpoint" not in (DeltaTable(path).protocol().writer_features or []), (
+            "delta-rs now adds v2Checkpoint; delta.checkpointPolicy can be honored on its "
+            "create path again"
         )
 
     """If one of these fails, delta-rs changed and the matrix needs updating."""
@@ -227,6 +239,12 @@ class TestSetProbesAgainstInstalledDeltaRs:
             # protocol, so the matrix records it as rejected on purpose.
             protocol = DeltaTable(path).protocol()
             assert accepted and "variantType" in (protocol.writer_features or [])
+            assert row.deltars_set is PropertyEffect.REJECTED
+            return
+        if key == "delta.checkpointPolicy":
+            # Accepted, but stored without the v2Checkpoint feature it needs.
+            protocol = DeltaTable(path).protocol()
+            assert accepted and "v2Checkpoint" not in (protocol.writer_features or [])
             assert row.deltars_set is PropertyEffect.REJECTED
             return
         if key == "delta.minReaderVersion":
