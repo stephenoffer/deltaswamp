@@ -144,6 +144,11 @@ class KernelEngine:
         """Workers can each read a planned subset of a snapshot's files."""
         return _native_has("file_restricted_scan", "files")
 
+    @property
+    def supports_distributed_write(self) -> bool:
+        """Workers can write data files that a coordinator commits together."""
+        return _native_has("distributed_write")
+
     #: SQL predicates are parsed here: the kernel skips files with the
     #: structured form, and the exact row filter is applied afterwards.
     supports_predicates = True
@@ -198,7 +203,7 @@ class KernelEngine:
         # Writer-only features never block a read; only reader and
         # reader-writer features can. This asymmetry is the whole point.
         blockers: list[str] = []
-        for name in table.reader_features:
+        for name in table.effective_reader_features:
             feature = feature_from_wire(name)
             if feature is None:
                 blockers.append(f"{name} (unrecognised reader feature)")
@@ -228,7 +233,7 @@ class KernelEngine:
         if operation in _WRITE_OPS or operation in METADATA_OPERATIONS:
             write_blockers: list[str] = []
             metadata_only = operation in METADATA_OPERATIONS
-            for name in table.writer_features:
+            for name in table.effective_writer_features:
                 feature = feature_from_wire(name)
                 if feature is None:
                     write_blockers.append(f"{name} (unrecognized writer feature)")
@@ -1143,6 +1148,57 @@ class KernelEngine:
                 )
             )
         return splits
+
+    def write_files(self, table: ResolvedTable, data: Any) -> bytes:
+        """Write data files for `table` without committing them.
+
+        Returns opaque fragment bytes describing what was written. The files
+        exist and are durable once this returns; they belong to no version
+        until `commit_files` accepts them, so a coordinator that abandons the
+        write leaves them behind.
+        """
+        if not self.supports_distributed_write:
+            raise NotImplementedError(
+                "the installed native extension cannot write files without committing"
+            )
+        snapshot = self.snapshot(table, write=True)
+        result: bytes = snapshot.write_files(
+            _as_record_batch_reader(data), uc=self._uc_commit_config(table)
+        )
+        return result
+
+    def commit_files(
+        self,
+        table: ResolvedTable,
+        fragments: list[bytes],
+        *,
+        overwrite: bool = False,
+        engine_info: str | None = None,
+        operation: str = "WRITE",
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Commit fragments from `write_files` as one transaction.
+
+        Every fragment lands at a single version, so a distributed write is
+        atomic: a reader sees all of it or none of it.
+        """
+        if not self.supports_distributed_write:
+            raise NotImplementedError(
+                "the installed native extension cannot commit externally written files"
+            )
+        snapshot = self.snapshot(table, write=True)
+        version: int = snapshot.commit_files(
+            list(fragments),
+            uc=self._uc_commit_config(table),
+            engine_info=engine_info or f"deltaswamp/{_version()}",
+            operation=operation,
+            overwrite=overwrite,
+            txn=txn,
+            commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+        )
+        self._maybe_checkpoint(table, version)
+        return version
 
     def execute_scan(
         self,

@@ -11,6 +11,7 @@ from typing import Any
 import deltaswamp as ds
 import pytest
 from deltaswamp.capability import Engine, Operation
+from deltaswamp.errors import UnreachableTableError
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
@@ -499,3 +500,146 @@ class TestUnmodelledWriterFeatures:
         t = self._with_writer_feature(conn, path, "identityColumns")
         assert not t.can(Operation.APPEND).ok
         assert t.can(Operation.ADD_COLUMN).ok
+
+
+class TestDistributedWrite:
+    """Plan on the driver, write on workers, commit once.
+
+    The failure this shape exists to prevent is the usual one in distributed
+    Delta writers: discovering at commit time that the table refuses the write,
+    after the compute is spent, leaving orphaned Parquet behind.
+    """
+
+    def test_fragments_from_several_workers_land_as_one_version(self, conn: Any, path: str) -> None:
+        import pickle
+
+        table = conn.open_table(path)
+        before = table.version
+        plan = conn.open_table(path).plan_write()
+        fragments = [
+            pickle.loads(pickle.dumps(plan)).write(pa.table({"id": [10], "city": ["a"]})),
+            pickle.loads(pickle.dumps(plan)).write(pa.table({"id": [11], "city": ["b"]})),
+            pickle.loads(pickle.dumps(plan)).write(pa.table({"id": [12], "city": ["c"]})),
+        ]
+        assert conn.open_table(path).version == before, "nothing commits before commit()"
+
+        version = plan.commit(fragments)
+        assert version == before + 1, "three fragments, one version"
+        assert conn.open_table(path).to_arrow().num_rows == 6
+
+    def test_the_plan_pickles_without_a_credential(self, conn: Any, path: str) -> None:
+        import pickle
+
+        payload = pickle.dumps(conn.open_table(path).plan_write())
+        for shape in (b"dapi", b"AKIA", b"aws_secret_access_key"):
+            assert shape not in payload
+
+    def test_overwrite_removes_the_old_files_in_the_same_commit(self, conn: Any, path: str) -> None:
+        plan = conn.open_table(path).plan_write(mode="overwrite")
+        plan.commit([plan.write(pa.table({"id": [99], "city": ["z"]}))])
+        assert conn.open_table(path).to_arrow().to_pydict()["id"] == [99]
+
+    def test_an_unknown_mode_is_refused(self, conn: Any, path: str) -> None:
+        with pytest.raises(UnreachableTableError, match="append"):
+            conn.open_table(path).plan_write(mode="upsert")
+
+    def test_a_partitioned_table_writes_partition_directories(self, conn: Any) -> None:
+        import glob
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        table = conn.create_table(
+            location,
+            pa.schema([("id", pa.int64()), ("region", pa.string())]),
+            partition_by=["region"],
+        )
+        plan = table.plan_write()
+        plan.commit(
+            [
+                plan.write(pa.table({"id": [1, 2], "region": ["us", "eu"]})),
+                plan.write(pa.table({"id": [3], "region": ["us"]})),
+            ]
+        )
+        written = {
+            os.path.basename(os.path.dirname(f))
+            for f in glob.glob(os.path.join(location, "*", "*.parquet"))
+        }
+        assert written == {"region=us", "region=eu"}
+        assert conn.open_table(location).to_arrow().num_rows == 3
+
+    def test_an_idempotent_plan_refuses_a_replay_before_the_job(self, conn: Any, path: str) -> None:
+        """The whole point of planning: catch it before the compute, not after."""
+        plan = conn.open_table(path).plan_write(txn=("nightly", 1))
+        plan.commit([plan.write(pa.table({"id": [7], "city": ["x"]}))])
+
+        with pytest.raises(UnreachableTableError, match="already committed"):
+            conn.open_table(path).plan_write(txn=("nightly", 1))
+
+    def test_an_append_lands_on_top_of_a_concurrent_writer(self, conn: Any, path: str) -> None:
+        """An append means "add these rows", so a racing writer is not a conflict."""
+        plan = conn.open_table(path).plan_write()
+        fragment = plan.write(pa.table({"id": [10], "city": ["a"]}))
+        conn.open_table(path).append(pa.table({"id": [99], "city": ["z"]}))
+
+        plan.commit([fragment])
+        got = set(conn.open_table(path).to_arrow().to_pydict()["id"])
+        assert {10, 99} <= got, "both writers' rows must survive"
+
+    def test_a_raced_overwrite_is_refused_rather_than_losing_the_winner(
+        self, conn: Any, path: str
+    ) -> None:
+        """An overwrite removes what it finds, so a racing writer would vanish.
+
+        Nothing in the log would record that a writer was lost, which is why
+        this is refused rather than resolved silently.
+        """
+        plan = conn.open_table(path).plan_write(mode="overwrite")
+        fragment = plan.write(pa.table({"id": [10], "city": ["a"]}))
+        conn.open_table(path).append(pa.table({"id": [99], "city": ["z"]}))
+
+        with pytest.raises(UnreachableTableError, match="discard"):
+            plan.commit([fragment])
+        assert 99 in conn.open_table(path).to_arrow().to_pydict()["id"]
+
+    def test_a_raced_overwrite_can_be_forced(self, conn: Any, path: str) -> None:
+        plan = conn.open_table(path).plan_write(mode="overwrite")
+        fragment = plan.write(pa.table({"id": [10], "city": ["a"]}))
+        conn.open_table(path).append(pa.table({"id": [99], "city": ["z"]}))
+
+        plan.commit([fragment], allow_concurrent_overwrite=True)
+        assert conn.open_table(path).to_arrow().to_pydict()["id"] == [10]
+
+    def test_an_unraced_overwrite_needs_no_opt_in(self, conn: Any, path: str) -> None:
+        plan = conn.open_table(path).plan_write(mode="overwrite")
+        plan.commit([plan.write(pa.table({"id": [10], "city": ["a"]}))])
+        assert conn.open_table(path).to_arrow().to_pydict()["id"] == [10]
+
+    def test_a_refused_write_writes_no_files(self, conn: Any, path: str) -> None:
+        """A table the kernel cannot write must be refused before any file lands."""
+        import glob
+        import json
+        import os
+
+        conn.open_table(path).to_arrow()
+        logs = sorted(glob.glob(os.path.join(path, "_delta_log", "*.json")))
+        nxt = int(os.path.basename(logs[-1]).split(".")[0]) + 1
+        with open(os.path.join(path, "_delta_log", f"{nxt:020d}.json"), "w") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "protocol": {
+                            "minReaderVersion": 3,
+                            "minWriterVersion": 7,
+                            "readerFeatures": [],
+                            "writerFeatures": ["checkpointProtection"],
+                        }
+                    }
+                )
+                + "\n"
+            )
+        before = len(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
+        with pytest.raises(UnreachableTableError, match="checkpointProtection"):
+            conn.open_table(path).plan_write()
+        after = len(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
+        assert after == before, "a refused plan must not have written anything"

@@ -1,4 +1,4 @@
-"""Distributed reads: plan once on the driver, read splits on workers.
+"""Distributed reads and writes: plan on the driver, do the work on workers.
 
 A plan is a list of `ScanSplit`s pinned to one snapshot version. What travels
 to a worker is the engine, the resolved table (with its *credential provider*,
@@ -10,6 +10,14 @@ appears in a task payload.
 
 The Ray Data datasource is a thin layer over that: one read task per group of
 splits, balanced by bytes.
+
+Writes run the same shape in reverse. `WritePlan` settles on the driver whether
+the commit can succeed *before* any worker runs, each worker writes data files
+and returns an opaque fragment, and the driver commits every fragment as one
+transaction. That ordering is the point: the common failure in distributed Delta
+writers is discovering at commit time that the table refuses the write, after an
+hour of compute, leaving orphaned Parquet behind. Here the refusal arrives
+before the first byte is written, carrying the reason.
 """
 
 from __future__ import annotations
@@ -18,7 +26,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, cast
 
-__all__ = ["DeltaSwampDatasource", "ScanPlan", "balance"]
+__all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance"]
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,135 @@ class ScanPlan:
 
     def partitions(self, n: int) -> list[tuple[Any, ...]]:
         return balance(self.splits, n)
+
+
+@dataclass(frozen=True)
+class WritePlan:
+    """A validated distributed write: workers produce files, the driver commits.
+
+    Built by `Table.plan_write()`, which refuses up front if the table cannot
+    accept the write, so a job never runs against a table that will reject it.
+
+    Picklable by the same rule as `ScanPlan`: it carries the engine, the
+    resolved table and its *credential provider*, never a credential. A worker
+    vends its own, so nothing secret enters a task payload and a long job does
+    not die on a token frozen at submission time.
+    """
+
+    engine: Any
+    table: Any
+    mode: str = "append"
+    version: int | None = None
+    txn: tuple[str, int] | None = None
+    commit_metadata: dict[str, Any] | None = None
+
+    @property
+    def overwrite(self) -> bool:
+        return self.mode == "overwrite"
+
+    def write(self, data: Any) -> bytes:
+        """Worker side: write `data` as files, returning a fragment to send back.
+
+        The files are durable when this returns but belong to no version yet.
+        Every fragment must reach `commit()` or the files are orphaned.
+        """
+        result: bytes = self.engine.write_files(self.table, data)
+        return result
+
+    def commit(
+        self,
+        fragments: Iterable[bytes],
+        *,
+        operation: str = "WRITE",
+        retries: int = 0,
+        allow_concurrent_overwrite: bool = False,
+    ) -> int:
+        """Driver side: commit every fragment as one transaction.
+
+        Returns the committed version. The commit resolves the table again, so
+        an append lands on top of whatever else has been written since the plan
+        was made rather than failing on it -- which is what an append means, and
+        why one rarely conflicts here at all.
+
+        An overwrite is the opposite: it removes what it finds, so committing
+        against a table that has moved on would discard a writer that arrived
+        after planning. That is refused unless `allow_concurrent_overwrite` says
+        the last writer should win.
+
+        On a catalog-managed table the catalog arbitrates and can still reject
+        the commit outright. The table is untouched when it does, and the
+        fragments stay valid: they describe data files, which carry no version,
+        so the same fragments can be committed again against a fresh snapshot.
+        `retries` re-attempts that here for tables this library commits itself;
+        a catalog-managed table has to be re-opened through its catalog first,
+        and says so rather than spinning against a stale commit tail.
+        """
+        from .errors import CommitConflictError, UnreachableTableError
+
+        collected = list(fragments)
+        if self.overwrite and not allow_concurrent_overwrite:
+            self._refuse_if_the_table_moved()
+
+        attempts = max(0, retries) + 1
+        last: Exception | None = None
+        conflict_version = -1
+        for _ in range(attempts):
+            try:
+                version: int = self.engine.commit_files(
+                    self.table,
+                    collected,
+                    overwrite=self.overwrite,
+                    operation=operation,
+                    txn=self.txn,
+                    commit_metadata=self.commit_metadata,
+                )
+            except CommitConflictError as exc:
+                last = exc
+                conflict_version = exc.version
+                if self.table.is_catalog_managed:
+                    # The ratified tail and the version ceiling were captured
+                    # when the table was resolved, so re-committing here would
+                    # keep racing against the same stale view.
+                    raise UnreachableTableError(
+                        "retry the commit",
+                        "this table is catalog-managed, and its commit tail was captured "
+                        f"when it was resolved, so a retry here would reuse it ({exc})",
+                        "re-open the table through the catalog and commit the same "
+                        "fragments against the fresh snapshot -- they stay valid",
+                    ) from exc
+                continue
+            return version
+
+        raise CommitConflictError(
+            conflict_version,
+            f"another writer committed first on each of {attempts} attempts ({last}). "
+            "The fragments are still valid: re-open the table and commit them again.",
+        )
+
+    def _refuse_if_the_table_moved(self) -> None:
+        """Refuse an overwrite whose planned snapshot is no longer current.
+
+        The commit removes every file it can see, so if the table advanced
+        between planning and committing, those rows would go too -- silently,
+        and with nothing in the log to say a writer was lost.
+        """
+        from .errors import UnreachableTableError
+
+        if self.version is None:
+            return
+        try:
+            current = self.engine.detail(self.table).get("version")
+        except Exception:
+            return  # cannot tell; the commit itself will still be atomic
+        if current is not None and current != self.version:
+            raise UnreachableTableError(
+                "commit this overwrite",
+                f"the table was at version {self.version} when the write was planned and "
+                f"is at {current} now. An overwrite removes what it finds, so committing "
+                "would discard whatever was written in between",
+                "re-plan against the current version, or pass "
+                "allow_concurrent_overwrite=True to let the last writer win",
+            )
 
 
 def balance(splits: Iterable[Any], n: int) -> list[tuple[Any, ...]]:

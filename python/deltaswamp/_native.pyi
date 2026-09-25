@@ -328,5 +328,31 @@ class Snapshot:
         `commit_metadata` goes into commitInfo.
         """
 
+    def write_files(self, data: Any, uc: UcCommitConfig | None = None) -> bytes:
+        """Write data files without committing; returns opaque fragment bytes.
+
+        The worker half of a distributed write. Partitioned tables are handled
+        exactly as in `append`. The files are durable when this returns but
+        belong to no version until `commit_files` accepts them, so a coordinator
+        that abandons the write leaves them behind as garbage.
+        """
+
+    def commit_files(
+        self,
+        fragments: list[bytes],
+        uc: UcCommitConfig | None = None,
+        engine_info: str | None = None,
+        operation: str | None = None,
+        overwrite: bool = False,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, str] | None = None,
+    ) -> int:
+        """Commit fragments from `write_files` as one transaction.
+
+        Every fragment lands at a single version, so a distributed write is
+        atomic. `overwrite` removes every file visible in this snapshot in the
+        same commit. Raises the same errors as `append`.
+        """
+
     def publish(self, uc: UcCommitConfig | None = None) -> int:
         """Publish ratified-but-unpublished commits into `_delta_log/`."""

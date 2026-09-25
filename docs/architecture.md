@@ -342,6 +342,23 @@ reads only its files through a file-restricted kernel scan, which applies
 deletion vectors, column mapping and partition values exactly as the full scan
 does.
 
+Writes take the same shape in reverse, and the kernel's own write API is
+already built for it: a connector writes Parquet and hands back add-action
+metadata, which the kernel commits. Splitting that across machines needs the
+metadata to travel, so it moves as Arrow IPC rather than JSON -- the schema
+kernel expects is nested, follows the table's own schema for statistics, and
+gains columns under row tracking, so re-deriving it here would drift from
+`Transaction::add_files_schema` silently. Every fragment joins one transaction,
+so a distributed write appears at a single version.
+
+The ordering matters more than the mechanism. `plan_write` settles on the driver
+whether the commit can succeed before any worker runs, because the way a
+distributed Delta write normally fails is to find out at commit time, after the
+compute is spent, leaving orphaned Parquet that nobody owns. That check reads
+the protocol in full: a legacy `minWriterVersion` implies features it never
+names, and a connector that reads only the named list sees a featureless table
+and accepts a write it cannot perform.
+
 Credential refresh inside a single long read.
 
 Catalog-managed state is captured once at resolution. `log_tail` and

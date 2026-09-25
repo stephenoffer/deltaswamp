@@ -49,6 +49,9 @@ pub const FEATURES: &[&str] = &[
     "uc_create_table_request",
     "checkpoint",
     "file_restricted_scan",
+    // Distributed writes: workers produce data files, a coordinator commits
+    // them as one transaction.
+    "distributed_write",
 ];
 
 #[pyfunction]

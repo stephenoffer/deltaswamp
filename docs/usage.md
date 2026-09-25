@@ -444,6 +444,58 @@ engine's own Delta reader cannot open. `Connection.sql` runs on DuckDB by
 default (or `engine="polars"`), and can join tables from different catalogs.
 `engine="warehouse"` sends the query to Databricks as it stands.
 
+## Building a distributed connector on this
+
+`plan_scan` and `plan_write` are the two halves of the contract an engine like
+Ray Data needs: decide everything on the driver, do the work on workers, and
+never discover a refusal halfway.
+
+```python
+# --- driver: the write is settled here, before any compute
+plan = t.plan_write(mode="append")        # raises now if the table refuses it
+
+# --- workers: each writes its own shard and returns an opaque fragment
+fragment = plan.write(batch)              # bytes; files are durable, uncommitted
+
+# --- driver: one atomic commit of every fragment
+version = plan.commit(fragments)          # a reader sees all of it or none
+```
+
+`WritePlan` is picklable and carries the table's *credential provider*, never a
+credential, so each worker vends its own and nothing secret enters a task
+payload.
+
+Concurrency follows what the mode means. An **append** commits against the table
+as it is then, so a writer that arrived while the job ran is not a conflict --
+both sets of rows survive. An **overwrite** removes what it finds, so committing
+against a table that has moved on would discard that writer silently; that is
+refused, and `allow_concurrent_overwrite=True` is how you say last-writer-wins.
+Where a catalog does arbitrate and rejects the commit, the fragments stay valid
+-- they describe data files, which carry no version -- so the same fragments can
+be committed again against a fresh snapshot, which `retries=` does for tables
+this library commits itself.
+
+Three properties are the point:
+
+**The refusal arrives before the job runs.** A distributed Delta write usually
+fails by discovering at commit time that the table rejects it -- after an hour of
+compute, leaving orphaned Parquet nobody will clean up. `plan_write` raises on
+the driver with the reason, and the table's protocol is read in full first: a
+legacy `minWriterVersion` implies features it never names, and those are checked
+too.
+
+**The commit is one version.** Fragments from any number of workers land in a
+single transaction. Partial jobs are never visible.
+
+**Catalog-managed tables work.** The commit routes through the catalog's
+committer, so `plan_write` covers tables nothing else in Python can write, and
+`conn.create_table("cat.schema.name", schema)` brings one into existence through
+the catalog's staging flow.
+
+What stays on the driver: `delete`, `update`, `merge`, `optimize` and the rest of
+DML. Those are delta-rs operations, not append-shaped, and nothing here splits
+them across workers.
+
 ## Asking what is possible
 
 `capabilities()` reports every operation, whether it can be served, by which

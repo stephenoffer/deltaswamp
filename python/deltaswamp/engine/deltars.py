@@ -137,12 +137,12 @@ class DeltaRsEngine:
 
         # Reader features gate everything; writer features gate only writes.
         blockers: list[str] = []
-        for name in table.reader_features:
+        for name in table.effective_reader_features:
             feature = feature_from_wire(name)
             if feature is None or FEATURE_SUPPORT[feature].deltars_read is Support.NO:
                 blockers.append(name)
         if writing:
-            for name in table.writer_features:
+            for name in table.effective_writer_features:
                 feature = feature_from_wire(name)
                 if feature is None or FEATURE_SUPPORT[feature].deltars_write is Support.NO:
                     blockers.append(name)

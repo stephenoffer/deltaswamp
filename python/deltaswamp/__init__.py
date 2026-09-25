@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from .capability import Capability, Engine, Operation, TableFeature
 from .credentials import Cloud, CredentialProvider, Credentials
+from .distributed import ScanPlan, WritePlan
 from .errors import (
     BackfillRequiredError,
     CommitConflictError,
     CorruptTableError,
     CredentialError,
+    CredentialExpiryWarning,
     DeltaSwampError,
     EnginePanicError,
     FallbackRequiredError,
@@ -45,6 +47,7 @@ __all__ = [
     "Connection",
     "CorruptTableError",
     "CredentialError",
+    "CredentialExpiryWarning",
     "CredentialProvider",
     "Credentials",
     "DeltaSwampError",
@@ -59,10 +62,12 @@ __all__ = [
     "PropertyNotSupportedError",
     "RefKind",
     "Router",
+    "ScanPlan",
     "Table",
     "TableFeature",
     "TableRef",
     "UnreachableTableError",
+    "WritePlan",
     "__version__",
     "check_native",
     "connect",

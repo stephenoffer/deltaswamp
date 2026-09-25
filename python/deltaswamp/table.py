@@ -1036,6 +1036,59 @@ class Table:
             relation.create_view(name, replace=True)
         return relation
 
+    def plan_write(
+        self,
+        *,
+        mode: str = "append",
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Plan a distributed write, refusing now if the table will not accept it.
+
+        Returns a picklable `WritePlan`. Ship it to workers, call
+        `plan.write(batch)` there, send the fragments back, and commit them all
+        at once with `plan.commit(fragments)`. The write lands at a single
+        version: a reader sees the whole job or none of it.
+
+        The refusal happens here, on the driver, before any worker runs. That
+        is the point of planning separately -- the usual way a distributed Delta
+        write fails is to discover at commit time that the table rejects it,
+        after the compute is spent, leaving orphaned Parquet behind. Anything
+        `can()` reports as unavailable is raised here instead, with the reason.
+
+        `mode` is ``append`` or ``overwrite``; overwrite removes every file
+        visible in the planned snapshot in the same commit.
+        """
+        from .distributed import WritePlan
+
+        if mode not in ("append", "overwrite"):
+            raise UnreachableTableError(
+                f"plan a write with mode={mode!r}",
+                "a distributed write is 'append' or 'overwrite'",
+            )
+        operation = Operation.OVERWRITE if mode == "overwrite" else Operation.APPEND
+        needs = {"distributed_write"}
+        if txn is not None:
+            needs.add("idempotent_txn")
+        if commit_metadata is not None:
+            needs.add("commit_metadata")
+        if txn is not None and self._already_committed(txn):
+            raise UnreachableTableError(
+                f"plan an idempotent write for {txn[0]!r} at version {txn[1]}",
+                "that transaction is already committed, so running the job would "
+                "duplicate work whose result is already in the table",
+                "raise the txn version, or drop txn= to write unconditionally",
+            )
+        engine = self._engine(operation, frozenset(needs))
+        return WritePlan(
+            engine=engine,
+            table=self._enrich(),
+            mode=mode,
+            version=self.version,
+            txn=txn,
+            commit_metadata=commit_metadata,
+        )
+
     def plan_scan(
         self,
         *,

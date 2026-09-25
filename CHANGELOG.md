@@ -91,6 +91,34 @@ Databricks and the rest of the Delta ecosystem that drove this.
 - **Hand-offs**: `to_duckdb`, `to_polars(lazy=True)`, `to_ray_dataset`,
   `to_daft`, and `Connection.sql` for cross-catalog SQL on DuckDB or Polars.
 
+### Added for distributed connectors
+
+- **Distributed writes.** `Table.plan_write()` returns a picklable `WritePlan`;
+  workers call `plan.write(batch)` to produce data files and an opaque
+  fragment, and the driver calls `plan.commit(fragments)` to land every
+  fragment in one transaction at a single version. Catalog-managed tables are
+  included, so this reaches tables nothing else in Python can write. New native
+  primitives `Snapshot.write_files` / `Snapshot.commit_files` carry the
+  add-action metadata as Arrow IPC, which keeps kernel's own schema byte-exact
+  instead of re-deriving one that would drift.
+- Concurrency on a distributed commit follows the mode: an append lands on top
+  of a writer that arrived while the job ran, while an overwrite against a table
+  that has since moved is refused rather than silently discarding it, with
+  `allow_concurrent_overwrite=True` to ask for last-writer-wins. `retries=`
+  rebases a rejected commit, and a catalog-managed table says to re-open rather
+  than spinning against the commit tail it captured at resolution.
+- The refusal now happens on the driver, before any worker runs. The usual way
+  a distributed Delta write fails is to discover at commit time that the table
+  rejects it, after the compute is spent, leaving orphaned Parquet; `plan_write`
+  raises there and then with the reason.
+- **Legacy protocol versions are expanded to the features they imply.** Below
+  reader 3 / writer 7 a protocol lists no features -- the version number is the
+  feature set. Reading only the named list made such a table look featureless,
+  so an engine accepted a write it could not perform and failed at commit. A
+  `(2, 5)` table now correctly reports `checkConstraints` and is refused up
+  front. `ResolvedTable.effective_reader_features` /
+  `effective_writer_features` expose the merged view, and both engines use them.
+
 ### Fixed
 
 - Catalog-managed appends never reached the catalog: the UC commit ran outside
