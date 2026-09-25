@@ -34,7 +34,7 @@ from deltaswamp.identity import RefKind, TableRef, parse_ref  # noqa: E402
 from pyiceberg.partitioning import PartitionField, PartitionSpec  # noqa: E402
 from pyiceberg.transforms import BucketTransform, IdentityTransform  # noqa: E402
 
-from tests.unit.test_iceberg import (  # noqa: E402
+from tests.integration.test_iceberg import (  # noqa: E402
     ARROW,
     SCHEMA,
     DirectoryCatalog,

@@ -73,7 +73,7 @@ class TestDeltaRsRoute:
         t.add_constraint({"pos": "id > 0"})
         assert "delta.constraints.pos" in t.properties()
         t.drop_constraint("pos")
-        # Regression: a re-read after ALTER used to keep the stale property.
+        # The table is re-read after an ALTER, so the dropped property is gone.
         assert "delta.constraints.pos" not in t.properties()
         t.drop_constraint("pos", if_exists=True)
 
@@ -98,6 +98,13 @@ class TestDeltaRsRoute:
 
     def test_count_with_predicate(self, conn: Any, path: str) -> None:
         assert conn.open_table(path).count(predicate="id >= 2") == 2
+
+    def test_added_features_leave_the_table_writable(self, conn: Any, path: str) -> None:
+        conn.open_table(path).add_feature(["changeDataFeed", "v2Checkpoint"])
+        protocol = reread(path).protocol()
+        assert {"changeDataFeed", "v2Checkpoint"} <= set(protocol.writer_features or [])
+        conn.open_table(path).append(pa.table({"id": [4], "city": ["kyiv"]}))
+        assert conn.open_table(path).count() == 4
 
 
 @needs_commit_raw

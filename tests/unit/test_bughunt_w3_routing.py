@@ -38,9 +38,9 @@ def _data(n: int = 0) -> Any:
 @pytest.fixture
 def conn() -> Any:
     from deltaswamp.catalog.filesystem import FilesystemCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.deltars import DeltaRsEngine
     from deltaswamp.engine.kernel import KernelEngine
-    from deltaswamp.table import Connection
 
     return Connection(
         catalog=FilesystemCatalog(),
@@ -51,8 +51,8 @@ def conn() -> Any:
 @pytest.fixture
 def kernel_only() -> Any:
     from deltaswamp.catalog.filesystem import FilesystemCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.kernel import KernelEngine
-    from deltaswamp.table import Connection
 
     return Connection(
         catalog=FilesystemCatalog(), router=Router(engines={Engine.KERNEL: KernelEngine()})

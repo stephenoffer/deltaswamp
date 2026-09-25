@@ -81,7 +81,7 @@ pub fn commit_raw(
 ///
 /// Step three of the managed-table creation flow: after staging the table in
 /// UC and committing v0 with `uc_required_properties`, send this to the UC
-/// `tables` endpoint to finalise registration.
+/// `tables` endpoint to finalize registration.
 #[pyfunction]
 #[pyo3(signature = (table_root, table_name, options = None))]
 pub fn uc_create_table_request(
@@ -117,7 +117,7 @@ pub fn uc_create_table_request(
             &snapshot, engine_ref, table_name,
         )?;
         serde_json::to_string(&request)
-            .map_err(|e| NativeError::Invalid(format!("could not serialise the UC request: {e}")))
+            .map_err(|e| NativeError::Invalid(format!("could not serialize the UC request: {e}")))
     })?;
     Ok(body)
 }

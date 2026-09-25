@@ -750,8 +750,8 @@ def test_table_schema_and_count_do_not_read_everything_twice(
     rich: FakeSharingServer,
 ) -> None:
     from deltaswamp.capability import Engine
+    from deltaswamp.connection import Connection
     from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     catalog = SharingCatalog(
         {

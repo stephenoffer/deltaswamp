@@ -27,6 +27,7 @@ pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
 
+from tests import helpers  # noqa: E402
 from tests.fake_uc import FakeTable, FakeUnityCatalog  # noqa: E402
 
 
@@ -158,10 +159,8 @@ class TestTheGapThisCloses:
 
     def test_kernel_reads_through_the_staged_commit(self, catalog_managed: Any) -> None:
         """With the tail, the same table reads at version 1."""
-        from deltaswamp._native import Snapshot
-
         _uc, path, commit, _id = catalog_managed
-        snapshot = Snapshot.resolve(
+        snapshot = helpers.snapshot(
             path,
             log_tail=[
                 (commit["version"], commit["file_name"], commit["timestamp"], commit["file_size"])
@@ -175,17 +174,13 @@ class TestTheGapThisCloses:
 class TestThroughThePublicAPI:
     @pytest.fixture
     def conn(self, catalog_managed: Any) -> Any:
-        from deltaswamp.capability import Engine
+        from deltaswamp import Connection
         from deltaswamp.catalog.ossuc import OSSUnityCatalog
-        from deltaswamp.engine.deltars import DeltaRsEngine
-        from deltaswamp.engine.kernel import KernelEngine
-        from deltaswamp.router import Router
-        from deltaswamp.table import Connection
 
         uc, _path, _commit, _table_id = catalog_managed
         return Connection(
             catalog=OSSUnityCatalog(uc.url),
-            router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
+            router=helpers.direct_router(),
         )
 
     def test_read_routes_to_kernel_and_sees_the_staged_rows(self, conn: Any) -> None:
@@ -238,17 +233,13 @@ class TestLifecycle:
 
     @pytest.fixture
     def conn(self, catalog_managed: Any) -> Any:
-        from deltaswamp.capability import Engine
+        from deltaswamp import Connection
         from deltaswamp.catalog.ossuc import OSSUnityCatalog
-        from deltaswamp.engine.deltars import DeltaRsEngine
-        from deltaswamp.engine.kernel import KernelEngine
-        from deltaswamp.router import Router
-        from deltaswamp.table import Connection
 
         uc, _path, _commit, _id = catalog_managed
         return Connection(
             catalog=OSSUnityCatalog(uc.url),
-            router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
+            router=helpers.direct_router(),
             default_catalog="main",
             default_schema="sales",
         )
@@ -301,17 +292,13 @@ def writable_catalog_managed(tmp_path: Any) -> Any:
     -- which is the only supported way to bring such a table into existence, and
     the result accepts commits.
     """
-    from deltaswamp.capability import Engine
+    from deltaswamp import Connection
     from deltaswamp.catalog.ossuc import OSSUnityCatalog
-    from deltaswamp.engine.deltars import DeltaRsEngine
-    from deltaswamp.engine.kernel import KernelEngine
-    from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     with FakeUnityCatalog(staging_root=str(tmp_path)) as uc:
         conn = Connection(
             catalog=OSSUnityCatalog(uc.url),
-            router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
+            router=helpers.direct_router(),
         )
         conn.create_catalog("main")
         conn.create_schema("main.sales")
@@ -419,19 +406,13 @@ class TestCommitFailuresReachCallersAsLibraryErrors:
 
     @pytest.fixture
     def uc_and_conn(self, tmp_path: Any) -> Any:
-        from deltaswamp.capability import Engine
+        from deltaswamp import Connection
         from deltaswamp.catalog.ossuc import OSSUnityCatalog
-        from deltaswamp.engine.deltars import DeltaRsEngine
-        from deltaswamp.engine.kernel import KernelEngine
-        from deltaswamp.router import Router
-        from deltaswamp.table import Connection
 
         with FakeUnityCatalog(staging_root=str(tmp_path)) as uc:
             conn = Connection(
                 catalog=OSSUnityCatalog(uc.url),
-                router=Router(
-                    engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}
-                ),
+                router=helpers.direct_router(),
             )
             conn.create_catalog("main")
             conn.create_schema("main.sales")

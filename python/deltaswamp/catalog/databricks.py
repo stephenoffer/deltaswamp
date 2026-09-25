@@ -25,12 +25,14 @@ import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from .._sdk import PRODUCT
+from .._sdk import PRODUCT, workspace_client
+from .._util import enum_value
 from ..credentials.base import Credentials, Operation
 from ..credentials.databricks import (
     DatabricksCredentialProvider,
     _config_attributes,
     _error_kind,
+    credentials_from_response,
 )
 from ..errors import (
     DeltaSwampError,
@@ -69,7 +71,7 @@ __all__ = ["UC_DELTA_API_BASE", "DatabricksUnityCatalog"]
 UC_DELTA_API_BASE = "/api/2.1/unity-catalog/delta/v1"
 
 # Capability flags from the securable-kind manifest. Treated as an open world:
-# Databricks does not publish the full enum, so an unrecognised flag is ignored
+# Databricks does not publish the full enum, so an unrecognized flag is ignored
 # rather than fatal.
 CAP_EXTERNAL_READ = "HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT"
 CAP_EXTERNAL_WRITE = "HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT"
@@ -210,7 +212,7 @@ def _three_part(name: TableRef | str, what: str) -> tuple[str, str, str]:
 class _RawPrivilege:
     """A privilege name this SDK's enum does not know yet.
 
-    The SDK serialises privileges with ``.value``, so this is all it needs;
+    The SDK serializes privileges with ``.value``, so this is all it needs;
     refusing an unknown name would make every new privilege ungrantable until
     the SDK caught up.
     """
@@ -232,6 +234,16 @@ def _sdk_privileges(privileges: Iterable[str]) -> list[Any]:
     if not out:
         raise InvalidReferenceError("grant/revoke needs at least one privilege")
     return out
+
+
+def _external(capabilities: frozenset[str] | None, flag: str, policy: str | None) -> bool | None:
+    """One manifest flag, overridden by a fine-grained access policy.
+
+    None means the catalog was never asked, which is not a refusal.
+    """
+    if policy is not None:
+        return False
+    return None if capabilities is None else flag in capabilities
 
 
 class DatabricksUnityCatalog:
@@ -329,23 +341,13 @@ class DatabricksUnityCatalog:
 
     def _build_workspace(self) -> Any:
         if self._client is None:
-            try:
-                from .._sdk import workspace_client
-            except ImportError as exc:  # pragma: no cover
-                raise PreflightError(
-                    "the databricks-sdk package is required for Unity Catalog access"
-                ) from exc
-            if self._explicit_config is not None:
-                self._client = workspace_client(config=self._explicit_config)
-            else:
-                kwargs = dict(self._config_kwargs)
-                if self._profile:
-                    kwargs["profile"] = self._profile
-                if self._host:
-                    kwargs["host"] = self._host
-                if self._token:
-                    kwargs["token"] = self._token
-                self._client = workspace_client(**kwargs)
+            self._client = workspace_client(
+                config=self._explicit_config,
+                profile=self._profile,
+                host=self._host,
+                token=self._token,
+                **self._config_kwargs,
+            )
         return self._client
 
     def _metastore_region(self) -> str | None:
@@ -436,29 +438,20 @@ class DatabricksUnityCatalog:
 
         info = self._get_table(ref)
         capabilities = self._capabilities_for(ref, info)
-        # With no manifest to consult, a row filter or column mask on the table
-        # still decides it: vending refuses such a table outright, so claiming
-        # "unknown" sent the read into a credential error instead of the SQL
-        # fallback or a refusal that names the cause.
-        governed = self._has_row_filter_or_mask(info)
-        read_ok = None if capabilities is None else CAP_EXTERNAL_READ in capabilities
-        write_ok = None if capabilities is None else CAP_EXTERNAL_WRITE in capabilities
-        if capabilities is None and governed:
-            read_ok = write_ok = False
-
         # Databricks also exposes delta runtime properties separately; they carry
         # the delta.* settings that decide routing.
         properties = self._properties(info)
 
         table_type = self._table_type(info)
+        policy = self._access_policy(info)
         resolved = ResolvedTable(
             ref=ref,
             location=_r2_as_s3(getattr(info, "storage_location", None)),
             table_type=table_type,
-            data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
+            data_source_format=enum_value(getattr(info, "data_source_format", None)),
             securable_kind=self._securable_kind(info),
             table_id=getattr(info, "table_id", None),
-            # table_uuid is deliberately unset. It means the Delta log's
+            # table_uuid is left unset. It means the Delta log's
             # Metadata.id, and Databricks' table_id is a different thing: the UC
             # securable's own UUID, which names the storage directory. Setting
             # it here made the identity check compare two unrelated namespaces,
@@ -466,8 +459,9 @@ class DatabricksUnityCatalog:
             # exposes no Delta metadata id, so there is nothing to compare.
             etag=getattr(info, "etag", None),
             properties=properties,
-            external_read_supported=read_ok,
-            external_write_supported=write_ok,
+            external_read_supported=_external(capabilities, CAP_EXTERNAL_READ, policy),
+            external_write_supported=_external(capabilities, CAP_EXTERNAL_WRITE, policy),
+            access_policy=policy,
             credential_provider=self._credential_provider(info),
         )
 
@@ -476,13 +470,11 @@ class DatabricksUnityCatalog:
         # Every Unity Catalog table is reachable through the catalog's Iceberg
         # REST endpoint when it has Iceberg metadata (managed Iceberg, foreign
         # Iceberg, UniForm); the Iceberg engine decides whether it applies.
-        import dataclasses as _dc
-
         from ..engine.iceberg import iceberg_rest_uri
 
         host = getattr(getattr(self.workspace, "config", None), "host", None) or self._host
         if host:
-            resolved = _dc.replace(
+            resolved = dataclasses.replace(
                 resolved, iceberg_rest_uri=iceberg_rest_uri(host, databricks=True)
             )
 
@@ -500,14 +492,6 @@ class DatabricksUnityCatalog:
             table_url=getattr(info, "storage_location", None),
             region=self._metastore_region(),
             **self._provider_kwargs(),
-        )
-
-    @staticmethod
-    def _has_row_filter_or_mask(info: Any) -> bool:
-        if getattr(info, "row_filter", None) is not None:
-            return True
-        return any(
-            getattr(c, "mask", None) is not None for c in getattr(info, "columns", None) or ()
         )
 
     @staticmethod
@@ -652,13 +636,10 @@ class DatabricksUnityCatalog:
         # in the caller's setup rather than a Databricks-side gate.
         if "User-Agent" in text and "insufficient" in text:
             return PreflightError(
-                f"cannot {action}: Databricks restricts writes through the Unity Catalog "
-                "Delta API to connectors it has allowlisted, and it does not recognise "
-                f"{PRODUCT!r}. This is a Databricks-side registration, not a "
-                "misconfiguration here: reads of catalog-managed tables go through the "
-                "same API and are unaffected. Ask Databricks support to allowlist the "
-                "connector, or use ds.connect(..., allow_sql_fallback=True) to create "
-                f"and write managed tables through a SQL warehouse. Underlying error: {exc}"
+                f"cannot {action}: Databricks allows writes through the Unity Catalog "
+                f"Delta API only from allowlisted connectors, and {PRODUCT!r} is not one "
+                "yet. Reads are unaffected. Use ds.connect(..., allow_sql_fallback=True) "
+                f"to write through a SQL warehouse. Underlying error: {exc}"
             )
         if typed == "transient":
             return PreflightError(
@@ -697,16 +678,11 @@ class DatabricksUnityCatalog:
 
     def _with_catalog_commits(self, resolved: ResolvedTable) -> ResolvedTable:
         """Attach the ratified commit tail and the max trustworthy version."""
-        import dataclasses
-
         ref = resolved.ref
         assert ref.catalog and ref.schema and ref.table
-        # Each segment escaped, as `_delta_api_tables_path` does for the POSTs:
-        # a table named with ``#`` or ``?`` otherwise truncated the path.
-        path = (
-            f"{UC_DELTA_API_BASE}/catalogs/{_segment(ref.catalog)}"
-            f"/schemas/{_segment(ref.schema)}/tables/{_segment(ref.table)}"
-        )
+        # Each segment escaped, as for the POSTs: a table named with ``#`` or
+        # ``?`` otherwise truncated the path.
+        path = self._delta_api_tables_path(ref, f"tables/{_segment(ref.table)}")
         try:
             body = self.workspace.api_client.do("GET", path, headers={"Accept": "application/json"})
         except Exception as exc:
@@ -767,12 +743,7 @@ class DatabricksUnityCatalog:
                 raw=f"{catalog}.{schema}.{info.name}",
             )
             caps = self._manifest_capabilities(info)
-            read_ok = None if caps is None else CAP_EXTERNAL_READ in caps
-            write_ok = None if caps is None else CAP_EXTERNAL_WRITE in caps
-            # As in resolve(): with no manifest, a row filter or column mask
-            # still decides it -- vending refuses such a table outright.
-            if caps is None and self._has_row_filter_or_mask(info):
-                read_ok = write_ok = False
+            policy = self._access_policy(info)
             # Properties and a credential provider too: without them a listed
             # table reported itself as not catalog-managed and could not vend
             # storage credentials, so opening it failed or took the wrong path.
@@ -781,13 +752,14 @@ class DatabricksUnityCatalog:
                     ref=ref,
                     location=_r2_as_s3(getattr(info, "storage_location", None)),
                     table_type=self._table_type(info),
-                    data_source_format=self._enum_value(getattr(info, "data_source_format", None)),
+                    data_source_format=enum_value(getattr(info, "data_source_format", None)),
                     securable_kind=self._securable_kind(info),
                     table_id=getattr(info, "table_id", None),
                     etag=getattr(info, "etag", None),
                     properties=self._properties(info),
-                    external_read_supported=read_ok,
-                    external_write_supported=write_ok,
+                    external_read_supported=_external(caps, CAP_EXTERNAL_READ, policy),
+                    external_write_supported=_external(caps, CAP_EXTERNAL_WRITE, policy),
+                    access_policy=policy,
                     credential_provider=self._credential_provider(info),
                 )
             )
@@ -876,6 +848,27 @@ class DatabricksUnityCatalog:
         return cache.get((ref.table or "").lower())
 
     @staticmethod
+    def _access_policy(info: Any) -> str | None:
+        """The row filter or column masks on a table, described, or None.
+
+        Credential vending refuses such a table ("row filter or column mask not
+        supported on assigned clusters"), yet its capability manifest still
+        carries HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT, so the manifest alone
+        cannot rule it out.
+        """
+        found: list[str] = []
+        row_filter = getattr(info, "row_filter", None)
+        if row_filter is not None:
+            name = getattr(row_filter, "function_name", None)
+            found.append(f"row filter {name}" if name else "a row filter")
+        for column in getattr(info, "columns", None) or ():
+            mask = getattr(column, "mask", None)
+            if mask is not None:
+                name = getattr(mask, "function_name", None)
+                found.append(f"column mask on {column.name}" + (f" ({name})" if name else ""))
+        return "; ".join(found) or None
+
+    @staticmethod
     def _manifest_capabilities(info: Any) -> frozenset[str] | None:
         manifest = getattr(info, "securable_kind_manifest", None)
         if manifest is None:
@@ -884,23 +877,17 @@ class DatabricksUnityCatalog:
         if caps is None:
             return None
         # `str()` of an enum member is "Cls.NAME" and never matches a flag.
-        return frozenset(v for v in (DatabricksUnityCatalog._enum_value(c) for c in caps) if v)
-
-    @staticmethod
-    def _enum_value(value: Any) -> str | None:
-        if value is None:
-            return None
-        return getattr(value, "value", None) or str(value)
+        return frozenset(v for v in (enum_value(c) for c in caps) if v)
 
     @classmethod
     def _table_type(cls, info: Any) -> TableType | None:
-        raw = cls._enum_value(getattr(info, "table_type", None))
+        raw = enum_value(getattr(info, "table_type", None))
         if raw is None:
             return None
         try:
             return TableType(raw)
         except ValueError:
-            # Forward compatibility: an unrecognised table_type must not crash
+            # Forward compatibility: an unrecognized table_type must not crash
             # resolution. The router refuses it by name instead.
             return None
 
@@ -908,10 +895,10 @@ class DatabricksUnityCatalog:
     def _securable_kind(cls, info: Any) -> str | None:
         manifest = getattr(info, "securable_kind_manifest", None)
         if manifest is not None:
-            kind = cls._enum_value(getattr(manifest, "securable_kind", None))
+            kind = enum_value(getattr(manifest, "securable_kind", None))
             if kind:
                 return kind
-        return cls._enum_value(getattr(info, "securable_kind", None))
+        return enum_value(getattr(info, "securable_kind", None))
 
     # ---------------------------------------------------------------- preflight
 
@@ -1546,15 +1533,15 @@ class DatabricksUnityCatalog:
             ),
             securable_type="EXTERNAL_LOCATION",
         )
-        # Same response shape as table vending; reuse its parsing, including
-        # the explicit Azure endpoint.
-        # With the metastore region: UC vends S3 path keys without one too, and
-        # a bucket outside us-east-1 then fails on the Location-less redirect.
-        parser = DatabricksCredentialProvider(
-            table_id="", table_url=url, region=self._metastore_region()
-        )
-        creds = parser._to_credentials(
-            response, Operation.READ if op == "PATH_READ" else Operation.READ_WRITE
+        # Same response shape as table vending, including the explicit Azure
+        # endpoint. With the metastore region: UC vends S3 path keys without
+        # one too, and a bucket outside us-east-1 then fails on the
+        # Location-less redirect.
+        creds = credentials_from_response(
+            response,
+            url=url,
+            aws_region=self._metastore_region(),
+            operation=Operation.READ if op == "PATH_READ" else Operation.READ_WRITE,
         )
         return dataclasses.replace(creds, table_id=None, scope_prefix=creds.url or url)
 

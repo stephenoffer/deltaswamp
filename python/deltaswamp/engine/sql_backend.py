@@ -1,23 +1,13 @@
 """Running SQL on a Databricks warehouse through the Statement Execution API.
 
-Why this and not `databricks-sql-connector`: the SDK is already a base
-dependency, it shares the connection's authentication, and the Statement
-Execution API hands results back as Arrow IPC without an extra driver, a
-Thrift session, or a second auth code path. The connector would add a heavy
-optional install to buy nothing the fallback needs, so this is the only
-backend and the `sql` extra is not required.
+The API comes with `databricks-sdk`, which is already a base dependency and
+shares the connection's authentication, so no SQL connector is needed.
 
-Three habits this module keeps deliberately:
-
-* **Results are always Arrow.** Queries run with `format=ARROW_STREAM` and
-  `disposition=EXTERNAL_LINKS`, so a large result streams from cloud storage
-  instead of being squeezed through the JSON inline limit.
-* **The Databricks token never leaves for storage.** Presigned result links are
-  fetched with only the headers the link itself carries. Sending the workspace
-  `Authorization` header to a cloud bucket would leak it to a third party, and
-  some stores reject the request outright when it is present.
-* **Values travel as parameters.** Callers bind user-supplied literals as named
-  `:markers` (`StatementParameterListItem`), so a value is never spliced into
+- Queries run with `format=ARROW_STREAM` and `disposition=EXTERNAL_LINKS`, so a
+  large result streams from cloud storage instead of hitting the inline limit.
+- Presigned result links are fetched with only the headers the link carries.
+  The workspace `Authorization` header never goes to a storage bucket.
+- User-supplied values are bound as named `:markers`, never spliced into
   statement text. Identifiers cannot be parameters and are quoted by the engine.
 """
 
@@ -33,6 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .._util import enum_value
 from ..errors import DeltaSwampError
 
 __all__ = [
@@ -228,12 +219,6 @@ def _default_opener(request: urllib.request.Request, timeout: float) -> Any:
     return urllib.request.urlopen(request, timeout=timeout)
 
 
-def _enum_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    return str(getattr(value, "value", value))
-
-
 class SdkStatementBackend:
     """Runs statements through `WorkspaceClient.statement_execution`.
 
@@ -330,7 +315,7 @@ class SdkStatementBackend:
         interval = self._poll_interval
         while True:
             status = getattr(response, "status", None)
-            state = _enum_value(getattr(status, "state", None)) or "PENDING"
+            state = enum_value(getattr(status, "state", None)) or "PENDING"
             if state in _TERMINAL:
                 break
             if not statement_id:
@@ -363,7 +348,7 @@ class SdkStatementBackend:
         raise SqlStatementError(
             message,
             statement_id=statement_id,
-            error_code=_enum_value(getattr(error, "error_code", None)),
+            error_code=enum_value(getattr(error, "error_code", None)),
             sql_state=getattr(status, "sql_state", None),
             state=state,
         )
@@ -710,7 +695,7 @@ def _manifest_arrow_type(column: Any) -> Any:
     """
     import pyarrow as pa
 
-    type_name = _enum_value(getattr(column, "type_name", None))
+    type_name = enum_value(getattr(column, "type_name", None))
     text = str(getattr(column, "type_text", None) or "").strip()
     if text:
         with contextlib.suppress(ValueError, IndexError):

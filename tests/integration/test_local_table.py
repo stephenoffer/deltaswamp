@@ -6,31 +6,22 @@ resolution, routing, both engines and the public API together.
 
 from __future__ import annotations
 
+import datetime as dt
+import sys
+import warnings
 from typing import Any
 
 import deltaswamp as ds
 import pytest
 from deltaswamp.capability import Engine, Operation
-from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
+from deltaswamp.errors import EngineFallbackWarning, InvalidArgumentError, UnreachableTableError
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
 
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
 
-
-@pytest.fixture
-def conn() -> Any:
-    from deltaswamp.catalog.filesystem import FilesystemCatalog
-    from deltaswamp.engine.deltars import DeltaRsEngine
-    from deltaswamp.engine.kernel import KernelEngine
-    from deltaswamp.router import Router
-    from deltaswamp.table import Connection
-
-    return Connection(
-        catalog=FilesystemCatalog(),
-        router=Router(engines={Engine.KERNEL: KernelEngine(), Engine.DELTARS: DeltaRsEngine()}),
-    )
+from tests import helpers  # noqa: E402
 
 
 @pytest.fixture
@@ -67,12 +58,7 @@ class TestRead:
         assert t.head(2, columns=["city"]).column_names == ["city"]
 
     def test_head_stops_reading_once_it_has_enough(self, conn: Any, path: str) -> None:
-        """head() must not materialise the table to slice it.
-
-        It used to be `to_arrow().slice(0, n)`, which on a real multi-terabyte
-        table never returned -- it hung the live suite on a 10 TiB table until
-        this was changed to consume the stream and stop.
-        """
+        """head() consumes the stream and stops, never materialising the table to slice it."""
         t = conn.open_table(path)
         consumed: list[int] = []
         original = t.scan
@@ -120,6 +106,48 @@ class TestWrite:
         before = len(t.history())
         t.append(pa.table({"id": [5], "city": ["tunis"]}))
         assert len(t.history()) == before + 1
+
+
+class TestHistory:
+    def test_a_failing_read_moves_to_the_next_engine(self, conn: Any, path: str) -> None:
+        from deltaswamp.engine.deltars import DeltaRsEngine
+
+        class Broken(DeltaRsEngine):
+            def history(self, *_: Any, **__: Any) -> Any:
+                raise RuntimeError("Invalid JSON in file stats")
+
+        class Backup(helpers.FakeEngine):
+            def history(self, *_: Any, **__: Any) -> Any:
+                return [{"version": 0}]
+
+        table = conn.open_table(path)
+        conn.router.engines[Engine.DELTARS] = Broken()
+        conn.router.engines[Engine.ICEBERG] = Backup(Engine.ICEBERG)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert table.history() == [{"version": 0}]
+        assert any(issubclass(w.category, EngineFallbackWarning) for w in caught)
+
+    def test_the_original_error_surfaces_when_nothing_else_can(self, conn: Any, path: str) -> None:
+        from deltaswamp.engine.deltars import DeltaRsEngine
+
+        class Broken(DeltaRsEngine):
+            def history(self, *_: Any, **__: Any) -> Any:
+                raise RuntimeError("Invalid JSON in file stats")
+
+        conn.router.engines[Engine.DELTARS] = Broken()
+        with pytest.raises(RuntimeError, match="Invalid JSON"):
+            conn.open_table(path).history()
+
+    def test_timestamps_are_epoch_ms_on_every_engine(self, conn: Any, path: str) -> None:
+        from deltaswamp.engine.deltars import DeltaRsEngine
+
+        class Warehouse(DeltaRsEngine):
+            def history(self, *_: Any, **__: Any) -> Any:
+                return [{"version": 0, "timestamp": dt.datetime(2026, 1, 1, tzinfo=dt.UTC)}]
+
+        conn.router.engines[Engine.DELTARS] = Warehouse()
+        assert conn.open_table(path).history()[0]["timestamp"] == 1767225600000
 
 
 class TestCrossEngineAgreement:
@@ -244,16 +272,9 @@ class TestOptionalDependencyErrors:
     def test_missing_extra_names_the_install_command(
         self, conn: Any, path: str, monkeypatch: Any
     ) -> None:
-        import builtins
-
-        real_import = builtins.__import__
-
-        def blocked(name: str, *args: Any, **kwargs: Any) -> Any:
-            if name == "polars":
-                raise ImportError("blocked for test")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", blocked)
+        # A None entry makes importlib.import_module raise ImportError, even
+        # when an earlier test has already imported polars.
+        monkeypatch.setitem(sys.modules, "polars", None)
         with pytest.raises(ImportError, match=r"deltaswamp\[polars\]"):
             conn.open_table(path).to_polars()
 
@@ -410,8 +431,8 @@ class TestTableIdentity:
         Reading on regardless means reading a different table."""
         import dataclasses
 
+        from deltaswamp import Table
         from deltaswamp.errors import CorruptTableError
-        from deltaswamp.table import Table
 
         resolved = conn.open_table(path).resolved
         stale = dataclasses.replace(resolved, table_uuid="00000000-dead-beef-0000-000000000000")
@@ -421,11 +442,10 @@ class TestTableIdentity:
     def test_matching_id_passes(self, conn: Any, path: str) -> None:
         import dataclasses
 
-        from deltaswamp._native import Snapshot
-        from deltaswamp.table import Table
+        from deltaswamp import Table
 
         resolved = conn.open_table(path).resolved
-        actual = Snapshot.resolve(path).metadata_id
+        actual = helpers.snapshot(path).metadata_id
         matched = dataclasses.replace(resolved, table_uuid=actual)
         assert Table(conn, matched).features() is not None
 
@@ -586,9 +606,7 @@ class TestDistributedWrite:
         got = set(conn.open_table(path).to_arrow().to_pydict()["id"])
         assert {10, 99} <= got, "both writers' rows must survive"
 
-    def test_a_raced_overwrite_is_refused_rather_than_losing_the_winner(
-        self, conn: Any, path: str
-    ) -> None:
+    def test_a_raced_overwrite_is_refused(self, conn: Any, path: str) -> None:
         """An overwrite removes what it finds, so a racing writer would vanish.
 
         Nothing in the log would record that a writer was lost, which is why
@@ -841,7 +859,7 @@ class TestEnforcementIsNotBypassed:
         plan.commit([plan.write(pa.table({"id": [9], "city": ["z"]}))])
         assert conn.open_table(path).to_arrow().num_rows == 4
 
-    def test_row_tracking_refuses_an_overwrite_before_the_workers_run(self, conn: Any) -> None:
+    def test_row_tracking_refuses_overwrite_before_workers_run(self, conn: Any) -> None:
         """A kernel overwrite removes every visible file in the same commit.
 
         Kernel 0.28 refuses a commit that stages removes on a row-tracked table,
@@ -1023,3 +1041,83 @@ class TestDistributedWriteOutputIsPortable:
         theirs = DeltaTable(location).to_pyarrow_table().to_pydict()
         assert sorted(theirs["id"]) == [1, 2, 3]
         assert sorted(theirs["region"]) == ["eu", "us", "us"]
+
+
+class TestConcurrentDistributedJobs:
+    """Several jobs committing to one table at once, which is the normal case.
+
+    Each still has to win the race for its version, and they genuinely collide:
+    four committing at once leaves one winner and three conflicts unless the
+    losers rebase. Rebasing an append is always correct, so it happens by
+    default -- a connector should not have to discover this and write the loop.
+    """
+
+    @staticmethod
+    def _table(conn: Any) -> str:
+        import os
+        import tempfile
+
+        location = os.path.join(tempfile.mkdtemp(), "t")
+        conn.create_table(location, pa.schema([("id", pa.int64())]))
+        return location
+
+    @staticmethod
+    def _run(conn: Any, location: str, bases: tuple[int, ...], **commit: Any) -> list[Any]:
+        import concurrent.futures as futures
+
+        def job(base: int) -> Any:
+            plan = conn.open_table(location).plan_write()
+            fragments = [plan.write(pa.table({"id": [base + i]})) for i in range(3)]
+            try:
+                return plan.commit(fragments, **commit)
+            except Exception as exc:  # returning it is the point: which jobs fail
+                return exc
+
+        with futures.ThreadPoolExecutor(len(bases)) as pool:
+            return list(pool.map(job, bases))
+
+    def test_concurrent_appends_all_land_by_default(self, conn: Any) -> None:
+        location = self._table(conn)
+        bases = (100, 200, 300, 400)
+        results = self._run(conn, location, bases)
+
+        assert all(isinstance(r, int) for r in results), (
+            f"a concurrent append was lost: {[r for r in results if not isinstance(r, int)]}"
+        )
+        assert sorted(results) == [1, 2, 3, 4], "each job should take the next version"
+
+        got = sorted(conn.open_table(location).to_arrow().to_pydict()["id"])
+        assert len(got) == len(bases) * 3
+        assert len(got) == len(set(got)), "no row written twice"
+        for base in bases:
+            assert len([i for i in got if base <= i < base + 3]) == 3, (
+                f"job {base} landed partially"
+            )
+
+    def test_without_retries_the_losers_say_so(self, conn: Any) -> None:
+        """The conflict is still reportable for a caller who wants to see it."""
+        from deltaswamp.errors import CommitConflictError
+
+        location = self._table(conn)
+        results = self._run(conn, location, (100, 200, 300, 400), retries=0)
+
+        committed = [r for r in results if isinstance(r, int)]
+        refused = [r for r in results if isinstance(r, CommitConflictError)]
+        assert len(committed) >= 1
+        assert len(committed) + len(refused) == 4, f"unexpected failure: {results}"
+
+        got = sorted(conn.open_table(location).to_arrow().to_pydict()["id"])
+        assert len(got) == len(committed) * 3, "a refused job must leave nothing behind"
+
+    def test_an_overwrite_does_not_retry_by_default(self, conn: Any) -> None:
+        """Retrying an overwrite means overwriting whoever just won."""
+        location = self._table(conn)
+        conn.open_table(location).append(pa.table({"id": [1]}))
+
+        plan = conn.open_table(location).plan_write(mode="overwrite")
+        fragment = plan.write(pa.table({"id": [9]}))
+        conn.open_table(location).append(pa.table({"id": [99]}))
+
+        with pytest.raises(UnreachableTableError, match="discard"):
+            plan.commit([fragment])
+        assert 99 in conn.open_table(location).to_arrow().to_pydict()["id"]

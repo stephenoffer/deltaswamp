@@ -16,7 +16,7 @@ import time
 import urllib.parse
 from typing import Any
 
-from tests.fake_uc import DELTA_API, UC_API, FakeUnityCatalog
+from tests.fake_uc import DELTA_API, UC_API, FakeTable, FakeUnityCatalog
 
 
 class StrictUnityCatalog(FakeUnityCatalog):
@@ -39,7 +39,11 @@ class StrictUnityCatalog(FakeUnityCatalog):
         #: Served by GET metastore_summary (Databricks), when set.
         self.metastore_region: str | None = None
 
-    def _table_info(self, table: Any, full_name: str | None = None) -> dict[str, Any]:
+    # The base is a staticmethod; this override needs `self` for the extras,
+    # and every caller goes through an instance, so the call shapes agree.
+    def _table_info(  # type: ignore[override]
+        self, table: FakeTable, full_name: str | None = None
+    ) -> dict[str, Any]:
         info = FakeUnityCatalog._table_info(table, full_name)
         info.update(self.table_extras.get(full_name or "", {}))
         return info

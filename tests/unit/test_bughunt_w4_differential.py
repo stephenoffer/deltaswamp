@@ -21,7 +21,8 @@ NAN = float("nan")
 
 
 def rows(table: Any, text: str) -> list[Any]:
-    return P.filter_table(table, text).column(0).to_pylist()
+    values: list[Any] = P.filter_table(table, text).column(0).to_pylist()
+    return values
 
 
 class TestNumericCoercion:

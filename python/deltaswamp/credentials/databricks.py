@@ -1,20 +1,16 @@
 """Databricks Unity Catalog credential vending.
 
-Deliberate choices, each tied to a failure mode observed in the wild:
-
-* **We never reimplement Databricks auth.** `databricks.sdk.core.Config` is the
-  only thing in the ecosystem that already handles the full permutation --
-  PAT, OAuth U2M/M2M, Azure CLI/MSI/SP, GCP SA, GitHub OIDC, in-cluster runtime.
-  We take a `Config` (or the arguments to build one) and let it resolve.
-* **OAuth M2M is the right default for long jobs; PAT has no refresh story.**
-* **The provider is picklable, the credential is not.** `__getstate__` drops the
-  live client and the cached secret, so shipping this to a Ray worker sends
-  configuration rather than a token, and each worker vends its own.
-* **Azure gets an explicit endpoint.** Account-name inference happens to work on
-  `*.blob.core.windows.net` and silently breaks everywhere else.
-* **AWS gets an explicit region.** UC vends keys but no region, and object_store
-  then defaults to us-east-1, so every bucket outside it answers a redirect with
-  no Location header. The catalog supplies its metastore's region.
+- Authentication is `databricks.sdk.core.Config`, which already covers PAT,
+  OAuth U2M and M2M, Azure CLI, MSI and service principals, GCP service
+  accounts, GitHub OIDC and in-cluster runtimes. Prefer OAuth M2M for long
+  jobs, since a PAT cannot be refreshed.
+- The provider is picklable and the credential is not: `__getstate__` drops the
+  live client and the cached secret, so a Ray worker gets configuration and
+  vends its own credential.
+- Azure always gets an explicit endpoint. Account-name inference only works on
+  `*.blob.core.windows.net`.
+- AWS always gets an explicit region. UC vends keys without one, and
+  object_store would otherwise assume us-east-1 and fail on any other bucket.
 """
 
 from __future__ import annotations
@@ -26,6 +22,7 @@ from datetime import UTC
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from .._sdk import workspace_client
 from ..errors import CredentialError
 from .base import DEFAULT_REFRESH_MARGIN_SECONDS, Cloud, Credentials, Operation
 
@@ -202,6 +199,8 @@ def r2_endpoint_for(url: str) -> str | None:
 
 
 def _response_fields(resp: Any) -> list[str]:
+    if isinstance(resp, dict):
+        return sorted(str(k) for k in resp if not str(k).startswith("_"))
     as_dict = getattr(resp, "as_dict", None)
     if callable(as_dict):
         try:
@@ -376,24 +375,13 @@ class DatabricksCredentialProvider:
 
     def _workspace_locked(self) -> Any:
         if self._client is None:
-            try:
-                from .._sdk import workspace_client
-            except ImportError as exc:  # pragma: no cover
-                raise CredentialError(
-                    "the databricks-sdk package is required for Unity Catalog access; "
-                    "install deltaswamp's base dependencies"
-                ) from exc
-            if self._explicit_config is not None:
-                self._client = workspace_client(config=self._explicit_config)
-            else:
-                kwargs = dict(self._config_kwargs)
-                if self._profile:
-                    kwargs["profile"] = self._profile
-                if self._host:
-                    kwargs["host"] = self._host
-                if self._token:
-                    kwargs["token"] = self._token
-                self._client = workspace_client(**kwargs)
+            self._client = workspace_client(
+                config=self._explicit_config,
+                profile=self._profile,
+                host=self._host,
+                token=self._token,
+                **self._config_kwargs,
+            )
         return self._client
 
     def _margin_for(self, operation: Operation, cached: Credentials) -> float:
@@ -551,116 +539,19 @@ class DatabricksCredentialProvider:
                 ) from exc
             raise CredentialError(
                 f"credential vending failed for table_id={self._table_id} ({operation.value}). "
-                "Common causes, in order of likelihood: the metastore does not have "
-                "external data access enabled (an account-admin setting, off by default); "
-                "the principal lacks EXTERNAL USE SCHEMA on the schema (grantable only by "
-                "the catalog owner); or the table has row filters or column masks, which "
-                f"vending refuses outright. Underlying error: {exc}"
+                "Usually one of: external data access is off on the metastore (an "
+                "account-admin setting); the principal lacks EXTERNAL USE SCHEMA; or the "
+                f"table has a row filter or column mask. Underlying error: {exc}"
             ) from exc
 
         return self._to_credentials(resp, operation)
 
     def _to_credentials(self, resp: Any, operation: Operation) -> Credentials:
-        url = getattr(resp, "url", None) or self._table_url or ""
-        expires_at = _expires_at_seconds(getattr(resp, "expiration_time", None))
-
-        secrets: dict[str, str] = {}
-        cloud: Cloud
-
-        if getattr(resp, "aws_temp_credentials", None):
-            c = resp.aws_temp_credentials
-            cloud = Cloud.AWS
-            secrets = _require(
-                {
-                    "aws_access_key_id": getattr(c, "access_key_id", None),
-                    "aws_secret_access_key": getattr(c, "secret_access_key", None),
-                },
-                "AWS",
-            )
-            if getattr(c, "session_token", None):
-                secrets["aws_session_token"] = str(c.session_token)
-            # UC vends keys but never a region. Without one object_store falls
-            # back to us-east-1 and any other bucket answers a redirect carrying
-            # no Location header, which surfaces as an opaque "Generic S3 error".
-            region = self._aws_region()
-            if region:
-                secrets["aws_region"] = region
-            if getattr(c, "access_point", None):
-                # The ARN names the access point's own region, which wins.
-                secrets.update(_s3_access_point_options(str(c.access_point)))
-        elif getattr(resp, "r2_temp_credentials", None):
-            c = resp.r2_temp_credentials
-            cloud = Cloud.R2
-            secrets = _require(
-                {
-                    "aws_access_key_id": getattr(c, "access_key_id", None),
-                    "aws_secret_access_key": getattr(c, "secret_access_key", None),
-                },
-                "R2",
-            )
-            if getattr(c, "session_token", None):
-                secrets["aws_session_token"] = str(c.session_token)
-            # R2 speaks S3 at the account's own endpoint. Without it these keys
-            # went to AWS S3 in us-east-1, which rejects them.
-            endpoint = r2_endpoint_for(url)
-            if endpoint is None:
-                raise CredentialError(
-                    f"cannot derive a Cloudflare R2 endpoint from {url!r}; expected "
-                    "r2://bucket@<account>.r2.cloudflarestorage.com/..."
-                )
-            secrets["aws_endpoint_url"] = endpoint
-            secrets["aws_region"] = "auto"
-        elif getattr(resp, "azure_user_delegation_sas", None):
-            cloud = Cloud.AZURE
-            sas = getattr(resp.azure_user_delegation_sas, "sas_token", None)
-            if not sas:
-                raise CredentialError("Unity Catalog returned an Azure SAS block with no token")
-            # The SAS is a query string; a leading "?" is not part of it.
-            secrets = {"azure_storage_sas_key": str(sas).lstrip("?")}
-            endpoint = azure_endpoint_for(url)
-            if endpoint is None:
-                raise CredentialError(
-                    f"cannot derive an Azure endpoint from {url!r}; object_store would "
-                    "fall back to account-name inference, which breaks Azurite, "
-                    "private-link DNS and sovereign clouds"
-                )
-            secrets["azure_endpoint"] = endpoint
-            if endpoint.startswith("http://"):
-                # object_store refuses plain-http endpoints unless told to allow
-                # them, so an emulator endpoint alone failed every request with
-                # "URL scheme is not allowed".
-                secrets["azure_allow_http"] = "true"
-        elif getattr(resp, "azure_aad", None):
-            # The SDK surfaces this, but object_store has no bearer path for
-            # Azure -- only SAS. Say so rather than producing a broken store.
-            raise CredentialError(
-                "Unity Catalog returned an Azure AAD token, but the object-store layer "
-                "supports only user-delegation SAS for Azure. Ask Databricks support to "
-                "enable SAS vending for this metastore, or use the SQL fallback."
-            )
-        elif getattr(resp, "gcp_oauth_token", None):
-            cloud = Cloud.GCP
-            # Our own key, consumed by the Rust store layer. Note delta-rs maps
-            # this onto google_application_credentials, which object_store reads
-            # as a *file path* -- so that path is broken for vended tokens.
-            token = getattr(resp.gcp_oauth_token, "oauth_token", None)
-            if not token:
-                raise CredentialError("Unity Catalog returned a GCP block with no OAuth token")
-            secrets = {"google_bearer_token": str(token)}
-        else:
-            raise CredentialError(
-                "Unity Catalog returned no recognised credential block for "
-                f"table_id={self._table_id}. Response fields: {_response_fields(resp)}"
-            )
-
-        return Credentials(
-            cloud=cloud,
-            url=url,
-            expires_at=expires_at,
-            secrets=secrets,
-            # Azure SAS is path-scoped, so the store registry must key on this.
-            scope_prefix=url or None,
+        return credentials_from_response(
+            resp,
+            url=self._table_url or "",
             table_id=self._table_id,
+            aws_region=self._aws_region(),
             operation=operation,
         )
 
@@ -701,3 +592,119 @@ class DatabricksCredentialProvider:
 
     def __repr__(self) -> str:
         return f"DatabricksCredentialProvider(table_id={self._table_id!r})"
+
+
+def _get(obj: Any, name: str) -> Any:
+    """A field of an SDK response object or of the same response as JSON."""
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def credentials_from_response(
+    resp: Any,
+    *,
+    url: str = "",
+    table_id: str | None = None,
+    aws_region: str | None = None,
+    operation: Operation | None = None,
+) -> Credentials:
+    """Map a Unity Catalog temporary-credentials response to object-store options.
+
+    `resp` is the Databricks SDK response or the same response as JSON from
+    open-source Unity Catalog; table and path vending share the shape.
+    """
+    url = _get(resp, "url") or url
+    expiry = _get(resp, "expiration_time")
+    if expiry is None:
+        expiry = _get(resp, "expirationTime")
+    expires_at = _expires_at_seconds(expiry)
+    cloud: Cloud
+
+    if aws := _get(resp, "aws_temp_credentials"):
+        cloud = Cloud.AWS
+        secrets = _require(
+            {
+                "aws_access_key_id": _get(aws, "access_key_id"),
+                "aws_secret_access_key": _get(aws, "secret_access_key"),
+            },
+            "AWS",
+        )
+        if token := _get(aws, "session_token"):
+            secrets["aws_session_token"] = str(token)
+        # UC vends keys but never a region, and object_store would assume
+        # us-east-1; any other bucket then fails with an opaque redirect.
+        region = aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        if region:
+            secrets["aws_region"] = region
+        if access_point := _get(aws, "access_point"):
+            # The ARN names the access point's own region, which wins.
+            secrets.update(_s3_access_point_options(str(access_point)))
+    elif r2 := _get(resp, "r2_temp_credentials"):
+        cloud = Cloud.R2
+        secrets = _require(
+            {
+                "aws_access_key_id": _get(r2, "access_key_id"),
+                "aws_secret_access_key": _get(r2, "secret_access_key"),
+            },
+            "R2",
+        )
+        if token := _get(r2, "session_token"):
+            secrets["aws_session_token"] = str(token)
+        # R2 speaks S3 at the account's own endpoint. Without it these keys
+        # went to AWS S3 in us-east-1, which rejects them.
+        endpoint = r2_endpoint_for(url)
+        if endpoint is None:
+            raise CredentialError(
+                f"cannot derive a Cloudflare R2 endpoint from {url!r}; expected "
+                "r2://bucket@<account>.r2.cloudflarestorage.com/..."
+            )
+        secrets["aws_endpoint_url"] = endpoint
+        secrets["aws_region"] = "auto"
+    elif sas_block := _get(resp, "azure_user_delegation_sas"):
+        cloud = Cloud.AZURE
+        sas = _get(sas_block, "sas_token")
+        if not sas:
+            raise CredentialError("Unity Catalog returned an Azure SAS block with no token")
+        endpoint = azure_endpoint_for(url)
+        if endpoint is None:
+            raise CredentialError(
+                f"cannot derive an Azure endpoint from {url!r}; object_store would "
+                "fall back to account-name inference, which breaks Azurite, "
+                "private-link DNS and sovereign clouds"
+            )
+        # The SAS is a query string; a leading "?" is not part of it.
+        secrets = {"azure_storage_sas_key": str(sas).lstrip("?"), "azure_endpoint": endpoint}
+        if endpoint.startswith("http://"):
+            # object_store refuses plain-http endpoints unless told to allow
+            # them, so an emulator endpoint alone failed every request with
+            # "URL scheme is not allowed".
+            secrets["azure_allow_http"] = "true"
+    elif _get(resp, "azure_aad"):
+        raise CredentialError(
+            "Unity Catalog returned an Azure AAD token, but the object-store layer "
+            "supports only user-delegation SAS for Azure. Ask Databricks support to "
+            "enable SAS vending for this metastore, or use the SQL fallback."
+        )
+    elif gcp := _get(resp, "gcp_oauth_token"):
+        cloud = Cloud.GCP
+        # Consumed by the Rust store layer. delta-rs maps a token onto
+        # google_application_credentials, which object_store reads as a file path.
+        token = _get(gcp, "oauth_token")
+        if not token:
+            raise CredentialError("Unity Catalog returned a GCP block with no OAuth token")
+        secrets = {"google_bearer_token": str(token)}
+    else:
+        raise CredentialError(
+            f"Unity Catalog returned no recognized credential block (table_id={table_id}). "
+            f"Response fields: {_response_fields(resp)}"
+        )
+
+    return Credentials(
+        cloud=cloud,
+        url=url,
+        expires_at=expires_at,
+        secrets=secrets,
+        # Azure SAS is path-scoped, so the store registry must key on this.
+        scope_prefix=url or None,
+        table_id=table_id,
+        operation=operation,
+    )

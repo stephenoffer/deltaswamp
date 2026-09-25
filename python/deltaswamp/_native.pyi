@@ -167,7 +167,7 @@ def uc_create_table_request(
 
     Resolves the snapshot at version 0 of `table_root` (which must have been
     committed with `uc_required_properties`) and returns the body to POST to
-    the UC tables endpoint to finalise a managed table. It carries the schema,
+    the UC tables endpoint to finalize a managed table. It carries the schema,
     partition columns, protocol, properties (plus `delta.checkpointPolicy=v2`),
     the `delta.clustering`/`delta.rowTracking` domain metadata and the v0
     commit timestamp. `table_name` is passed through as the request's `name`.
@@ -264,7 +264,7 @@ class Snapshot:
         listed. Other files are dropped before any data or deletion-vector
         I/O. Semantics per file are those of the full scan: deletion vectors
         applied, column mapping and partition values resolved, row order within
-        a file preserved, and `predicate` skipping still honoured on top. Paths
+        a file preserved, and `predicate` skipping still honored on top. Paths
         not in this snapshot are ignored; `[]` yields an empty stream with the
         same schema. So scans over a partition of `files()` union to the full
         scan -- the building block for distributed reads.
@@ -349,7 +349,7 @@ class Snapshot:
         Partitioned tables are supported: `data` must include every partition
         column (matched case-insensitively). Rows are grouped by their distinct
         partition-value tuple and each group is written as its own file with
-        the partition columns removed; the kernel serialises the values per the
+        the partition columns removed; the kernel serializes the values per the
         Delta protocol (NULL -> null / `__HIVE_DEFAULT_PARTITION__` directory,
         dates as YYYY-MM-DD, timestamps in UTC). A partition column that cannot
         be cast to the table's type without changing a value is a ValueError.

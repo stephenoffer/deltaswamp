@@ -111,7 +111,7 @@ fn project(batch: &RecordBatch) -> Result<RecordBatch> {
     let partition_values = constants
         .column_by_name("partitionValues")
         .ok_or_else(|| missing("fileConstantValues.partitionValues"))?;
-    let partition_values = normalise_map(partition_values)?;
+    let partition_values = normalize_map(partition_values)?;
 
     let dv = column("deletionVector")?;
     let dv = dv
@@ -138,7 +138,7 @@ fn project(batch: &RecordBatch) -> Result<RecordBatch> {
 
 /// Give the map column our field names, so the output schema is stable no
 /// matter how kernel names its map entries internally.
-fn normalise_map(array: &ArrayRef) -> Result<ArrayRef> {
+fn normalize_map(array: &ArrayRef) -> Result<ArrayRef> {
     let map = array
         .as_map_opt()
         .ok_or_else(|| missing("fileConstantValues.partitionValues (as a map)"))?;

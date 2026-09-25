@@ -358,10 +358,10 @@ class TestUpdate:
 
 class TestTimeTravel:
     def test_pre_epoch_timestamp_rounds_down(self) -> None:
-        from deltaswamp.engine.kernel import _timestamp_ms
+        from deltaswamp._util import timestamp_ms
 
         moment = dt.datetime(1969, 12, 31, 23, 59, 59, 999500, tzinfo=dt.UTC)
-        assert _timestamp_ms(moment) == -1
+        assert timestamp_ms(moment) == -1
 
     def test_version_past_latest_is_a_clear_error(self, plain: str) -> None:
         with pytest.raises(UnreachableTableError, match="no such version"):
@@ -457,7 +457,7 @@ class TestDatasource:
         assert all(len(t.read_fn.__defaults__[0].splits) == 2 for t in tasks)
         rows = sorted(
             r
-            for t in pickle.loads(cloudpickle.dumps(tasks))  # type: ignore[no-untyped-call]
+            for t in pickle.loads(cloudpickle.dumps(tasks))  # type: ignore[no-untyped-call, unused-ignore]
             for b in t()
             for r in b["id"].to_pylist()
         )

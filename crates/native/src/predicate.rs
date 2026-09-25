@@ -1,6 +1,6 @@
 //! A JSON predicate AST, converted into a kernel `Predicate` for file skipping.
 //!
-//! The predicate we hand the kernel is **only an optimisation**. It lets the
+//! The predicate we hand the kernel is **only an optimization**. It lets the
 //! scan drop whole files whose statistics or partition values prove no row can
 //! match; it never filters rows (kernel disables Parquet pushdown until it can
 //! track row indexes, which is also what keeps deletion vectors positional).
@@ -235,7 +235,7 @@ fn coerce_literal(node: &Value, target: &PrimitiveType) -> Option<Scalar> {
                     n.as_f64().map(Scalar::Double)
                 }
             }
-            P::Decimal(dt) => normalise_decimal(&n.to_string(), dt.scale())
+            P::Decimal(dt) => normalize_decimal(&n.to_string(), dt.scale())
                 .and_then(|raw| target.parse_scalar(&raw).ok()),
             P::Timestamp if matches!(declared, "timestamp" | "timestamp_ntz") => {
                 n.as_i64().map(Scalar::Timestamp)
@@ -262,7 +262,7 @@ fn coerce_literal(node: &Value, target: &PrimitiveType) -> Option<Scalar> {
             }
             P::TimestampNtz => parse_timestamp_ntz(s),
             P::Decimal(dt) => {
-                normalise_decimal(s, dt.scale()).and_then(|raw| target.parse_scalar(&raw).ok())
+                normalize_decimal(s, dt.scale()).and_then(|raw| target.parse_scalar(&raw).ok())
             }
             // A decimal string against a binary float column cannot be compared
             // exactly, and binary literals have no agreed JSON encoding.
@@ -301,7 +301,7 @@ fn parse_timestamp_ntz(s: &str) -> Option<Scalar> {
 ///
 /// Kernel's decimal parser demands the scale match exactly. Padding with zeros
 /// is exact; dropping non-zero digits would round, so that is refused.
-fn normalise_decimal(raw: &str, scale: u8) -> Option<String> {
+fn normalize_decimal(raw: &str, scale: u8) -> Option<String> {
     let raw = raw.trim();
     if raw.contains(['e', 'E']) || raw.is_empty() {
         return None;
@@ -554,12 +554,12 @@ mod tests {
     }
 
     #[test]
-    fn decimal_normalisation() {
-        assert_eq!(normalise_decimal("1.5", 2).as_deref(), Some("1.50"));
-        assert_eq!(normalise_decimal("-3", 2).as_deref(), Some("-3.00"));
-        assert_eq!(normalise_decimal("1.500", 2).as_deref(), Some("1.50"));
-        assert_eq!(normalise_decimal("1.505", 2), None);
-        assert_eq!(normalise_decimal("7.0", 0).as_deref(), Some("7"));
-        assert_eq!(normalise_decimal("1e3", 0), None);
+    fn decimal_normalization() {
+        assert_eq!(normalize_decimal("1.5", 2).as_deref(), Some("1.50"));
+        assert_eq!(normalize_decimal("-3", 2).as_deref(), Some("-3.00"));
+        assert_eq!(normalize_decimal("1.500", 2).as_deref(), Some("1.50"));
+        assert_eq!(normalize_decimal("1.505", 2), None);
+        assert_eq!(normalize_decimal("7.0", 0).as_deref(), Some("7"));
+        assert_eq!(normalize_decimal("1e3", 0), None);
     }
 }

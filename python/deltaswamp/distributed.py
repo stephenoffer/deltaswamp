@@ -1,30 +1,22 @@
 """Distributed reads and writes: plan on the driver, do the work on workers.
 
-A plan is a list of `ScanSplit`s pinned to one snapshot version. What travels
-to a worker is the engine, the resolved table (with its *credential provider*,
-never a credential) and the splits. The worker re-resolves that exact version
--- including a catalog-managed table's commit tail, which was captured at
-resolution -- and reads only its files, vending its own storage credentials.
-So a long job does not die on a token frozen at submission time, and no secret
-appears in a task payload.
+A scan plan is a list of `ScanSplit`s pinned to one snapshot version. A worker
+receives the engine, the resolved table (with its credential provider, never a
+credential) and its splits, re-resolves that exact version and vends its own
+storage credentials. The Ray Data datasource makes one read task per
+byte-balanced group of splits.
 
-The Ray Data datasource is a thin layer over that: one read task per group of
-splits, balanced by bytes.
-
-Writes run the same shape in reverse. `WritePlan` settles on the driver whether
-the commit can succeed *before* any worker runs, each worker writes data files
-and returns an opaque fragment, and the driver commits every fragment as one
-transaction. That ordering is the point: the common failure in distributed Delta
-writers is discovering at commit time that the table refuses the write, after an
-hour of compute, leaving orphaned Parquet behind. Here the refusal arrives
-before the first byte is written, carrying the reason.
+Writes run in reverse. `WritePlan` checks on the driver that the commit can
+succeed before any worker runs, workers write data files and return opaque
+fragments, and the driver commits every fragment in one transaction.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from dataclasses import fields as dataclass_fields
+from typing import Any, ClassVar, cast
 
 __all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance"]
 
@@ -52,7 +44,7 @@ class ScanPlan:
 
     def __reduce__(self) -> tuple[Any, ...]:
         # What crosses a process boundary: see `_for_workers`.
-        fields = {f: getattr(self, f) for f in self.__dataclass_fields__}
+        fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
         if not self.ship_catalog_auth:
             fields["table"] = _for_workers(self.table, write=False)
         return (_rebuild, (type(self), fields))
@@ -137,6 +129,14 @@ class WritePlan:
     #: them the catalog token) to workers. Off by default: see _for_workers.
     ship_catalog_auth: bool = False
 
+    #: Retries an ordinary append gets when `retries` is not given. Concurrent
+    #: jobs really do collide -- four committing at once leaves one winner and
+    #: three `CommitConflictError`s -- and rebasing an append is always correct,
+    #: so the default matches `KernelEngine.metadata_commit_attempts` rather
+    #: than leaving every connector to write the same loop. An overwrite gets
+    #: none, and so does a catalog-managed table, which cannot rebase here.
+    default_append_retries: ClassVar[int] = 5
+
     @property
     def overwrite(self) -> bool:
         return self.mode == "overwrite"
@@ -144,7 +144,7 @@ class WritePlan:
     def __reduce__(self) -> tuple[Any, ...]:
         # What crosses a process boundary: see `_for_workers`. The driver keeps
         # its own copy, with full catalog access, for the commit.
-        fields = {f: getattr(self, f) for f in self.__dataclass_fields__}
+        fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
         if not self.ship_catalog_auth:
             fields["table"] = _for_workers(self.table, write=True)
             fields["catalog"] = None
@@ -184,8 +184,13 @@ class WritePlan:
 
         Returns the committed version. The commit resolves the table again, so
         an append lands on top of whatever else has been written since the plan
-        was made rather than failing on it -- which is what an append means, and
-        why one rarely conflicts here at all.
+        was made rather than failing on it, which is what an append means.
+
+        It still has to win the race for its version, and concurrent jobs
+        do collide: four committing at once leaves one winner and three
+        conflicts. Rebasing an append is always correct, so `retries` defaults
+        to `default_append_retries` and the losers simply commit at the next
+        version. Pass `retries=0` to see the conflict instead.
 
         An overwrite is the opposite: it removes what it finds, so committing
         against a table that has moved on would discard a writer that arrived
@@ -199,8 +204,9 @@ class WritePlan:
         `retries` re-attempts that here for tables this library commits itself;
         a catalog-managed table has to be re-opened through its catalog first,
         and says so rather than spinning against a stale commit tail. Left as
-        None, an append on a path table retries as `Table.append` does (the
-        engine's `append_commit_retries`); anything else does not.
+        None, an ordinary append on a path table gets `default_append_retries`;
+        an overwrite gets none, because retrying one means overwriting the
+        writer that just won.
         """
         from .errors import (
             CommitConflictError,
@@ -219,13 +225,16 @@ class WritePlan:
                 f"operation must be a non-empty string such as 'WRITE', not {operation!r}"
             )
         if retries is None:
-            # A blind append commutes with any concurrent commit and its
-            # fragments are reusable, so losing a race is no reason to fail.
-            # With no retries, five of six racing distributed appends raised
-            # CommitConflictError where Table.append would have retried.
-            simple = not self.overwrite and not self.table.is_catalog_managed
-            default = getattr(self.engine, "append_commit_retries", 0)
-            retries = int(default) if simple and isinstance(default, int) else 0
+            # Only an ordinary append gets them. Retrying an overwrite means
+            # overwriting the writer that just won, and a catalog-managed table
+            # cannot rebase here at all -- it would spin against the commit tail
+            # captured when it was resolved, so defaulting to a retry that
+            # cannot work would only change which error the caller sees.
+            retries = (
+                0
+                if (self.overwrite or self.table.is_catalog_managed)
+                else self.default_append_retries
+            )
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
             raise InvalidArgumentError(f"retries must be a non-negative int, not {retries!r}")
         attempts = retries + 1
@@ -557,7 +566,7 @@ def balance(splits: Iterable[Any], n: int) -> list[tuple[Any, ...]]:
     """Group splits into at most `n` bins of roughly equal bytes.
 
     Largest-first greedy assignment: good enough to keep one huge file from
-    serialising the job, and deterministic, so a retried task reads the same
+    serializing the job, and deterministic, so a retried task reads the same
     files.
     """
     items = sorted(splits, key=lambda s: (-s.size, s.path))

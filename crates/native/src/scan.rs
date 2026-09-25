@@ -160,7 +160,7 @@ impl Iterator for KernelBatchReader {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Deliberately a 1:1 pass-through. Do not batch, coalesce, reorder or
+        // A 1:1 pass-through. Do not batch, coalesce, reorder or
         // filter here; see the module docs.
         if self.failed {
             return None;

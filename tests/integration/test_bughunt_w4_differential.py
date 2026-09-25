@@ -27,10 +27,10 @@ NAN = float("nan")
 
 def connection(kind: str) -> Any:
     from deltaswamp.catalog.filesystem import FilesystemCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.deltars import DeltaRsEngine
     from deltaswamp.engine.kernel import KernelEngine
     from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     engine = {"kernel": (Engine.KERNEL, KernelEngine), "deltars": (Engine.DELTARS, DeltaRsEngine)}
     key, cls = engine[kind]

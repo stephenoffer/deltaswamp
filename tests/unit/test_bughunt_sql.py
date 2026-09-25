@@ -20,7 +20,7 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 
 from deltaswamp.catalog import ResolvedTable  # noqa: E402
-from deltaswamp.engine import sql as sqlmod  # noqa: E402
+from deltaswamp.engine import sql_text as sq  # noqa: E402
 from deltaswamp.engine.sql import SqlEngine  # noqa: E402
 from deltaswamp.engine.sql_backend import (  # noqa: E402
     ParameterBinder,
@@ -390,19 +390,19 @@ def test_add_columns_from_an_arrow_struct_field() -> None:
 
 def test_sql_type_still_rejects_injection_outside_backticks() -> None:
     with pytest.raises(ValueError):
-        sqlmod._sql_type("STRUCT<`a`: INT>; DROP TABLE x")
+        sq.sql_type("STRUCT<`a`: INT>; DROP TABLE x")
 
 
 def test_arrow_unsigned_and_dictionary_types_map() -> None:
-    assert sqlmod._arrow_to_sql(pa.uint32()) == "BIGINT"
-    assert sqlmod._arrow_to_sql(pa.uint64()) == "DECIMAL(20,0)"
-    assert sqlmod._arrow_to_sql(pa.dictionary(pa.int32(), pa.string())) == "STRING"
-    assert sqlmod._arrow_to_sql(pa.list_(pa.int8(), 3)) == "ARRAY<TINYINT>"
+    assert sq.arrow_to_sql(pa.uint32()) == "BIGINT"
+    assert sq.arrow_to_sql(pa.uint64()) == "DECIMAL(20,0)"
+    assert sq.arrow_to_sql(pa.dictionary(pa.int32(), pa.string())) == "STRING"
+    assert sq.arrow_to_sql(pa.list_(pa.int8(), 3)) == "ARRAY<TINYINT>"
 
 
 def test_arrow_decimal256_beyond_38_is_refused() -> None:
     with pytest.raises(UnreachableTableError, match="38"):
-        sqlmod._arrow_to_sql(pa.decimal256(50, 2))
+        sq.arrow_to_sql(pa.decimal256(50, 2))
 
 
 def test_merge_clauses_are_emitted_in_grammar_order() -> None:
@@ -550,7 +550,7 @@ def test_set_properties_none_value_is_refused() -> None:
 
 def test_variant_preview_feature_wire_name() -> None:
     feature = SimpleNamespace(value="TableFeatures.VariantTypePreview")
-    assert sqlmod._feature_name(feature) == "variantType-preview"
+    assert sq.feature_name(feature) == "variantType-preview"
 
 
 def test_update_new_values_none_is_the_null_literal() -> None:

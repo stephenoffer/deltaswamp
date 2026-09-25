@@ -2,7 +2,7 @@
 
 These run against hand-built protocol/metadata dicts, so every refusal and
 every protocol upgrade is visible without a table on disk. The end-to-end path
-through the native commit is covered in tests/integration/test_native_ddl.py.
+through the native commit is covered in tests/integration/test_ddl.py.
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ class TestProtocolUpgrades:
         assert upgraded is not None
         assert "domainMetadata" in upgraded["writerFeatures"]
 
-    def test_legacy_column_mapping_reader_stays_legacy_for_writer_features(self) -> None:
+    def test_legacy_writer_5_already_implies_cdf(self) -> None:
         upgraded = m.with_features(
             {"minReaderVersion": 2, "minWriterVersion": 5}, ["changeDataFeed"]
         )

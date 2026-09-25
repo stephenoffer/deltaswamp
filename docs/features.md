@@ -1,30 +1,12 @@
-# Ecosystem audit
+# Feature map
 
-What exists for Delta Lake and Unity Catalog across Databricks and the open
-ecosystem, what a Python user can reach today, and how deltaswamp gets to each
-piece: by composing an existing library, by a thin integration, or by filling
-a gap itself.
+Every Delta Lake and Unity Catalog feature, on Databricks and in open source,
+and how deltaswamp reaches it. Where a library already does the job,
+deltaswamp calls it. Its own code covers the gaps: the kernel binding,
+metadata-only commits, exact filtering for kernel predicates, staging flows,
+credential lifetimes, GCS bearer tokens and Azure endpoints.
 
-The rule behind every row is the one in the README. If a library already does
-something well, deltaswamp calls it and does not reimplement it. It writes its
-own code only where nothing exists (the kernel binding, metadata-only commits,
-exact filtering for kernel predicates, staging flows), or where the existing
-implementation is wrong for this use (credential lifetimes, GCS bearer tokens,
-Azure endpoints).
-
-- [The landscape](#the-landscape)
-- [How to read the matrices](#how-to-read-the-matrices)
-- [Reading](#reading)
-- [Writing and DML](#writing-and-dml)
-- [Schema and table DDL](#schema-and-table-ddl)
-- [Table features](#table-features)
-- [Maintenance and the log](#maintenance-and-the-log)
-- [Unity Catalog](#unity-catalog)
-- [Sharing and interoperability](#sharing-and-interoperability)
-- [Compute integrations](#compute-integrations)
-- [What remains out of reach](#what-remains-out-of-reach)
-
-## The landscape
+## Building blocks
 
 | Component | What it is | What deltaswamp takes from it |
 |---|---|---|
@@ -37,8 +19,8 @@ Azure endpoints).
 | PyIceberg | Iceberg in Python, including REST catalogs | managed and foreign Iceberg tables through UC's Iceberg REST endpoint |
 | DuckDB, Polars, Daft, Ray | query and compute engines | hand-offs over the Arrow PyCapsule interface, and `Connection.sql` |
 
-Nothing else in Python composes these. Each covers a slice and fails
-differently on the rest, which is the whole case for a router.
+Each covers a slice and fails differently on the rest, which is why
+deltaswamp routes between them.
 
 ## How to read the matrices
 
@@ -69,7 +51,7 @@ Several values in one cell are a routing chain, tried in order.
 | Column projection | all | kernel, delta-rs, warehouse | |
 | Predicate filtering | all | kernel (native), delta-rs, warehouse | kernel skips files; the exact row filter is applied here, from one parsed predicate |
 | Time travel by version | all | kernel, delta-rs, warehouse | |
-| Time travel by timestamp | all | kernel, delta-rs, warehouse | kernel honours in-commit timestamps |
+| Time travel by timestamp | all | kernel, delta-rs, warehouse | kernel honors in-commit timestamps |
 | Change data feed | DBR, Spark, delta-rs, kernel | delta-rs, kernel, sharing, warehouse | kernel covers path tables delta-rs cannot open; by version or timestamp |
 | CDF on catalog-managed tables | DBR | warehouse | the kernel's TableChanges takes no catalog tail |
 | History | all | delta-rs, iceberg, warehouse | |
@@ -96,7 +78,7 @@ Several values in one cell are a routing chain, tried in order.
 | DELETE / UPDATE | DBR, Spark, delta-rs | delta-rs, warehouse, kernel (native rewrite) | copy-on-write; the kernel path rewrites the whole table in one commit, bounded in size |
 | MERGE | DBR, Spark, delta-rs | delta-rs, warehouse | one clause API for both; the warehouse merges from a staged source |
 | DML on catalog-managed tables | DBR | kernel (native rewrite), warehouse | DELETE/UPDATE/replaceWhere by rewrite; MERGE needs the warehouse; row-tracked tables need the warehouse |
-| Deletion-vector authoring | DBR, Spark | — | `Transaction::update_deletion_vectors` does not exist in kernel 0.28 |
+| Deletion-vector authoring | DBR, Spark | — | kernel 0.28 has `update_deletion_vectors` only as an internal API; not bound yet |
 | Row-level concurrency | DBR | — | a Databricks conflict-detection feature |
 | Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction. Catalog-managed tables included |
 | COPY INTO / Auto Loader | DBR | warehouse (`Connection.sql(engine="warehouse")`) | ingestion, not table access |
@@ -121,7 +103,7 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 | Table and column comments | all | delta-rs, native, warehouse | |
 | SET / UNSET TBLPROPERTIES | all | delta-rs, native, warehouse | native validates keys and raises the protocol when a value implies a feature |
 | ADD / DROP CHECK constraint | DBR, Spark, delta-rs | delta-rs, native (drop), warehouse | adding validates existing rows, which delta-rs does |
-| ADD FEATURE | DBR, Spark, delta-rs | delta-rs, native, warehouse | refuses features that need a backfill (row tracking) |
+| ADD FEATURE | DBR, Spark, delta-rs | delta-rs (features it can write), native, warehouse | native adds dependencies alongside and refuses features that need a backfill (row tracking) |
 | DROP FEATURE | DBR, Spark | warehouse | needs history truncation and checkpoint protection |
 | CLUSTER BY (change keys) | DBR, Spark | native, warehouse | writes the `delta.clustering` domain |
 | CLUSTER BY AUTO | DBR | warehouse | predictive optimization chooses keys |
@@ -131,13 +113,15 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 
 ## Table features
 
-`docs/conformance.md` has the full per-engine matrix for all 34 features.
-In summary: the kernel reads every standard feature except geospatial (gated
-in 0.28). delta-rs refuses 19 of them outright, including `catalogManaged`,
-`vacuumProtocolCheck`, `domainMetadata` (so every liquid-clustered and
-row-tracked table), type widening and in-commit timestamps. Collations and
-checkpoint protection have no kernel variant and block writes on both
-engines.
+`docs/conformance.md` has the full per-engine matrix for all 36 features.
+In summary: the kernel reads every standard feature except geospatial and
+adaptiveMetadata-preview (both gated off in this build). For reads, delta-rs
+refuses seven reader-writer features: `catalogManaged` and its preview, type
+widening and variant shredding (two spellings each), and `vacuumProtocolCheck`.
+Writer-only features such as `domainMetadata` (so every liquid-clustered and
+row-tracked table) and in-commit timestamps block its writes but not its reads.
+Collations, checkpoint protection and `icebergWriterCompatV1` have no kernel
+variant; all three are writer-only, so both engines read and neither writes.
 
 ## Maintenance and the log
 
@@ -160,7 +144,7 @@ engines.
 | CONVERT TO DELTA | DBR, Spark, delta-rs | delta-rs | |
 | Symlink manifests | Spark, delta-rs | delta-rs | |
 | Predictive optimization | DBR | — | server-side scheduling; `Table.info()` reports whether it is on |
-| Auto optimize / auto compaction | DBR | — | writer-side behaviour of Databricks; stored as properties only |
+| Auto optimize / auto compaction | DBR | — | writer-side behavior of Databricks; stored as properties only |
 
 ## Unity Catalog
 
@@ -210,56 +194,19 @@ engines.
 | Daft | `to_daft` | |
 | Cross-catalog SQL | `Connection.sql(query, tables=...)` | join a catalog-managed table with a Glue table and a path |
 
-## What remains out of reach
+## Out of reach
 
-Each of these is blocked, and the blocker is named, so it is clear what would
-unblock it.
+| Gap | Blocker |
+|---|---|
+| Deletion-vector authoring | kernel 0.28 has `update_deletion_vectors` only as an internal API, not bound yet. DML on kernel-only tables is a bounded whole-table rewrite; MERGE and row-tracked tables need the warehouse |
+| CDF on catalog-managed tables outside Databricks | the kernel's `TableChanges` takes no catalog commit tail |
+| Incremental reads without a change feed | the kernel's `incremental_scan` is not bound yet; `Table.changes()` covers tables with CDF |
+| Databricks server-side behavior (predictive optimization, auto compaction, row-level concurrency, Photon, CLUSTER BY AUTO) | these are things a Databricks cluster does, not table formats; the warehouse fallback is the only way in |
+| UniForm metadata generation outside Databricks | Databricks-only |
+| Managed-table creation and catalog-managed commits on Databricks | Databricks allowlists which connectors may write through the UC Delta API, by User-Agent |
+| Writes to UC managed tables without `HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT` | a per-table decision by the catalog; the warehouse fallback serves them |
 
-- **Deletion-vector authoring**: delta-kernel-rs 0.28 has no
-  `update_deletion_vectors`. DML on kernel-only tables is therefore a bounded
-  whole-table rewrite, and MERGE and row-tracked tables need the warehouse.
-- **CDF on catalog-managed tables** outside Databricks: the kernel's
-  `TableChanges` takes no catalog commit tail.
-- **Incremental reads without a change feed**: `incremental_scan` exists in
-  the kernel and is not yet bound. `Table.changes()` covers tables with CDF.
-- **Databricks server-side behaviour**: predictive optimization, auto
-  compaction, row-level concurrency, Photon and CLUSTER BY AUTO. These are not
-  table formats; they are things a Databricks cluster does. The warehouse
-  fallback is the only way in.
-- **UniForm metadata generation** outside Databricks.
-- **Writes through the Unity Catalog Delta API on Databricks**, which covers
-  managed-table creation and catalog-managed commits. Databricks allowlists
-  which connectors may call those endpoints, keyed on the product User-Agent,
-  and refuses anything it does not recognise:
-
-  > The UC Delta API requires clients to identify the calling application in the
-  > User-Agent header. The provided User-Agent '...' is insufficient.
-
-  deltaswamp sends `deltaswamp/<version>` (see `deltaswamp._sdk`), which is a
-  precondition, not a solution: the name has to be registered with Databricks.
-  Until it is, `create_table` for a managed table and any catalog-managed write
-  need `allow_sql_fallback=True`. **Reads are unaffected** — the commit tail for
-  a catalog-managed table comes from the same API and is served normally, which
-  is verified against a live workspace.
-- **Writing to a Unity Catalog managed table from outside Databricks at all**,
-  where the metastore withholds `HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT`. This
-  is a per-table decision by the catalog, not a protocol limit; the warehouse
-  fallback serves those writes and the refusal says so.
-
-## What this pass found and fixed
-
-Auditing against the ecosystem also turned up defects in what already existed.
-They are listed here because each one was a claimed capability that did not
-work:
-
-- Catalog-managed appends never reached the catalog. The UC committer needs a
-  Tokio handle in scope, and the commit ran on a bare thread; no test had driven
-  a commit through a catalog end to end. The fake Unity Catalog now ratifies
-  commits the way the real one does, so this is covered.
-- The "checkpoint deadlock" was not a PyO3 problem. The default engine's
-  single-threaded background executor waits on itself inside the checkpoint
-  writer. Switching to the multi-threaded executor fixed it.
-- `OVERWRITE` was never routed to the kernel, so the documented full overwrite
-  of a catalog-managed table was unreachable.
-- Table properties read back stale after an ALTER.
-- 403s named the wrong missing privilege, because of an enum/str mismatch.
+deltaswamp identifies itself as `deltaswamp/<version>` (see `deltaswamp._sdk`),
+but the name still has to be registered with Databricks. Until then, managed
+`create_table` and catalog-managed writes need `allow_sql_fallback=True`. Reads
+are unaffected: the commit tail comes from the same API and is served normally.

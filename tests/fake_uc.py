@@ -196,10 +196,7 @@ class FakeUnityCatalog:
                         return self._send(404, {"message": f"{full} does not exist"})
                     # Kebab-case, with location nested under `metadata`: this
                     # is the shape a real Databricks metastore returns, and the
-                    # create-table response below already models it. This one
-                    # used to answer in snake_case, so the parser could read
-                    # `latest_table_version` here and silently read nothing at
-                    # all in production.
+                    # create-table response below models it too.
                     return self._send(
                         200,
                         {

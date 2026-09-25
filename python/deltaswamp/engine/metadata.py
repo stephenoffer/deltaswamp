@@ -5,7 +5,7 @@ under column mapping, widening a type, flipping nullability, changing the
 clustering keys, setting a property, writing a comment: each is one commit that
 replaces the `metaData` action (and sometimes the `protocol`, or a
 `domainMetadata` action) and nothing else. Yet delta-rs implements a handful of
-these, rejects most of the property surface on ALTER, and cannot touch a table
+these, rejects part of the property surface on ALTER, and cannot write a table
 that carries `domainMetadata` at all -- which is every liquid-clustered table.
 Databricks treats the rest as its own.
 
@@ -1240,7 +1240,7 @@ _ENABLING: dict[str, str] = {
     "delta.enableInCommitTimestamps": "inCommitTimestamp",
 }
 
-#: Keys the kernel recognises; anything else under `delta.` is refused.
+#: Keys the kernel recognizes; anything else under `delta.` is refused.
 _KNOWN_KEYS = frozenset(
     {
         "delta.appendOnly",

@@ -36,10 +36,8 @@ those operations are refused up front so the router moves on.
 from __future__ import annotations
 
 import contextlib
-import datetime as _dt
 import io
 import numbers
-import re
 import uuid
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
@@ -48,8 +46,9 @@ from typing import Any
 from ..capability import OPERATION_ENGINES, READ_OPERATIONS, Capability, Operation
 from ..capability import Engine as EngineKind
 from ..catalog import ResolvedTable, TableType
-from ..errors import InvalidArgumentError, UnreachableTableError
+from ..errors import InvalidArgumentError, SqlFallbackWarning, UnreachableTableError
 from ..identity import RefKind, split_identifier
+from . import sql_text as sq
 from .base import missing_method
 from .sql_backend import (
     ParameterBinder,
@@ -82,7 +81,7 @@ _NOT_WRITABLE_TYPES = frozenset(
 
 #: Reads that only make sense on a Delta table with a transaction log.
 _LOG_READS: frozenset[Operation] = frozenset(
-    {Operation.TIME_TRAVEL, Operation.CDF, Operation.HISTORY}
+    {Operation.TIME_TRAVEL, Operation.CDF, Operation.HISTORY, Operation.DETAIL}
 )
 
 #: Tuning knobs from the delta-rs signatures that have no meaning on a
@@ -99,195 +98,12 @@ _IGNORABLE_TUNING = frozenset(
     }
 )
 
-_PRIVILEGE = re.compile(r"^[A-Za-z][A-Za-z _]*$")
-_FORBIDDEN_IN_TYPE = re.compile(r"(;|--|/\*|\*/|'|\"|`)")
+
 _STAGING_DIR = "deltaswamp-staging"
-
-#: delta-rs `TableFeatures` members whose wire name is not just camelCase.
-_FEATURE_ALIASES = {
-    "TimestampWithoutTimezone": "timestampNtz",
-    # The protocol spells the preview features with a hyphen.
-    "VariantTypePreview": "variantType-preview",
-    "TypeWideningPreview": "typeWidening-preview",
-}
-
-
-# ------------------------------------------------------------------ quoting
-
-
-def _quote(identifier: str) -> str:
-    """Backtick-quote an identifier, doubling any embedded backtick."""
-    return "`" + str(identifier).replace("`", "``") + "`"
-
-
-def _column(column: str | Sequence[str]) -> str:
-    """Quote a column. A str is one identifier; a list is a nested field path."""
-    if isinstance(column, str):
-        return _quote(column)
-    parts = list(column)
-    if not parts:
-        raise InvalidArgumentError("a column path needs at least one part")
-    return ".".join(_quote(p) for p in parts)
-
-
-def _columns(columns: str | Sequence[str | Sequence[str]]) -> str:
-    # A bare string is one column. Iterating it would quote each character,
-    # so zorder(t, "city") became ZORDER BY (`c`, `i`, `t`, `y`).
-    if isinstance(columns, str):
-        return _column(columns)
-    return ", ".join(_column(c) for c in columns)
-
-
-def _qualified(name: str) -> str:
-    """Quote a dotted, possibly backtick-quoted, name part by part."""
-    return ".".join(_quote(p) for p in split_identifier(name))
-
-
-def _name(table: ResolvedTable) -> str:
-    ref = table.ref
-    if ref.kind is not RefKind.CATALOG:
-        raise UnreachableTableError(
-            "address the table by name",
-            "a SQL warehouse addresses tables by name; this is a path reference",
-        )
-    return ".".join(_quote(p) for p in (ref.catalog, ref.schema, ref.table) if p is not None)
-
-
-def _literal(value: str | None) -> str:
-    """A string literal for grammar positions that refuse parameter markers.
-
-    Databricks string literals honour backslash escapes, so both the backslash
-    and the quote must be escaped or ``\\'`` would close the literal early.
-    """
-    if value is None:
-        return "NULL"
-    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
-_QUOTED_IDENTIFIER = re.compile(r"`(?:[^`]|``)*`")
-
-
-def _sql_type(type_text: str) -> str:
-    """Pass a SQL type through, refusing text that could end the statement.
-
-    Backtick-quoted field names (``STRUCT<`a b`: INT>``, which is also what
-    `_arrow_to_sql` produces for a struct) are allowed; they are checked as
-    balanced quoted identifiers and skipped, and only the rest is screened.
-    """
-    text = str(type_text).strip()
-    unquoted = _QUOTED_IDENTIFIER.sub("", text)
-    if not text or _FORBIDDEN_IN_TYPE.search(unquoted):
-        raise InvalidArgumentError(f"{type_text!r} is not a SQL type")
-    return text
-
-
-def _principal(principal: str) -> str:
-    return _quote(principal)
-
-
-def _privileges(privileges: str | Sequence[str]) -> str:
-    items = [privileges] if isinstance(privileges, str) else list(privileges)
-    if not items:
-        raise InvalidArgumentError("at least one privilege is required")
-    for item in items:
-        if not _PRIVILEGE.match(item):
-            raise InvalidArgumentError(f"{item!r} is not a privilege name")
-    return ", ".join(" ".join(i.upper().split()) for i in items)
-
-
-def _feature_name(feature: Any) -> str:
-    """The wire name of a feature, from a string or a delta-rs `TableFeatures`."""
-    if isinstance(feature, str):
-        return feature
-    text = str(getattr(feature, "value", feature))
-    member = text.rsplit(".", 1)[-1]
-    if member in _FEATURE_ALIASES:
-        return _FEATURE_ALIASES[member]
-    return member[:1].lower() + member[1:]
-
-
-def _property_value(key: Any, value: Any) -> str:
-    """A TBLPROPERTIES value as the text Delta readers parse.
-
-    `str(True)` is ``'True'``; delta-rs and delta-kernel parse table-property
-    booleans case-sensitively, so ``delta.appendOnly = 'True'`` was a table
-    they could no longer read the configuration of.
-    """
-    if value is None:
-        raise InvalidArgumentError(f"property {key!r} has the value None; use unset_properties")
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def _properties(properties: Mapping[str, Any]) -> str:
-    unset = sorted(str(k) for k, v in properties.items() if v is None)
-    if unset:
-        # str(None) would have stored the literal string 'None'.
-        raise InvalidArgumentError(
-            f"property values cannot be None ({', '.join(unset)}); use unset_properties"
-        )
-    return ", ".join(
-        f"{_literal(str(k))} = {_literal(_property_value(k, v))}" for k, v in properties.items()
-    )
-
-
-def _predicate(predicate: str | None) -> str | None:
-    """None means "no predicate"; an empty or blank string is refused.
-
-    Truthiness turned ``delete("")`` into an unconditional DELETE of every
-    row (and the same for UPDATE), which is the worst way to misread a typo.
-    """
-    if predicate is None:
-        return None
-    if not isinstance(predicate, str):
-        raise TypeError(f"a predicate must be a SQL string, got {type(predicate).__name__}")
-    if not predicate.strip():
-        raise InvalidArgumentError(
-            "the predicate is empty; pass None to mean every row, or a SQL condition"
-        )
-    return predicate
-
-
-def _expression(value: Any) -> str:
-    """A caller's SQL expression. None is NULL (not the identifier `None`);
-    anything else must already be SQL text -- `", ".join` on a non-str value
-    was a bare TypeError."""
-    if value is None:
-        return "NULL"
-    return str(value)
-
-
-def _timestamp_text(value: Any) -> str:
-    """A time-travel timestamp as text with an explicit offset.
-
-    A naive value means UTC everywhere else in deltaswamp (delta-rs reads it
-    so). Sent without an offset, the warehouse read it in the *session* time
-    zone instead, which a workspace can set to anything -- so the same call
-    travelled to a different version depending on the engine. Epoch
-    milliseconds (what `history()` reports) are UTC too.
-    """
-    if isinstance(value, bool):
-        raise TypeError("a timestamp cannot be a bool")
-    if isinstance(value, numbers.Real):
-        moment = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC) + _dt.timedelta(milliseconds=float(value))
-    elif isinstance(value, _dt.datetime):
-        moment = value
-    elif isinstance(value, _dt.date):
-        moment = _dt.datetime(value.year, value.month, value.day)
-    else:
-        text = str(value).strip()
-        try:
-            moment = _dt.datetime.fromisoformat(text)
-        except ValueError:
-            return text  # let the warehouse say what it makes of it
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=_dt.UTC)
-    return moment.isoformat()
 
 
 def _reject_unsupported(what: str, kwargs: Mapping[str, Any]) -> None:
-    """Refuse arguments the warehouse cannot honour rather than ignoring them."""
+    """Refuse arguments the warehouse cannot honor rather than ignoring them."""
     unsupported = sorted(
         k for k, v in kwargs.items() if k not in _IGNORABLE_TUNING and v not in (None, False)
     )
@@ -512,10 +328,6 @@ def _parquet_bytes(table: Any) -> bytes:
 # ------------------------------------------------------------------ engine
 
 
-class SqlFallbackWarning(UserWarning):
-    """Raised when an operation is served by a SQL warehouse rather than directly."""
-
-
 class SqlEngine:
     """Executes operations as SQL against a Databricks warehouse."""
 
@@ -672,6 +484,57 @@ class SqlEngine:
                 ok=False,
                 reason=f"the table is a {kind.value}, which has no Delta log to read",
             )
+        if kind is TableType.MATERIALIZED_VIEW and operation in _LOG_READS:
+            # A materialized view is backed by Delta, but its log belongs to the
+            # pipeline: DESCRIBE HISTORY and DESCRIBE DETAIL both fail with
+            # EXPECT_TABLE_NOT_VIEW.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is a materialized view, whose Delta log is managed by its "
+                    "pipeline; the warehouse refuses DESCRIBE HISTORY and DESCRIBE DETAIL on it"
+                ),
+            )
+        widening = {"typeWidening", "typeWidening-preview"} & table.features or (
+            table.properties.get("delta.enableTypeWidening", "").lower() == "true"
+        )
+        if operation is Operation.ALTER_COLUMN_TYPE and table.features and not widening:
+            # Databricks answers DELTA_UNSUPPORTED_ALTER_TABLE_CHANGE_COL_OP even
+            # for INT -> BIGINT until type widening is on.
+            return Capability(
+                operation,
+                ok=False,
+                reason="type widening is not enabled on this table, and Databricks changes "
+                "a column's type only under it",
+                remedy="t.set_properties({'delta.enableTypeWidening': 'true'}) first",
+            )
+        mapping = table.properties.get("delta.columnMapping.mode", "none").lower()
+        if (
+            operation in (Operation.DROP_COLUMN, Operation.RENAME_COLUMN)
+            and table.features
+            and mapping not in ("name", "id")
+        ):
+            # DELTA_UNSUPPORTED_DROP_COLUMN otherwise: without
+            # column mapping a column's name is also its name in every file.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table does not use column mapping, and Databricks renames or "
+                "drops a column only under it",
+                remedy="t.set_properties({'delta.columnMapping.mode': 'name'}) first",
+            )
+        if operation is Operation.ZORDER and "clustering" in table.features:
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is liquid-clustered, and Databricks refuses Z-ORDER on it "
+                    "(DELTA_CLUSTERING_WITH_ZORDER_BY)"
+                ),
+                remedy="t.optimize() clusters by the table's clustering keys; "
+                "t.cluster_by([...]) changes them",
+            )
         if kind in _NOT_WRITABLE_TYPES and operation not in READ_OPERATIONS:
             return Capability(
                 operation,
@@ -694,26 +557,19 @@ class SqlEngine:
 
     def _workspace(self) -> Any:
         if self._client is None:
-            from databricks.sdk.core import Config
-
-            from .._sdk import PRODUCT, sdk_version, workspace_client
+            from .._sdk import workspace_client
 
             carried: dict[str, Any] = getattr(self, "_config_kwargs", None) or {}
             if self._config is None and carried:
                 # An unpickled copy of an engine built from an explicit Config.
+                from .._sdk import PRODUCT, sdk_version
+
                 identity = {"product": PRODUCT, "product_version": sdk_version()}
-                cfg: Any = Config(**{**carried, **identity})
+                self._client = workspace_client(**{**carried, **identity})
             else:
-                # Named explicitly rather than splatted: Config's signature is
-                # heterogeneous, so **kwargs defeats type checking here.
-                cfg = self._config or Config(
-                    profile=self._profile,
-                    host=self._host,
-                    token=self._token,
-                    product=PRODUCT,
-                    product_version=sdk_version(),
+                self._client = workspace_client(
+                    config=self._config, profile=self._profile, host=self._host, token=self._token
                 )
-            self._client = workspace_client(config=cfg)
         return self._client
 
     def _resolve_warehouse(self) -> str | None:
@@ -846,13 +702,13 @@ class SqlEngine:
             # One of them was silently ignored before.
             raise InvalidArgumentError("pass version or timestamp, not both")
         binder = ParameterBinder()
-        projection = _columns(columns) if columns else "*"
-        sql = f"SELECT {projection} FROM {_name(table)}"
+        projection = sq.columns(columns) if columns else "*"
+        sql = f"SELECT {projection} FROM {sq.name(table)}"
         if version is not None:
             sql += f" VERSION AS OF {int(version)}"
         elif timestamp is not None:
-            sql += f" TIMESTAMP AS OF {binder.bind(_timestamp_text(timestamp), type='TIMESTAMP')}"
-        if _predicate(predicate) is not None:
+            sql += f" TIMESTAMP AS OF {binder.bind(sq.timestamp_text(timestamp), type='TIMESTAMP')}"
+        if sq.predicate(predicate) is not None:
             sql += f" WHERE {predicate}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
@@ -867,7 +723,7 @@ class SqlEngine:
             if limit == 0:
                 # `if limit:` read 0 as "no limit" and returned the whole history.
                 return []
-        sql = f"DESCRIBE HISTORY {_name(table)}"
+        sql = f"DESCRIBE HISTORY {sq.name(table)}"
         if limit is not None:
             sql += f" LIMIT {limit}"
         return [_history_entry(row) for row in _rows(self._query(Operation.HISTORY, sql))]
@@ -884,7 +740,7 @@ class SqlEngine:
                 "DESCRIBE DETAIL only describes the current version of a table",
                 "open the table without a version",
             )
-        name = _name(table)
+        name = sq.name(table)
         row = _first(self._query(Operation.DETAIL, f"DESCRIBE DETAIL {name}"))
         out = dict(row)
         if table.table_type not in (TableType.VIEW, TableType.METRIC_VIEW):
@@ -903,7 +759,7 @@ class SqlEngine:
 
     def describe_extended(self, table: ResolvedTable) -> dict[str, Any]:
         """DESCRIBE TABLE EXTENDED, as ``{"columns": [...], <detail>: <value>}``."""
-        rows = _rows(self._query("describe_extended", f"DESCRIBE TABLE EXTENDED {_name(table)}"))
+        rows = _rows(self._query("describe_extended", f"DESCRIBE TABLE EXTENDED {sq.name(table)}"))
         columns: list[dict[str, Any]] = []
         info: dict[str, Any] = {}
         section = "columns"
@@ -947,17 +803,17 @@ class SqlEngine:
             raise InvalidArgumentError("pass ending_version or ending_timestamp, not both")
         binder = ParameterBinder()
         if starting_timestamp is not None:
-            start = binder.bind(_timestamp_text(starting_timestamp), type="TIMESTAMP")
+            start = binder.bind(sq.timestamp_text(starting_timestamp), type="TIMESTAMP")
         else:
             start = binder.bind(0 if starting_version is None else int(starting_version))
-        args = [_literal(_name(table)), start]
+        args = [sq.literal(sq.name(table)), start]
         if ending_timestamp is not None:
-            args.append(binder.bind(_timestamp_text(ending_timestamp), type="TIMESTAMP"))
+            args.append(binder.bind(sq.timestamp_text(ending_timestamp), type="TIMESTAMP"))
         elif ending_version is not None:
             args.append(binder.bind(int(ending_version)))
-        projection = _columns(columns) if columns else "*"
+        projection = sq.columns(columns) if columns else "*"
         sql = f"SELECT {projection} FROM table_changes({', '.join(args)})"
-        if _predicate(predicate) is not None:
+        if sq.predicate(predicate) is not None:
             sql += f" WHERE {predicate}"
         return self._query(Operation.CDF, sql, binder)
 
@@ -987,8 +843,11 @@ class SqlEngine:
             with contextlib.suppress(Exception):
                 files.delete(path)
             raise
+        # Each statement projects the staged columns itself (`_staged_columns`):
+        # read_files adds a `_rescued_data` column of its own.
+        relation = f"read_files({sq.literal(path)}, format => 'parquet')"
         try:
-            yield f"read_files({_literal(path)}, format => 'parquet')", arrow
+            yield relation, arrow
         finally:
             try:
                 files.delete(path)
@@ -1008,10 +867,10 @@ class SqlEngine:
         column error, or a new column under schema evolution) and to MERGE's
         `UPDATE SET *` / `INSERT *`. The Arrow schema staged is known exactly.
         """
-        return _columns(list(arrow.column_names))
+        return sq.columns(list(arrow.column_names))
 
     def _table_columns(self, table: ResolvedTable) -> list[str]:
-        result = self._query(Operation.SCAN, f"SELECT * FROM {_name(table)} LIMIT 0")
+        result = self._query(Operation.SCAN, f"SELECT * FROM {sq.name(table)} LIMIT 0")
         return list(result.schema.names)
 
     # ------------------------------------------------------------------ write
@@ -1030,7 +889,7 @@ class SqlEngine:
         with self._staged(data) as (source, arrow):
             self._run(
                 Operation.APPEND,
-                f"INSERT{evolve} INTO {_name(table)} BY NAME "
+                f"INSERT{evolve} INTO {sq.name(table)} BY NAME "
                 f"SELECT {self._staged_columns(arrow)} FROM {source}",
             )
 
@@ -1050,7 +909,7 @@ class SqlEngine:
         in the data, by building a parameterized REPLACE WHERE from them.
         """
         self._check_write_args("overwrite", schema_mode, kwargs)
-        predicate = _predicate(predicate)
+        predicate = sq.predicate(predicate)
         if partition_overwrite not in ("static", "dynamic"):
             raise UnreachableTableError(
                 f"overwrite with partition_overwrite={partition_overwrite!r}",
@@ -1062,7 +921,7 @@ class SqlEngine:
                 "dynamic partition overwrite derives its own predicate from the data, so "
                 "it cannot be combined with an explicit one",
             )
-        name = _name(table)
+        name = sq.name(table)
         # schema_mode="merge" was accepted and then dropped, so new columns in
         # the data failed the overwrite instead of evolving the schema.
         evolve = " WITH SCHEMA EVOLUTION" if schema_mode == "merge" else ""
@@ -1100,7 +959,7 @@ class SqlEngine:
             self._run(
                 Operation.REPLACE_WHERE,
                 f"INSERT{evolve} INTO {name} REPLACE WHERE {predicate} "
-                f"SELECT {_columns(projection)} FROM {source}",
+                f"SELECT {sq.columns(projection)} FROM {source}",
                 binder,
             )
 
@@ -1138,7 +997,7 @@ class SqlEngine:
         clauses = []
         for values in sorted(tuples, key=repr):
             terms = [
-                f"{_quote(c)} IS NULL" if v is None else f"{_quote(c)} = {binder.bind(v)}"
+                f"{sq.quote(c)} IS NULL" if v is None else f"{sq.quote(c)} = {binder.bind(v)}"
                 for c, v in zip(partitions, values, strict=True)
             ]
             clauses.append("(" + " AND ".join(terms) + ")")
@@ -1151,7 +1010,7 @@ class SqlEngine:
                 f"{what} with schema_mode='overwrite' via SQL",
                 "replacing a table's schema from a statement also discards its properties, "
                 "comments and grants",
-                "use CREATE OR REPLACE TABLE deliberately, via query()",
+                "use CREATE OR REPLACE TABLE explicitly, via query()",
             )
         if schema_mode not in (None, "merge"):
             raise UnreachableTableError(
@@ -1169,8 +1028,8 @@ class SqlEngine:
         # delta-rs arguments arrive here via Table.delete(**kwargs); without
         # this they were a bare TypeError, and harmless tuning was refused.
         _reject_unsupported("delete", kwargs)
-        sql = f"DELETE FROM {_name(table)}"
-        if _predicate(predicate) is not None:
+        sql = f"DELETE FROM {sq.name(table)}"
+        if sq.predicate(predicate) is not None:
             sql += f" WHERE {predicate}"
         return _dml_metrics(_first(self._query(Operation.DELETE, sql)), "num_deleted_rows")
 
@@ -1195,12 +1054,12 @@ class SqlEngine:
         binder = ParameterBinder()
         # A None expression is NULL; spliced as text it was the identifier `None`.
         assignments = [
-            f"{_quote(k)} = {'NULL' if v is None else v}" for k, v in (updates or {}).items()
+            f"{sq.quote(k)} = {'NULL' if v is None else v}" for k, v in (updates or {}).items()
         ]
         # None is written as the NULL literal: a STRING-typed NULL marker is
         # refused by ANSI store assignment into an INT/DATE/... column.
         assignments += [
-            f"{_quote(k)} = {'NULL' if v is None else binder.bind(v)}"
+            f"{sq.quote(k)} = {'NULL' if v is None else binder.bind(v)}"
             for k, v in (new_values or {}).items()
         ]
         both = {str(k).lower() for k in (updates or {})} & {
@@ -1211,8 +1070,8 @@ class SqlEngine:
             raise InvalidArgumentError(
                 f"column(s) {', '.join(sorted(both))} are set by both updates and new_values"
             )
-        sql = f"UPDATE {_name(table)} SET {', '.join(assignments)}"
-        if _predicate(predicate) is not None:
+        sql = f"UPDATE {sq.name(table)} SET {', '.join(assignments)}"
+        if sq.predicate(predicate) is not None:
             sql += f" WHERE {predicate}"
         return _dml_metrics(_first(self._query(Operation.UPDATE, sql, binder)), "num_updated_rows")
 
@@ -1274,15 +1133,15 @@ class SqlEngine:
         """
         _reject_unsupported("optimize", kwargs)
         binder = ParameterBinder()
-        sql = f"OPTIMIZE {_name(table)}"
+        sql = f"OPTIMIZE {sq.name(table)}"
         if full:
             sql += " FULL"
-        conditions = [f"({predicate})"] if _predicate(predicate) is not None else []
+        conditions = [f"({predicate})"] if sq.predicate(predicate) is not None else []
         conditions += [_filter_sql(f, binder) for f in partition_filters or []]
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         if zorder_by:
-            sql += f" ZORDER BY ({_columns(zorder_by)})"
+            sql += f" ZORDER BY ({sq.columns(zorder_by)})"
         return _first(
             self._query(Operation.ZORDER if zorder_by else Operation.OPTIMIZE, sql, binder)
         )
@@ -1314,7 +1173,7 @@ class SqlEngine:
                 "has no session to change it in",
                 "VACUUM with a retention at or above delta.deletedFileRetentionDuration",
             )
-        sql = f"VACUUM {_name(table)}"
+        sql = f"VACUUM {sq.name(table)}"
         if lite:
             sql += " LITE"
         elif full:
@@ -1350,15 +1209,15 @@ class SqlEngine:
         if isinstance(target, numbers.Integral):
             clause = f"VERSION AS OF {int(target)}"
         else:
-            clause = f"TIMESTAMP AS OF {_literal(_timestamp_text(target))}"
-        return _first(self._query(Operation.RESTORE, f"RESTORE TABLE {_name(table)} TO {clause}"))
+            clause = f"TIMESTAMP AS OF {sq.literal(sq.timestamp_text(target))}"
+        return _first(self._query(Operation.RESTORE, f"RESTORE TABLE {sq.name(table)} TO {clause}"))
 
     def repair(
         self, table: ResolvedTable, *, dry_run: bool = False, **kwargs: Any
     ) -> dict[str, Any]:
         """FSCK REPAIR TABLE [DRY RUN]. Shaped like delta-rs's result."""
         _reject_unsupported("repair", kwargs)
-        sql = f"FSCK REPAIR TABLE {_name(table)}" + (" DRY RUN" if dry_run else "")
+        sql = f"FSCK REPAIR TABLE {sq.name(table)}" + (" DRY RUN" if dry_run else "")
         rows = _rows(self._query(Operation.REPAIR, sql))
         # A row naming no file used to be reported as the file "None".
         removed = [str(p) for r in rows if r for p in [r.get("dataFilePath") or r.get("path")] if p]
@@ -1381,8 +1240,8 @@ class SqlEngine:
             clause = "APPLY (PURGE)"
         else:
             raise InvalidArgumentError("REORG needs purge=True or an iceberg_compat_version")
-        where = f" WHERE {predicate}" if _predicate(predicate) is not None else ""
-        self._run(Operation.REORG, f"REORG TABLE {_name(table)}{where} {clause}")
+        where = f" WHERE {predicate}" if sq.predicate(predicate) is not None else ""
+        self._run(Operation.REORG, f"REORG TABLE {sq.name(table)}{where} {clause}")
         return _ok()
 
     def clone(
@@ -1406,11 +1265,11 @@ class SqlEngine:
         if if_not_exists:
             verb += " IF NOT EXISTS"
         kind = "SHALLOW CLONE" if shallow else "DEEP CLONE"
-        sql = f"{verb} {_qualified(target)} {kind} {_name(table)}"
+        sql = f"{verb} {sq.qualified(target)} {kind} {sq.name(table)}"
         if version is not None:
             sql += f" VERSION AS OF {int(version)}"
         elif timestamp is not None:
-            sql += f" TIMESTAMP AS OF {_literal(_timestamp_text(timestamp))}"
+            sql += f" TIMESTAMP AS OF {sq.literal(sq.timestamp_text(timestamp))}"
         return _first(self._query(Operation.CLONE, sql)) or _ok()
 
     def analyze(
@@ -1425,14 +1284,14 @@ class SqlEngine:
 
         `columns="all"` computes every column's statistics.
         """
-        sql = f"ANALYZE TABLE {_name(table)} COMPUTE"
+        sql = f"ANALYZE TABLE {sq.name(table)} COMPUTE"
         sql += " DELTA STATISTICS" if delta_statistics else " STATISTICS"
         if isinstance(columns, str):
             if columns.lower() not in ("all", "*"):
                 raise InvalidArgumentError("columns must be a list of names, or 'all'")
             sql += " FOR ALL COLUMNS"
         elif columns:
-            sql += f" FOR COLUMNS {_columns(columns)}"
+            sql += f" FOR COLUMNS {sq.columns(columns)}"
         if noscan:
             if columns:
                 raise InvalidArgumentError("NOSCAN computes table-level statistics only")
@@ -1446,7 +1305,7 @@ class SqlEngine:
         Required when anything other than Databricks writes to a table with
         Iceberg reads enabled; without it the Iceberg view silently goes stale.
         """
-        self._run(Operation.SYNC_ICEBERG, f"MSCK REPAIR TABLE {_name(table)} SYNC METADATA")
+        self._run(Operation.SYNC_ICEBERG, f"MSCK REPAIR TABLE {sq.name(table)} SYNC METADATA")
         return _ok()
 
     def refresh(self, table: ResolvedTable, *, full: bool = False) -> dict[str, Any]:
@@ -1460,7 +1319,10 @@ class SqlEngine:
                 "refresh",
                 "REFRESH applies to materialized views and streaming tables only",
             )
-        self._run(Operation.REFRESH, f"REFRESH {kind} {_name(table)}" + (" FULL" if full else ""))
+        self._run(
+            Operation.REFRESH,
+            f"REFRESH {kind} {sq.name(table)}" + (" FULL" if full else ""),
+        )
         return _ok()
 
     # ------------------------------------------------------------------ ddl
@@ -1468,23 +1330,62 @@ class SqlEngine:
     def _alter(
         self, operation: Operation | str, table: ResolvedTable, clause: str
     ) -> dict[str, Any]:
-        self.execute(operation, f"ALTER TABLE {_name(table)} {clause}", fetch=False)
+        self.execute(operation, f"ALTER TABLE {sq.name(table)} {clause}", fetch=False)
         return _ok()
+
+    def create_managed(
+        self,
+        full_name: str,
+        schema: Any,
+        *,
+        partition_by: list[str] | None = None,
+        cluster_by: list[str] | None = None,
+        properties: dict[str, str] | None = None,
+        comment: str | None = None,
+    ) -> None:
+        """CREATE TABLE through the warehouse: an ordinary Databricks managed table.
+
+        The route when Unity Catalog's staging-table API refuses this client,
+        which Databricks does for any connector it has not allowlisted.
+        """
+        if partition_by and cluster_by:
+            raise UnreachableTableError(
+                f"create {full_name}", "a table is partitioned or clustered, not both"
+            )
+        nullable = {}
+        if hasattr(schema, "names") and hasattr(schema, "field"):
+            nullable = {schema.field(i).name: schema.field(i).nullable for i in range(len(schema))}
+        columns = ", ".join(
+            f"{sq.quote(n)} {sq.sql_type(t)}" + ("" if nullable.get(n, True) else " NOT NULL")
+            for n, t in sq.column_types(schema)
+        )
+        sql = f"CREATE TABLE {sq.qualified(full_name)} ({columns}) USING DELTA"
+        if partition_by:
+            sql += f" PARTITIONED BY ({sq.columns(partition_by)})"
+        if cluster_by:
+            sql += f" CLUSTER BY ({sq.columns(cluster_by)})"
+        if comment:
+            sql += f" COMMENT {sq.literal(comment)}"
+        if properties:
+            sql += f" TBLPROPERTIES ({sq.properties(properties)})"
+        self.execute(Operation.CREATE, sql, fetch=False)
 
     def add_columns(self, table: ResolvedTable, fields: Any, **kwargs: Any) -> dict[str, Any]:
         """ADD COLUMNS. `fields` is ``{name: sql_type}`` or Arrow fields/schema."""
         _reject_unsupported("add columns", kwargs)
-        pairs = [f"{_quote(n)} {_sql_type(t)}" for n, t in _column_types(fields)]
+        pairs = [f"{sq.quote(n)} {sq.sql_type(t)}" for n, t in sq.column_types(fields)]
         if not pairs:
             raise InvalidArgumentError("no columns given")
         return self._alter(Operation.ADD_COLUMN, table, f"ADD COLUMNS ({', '.join(pairs)})")
 
     def drop_column(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
-        return self._alter(Operation.DROP_COLUMN, table, f"DROP COLUMN {_column(column)}")
+        return self._alter(Operation.DROP_COLUMN, table, f"DROP COLUMN {sq.column(column)}")
 
     def rename_column(self, table: ResolvedTable, old: str, new: str) -> dict[str, Any]:
         return self._alter(
-            Operation.RENAME_COLUMN, table, f"RENAME COLUMN {_column(old)} TO {_quote(new)}"
+            Operation.RENAME_COLUMN,
+            table,
+            f"RENAME COLUMN {sq.column(old)} TO {sq.quote(new)}",
         )
 
     def set_properties(
@@ -1495,7 +1396,7 @@ class SqlEngine:
         _reject_unsupported("set table properties", kwargs)
         if not properties:
             raise InvalidArgumentError("no properties given")
-        pairs = _properties(properties)
+        pairs = sq.properties(properties)
         return self._alter(Operation.SET_PROPERTIES, table, f"SET TBLPROPERTIES ({pairs})")
 
     def unset_properties(
@@ -1505,7 +1406,7 @@ class SqlEngine:
         if not keys:
             raise InvalidArgumentError("no property keys given")
         guard = "IF EXISTS " if if_exists else ""
-        listed = ", ".join(_literal(k) for k in keys)
+        listed = ", ".join(sq.literal(k) for k in keys)
         return self._alter(
             Operation.UNSET_PROPERTIES, table, f"UNSET TBLPROPERTIES {guard}({listed})"
         )
@@ -1520,13 +1421,13 @@ class SqlEngine:
         else:
             features = list(feature)
         return self.set_properties(
-            table, {f"delta.feature.{_feature_name(f)}": "supported" for f in features}
+            table, {f"delta.feature.{sq.feature_name(f)}": "supported" for f in features}
         )
 
     def drop_feature(
         self, table: ResolvedTable, feature: Any, *, truncate_history: bool = False
     ) -> dict[str, Any]:
-        clause = f"DROP FEATURE {_quote(_feature_name(feature))}"
+        clause = f"DROP FEATURE {sq.quote(sq.feature_name(feature))}"
         if truncate_history:
             clause += " TRUNCATE HISTORY"
         return self._alter(Operation.DROP_FEATURE, table, clause)
@@ -1540,7 +1441,7 @@ class SqlEngine:
             raise InvalidArgumentError("no constraints given")
         for name, expression in constraints.items():
             # CHECK () or CHECK (None) failed on the warehouse with a parse error.
-            if _predicate(expression) is None or not str(name).strip():
+            if sq.predicate(expression) is None or not str(name).strip():
                 raise InvalidArgumentError(
                     f"constraint {name!r} needs a name and a CHECK expression"
                 )
@@ -1548,7 +1449,7 @@ class SqlEngine:
             self._alter(
                 Operation.ADD_CONSTRAINT,
                 table,
-                f"ADD CONSTRAINT {_quote(name)} CHECK ({expression})",
+                f"ADD CONSTRAINT {sq.quote(name)} CHECK ({expression})",
             )
         return _ok()
 
@@ -1557,11 +1458,14 @@ class SqlEngine:
     ) -> dict[str, Any]:
         guard = "IF EXISTS " if if_exists else ""
         return self._alter(
-            Operation.DROP_CONSTRAINT, table, f"DROP CONSTRAINT {guard}{_quote(name)}"
+            Operation.DROP_CONSTRAINT, table, f"DROP CONSTRAINT {guard}{sq.quote(name)}"
         )
 
     def set_comment(self, table: ResolvedTable, comment: str | None) -> dict[str, Any]:
-        self._run(Operation.SET_COMMENT, f"COMMENT ON TABLE {_name(table)} IS {_literal(comment)}")
+        self._run(
+            Operation.SET_COMMENT,
+            f"COMMENT ON TABLE {sq.name(table)} IS {sq.literal(comment)}",
+        )
         return _ok()
 
     def set_column_comment(
@@ -1570,7 +1474,7 @@ class SqlEngine:
         return self._alter(
             Operation.SET_COLUMN_COMMENT,
             table,
-            f"ALTER COLUMN {_column(column)} COMMENT {_literal(comment or '')}",
+            f"ALTER COLUMN {sq.column(column)} COMMENT {sq.literal(comment or '')}",
         )
 
     def alter_column_type(
@@ -1579,17 +1483,17 @@ class SqlEngine:
         return self._alter(
             Operation.ALTER_COLUMN_TYPE,
             table,
-            f"ALTER COLUMN {_column(column)} TYPE {_sql_type(_type_text(new_type))}",
+            f"ALTER COLUMN {sq.column(column)} TYPE {sq.sql_type(sq.type_text(new_type))}",
         )
 
     def set_not_null(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
         return self._alter(
-            Operation.SET_NOT_NULL, table, f"ALTER COLUMN {_column(column)} SET NOT NULL"
+            Operation.SET_NOT_NULL, table, f"ALTER COLUMN {sq.column(column)} SET NOT NULL"
         )
 
     def drop_not_null(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
         return self._alter(
-            Operation.DROP_NOT_NULL, table, f"ALTER COLUMN {_column(column)} DROP NOT NULL"
+            Operation.DROP_NOT_NULL, table, f"ALTER COLUMN {sq.column(column)} DROP NOT NULL"
         )
 
     def cluster_by(
@@ -1603,20 +1507,20 @@ class SqlEngine:
         elif not columns:
             clause = "CLUSTER BY NONE"
         else:
-            clause = f"CLUSTER BY ({_columns(columns)})"
+            clause = f"CLUSTER BY ({sq.columns(columns)})"
         return self._alter(Operation.CLUSTER_BY, table, clause)
 
     # ---------------------------------------------------- governance extras
 
     def undrop(self, full_name: str) -> dict[str, Any]:
         """UNDROP TABLE, within the catalog's retention window."""
-        self.execute("undrop", f"UNDROP TABLE {_qualified(full_name)}", fetch=False)
+        self.execute("undrop", f"UNDROP TABLE {sq.qualified(full_name)}", fetch=False)
         return _ok()
 
     def set_row_filter(
         self, table: ResolvedTable, function_name: str, columns: Sequence[str]
     ) -> dict[str, Any]:
-        clause = f"SET ROW FILTER {_qualified(function_name)} ON ({_columns(columns)})"
+        clause = f"SET ROW FILTER {sq.qualified(function_name)} ON ({sq.columns(columns)})"
         return self._alter("set_row_filter", table, clause)
 
     def drop_row_filter(self, table: ResolvedTable) -> dict[str, Any]:
@@ -1629,13 +1533,13 @@ class SqlEngine:
         function_name: str,
         using_columns: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        clause = f"ALTER COLUMN {_column(column)} SET MASK {_qualified(function_name)}"
+        clause = f"ALTER COLUMN {sq.column(column)} SET MASK {sq.qualified(function_name)}"
         if using_columns:
-            clause += f" USING COLUMNS ({_columns(using_columns)})"
+            clause += f" USING COLUMNS ({sq.columns(using_columns)})"
         return self._alter("set_column_mask", table, clause)
 
     def drop_column_mask(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
-        return self._alter("drop_column_mask", table, f"ALTER COLUMN {_column(column)} DROP MASK")
+        return self._alter("drop_column_mask", table, f"ALTER COLUMN {sq.column(column)} DROP MASK")
 
     def set_tags(
         self,
@@ -1647,9 +1551,9 @@ class SqlEngine:
             raise InvalidArgumentError("no tags given")
         # A key-only tag has an empty value; str(None) stored the text 'None'.
         pairs = ", ".join(
-            f"{_literal(k)} = {_literal('' if v is None else str(v))}" for k, v in tags.items()
+            f"{sq.literal(k)} = {sq.literal('' if v is None else str(v))}" for k, v in tags.items()
         )
-        target = f"ALTER COLUMN {_column(column)} " if column is not None else ""
+        target = f"ALTER COLUMN {sq.column(column)} " if column is not None else ""
         return self._alter("set_tags", table, f"{target}SET TAGS ({pairs})")
 
     def unset_tags(
@@ -1661,26 +1565,26 @@ class SqlEngine:
         keys = [keys] if isinstance(keys, str) else list(keys)
         if not keys:
             raise InvalidArgumentError("no tag keys given")
-        target = f"ALTER COLUMN {_column(column)} " if column is not None else ""
-        listed = ", ".join(_literal(k) for k in keys)
+        target = f"ALTER COLUMN {sq.column(column)} " if column is not None else ""
+        listed = ", ".join(sq.literal(k) for k in keys)
         return self._alter("unset_tags", table, f"{target}UNSET TAGS ({listed})")
 
     def set_owner(self, table: ResolvedTable, principal: str) -> dict[str, Any]:
-        return self._alter("set_owner", table, f"OWNER TO {_principal(principal)}")
+        return self._alter("set_owner", table, f"OWNER TO {sq.principal(principal)}")
 
     def grant(
         self, table: ResolvedTable, privileges: str | Sequence[str], principal: str
     ) -> dict[str, Any]:
-        sql = f"GRANT {_privileges(privileges)} ON TABLE {_name(table)} TO {_principal(principal)}"
+        target = f"TABLE {sq.name(table)} TO {sq.principal(principal)}"
+        sql = f"GRANT {sq.privileges(privileges)} ON {target}"
         self.execute("grant", sql, fetch=False)
         return _ok()
 
     def revoke(
         self, table: ResolvedTable, privileges: str | Sequence[str], principal: str
     ) -> dict[str, Any]:
-        sql = (
-            f"REVOKE {_privileges(privileges)} ON TABLE {_name(table)} FROM {_principal(principal)}"
-        )
+        source = f"TABLE {sq.name(table)} FROM {sq.principal(principal)}"
+        sql = f"REVOKE {sq.privileges(privileges)} ON {source}"
         self.execute("revoke", sql, fetch=False)
         return _ok()
 
@@ -1699,13 +1603,13 @@ class SqlEngine:
 
         `select_sql` is SQL by contract; bind values in it with `:name` markers.
         """
-        sql = ("CREATE OR REPLACE TABLE " if replace else "CREATE TABLE ") + _qualified(name)
+        sql = ("CREATE OR REPLACE TABLE " if replace else "CREATE TABLE ") + sq.qualified(name)
         if cluster_by:
-            sql += f" CLUSTER BY ({_columns(cluster_by)})"
+            sql += f" CLUSTER BY ({sq.columns(cluster_by)})"
         if comment is not None:
-            sql += f" COMMENT {_literal(comment)}"
+            sql += f" COMMENT {sq.literal(comment)}"
         if properties:
-            sql += f" TBLPROPERTIES ({_properties(properties)})"
+            sql += f" TBLPROPERTIES ({sq.properties(properties)})"
         sql += f" AS {select_sql}"
         self.execute("create_table_as", sql, fetch=False, parameters=parameters)
         return _ok()
@@ -1765,7 +1669,7 @@ class SqlMerger:
 
     def _add(self, kind: str, predicate: str | None, action: Any) -> SqlMerger:
         # Checked now, not after the source has been uploaded at execute().
-        _predicate(predicate)
+        sq.predicate(predicate)
         verb, arg = action
         if verb in ("UPDATE", "INSERT") and not arg:
             raise InvalidArgumentError(f"a MERGE {verb} clause needs at least one column to set")
@@ -1817,18 +1721,19 @@ class SqlMerger:
 
     def _action(self, action: Any, source_columns: list[str]) -> str:
         verb, arg = action
-        tgt, src = _quote(self._target_alias), _quote(self._source_alias)
+        tgt, src = sq.quote(self._target_alias), sq.quote(self._source_alias)
         if verb == "DELETE":
             return "DELETE"
         if verb in ("UPDATE", "INSERT") and not arg:
             raise InvalidArgumentError(f"a MERGE {verb} clause needs at least one column to set")
         if verb == "UPDATE":
             return "UPDATE SET " + ", ".join(
-                f"{tgt}.{_quote(self._target_column(k))} = {_expression(v)}" for k, v in arg.items()
+                f"{tgt}.{sq.quote(self._target_column(k))} = {sq.expression(v)}"
+                for k, v in arg.items()
             )
         if verb == "INSERT":
-            names = ", ".join(_quote(self._target_column(k)) for k in arg)
-            return f"INSERT ({names}) VALUES ({', '.join(_expression(v) for v in arg.values())})"
+            names = ", ".join(sq.quote(self._target_column(k)) for k in arg)
+            return f"INSERT ({names}) VALUES ({', '.join(sq.expression(v) for v in arg.values())})"
         # *_ALL: spell the columns out, so except_cols works on every runtime.
         # Names resolve case-insensitively, so except_cols=["ID"] excludes "id".
         excluded = {str(c).lower() for c in arg}
@@ -1838,11 +1743,13 @@ class SqlMerger:
         if verb == "UPDATE_ALL":
             if not arg:
                 return "UPDATE SET *"
-            return "UPDATE SET " + ", ".join(f"{tgt}.{_quote(c)} = {src}.{_quote(c)}" for c in cols)
+            return "UPDATE SET " + ", ".join(
+                f"{tgt}.{sq.quote(c)} = {src}.{sq.quote(c)}" for c in cols
+            )
         if not arg:
             return "INSERT *"
-        names = ", ".join(_quote(c) for c in cols)
-        values = ", ".join(f"{src}.{_quote(c)}" for c in cols)
+        names = ", ".join(sq.quote(c) for c in cols)
+        values = ", ".join(f"{src}.{sq.quote(c)}" for c in cols)
         return f"INSERT ({names}) VALUES ({values})"
 
     def statement(self, relation: str, source_columns: list[str]) -> str:
@@ -1851,9 +1758,9 @@ class SqlMerger:
             raise InvalidArgumentError("a MERGE needs at least one WHEN clause")
         evolve = " WITH SCHEMA EVOLUTION" if self._merge_schema else ""
         sql = (
-            f"MERGE{evolve} INTO {_name(self._table)} AS {_quote(self._target_alias)} "
-            f"USING (SELECT {_columns(source_columns)} FROM {relation}) "
-            f"AS {_quote(self._source_alias)} "
+            f"MERGE{evolve} INTO {sq.name(self._table)} AS {sq.quote(self._target_alias)} "
+            f"USING (SELECT {sq.columns(source_columns)} FROM {relation}) "
+            f"AS {sq.quote(self._source_alias)} "
             f"ON {self._predicate}"
         )
         # Spark's grammar takes WHEN MATCHED, then WHEN NOT MATCHED, then WHEN
@@ -1862,7 +1769,7 @@ class SqlMerger:
         # row, so a stable sort by kind keeps the meaning and makes it parse.
         ordered = sorted(self._clauses, key=lambda c: _CLAUSE_ORDER[c[0]])
         for kind, predicate, action in ordered:
-            condition = f" AND {predicate}" if _predicate(predicate) is not None else ""
+            condition = f" AND {predicate}" if sq.predicate(predicate) is not None else ""
             sql += f" WHEN {kind}{condition} THEN {self._action(action, source_columns)}"
         return sql
 
@@ -1887,8 +1794,8 @@ def _filter_sql(spec: tuple[str, str, Any], binder: ParameterBinder) -> str:
         if value is None:
             if op not in ("=", "!="):
                 raise InvalidArgumentError(f"cannot compare {column} {op} NULL")
-            return f"{_quote(column)} IS {'NOT ' if op == '!=' else ''}NULL"
-        return f"{_quote(column)} {op} {binder.bind(value)}"
+            return f"{sq.quote(column)} IS {'NOT ' if op == '!=' else ''}NULL"
+        return f"{sq.quote(column)} {op} {binder.bind(value)}"
     if op in ("in", "not in"):
         if isinstance(value, str | bytes) or not hasattr(value, "__iter__"):
             # list("abc") is ['a', 'b', 'c']: a lone string would silently
@@ -1900,116 +1807,8 @@ def _filter_sql(spec: tuple[str, str, Any], binder: ParameterBinder) -> str:
         if not values:
             raise InvalidArgumentError(f"an '{op}' filter on {column} needs at least one value")
         markers = ", ".join(binder.bind(v) for v in values)
-        return f"{_quote(column)} {op.upper()} ({markers})"
+        return f"{sq.quote(column)} {op.upper()} ({markers})"
     raise InvalidArgumentError(f"unsupported partition filter operator {op!r}")
-
-
-def _type_text(value: Any) -> str:
-    """A SQL type from SQL text, an Arrow DataType, or an Arrow Field.
-
-    `str(pa.int64())` is ``'int64'``, which is not a Databricks type.
-    """
-    if (type(value).__module__ or "").startswith("pyarrow"):
-        return _arrow_to_sql(getattr(value, "type", value))
-    return str(value)
-
-
-def _column_types(fields: Any) -> list[tuple[str, str]]:
-    """``{name: sql_type}``, an Arrow schema, or a list of Arrow fields."""
-    if isinstance(fields, Mapping):
-        # A value may be an Arrow DataType ({"n": pa.int32()}); str() of that
-        # is "int32", which is not a Databricks type.
-        return [(str(k), _type_text(v)) for k, v in fields.items()]
-    if hasattr(fields, "names") and hasattr(fields, "field"):  # an Arrow schema
-        items = [fields.field(i) for i in range(len(fields.names))]
-    elif hasattr(fields, "name") and hasattr(fields, "type"):  # a single field
-        items = [fields]
-    else:
-        items = list(fields)
-    out: list[tuple[str, str]] = []
-    for field in items:
-        name = getattr(field, "name", None)
-        arrow_type = getattr(field, "type", None)
-        if name is None or arrow_type is None:
-            raise UnreachableTableError(
-                "add columns via SQL",
-                "the SQL engine needs a {name: sql_type} mapping or Arrow fields",
-            )
-        out.append((str(name), _arrow_to_sql(arrow_type)))
-    return out
-
-
-def _arrow_to_sql(arrow_type: Any) -> str:
-    import pyarrow as pa
-    import pyarrow.types as t
-
-    if isinstance(arrow_type, pa.BaseExtensionType):  # uuid, json, a tensor ...
-        return _arrow_to_sql(arrow_type.storage_type)
-    if t.is_dictionary(arrow_type):  # e.g. a pandas categorical
-        return _arrow_to_sql(arrow_type.value_type)
-    if t.is_boolean(arrow_type):
-        return "BOOLEAN"
-    # Databricks has no unsigned integers: widen to the next type that holds
-    # every value, rather than refusing a uint column outright.
-    if t.is_uint8(arrow_type):
-        return "SMALLINT"
-    if t.is_uint16(arrow_type):
-        return "INT"
-    if t.is_uint32(arrow_type):
-        return "BIGINT"
-    if t.is_uint64(arrow_type):
-        return "DECIMAL(20,0)"
-    if t.is_float16(arrow_type):
-        return "FLOAT"
-    if t.is_null(arrow_type):
-        return "VOID"
-    if t.is_int8(arrow_type):
-        return "TINYINT"
-    if t.is_int16(arrow_type):
-        return "SMALLINT"
-    if t.is_int32(arrow_type):
-        return "INT"
-    if t.is_int64(arrow_type):
-        return "BIGINT"
-    if t.is_float32(arrow_type):
-        return "FLOAT"
-    if t.is_float64(arrow_type):
-        return "DOUBLE"
-    if t.is_decimal(arrow_type):
-        if arrow_type.precision > 38:
-            raise UnreachableTableError(
-                "add columns via SQL",
-                f"{arrow_type} has more than the 38 digits of precision a Databricks DECIMAL holds",
-            )
-        return f"DECIMAL({arrow_type.precision},{arrow_type.scale})"
-    if (
-        t.is_string(arrow_type)
-        or t.is_large_string(arrow_type)
-        or getattr(t, "is_string_view", lambda _t: False)(arrow_type)
-    ):
-        return "STRING"
-    if (
-        t.is_binary(arrow_type)
-        or t.is_large_binary(arrow_type)
-        or t.is_fixed_size_binary(arrow_type)
-        or getattr(t, "is_binary_view", lambda _t: False)(arrow_type)
-    ):
-        return "BINARY"
-    if t.is_date(arrow_type):
-        return "DATE"
-    if t.is_timestamp(arrow_type):
-        return "TIMESTAMP" if arrow_type.tz else "TIMESTAMP_NTZ"
-    if t.is_list(arrow_type) or t.is_large_list(arrow_type) or t.is_fixed_size_list(arrow_type):
-        return f"ARRAY<{_arrow_to_sql(arrow_type.value_type)}>"
-    if t.is_map(arrow_type):
-        return f"MAP<{_arrow_to_sql(arrow_type.key_type)}, {_arrow_to_sql(arrow_type.item_type)}>"
-    if t.is_struct(arrow_type):
-        inner = ", ".join(
-            f"{_quote(arrow_type.field(i).name)}: {_arrow_to_sql(arrow_type.field(i).type)}"
-            for i in range(arrow_type.num_fields)
-        )
-        return f"STRUCT<{inner}>"
-    raise UnreachableTableError("add columns via SQL", f"no SQL type for Arrow type {arrow_type}")
 
 
 def _check_volume(volume: str | None) -> tuple[str, str, str] | None:

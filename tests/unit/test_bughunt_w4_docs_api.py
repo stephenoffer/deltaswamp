@@ -12,7 +12,8 @@ pa = pytest.importorskip("pyarrow")
 import deltaswamp as ds  # noqa: E402
 from deltaswamp.errors import DeltaSwampError, InvalidArgumentError  # noqa: E402
 
-from tests.unit.test_sql_engine import RecordingBackend, engine, table  # noqa: E402
+from tests.helpers import resolved_table as table  # noqa: E402
+from tests.unit.sql_fakes import RecordingBackend, engine  # noqa: E402
 
 # ------------------------------------------------------------ SQL parity
 

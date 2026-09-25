@@ -17,7 +17,7 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 
-from deltaswamp.engine import sql as sqlmod  # noqa: E402
+from deltaswamp.engine import sql_text as sq  # noqa: E402
 from deltaswamp.engine.sql import SqlEngine  # noqa: E402
 from deltaswamp.engine.sql_backend import (  # noqa: E402
     SdkStatementBackend,
@@ -97,7 +97,7 @@ def test_extension_types_are_staged_as_their_storage() -> None:
     data = pa.table({"u": pa.array([uuid.uuid4().bytes], pa.binary(16)).cast(pa.uuid())})
     e.append(tbl(), data)
     assert staged_schema(files).field("u").type == pa.binary(16)
-    assert sqlmod._arrow_to_sql(pa.uuid()) == "BINARY"
+    assert sq.arrow_to_sql(pa.uuid()) == "BINARY"
 
 
 def test_decimal_beyond_38_is_refused_before_upload() -> None:
@@ -331,7 +331,7 @@ def test_create_table_as_properties_none_and_bool() -> None:
 
 def test_type_widening_preview_feature_wire_name() -> None:
     feature = SimpleNamespace(value="TableFeatures.TypeWideningPreview")
-    assert sqlmod._feature_name(feature) == "typeWidening-preview"
+    assert sq.feature_name(feature) == "typeWidening-preview"
 
 
 def test_add_feature_accepts_a_set_of_features() -> None:

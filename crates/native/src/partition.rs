@@ -2,14 +2,14 @@
 //!
 //! Kernel binds partition values per write context
 //! (`WriteState::partitioned_write_context`), and the data passed to the
-//! writer must *omit* the partition columns -- the kernel serialises the values
-//! into the Add action and materialises them into the file only when the
+//! writer must *omit* the partition columns -- the kernel serializes the values
+//! into the Add action and materializes them into the file only when the
 //! protocol demands it. So each incoming batch is grouped by its distinct
 //! partition-value tuples, each group loses its partition columns, and each
 //! group is written through its own context.
 //!
 //! Values are handed to the kernel as typed `Scalar`s, not strings: the kernel
-//! owns the Delta partition-value serialisation (dates as `YYYY-MM-DD`,
+//! owns the Delta partition-value serialization (dates as `YYYY-MM-DD`,
 //! timestamps in UTC, NULL as a JSON null), so we never have to get it right
 //! twice. Row order within a group is preserved; order across groups is not,
 //! which is harmless on a write (there is no deletion vector to line up).

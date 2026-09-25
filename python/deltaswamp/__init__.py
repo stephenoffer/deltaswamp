@@ -9,6 +9,7 @@ that names the blocker and the remedy.
 from __future__ import annotations
 
 from .capability import Capability, Engine, Operation, TableFeature
+from .connection import Connection, connect
 from .credentials import Cloud, CredentialProvider, Credentials
 from .distributed import ScanPlan, WritePlan
 from .errors import (
@@ -18,6 +19,8 @@ from .errors import (
     CredentialError,
     CredentialExpiryWarning,
     DeltaSwampError,
+    EngineFallbackWarning,
+    EngineLimitError,
     EnginePanicError,
     FallbackRequiredError,
     IgnoredPropertyWarning,
@@ -26,13 +29,14 @@ from .errors import (
     MissingDataFileError,
     PreflightError,
     PropertyNotSupportedError,
+    SqlFallbackWarning,
     TransientCommitError,
     UnreachableTableError,
 )
 from .identity import RefKind, TableRef, parse_ref
 from .predicate import PredicateError
 from .router import Router
-from .table import Connection, Table, connect
+from .table import Table
 
 __version__ = "0.1.0"
 
@@ -79,6 +83,8 @@ __all__ = [
     "Credentials",
     "DeltaSwampError",
     "Engine",
+    "EngineFallbackWarning",
+    "EngineLimitError",
     "EnginePanicError",
     "FallbackRequiredError",
     "IgnoredPropertyWarning",
@@ -92,6 +98,7 @@ __all__ = [
     "RefKind",
     "Router",
     "ScanPlan",
+    "SqlFallbackWarning",
     "Table",
     "TableFeature",
     "TableRef",

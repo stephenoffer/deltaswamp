@@ -22,7 +22,7 @@ pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
 
-from tests.fake_uc import FakeTable  # noqa: E402
+from tests.fake_uc import FakeTable, FakeUnityCatalog  # noqa: E402
 from tests.fake_uc_strict import StrictUnityCatalog  # noqa: E402
 
 SCHEMA = pa.schema([("id", pa.int64()), ("city", pa.string())])
@@ -47,9 +47,9 @@ def uc(tmp_path: pathlib.Path) -> Any:
         yield server
 
 
-def _oss(uc: StrictUnityCatalog) -> Any:
+def _oss(uc: FakeUnityCatalog) -> Any:
     from deltaswamp.catalog.ossuc import OSSUnityCatalog
-    from deltaswamp.table import Connection
+    from deltaswamp.connection import Connection
 
     return Connection(catalog=OSSUnityCatalog(uc.url), router=_router())
 
@@ -57,7 +57,7 @@ def _oss(uc: StrictUnityCatalog) -> Any:
 def _dbx(uc: StrictUnityCatalog, monkeypatch: pytest.MonkeyPatch) -> Any:
     pytest.importorskip("databricks.sdk")
     from deltaswamp.catalog.databricks import DatabricksUnityCatalog
-    from deltaswamp.table import Connection
+    from deltaswamp.connection import Connection
 
     for key in list(os.environ):
         if key.startswith("DATABRICKS"):
@@ -341,9 +341,12 @@ class TestRejectedCredentialIsRevended:
         provider = t.resolved.credential_provider
         invalidated: list[bool] = []
         real_invalidate = provider.invalidate
-        monkeypatch.setattr(
-            provider, "invalidate", lambda: (invalidated.append(True), real_invalidate())[1]
-        )
+
+        def recording_invalidate() -> Any:
+            invalidated.append(True)
+            return real_invalidate()
+
+        monkeypatch.setattr(provider, "invalidate", recording_invalidate)
         real = _native.Snapshot.resolve
         calls: list[int] = []
 
@@ -409,7 +412,7 @@ class TestRecreatedWhileResolving:
         flipped: list[str] = []
 
         def stale_once(table: Any, full_name: str | None = None) -> dict[str, Any]:
-            info = real(table, full_name)
+            info: dict[str, Any] = real(table, full_name)
             if full_name == "main.sales.cm" and not flipped:
                 flipped.append(info["table_id"])
                 info["table_id"] = "an-older-incarnation"

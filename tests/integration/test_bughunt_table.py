@@ -14,11 +14,11 @@ from deltaswamp.catalog import ResolvedTable, TableType
 from deltaswamp.errors import (
     CorruptTableError,
     DeltaSwampError,
+    InvalidArgumentError,
     InvalidReferenceError,
     UnreachableTableError,
 )
 from deltaswamp.identity import parse_ref
-from deltaswamp.table import InvalidArgumentError
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
@@ -29,10 +29,10 @@ pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension no
 @pytest.fixture
 def conn() -> Any:
     from deltaswamp.catalog.filesystem import FilesystemCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.deltars import DeltaRsEngine
     from deltaswamp.engine.kernel import KernelEngine
     from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     return Connection(
         catalog=FilesystemCatalog(),

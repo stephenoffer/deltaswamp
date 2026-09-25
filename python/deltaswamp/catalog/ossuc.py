@@ -11,6 +11,7 @@ Uses stdlib HTTP so the base install needs no extra dependency.
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import re
@@ -22,6 +23,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NoReturn, TypeVar
 
 from ..credentials.base import DEFAULT_REFRESH_MARGIN_SECONDS, Cloud, Credentials, Operation
+from ..credentials.databricks import _expires_at_seconds, credentials_from_response
 from ..errors import CredentialError, InvalidReferenceError, PreflightError
 from ..governance import (
     ColumnLineage,
@@ -190,6 +192,15 @@ def _cloud_for(url: str) -> Cloud:
     raise CredentialError(f"cannot tell which cloud {url!r} is on")
 
 
+_VENDED_BLOCKS = (
+    "aws_temp_credentials",
+    "r2_temp_credentials",
+    "azure_user_delegation_sas",
+    "azure_aad",
+    "gcp_oauth_token",
+)
+
+
 def _parse_vended(
     body: dict[str, Any],
     fallback_url: str | None = None,
@@ -198,6 +209,7 @@ def _parse_vended(
 ) -> Credentials:
     """Parse a UC temporary-credentials response (table or path).
 
+    The per-cloud blocks share `credentials_from_response` with Databricks.
     `fallback_url` is the table location, used when the response names no
     URL: without it the credential had no scope, so every table's credential
     shared one registry key and an Azure SAS scoped to one table path was
@@ -208,65 +220,21 @@ def _parse_vended(
             f"OSS Unity Catalog returned a non-object credentials response: {body!r:.200}"
         )
     url = body.get("url") or fallback_url or ""
-    expiry = body.get("expiration_time") or body.get("expirationTime")
-    try:
-        expires_at = float(expiry) / 1000.0 if expiry else None
-    except (TypeError, ValueError):
-        raise CredentialError(f"unparseable credential expiration_time {expiry!r}") from None
+    expiry = body.get("expiration_time")
+    if expiry is None:
+        expiry = body.get("expirationTime")
+    expires_at = _expires_at_seconds(expiry)
+    if expiry not in (None, "") and expires_at is None:
+        raise CredentialError(f"unparseable credential expiration_time {expiry!r}")
 
-    def block(name: str) -> Mapping[str, Any] | None:
-        # A server serialising every optional block explicitly sends the ones
-        # that do not apply as null; `in` alone then picked a null AWS block
-        # and crashed with a TypeError.
-        value = body.get(name)
-        return value if isinstance(value, Mapping) and value else None
-
-    def need(mapping: Mapping[str, Any], key: str, where: str) -> str:
-        value = mapping.get(key)
-        if not value:
-            raise CredentialError(
-                f"OSS Unity Catalog's {where} block has no {key!r} (fields: {sorted(mapping)})"
-            )
-        return str(value)
-
-    common: dict[str, Any] = {
-        "url": url,
-        "expires_at": expires_at,
-        "scope_prefix": url or None,
-        "table_id": table_id,
+    # A server serializing every optional block explicitly sends the ones that
+    # do not apply as null; those are skipped, not taken as the answer.
+    if any(isinstance(body.get(name), Mapping) and body.get(name) for name in _VENDED_BLOCKS):
         # What it was vended for: StaticCredentialProvider refuses to hand a
-        # read-only path credential to a write only when this says READ, and
-        # it was never set here, so a PATH_READ credential went on to a bare
-        # storage 403 mid-commit.
-        "operation": operation,
-    }
-    if (c := block("aws_temp_credentials")) is not None:
-        secrets = {
-            "aws_access_key_id": need(c, "access_key_id", "aws_temp_credentials"),
-            "aws_secret_access_key": need(c, "secret_access_key", "aws_temp_credentials"),
-        }
-        # Static IAM-user keys legitimately come without a session token.
-        if c.get("session_token"):
-            secrets["aws_session_token"] = str(c["session_token"])
-        return Credentials(cloud=Cloud.AWS, secrets=secrets, **common)
-    if (c := block("gcp_oauth_token")) is not None:
-        return Credentials(
-            cloud=Cloud.GCP,
-            secrets={"google_bearer_token": need(c, "oauth_token", "gcp_oauth_token")},
-            **common,
+        # read-only path credential to a write only when this says READ.
+        return credentials_from_response(
+            {**body, "url": url}, url=url, table_id=table_id, operation=operation
         )
-    if (c := block("azure_user_delegation_sas")) is not None:
-        from ..credentials.databricks import azure_endpoint_for
-
-        endpoint = azure_endpoint_for(url)
-        secrets = {"azure_storage_sas_key": need(c, "sas_token", "azure_user_delegation_sas")}
-        if endpoint:
-            secrets["azure_endpoint"] = endpoint
-            if endpoint.lower().startswith("http://"):
-                # object_store refuses a plain-http endpoint (Azurite) unless
-                # told to allow it: "URL scheme is not allowed".
-                secrets["azure_allow_http"] = "true"
-        return Credentials(cloud=Cloud.AZURE, secrets=secrets, **common)
     storage = body.get("storage-credentials") or body.get("storage_credentials")
     if isinstance(storage, Mapping):
         storage = [storage]
@@ -287,7 +255,7 @@ def _parse_vended(
             operation=operation,
         )
     raise CredentialError(
-        f"OSS Unity Catalog returned no recognised credential block: {sorted(body)}"
+        f"OSS Unity Catalog returned no recognized credential block: {sorted(body)}"
     )
 
 
@@ -296,8 +264,8 @@ class OSSUnityCredentialProvider:
 
     OSS UC omits `expirationTime` from its load-table response and has no
     `loadCredentials` endpoint (unitycatalog#1885), so there is often no expiry
-    to honour. We treat a missing expiry as "no stated deadline" rather than
-    inventing one, and re-vend on demand via `invalidate()`.
+    to honor. A missing expiry means no stated deadline; `invalidate()` forces a
+    re-vend.
     """
 
     def __init__(
@@ -313,9 +281,9 @@ class OSSUnityCredentialProvider:
         self._table_id = table_id
         self._location = location
         self._base_url = base_url
-        self._catalog = ref.catalog
-        self._schema = ref.schema
-        self._table = ref.table
+        self._catalog: str = ref.catalog
+        self._schema: str = ref.schema
+        self._table: str = ref.table
         self._token = token
         self._cache: dict[Operation, Credentials] = {}
         self._vended_at: dict[Operation, float] = {}
@@ -331,12 +299,7 @@ class OSSUnityCredentialProvider:
         return self._table_id
 
     def workspace_auth(self) -> tuple[str, str]:
-        """`(base_url, token)` for the commit API.
-
-        Without this, every catalog-managed write against an open-source Unity
-        Catalog server failed: the kernel committer asks the provider for the
-        endpoint and bearer token, and this class had no way to answer.
-        """
+        """`(base_url, token)` for the commit API."""
         return self._base_url.rstrip("/"), self._token or ""
 
     def invalidate(self) -> None:
@@ -358,8 +321,8 @@ class OSSUnityCredentialProvider:
         # built a different URL (or a different table) entirely.
         query = urllib.parse.urlencode({"operation": operation.value})
         path = (
-            f"{UC_DELTA_API}/catalogs/{_q(self._catalog or '')}/schemas/{_q(self._schema or '')}"
-            f"/tables/{_q(self._table or '')}/credentials?{query}"
+            f"{UC_DELTA_API}/catalogs/{_q(self._catalog)}/schemas/{_q(self._schema)}"
+            f"/tables/{_q(self._table)}/credentials?{query}"
         )
         try:
             body = _request(self._base_url, path, self._token)
@@ -456,11 +419,9 @@ class OSSUnityCatalog:
         # Every Unity Catalog table is reachable through the catalog's Iceberg
         # REST endpoint when it has Iceberg metadata (managed Iceberg, foreign
         # Iceberg, UniForm); the Iceberg engine decides whether it applies.
-        import dataclasses as _dc
-
         from ..engine.iceberg import iceberg_rest_uri
 
-        resolved = _dc.replace(
+        resolved = dataclasses.replace(
             resolved, iceberg_rest_uri=iceberg_rest_uri(self._base_url, databricks=False)
         )
 
@@ -498,8 +459,6 @@ class OSSUnityCatalog:
         )
 
     def _with_catalog_commits(self, resolved: ResolvedTable, ref: TableRef) -> ResolvedTable:
-        import dataclasses
-
         path = self._delta_tables_path(ref, f"tables/{_q(ref.table or '')}")
         try:
             body = self._call(
@@ -693,7 +652,7 @@ class OSSUnityCatalog:
 
     @staticmethod
     def _from_wire(body: Any) -> list[Grant]:
-        # Grant.list_from_api normalises OSS's "USE SCHEMA" to "USE_SCHEMA".
+        # Grant.list_from_api normalizes OSS's "USE SCHEMA" to "USE_SCHEMA".
         return Grant.list_from_api(body)
 
     def grants(

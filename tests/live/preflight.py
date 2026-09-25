@@ -1,6 +1,6 @@
 """Check a live-test setup before running the suite.
 
-Run with `python -m tests.live_preflight`. It reports the three things that
+Run with `python -m tests.live.preflight`. It reports the three things that
 usually go wrong -- a token that cannot authenticate, a metastore without
 external data access, and a missing schema grant -- so you learn which one you
 have in seconds rather than inferring it from a failure partway through a run.
@@ -86,7 +86,7 @@ def main() -> int:
         print(f"  ok    {len(vendable)} tables are eligible for credential vending")
 
     print()
-    print("ready: pytest tests/integration/test_live_databricks.py -v")
+    print("ready: pytest tests/live/test_live_databricks.py -v")
     return 0
 
 

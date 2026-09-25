@@ -25,10 +25,10 @@ pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension no
 
 def _conn(*kinds: Engine) -> Any:
     from deltaswamp.catalog.filesystem import FilesystemCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.deltars import DeltaRsEngine
     from deltaswamp.engine.kernel import KernelEngine
     from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     available = {Engine.KERNEL: KernelEngine, Engine.DELTARS: DeltaRsEngine}
     engines = {k: available[k]() for k in (kinds or (Engine.KERNEL, Engine.DELTARS))}
@@ -85,7 +85,7 @@ def test_deltars_txn_race_inside_the_commit_is_caught(path: str, monkeypatch: An
     conn = _conn(Engine.DELTARS)
     t = conn.open_table(path)
     real = deltalake.write_deltalake
-    fired = []
+    fired: list[int] = []
 
     def racing(target: Any, data: Any, **kwargs: Any) -> Any:
         if not fired:
@@ -112,7 +112,7 @@ def test_deltars_txn_append_retries_a_plain_lost_race(path: str, monkeypatch: An
     conn = _conn(Engine.DELTARS)
     t = conn.open_table(path)
     real = deltalake.write_deltalake
-    fired = []
+    fired: list[int] = []
 
     def racing(target: Any, data: Any, **kwargs: Any) -> Any:
         if not fired:
@@ -188,7 +188,7 @@ def _stale_write_open(monkeypatch: Any, stale: Any) -> None:
     from deltaswamp.engine.deltars import DeltaRsEngine
 
     real = DeltaRsEngine._open
-    served = []
+    served: list[int] = []
 
     def fake(self: Any, table: Any, *, version: Any = None, write: bool = False) -> Any:
         if write and version is None and not served:
@@ -333,7 +333,7 @@ def test_append_realigns_after_a_concurrent_add_column(path: str, monkeypatch: A
     conn = _conn()
     t = conn.open_table(path)
     real = DeltaRsEngine.append
-    fired = []
+    fired: list[int] = []
 
     def column_lands_first(self: Any, table: Any, data: Any, **kwargs: Any) -> Any:
         if not fired:
@@ -352,7 +352,7 @@ def test_overwrite_realigns_after_a_concurrent_add_column(path: str, monkeypatch
     conn = _conn()
     t = conn.open_table(path)
     real = DeltaRsEngine.overwrite
-    fired = []
+    fired: list[int] = []
 
     def column_lands_first(self: Any, table: Any, data: Any, **kwargs: Any) -> Any:
         if not fired:
@@ -429,7 +429,7 @@ def test_blind_append_is_rewritten_after_a_concurrent_metadata_change(
     conn = _conn(Engine.DELTARS)
     t = conn.open_table(path)
     real = deltalake.write_deltalake
-    fired = []
+    fired: list[int] = []
 
     def metadata_lands_first(target: Any, data: Any, **kwargs: Any) -> Any:
         if not fired:
@@ -450,7 +450,7 @@ def test_blind_append_is_rewritten_after_a_concurrent_metadata_change(
 
 def _stale_exists(monkeypatch: Any, misses: int = 2) -> None:
     """table_exists() answers "no" `misses` times: the checks ran before the winner."""
-    from deltaswamp.table import Connection
+    from deltaswamp.connection import Connection
 
     real = Connection.table_exists
     calls: list[int] = []

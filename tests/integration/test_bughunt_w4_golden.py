@@ -13,6 +13,7 @@ import os
 import shutil
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -41,7 +42,7 @@ def _partition_values(path: str) -> list[dict[str, str]]:
     return out
 
 
-def _dec(*values: str) -> pa.Array:
+def _dec(*values: str) -> Any:
     return pa.array([Decimal(v) for v in values], pa.decimal128(5, 2))
 
 
@@ -322,12 +323,18 @@ def test_fold_case_leaves_literals_functions_and_keywords_alone() -> None:
 def _generated(tmp_path: Path) -> str:
     import deltalake as dl
     from deltalake import Field, Schema
+    from deltalake.schema import PrimitiveType
 
     path = str(tmp_path / "gen")
     schema = Schema(
         [
-            Field("id", "long", nullable=True),
-            Field("g", "long", nullable=True, metadata={"delta.generationExpression": "id * 2"}),
+            Field("id", PrimitiveType("long"), nullable=True),
+            Field(
+                "g",
+                PrimitiveType("long"),
+                nullable=True,
+                metadata={"delta.generationExpression": "id * 2"},
+            ),
         ]
     )
     dl.DeltaTable.create(path, schema=schema)
@@ -391,14 +398,25 @@ def test_partition_delete_without_stats_reports_deleted_rows(tmp_path: Path) -> 
 def _generated_merge(tmp_path: Path) -> ds.Table:
     import deltalake as dl
     from deltalake import Field, Schema
+    from deltalake.schema import PrimitiveType
 
     path = str(tmp_path / "genm")
     schema = Schema(
         [
-            Field("id", "long", nullable=True),
-            Field("v", "long", nullable=True),
-            Field("g", "long", nullable=True, metadata={"delta.generationExpression": "id * 2"}),
-            Field("h", "long", nullable=True, metadata={"delta.generationExpression": "id + v"}),
+            Field("id", PrimitiveType("long"), nullable=True),
+            Field("v", PrimitiveType("long"), nullable=True),
+            Field(
+                "g",
+                PrimitiveType("long"),
+                nullable=True,
+                metadata={"delta.generationExpression": "id * 2"},
+            ),
+            Field(
+                "h",
+                PrimitiveType("long"),
+                nullable=True,
+                metadata={"delta.generationExpression": "id + v"},
+            ),
         ]
     )
     dl.DeltaTable.create(path, schema=schema)
@@ -407,7 +425,9 @@ def _generated_merge(tmp_path: Path) -> ds.Table:
 
 
 def _by_id(t: ds.Table) -> list[dict[str, int]]:
-    rows = ds.connect().table(t.location).to_arrow().to_pylist()
+    location = t.location
+    assert location is not None
+    rows = ds.connect().table(location).to_arrow().to_pylist()
     return sorted(rows, key=lambda r: r["id"])
 
 
@@ -478,7 +498,7 @@ def _vacuumed(tmp_path: Path) -> str:
     ],
     ids=["to_arrow", "to_pandas", "count", "head", "iterate", "read_all", "plan_scan"],
 )
-def test_missing_data_file_is_a_library_error(tmp_path: Path, read) -> None:
+def test_missing_data_file_is_a_library_error(tmp_path: Path, read: Any) -> None:
     _need_native()
     t = ds.connect().table(_vacuumed(tmp_path), version=0)
     with pytest.raises(errors.MissingDataFileError, match="VACUUM") as info:
@@ -507,7 +527,9 @@ def test_scan_stream_still_exports_through_the_c_interface(tmp_path: Path) -> No
     assert pl.DataFrame(t.scan()).height == 1
     assert pa.RecordBatchReader.from_stream(t.scan()).read_all().num_rows == 1
     stream = t.scan()  # noqa: F841 -- duckdb resolves it by name
-    assert duckdb.sql("select count(*) from stream").fetchone()[0] == 1
+    counted = duckdb.sql("select count(*) from stream").fetchone()
+    assert counted is not None
+    assert counted[0] == 1
     assert t.to_polars(lazy=True).collect().height == 1
 
 
@@ -524,3 +546,20 @@ def test_missing_data_file_is_typed_through_ray(tmp_path: Path) -> None:
     t = ds.connect().table(_vacuumed(tmp_path), version=0)
     with pytest.raises(errors.MissingDataFileError):
         t.to_ray_dataset().count()
+
+
+def test_cdf_reads_a_partition_value_that_needs_percent_encoding(tmp_path: Any) -> None:
+    """delta-rs load_cdf double-escapes the path (looks for k=a%2520b); the kernel does not."""
+    import deltaswamp as ds
+    import pyarrow as pa
+    from deltalake import write_deltalake
+
+    path = str(tmp_path / "t")
+    write_deltalake(
+        path,
+        pa.table({"k": ["a b"], "v": [1]}),
+        partition_by=["k"],
+        configuration={"delta.enableChangeDataFeed": "true"},
+    )
+    rows = pa.table(ds.connect().table(path).cdf(starting_version=0)).select(["k", "v"])
+    assert rows.to_pylist() == [{"k": "a b", "v": 1}]

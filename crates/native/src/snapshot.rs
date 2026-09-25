@@ -50,12 +50,12 @@ impl PySnapshot {
                 "the table root is empty; pass a URL or a filesystem path".to_string(),
             ));
         }
-        let normalised = if table_root.ends_with('/') {
+        let normalized = if table_root.ends_with('/') {
             table_root.to_string()
         } else {
             format!("{table_root}/")
         };
-        match Url::parse(&normalised) {
+        match Url::parse(&normalized) {
             // A one-letter "scheme" is a Windows drive (`C:\t`), not a URL.
             Ok(url) if url.scheme().len() > 1 => {
                 if url.query().is_some() || url.fragment().is_some() {
@@ -75,9 +75,9 @@ impl PySnapshot {
                 // `~` is a shell expansion; unexpanded it silently made a
                 // directory literally named "~" under the working directory.
                 let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
-                let expanded = match (normalised.strip_prefix("~/"), home) {
+                let expanded = match (normalized.strip_prefix("~/"), home) {
                     (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
-                    _ => std::path::PathBuf::from(&normalised),
+                    _ => std::path::PathBuf::from(&normalized),
                 };
                 let path = std::path::absolute(&expanded).map_err(|e| {
                     NativeError::Invalid(format!(
@@ -279,7 +279,7 @@ impl PySnapshot {
     /// `(min_reader_version, min_writer_version, reader_features, writer_features)`.
     ///
     /// Feature names are returned verbatim, including ones this build does not
-    /// recognise -- the Python layer decides what to do with them, because an
+    /// recognize -- the Python layer decides what to do with them, because an
     /// unknown writer-only feature must not block a read.
     fn protocol(&self) -> (i32, i32, Vec<String>, Vec<String>) {
         let protocol = self.inner.table_configuration().protocol();
@@ -423,16 +423,16 @@ impl PySnapshot {
     /// The current `metaData` action, as Delta-protocol JSON.
     fn metadata_json(&self) -> PyResult<String> {
         serde_json::to_string(self.inner.table_configuration().metadata())
-            .map_err(|e| NativeError::Invalid(format!("could not serialise metadata: {e}")).into())
+            .map_err(|e| NativeError::Invalid(format!("could not serialize metadata: {e}")).into())
     }
 
     /// The current `protocol` action, as Delta-protocol JSON.
     ///
     /// Feature lists appear only when the versions call for them (reader 3,
-    /// writer 7); the kernel serialiser omits them otherwise.
+    /// writer 7); the kernel serializer omits them otherwise.
     fn protocol_json(&self) -> PyResult<String> {
         serde_json::to_string(self.inner.table_configuration().protocol())
-            .map_err(|e| NativeError::Invalid(format!("could not serialise protocol: {e}")).into())
+            .map_err(|e| NativeError::Invalid(format!("could not serialize protocol: {e}")).into())
     }
 
     /// The configuration string of `domain`, or None if it has no live entry.

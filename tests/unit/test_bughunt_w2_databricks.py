@@ -247,7 +247,7 @@ class TestErrorKinds:
     def test_unconfigurable_auth_is_not_blamed_on_the_metastore(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import deltaswamp._sdk as sdk
+        import deltaswamp.credentials.databricks as sdk  # imports workspace_client by name
 
         def refuse(**kwargs: Any) -> Any:
             raise ValueError("default auth: cannot configure default credentials")
@@ -485,7 +485,7 @@ class TestCatalog:
             def as_dict(self) -> dict[str, Any]:
                 return {"host": self.host, "token": "dapi", "auth_type": "pat"}
 
-        catalog = DatabricksUnityCatalog(config=UnpicklableConfig())  # type: ignore[arg-type]
+        catalog = DatabricksUnityCatalog(config=UnpicklableConfig())  # type: ignore[arg-type, unused-ignore]
         clone = pickle.loads(pickle.dumps(catalog))
         assert clone._explicit_config is None
         assert clone._config_kwargs["host"] == "https://adb-1.azuredatabricks.net"

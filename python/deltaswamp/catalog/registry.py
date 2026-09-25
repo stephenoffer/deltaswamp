@@ -44,9 +44,8 @@ ENTRY_POINT_GROUP = "deltaswamp.catalogs"
 #: installed distribution metadata. Entry points are the *extension* mechanism,
 #: not the way deltaswamp finds its own modules: a source checkout, a vendored
 #: copy, a zipapp and several freezers (PyInstaller, py2app) all lose entry-point
-#: metadata, and losing it used to leave every built-in catalog unregistered and
-#: the library unusable. Entry points are layered on top of this map, so a third
-#: party can still register a new name -- or deliberately shadow a built-in one.
+#: metadata. Entry points are layered on top of this map, so a third party can
+#: still register a new name or shadow a built-in one.
 #:
 #: `tests/unit/test_registry.py` asserts this agrees with pyproject.toml.
 BUILTIN_CATALOGS: dict[str, str] = {
@@ -176,7 +175,7 @@ def catalog_for_uri(uri: str | None, **kwargs: Any) -> Catalog:
     if name is None:
         known = ", ".join(sorted(k for k in scheme_to_catalog if k))
         raise InvalidReferenceError(
-            f"unrecognised connection URI {uri!r}. Known schemes: {known}. "
+            f"unrecognized connection URI {uri!r}. Known schemes: {known}. "
             "Pass catalog=... to supply a catalog object directly."
         )
 

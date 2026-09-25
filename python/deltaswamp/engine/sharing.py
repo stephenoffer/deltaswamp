@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .. import predicate as sqlpred
 from ..capability import READ_OPERATIONS, Capability, Operation
 from ..capability import Engine as EngineKind
 from ..catalog import ResolvedTable
@@ -114,12 +115,11 @@ def filter_arrow_exact(table: Any, predicate: Any) -> Any:
     ``SELECT (<predicate>) FROM t``, which let a predicate close the
     parenthesis and run arbitrary DuckDB SQL.
     """
-    predicate_module = importlib.import_module("deltaswamp.predicate")
     if isinstance(predicate, _SandboxedSql):
         return _sandboxed_filter(table, predicate.text)
     try:
-        return predicate_module.filter_table(table, predicate)
-    except predicate_module.PredicateError:
+        return sqlpred.filter_table(table, predicate)
+    except sqlpred.PredicateError:
         if not isinstance(predicate, str) or _duckdb() is None:
             raise
         _screen_expression(predicate)
@@ -273,7 +273,7 @@ def _delta_type_to_arrow(delta_type: Any) -> Any:
             ),
         )
     raise UnreachableTableError(
-        "read a shared table", f"its schema has an unrecognised type {delta_type!r}"
+        "read a shared table", f"its schema has an unrecognized type {delta_type!r}"
     )
 
 
@@ -306,90 +306,40 @@ _HINT_VALUE_TYPES: dict[str, str] = {
     "string": "string",
     "date": "date",
 }
-_COMPARISONS: dict[str, tuple[str, bool]] = {
-    "=": ("equal", False),
-    "==": ("equal", False),
-    "<": ("lessThan", False),
-    "<=": ("lessThanOrEqual", False),
-    ">": ("greaterThan", False),
-    ">=": ("greaterThanOrEqual", False),
-    "!=": ("equal", True),
-    "<>": ("equal", True),
+_HINT_OPS: dict[str, tuple[str, bool]] = {
+    "eq": ("equal", False),
+    "ne": ("equal", True),
+    "lt": ("lessThan", False),
+    "le": ("lessThanOrEqual", False),
+    "gt": ("greaterThan", False),
+    "ge": ("greaterThanOrEqual", False),
 }
-_IDENT = r'(?:[A-Za-z_][A-Za-z0-9_]*|`[^`]+`|"[^"]+")'
-_LITERAL = r"(?:'(?:[^']|'')*'|-?\d+(?:\.\d+)?|true|false)"
-_COMPARISON = re.compile(
-    rf"^\s*({_IDENT})\s*(<=|>=|<>|!=|==|=|<|>)\s*({_LITERAL})\s*$", re.IGNORECASE
-)
-_NULL_CHECK = re.compile(rf"^\s*({_IDENT})\s+IS\s+(NOT\s+)?NULL\s*$", re.IGNORECASE)
 
 
-def _has_top_level_or(predicate: str) -> bool:
-    """True when an OR joins terms outside quotes and parentheses.
-
-    AND binds tighter than OR, so in ``a = 1 OR b = 2 AND c = 3`` the pieces
-    between top-level ANDs are *not* conjuncts of the whole predicate, and
-    sending any of them as a hint would let the server skip matching files.
-    """
-    depth, i, quote = 0, 0, ""
-    n = len(predicate)
-    while i < n:
-        ch = predicate[i]
-        if quote:
-            if ch == quote:
-                quote = ""
-        elif ch in "'\"`":
-            quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif (
-            depth <= 0
-            and predicate[i : i + 2].lower() == "or"
-            and (i == 0 or not (predicate[i - 1].isalnum() or predicate[i - 1] == "_"))
-            and (i + 2 >= n or not (predicate[i + 2].isalnum() or predicate[i + 2] == "_"))
-        ):
-            return True
-        i += 1
-    return False
+def _conjuncts(node: sqlpred.Node) -> Iterator[sqlpred.Node]:
+    """The top-level AND-ed terms. The parser applies SQL precedence, so in
+    ``a = 1 OR b = 2 AND c = 3`` the whole OR is one term and is not hinted:
+    sending ``c = 3`` alone would let the server skip matching files."""
+    if node.op == "and":
+        for child in node.args:
+            yield from _conjuncts(child)
+    else:
+        yield node
 
 
-def _split_top_level_and(predicate: str) -> list[str]:
-    """Split on AND outside quotes and parentheses."""
-    parts: list[str] = []
-    depth, start, i, quote = 0, 0, 0, ""
-    n = len(predicate)
-    while i < n:
-        ch = predicate[i]
-        if quote:
-            if ch == quote:
-                quote = ""
-        elif ch in "'\"`":
-            quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif (
-            depth == 0
-            and predicate[i : i + 3].lower() == "and"
-            and (i == 0 or predicate[i - 1].isspace())
-            and (i + 3 >= n or predicate[i + 3].isspace())
-        ):
-            parts.append(predicate[start:i])
-            start = i + 3
-            i += 3
-            continue
-        i += 1
-    parts.append(predicate[start:])
-    return parts
-
-
-def _unquote_ident(ident: str) -> str:
-    if ident[:1] in '`"' and ident[-1:] == ident[:1]:
-        return ident[1:-1]
-    return ident
+def _hint_literal(literal: sqlpred.Literal, value_type: str) -> str | None:
+    """The literal as the protocol spells it, or None if the types disagree."""
+    if literal.type == "string":
+        return str(literal.value) if value_type in ("string", "date") else None
+    if literal.type == "date":
+        return str(literal.value.isoformat()) if value_type == "date" else None
+    if literal.type == "boolean":
+        return str(literal.value).lower() if value_type == "bool" else None
+    if literal.type == "long":
+        return str(literal.value) if value_type in ("int", "long", "float", "double") else None
+    if literal.type in ("decimal", "double"):
+        return str(literal.value) if value_type in ("float", "double") else None
+    return None
 
 
 _INT_RANGES: dict[str, tuple[int, int]] = {
@@ -400,87 +350,68 @@ _INT_RANGES: dict[str, tuple[int, int]] = {
 }
 
 
-def _hint_leaf(conjunct: str, types: dict[str, tuple[str, str, str]]) -> dict[str, Any] | None:
+def _hint_leaf(node: sqlpred.Node, types: dict[str, tuple[str, str, str]]) -> dict[str, Any] | None:
     """One conjunct as a hint node, or None. `types` maps a lower-cased column
     name to (schema name, hint value type, Delta type)."""
-    null_check = _NULL_CHECK.match(conjunct)
-    if null_check:
-        known = types.get(_unquote_ident(null_check.group(1)).lower())
-        if known is None:
-            return None
-        # The schema's spelling: the server matches column names exactly.
-        column, value_type, _ = known
-        leaf: dict[str, Any] = {
-            "op": "isNull",
-            "children": [{"op": "column", "name": column, "valueType": value_type}],
-        }
-        return {"op": "not", "children": [leaf]} if null_check.group(2) else leaf
-
-    comparison = _COMPARISON.match(conjunct)
-    if not comparison:
+    column = node.args[0] if node.args else None
+    if not isinstance(column, sqlpred.Column) or len(column.path) != 1:
         return None
-    known = types.get(_unquote_ident(comparison.group(1)).lower())
+    known = types.get(column.path[0].lower())
     if known is None:
         return None
-    column, value_type, delta_type = known
-    op, negate = _COMPARISONS[comparison.group(2)]
-    raw = comparison.group(3)
-    if raw.startswith("'"):
-        if value_type not in ("string", "date"):
-            return None
-        from ..predicate import _unescape
+    # The schema's spelling: the server matches column names exactly.
+    name, value_type, delta_type = known
+    ref = {"op": "column", "name": name, "valueType": value_type}
 
-        # As the exact filter reads it (Spark's backslash escapes), so the
-        # hint and the filter agree on the value.
-        value = _unescape(raw)
-        if value_type == "date":
-            from datetime import date
+    if node.op in ("is_null", "is_not_null"):
+        leaf: dict[str, Any] = {"op": "isNull", "children": [ref]}
+        return {"op": "not", "children": [leaf]} if node.op == "is_not_null" else leaf
 
-            try:
-                date.fromisoformat(value)
-            except ValueError:
-                return None  # a date the server cannot parse; the hint is optional
-    elif raw.lower() in ("true", "false"):
-        if value_type != "bool":
+    if node.op not in _HINT_OPS or not isinstance(node.args[1], sqlpred.Literal):
+        return None
+    literal = node.args[1]
+    value = _hint_literal(literal, value_type)
+    if value is None:
+        return None
+    if value_type == "date" and literal.type == "string":
+        from datetime import date
+
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            return None  # a date the server cannot parse; the hint is optional
+    if delta_type in _INT_RANGES and literal.type == "long":
+        low, high = _INT_RANGES[delta_type]
+        if not low <= int(literal.value) <= high:
+            # Out of the column's range: the server cannot represent the
+            # literal in the column's type.
             return None
-        value = raw.lower()
-    else:
-        if value_type in ("int", "long") and "." in raw:
-            return None
-        if value_type not in ("int", "long", "float", "double"):
-            return None
-        if delta_type in _INT_RANGES:
-            low, high = _INT_RANGES[delta_type]
-            if not low <= int(raw) <= high:
-                # Out of the column's range: the server cannot represent the
-                # literal in the column's type.
-                return None
-        value = raw
+    op, negate = _HINT_OPS[node.op]
     if value_type in ("float", "double") and (negate or op.startswith("greaterThan")):
         # Statistics leave NaN out of min/max, and NaN (above every value)
         # satisfies `f > x` and `f != x`: a server skipping on such a hint
         # drops files whose NaN rows the exact filter keeps.
         return None
-    node: dict[str, Any] = {
+    compare = {
         "op": op,
-        "children": [
-            {"op": "column", "name": column, "valueType": value_type},
-            {"op": "literal", "value": value, "valueType": value_type},
-        ],
+        "children": [ref, {"op": "literal", "value": value, "valueType": value_type}],
     }
-    return {"op": "not", "children": [node]} if negate else node
+    return {"op": "not", "children": [compare]} if negate else compare
 
 
 def json_predicate_hints(predicate: str | None, schema: str | dict[str, Any]) -> str | None:
     """Translate the conjuncts of a SQL predicate the protocol can express.
 
-    Deliberately conservative: only top-level ``AND``-ed comparisons of a
-    top-level column against a literal of the column's own type, and ``IS
-    [NOT] NULL``, are translated; everything else is dropped. Dropping a
-    conjunct only weakens the hint, which is always safe, because the exact
-    predicate is applied to the rows afterwards anyway.
+    Only top-level ``AND``-ed comparisons of a top-level column against a
+    literal of the column's own type, and ``IS [NOT] NULL``, are translated.
+    Dropping a conjunct only weakens the hint, which is safe because the exact
+    predicate is applied to the rows afterward.
     """
-    if not predicate or _has_top_level_or(predicate):
+    if not predicate:
+        return None
+    try:
+        node = sqlpred.parse(predicate)
+    except sqlpred.PredicateError:
         return None
     parsed = json.loads(schema) if isinstance(schema, str) else schema
     types: dict[str, tuple[str, str, str]] = {}
@@ -489,7 +420,7 @@ def json_predicate_hints(predicate: str | None, schema: str | dict[str, Any]) ->
         if isinstance(kind, str) and kind in _HINT_VALUE_TYPES:
             name = str(field["name"])
             types[name.lower()] = (name, _HINT_VALUE_TYPES[kind], kind)
-    leaves = [leaf for part in _split_top_level_and(predicate) if (leaf := _hint_leaf(part, types))]
+    leaves = [leaf for part in _conjuncts(node) if (leaf := _hint_leaf(part, types))]
     if not leaves:
         return None
     tree = leaves[0] if len(leaves) == 1 else {"op": "and", "children": leaves}
@@ -1002,7 +933,7 @@ class SharingEngine:
             metadata = client.query_table_metadata(shared).metadata
             return json_predicate_hints(predicate, metadata.schema_string)
         except Exception:
-            return None  # a hint is an optimisation; never fail the read over one
+            return None  # a hint is an optimization; never fail the read over one
 
     # ------------------------------------------------------------------- read
 

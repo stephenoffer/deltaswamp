@@ -79,7 +79,7 @@ fn has_azure_endpoint(options: &HashMap<String, String>) -> bool {
     })
 }
 
-/// Build an object store for `url`, honouring vended credentials.
+/// Build an object store for `url`, honoring vended credentials.
 pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
     if is_azure(url) && !has_azure_endpoint(options) {
         // Refusing here rather than letting a confusing 403 surface later.

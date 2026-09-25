@@ -28,10 +28,10 @@ pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension no
 @pytest.fixture
 def conn() -> Any:
     from deltaswamp.catalog.filesystem import FilesystemCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.deltars import DeltaRsEngine
     from deltaswamp.engine.kernel import KernelEngine
     from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     return Connection(
         catalog=FilesystemCatalog(),
@@ -335,10 +335,10 @@ def test_racing_distributed_appends_all_land_by_default(conn: Any) -> None:
 @pytest.fixture
 def uc_conn(tmp_path: Any) -> Any:
     from deltaswamp.catalog.ossuc import OSSUnityCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.deltars import DeltaRsEngine
     from deltaswamp.engine.kernel import KernelEngine
     from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     from tests.fake_uc import FakeUnityCatalog
 
@@ -499,10 +499,10 @@ _SECRET = "dapi-SECRET-CATALOG-TOKEN-0123456789"
 @pytest.fixture
 def token_conn(tmp_path: Any) -> Any:
     from deltaswamp.catalog.ossuc import OSSUnityCatalog
+    from deltaswamp.connection import Connection
     from deltaswamp.engine.deltars import DeltaRsEngine
     from deltaswamp.engine.kernel import KernelEngine
     from deltaswamp.router import Router
-    from deltaswamp.table import Connection
 
     from tests.fake_uc import FakeUnityCatalog
 

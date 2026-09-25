@@ -1,14 +1,10 @@
 """The engine abstraction.
 
-Planning and execution are separate calls, deliberately. `plan_scan` returns
-serializable `ScanSplit`s; `execute_scan` consumes them and may run in another
-process. A single monolithic `scan()` cannot be distributed later without
-rewriting every implementation, and this library exists partly to feed Ray Data.
-
-The same split applies to writes: workers produce `AddFile` records, the driver
-commits them in one transaction. Kernel's `WriteState` is explicitly designed to
-be encoded and shipped to distributed writers, so we mirror that shape rather
-than inventing one.
+Planning and execution are separate calls. `plan_scan` returns serializable
+`ScanSplit`s and `execute_scan` consumes them, possibly in another process, so
+every engine can be distributed. Writes mirror the kernel's `WriteState`:
+workers produce add-file records and the driver commits them in one
+transaction.
 """
 
 from __future__ import annotations
@@ -127,7 +123,7 @@ class Engine(Protocol):
 
         Must never raise for an unsupported combination -- return a `Capability`
         with `ok=False` and a reason naming the blocker. The router aggregates
-        these into `Table.capabilities()`, which is the library's honesty surface.
+        these into `Table.capabilities()`.
         """
         ...
 

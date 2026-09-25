@@ -12,11 +12,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
+pytest.importorskip("pyarrow")
 n = pytest.importorskip("deltaswamp._native")
+
+import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
 
 
 def _read(snapshot: Any, **kwargs: Any) -> pa.Table:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -17,6 +17,8 @@ pa = pytest.importorskip("pyarrow")
 
 import deltaswamp as ds  # noqa: E402
 from deltaswamp.capability import Engine  # noqa: E402
+from deltaswamp.catalog.base import Catalog  # noqa: E402
+from deltaswamp.engine.deltars import DeltaRsEngine  # noqa: E402
 from deltaswamp.errors import (  # noqa: E402
     DeltaSwampError,
     InvalidArgumentError,
@@ -77,7 +79,7 @@ def test_a_minimal_plugin_catalog_refuses_missing_methods(tmp_path: Any) -> None
         def list_tables(self, catalog: str, schema: str) -> list[Any]:
             return []
 
-    conn = ds.connect(catalog=Minimal())
+    conn = ds.connect(catalog=cast(Catalog, Minimal()))
     with pytest.raises(UnreachableTableError, match="list_catalogs"):
         conn.list_catalogs()
     with pytest.raises(UnreachableTableError, match="drop_table"):
@@ -136,7 +138,7 @@ def test_files_has_one_layout_whichever_engine_lists_them(conn: Any, tmp_path: A
         t._invalidate()
         via_kernel = t.files()
     finally:
-        conn.router.engines[Engine.DELTARS] = ds.table.DeltaRsEngine()
+        conn.router.engines[Engine.DELTARS] = DeltaRsEngine()
     assert isinstance(via_deltars, pa.Table) and isinstance(via_kernel, pa.Table)
     assert kernel is conn.router.engines[Engine.KERNEL]
     shared = [c for c in via_kernel.column_names if c != "deletion_vector"]

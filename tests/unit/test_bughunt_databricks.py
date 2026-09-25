@@ -255,11 +255,11 @@ class TestCredentialVending:
 
     def test_unrecognised_response_names_fields_without_crashing(self) -> None:
         p = _provider()
-        with pytest.raises(CredentialError, match="no recognised credential block"):
+        with pytest.raises(CredentialError, match="no recognized credential block"):
             p._to_credentials(
                 uc.GenerateTemporaryTableCredentialResponse(url="s3://b"), Operation.READ
             )
-        with pytest.raises(CredentialError, match="no recognised credential block"):
+        with pytest.raises(CredentialError, match="no recognized credential block"):
             p._to_credentials({"url": "s3://b"}, Operation.READ)
 
     def test_vend_not_found_says_table_was_dropped(self, ws: FakeWorkspace) -> None:
@@ -312,7 +312,7 @@ class TestCredentialVending:
             def as_dict(self) -> dict[str, Any]:
                 return {"host": self.host, "client_id": "sp", "auth_type": "oauth-m2m"}
 
-        p = DatabricksCredentialProvider("tid-1", config=FakeConfig())  # type: ignore[arg-type]
+        p = DatabricksCredentialProvider("tid-1", config=FakeConfig())  # type: ignore[arg-type, unused-ignore]
         clone = pickle.loads(pickle.dumps(p))
         assert clone._explicit_config is None
         assert clone._config_kwargs["host"] == "https://adb-1.azuredatabricks.net"
@@ -332,7 +332,7 @@ class TestCredentialVending:
     def test_workspace_client_built_once_under_concurrency(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import deltaswamp._sdk as sdk
+        import deltaswamp.credentials.databricks as sdk  # imports workspace_client by name
 
         built: list[int] = []
 

@@ -13,8 +13,8 @@ from typing import Any
 
 import deltaswamp as ds
 import pytest
-from deltaswamp.capability import PROPERTY_SUPPORT, Engine, PropertyEffect, property_support
-from deltaswamp.properties import effect_for
+from deltaswamp.capability import Engine
+from deltaswamp.properties import PROPERTY_SUPPORT, PropertyEffect, effect_for, property_support
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
@@ -139,3 +139,73 @@ class TestProbesAgainstKernel:
                 partition_by=["city"],
                 cluster_by=["id"],
             )
+
+
+_SET_VALUES = {
+    "delta.columnMapping.mode": "name",
+    "delta.checkpointPolicy": "v2",
+    "delta.minWriterVersion": "4",
+    "delta.minReaderVersion": "2",
+    "delta.isolationLevel": "WriteSerializable",
+    "delta.parquet.compression.codec": "zstd",
+    "delta.parquet.format.version": "2.12.0",
+    "delta.universalFormat.enabledFormats": "iceberg",
+    "delta.dataSkippingStatsColumns": "id",
+    "delta.targetFileSize": "134217728",
+}
+
+
+def _set_value(key: str) -> str:
+    if key in _SET_VALUES:
+        return _SET_VALUES[key]
+    if key.endswith("Duration"):
+        return "interval 7 days"
+    if key.startswith(("delta.enable", "delta.autoOptimize", "delta.appendOnly")) or key in (
+        "delta.checkpoint.writeStatsAsJson",
+        "delta.checkpoint.writeStatsAsStruct",
+        "delta.randomizeFilePrefixes",
+        "delta.tuneFileSizesForRewrites",
+    ):
+        return "true"
+    return "5"
+
+
+class TestSetProbesAgainstInstalledDeltaRs:
+    """The ALTER column drifted once already: every SET key was recorded as
+    rejected, while deltalake 1.6.5 took most of them."""
+
+    @pytest.mark.parametrize("key", sorted(PROPERTY_SUPPORT))
+    def test_set_claim_matches_the_engine(self, key: str, tmp_path: Any) -> None:
+        from deltalake import DeltaTable, write_deltalake
+
+        row = PROPERTY_SUPPORT[key]
+        if row.deltars_set is PropertyEffect.UNSUPPORTED:
+            pytest.skip("not probed")
+        path = str(tmp_path / "t")
+        write_deltalake(path, pa.table({"id": [1], "city": ["oslo"]}))
+        try:
+            DeltaTable(path).alter.set_table_properties({key: _set_value(key)})
+            accepted = True
+        except Exception:
+            accepted = False
+        except BaseException as exc:
+            if type(exc).__name__ != "PanicException":
+                raise
+            accepted = False
+        if key == "delta.enableDeletionVectors":
+            # Accepted, but it stamps a spurious variantType feature into the
+            # protocol, so the matrix records it as rejected on purpose.
+            protocol = DeltaTable(path).protocol()
+            assert accepted and "variantType" in (protocol.writer_features or [])
+            assert row.deltars_set is PropertyEffect.REJECTED
+            return
+        if key == "delta.minReaderVersion":
+            # Accepted, and it leaves protocol (2, 2): reader version 2 means
+            # column mapping, which needs writer 5. Rejected on purpose.
+            assert accepted and DeltaTable(path).protocol().min_writer_version < 5
+            assert row.deltars_set is PropertyEffect.REJECTED
+            return
+        claimed = row.deltars_set is not PropertyEffect.REJECTED
+        assert accepted is claimed, (
+            f"{key}: matrix says {row.deltars_set}, engine accepted={accepted}"
+        )

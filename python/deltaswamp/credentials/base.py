@@ -88,7 +88,7 @@ class Credentials:
     def registry_key(self) -> tuple[str, str]:
         """The key a store registry must use.
 
-        Deliberately (table identity, path prefix) rather than (scheme, bucket):
+        Keyed by (table identity, path prefix) rather than (scheme, bucket):
         see the note on `scope_prefix`.
         """
         return (self.table_id or "", self.scope_prefix or self.url)
@@ -178,7 +178,7 @@ class StaticCredentialProvider:
 
     Used where the catalog vends a credential for a *path* rather than a table
     -- creating an external table, or reading a log before registering it --
-    so there is no table identity to re-vend against. It is deliberately not
+    so there is no table identity to re-vend against. It is not
     refreshable: past `expires_at` it raises rather than handing out a dead
     credential that fails later with a storage 403.
     """
@@ -211,6 +211,10 @@ class StaticCredentialProvider:
 
     def invalidate(self) -> None:
         """Nothing to refresh; the next call re-checks expiry."""
+
+    def peek(self) -> Credentials:
+        """The held credential, without the expiry check."""
+        return self._credentials
 
     def __repr__(self) -> str:
         return f"StaticCredentialProvider({self._credentials!r})"
