@@ -699,6 +699,29 @@ def _cdf_enabled(configuration: Mapping[str, str]) -> bool:
     return str(configuration.get("delta.enableChangeDataFeed", "false")).lower() == "true"
 
 
+def cdf_name_clash(names: Iterable[str], properties: Mapping[str, Any] | None) -> list[str]:
+    """The column names the change data feed reserves, if `properties` enable it.
+
+    For the routes that do not compute a metadata change here (a delta-rs
+    create, a schema-evolving write): the feed then failed every DML and read
+    after reporting success.
+    """
+    enabled = any(
+        str(key).lower() == "delta.enablechangedatafeed" and str(value).lower() == "true"
+        for key, value in (properties or {}).items()
+    )
+    return [name for name in names if enabled and name.lower() in _CDF_RESERVED]
+
+
+def cdf_clash_error(operation: str, clash: list[str]) -> UnreachableTableError:
+    return _refuse(
+        operation,
+        f"the change data feed reserves the column names {sorted(_CDF_RESERVED)}, "
+        f"and the schema has {clash}",
+        "rename those columns, or leave delta.enableChangeDataFeed off",
+    )
+
+
 def add_columns(state: TableState, new_fields: list[dict[str, Any]]) -> Change:
     """ADD COLUMNS. `new_fields` are Delta schema field dicts."""
     schema = state.schema
@@ -857,6 +880,15 @@ def rename_column(state: TableState, old: str, new: str) -> Change:
         )
     if leaf == current:
         return Change("RENAME COLUMN", {"oldColumnPath": old, "newColumnPath": new})
+    if leaf.lower() == current.lower():
+        # Column names are case-insensitive, so this renames a column to
+        # itself; Databricks refuses it, and the same call must not succeed
+        # here and fail on the warehouse.
+        raise _refuse(
+            f"rename column {old} to {new}",
+            "the new name differs only in case, and column names are case-insensitive",
+            "rename it to a different name, then to the new spelling",
+        )
     dependents = _dependents(state, current)
     if dependents:
         raise _refuse(
@@ -961,7 +993,19 @@ def alter_column_type(state: TableState, column: str, new_type: str) -> Change:
     if len(path) == 1 and target["name"].lower() in {
         p.lower() for p in state.metadata.get("partitionColumns") or []
     }:
-        raise _refuse(f"change the type of {column}", "it is a partition column")
+        # Partition values are strings in the add actions, parsed with the
+        # column's current type: "7" is as good a long as an int, and
+        # Databricks widens numeric partition columns. But the kernel refuses
+        # "1.50" as decimal(7,3) -- a scale change leaves every stored value
+        # unparseable -- and a date's "2024-01-01" is not a timestamp_ntz.
+        old_dec, new_dec = _DECIMAL.fullmatch(old_type), _DECIMAL.fullmatch(new_type)
+        old_scale = int(old_dec.group(2)) if old_dec else 0
+        if old_type == "date" or (new_dec is not None and int(new_dec.group(2)) != old_scale):
+            raise _refuse(
+                f"change the type of {column} from {old_type} to {new_type}",
+                "it is a partition column, and its stored values (strings in the log) "
+                "would not parse as the new type",
+            )
     # Spark refuses a type change under a CHECK constraint or a generated
     # column: the expression was validated against the old type, and a
     # generated column's stored type no longer matches what it computes.
@@ -1250,7 +1294,9 @@ _KNOWN_KEYS = frozenset(
         "delta.checkpoint.writeStatsAsStruct",
         "delta.checkpointInterval",
         "delta.checkpointPolicy",
+        "delta.checkpointRetentionDuration",
         "delta.columnMapping.mode",
+        "delta.compatibility.symlinkFormatManifest.enabled",
         "delta.dataSkippingNumIndexedCols",
         "delta.dataSkippingStatsColumns",
         "delta.deletedFileRetentionDuration",
@@ -1277,6 +1323,7 @@ _BOOLEAN_KEYS = frozenset(
         "delta.autoOptimize.optimizeWrite",
         "delta.checkpoint.writeStatsAsJson",
         "delta.checkpoint.writeStatsAsStruct",
+        "delta.compatibility.symlinkFormatManifest.enabled",
         "delta.enableChangeDataFeed",
         "delta.enableDeletionVectors",
         "delta.enableExpiredLogCleanup",
@@ -1297,6 +1344,7 @@ _INTEGER_KEYS: dict[str, int] = {
 }
 _DURATION_KEYS = frozenset(
     {
+        "delta.checkpointRetentionDuration",
         "delta.deletedFileRetentionDuration",
         "delta.logRetentionDuration",
         "delta.setTransactionRetentionDuration",

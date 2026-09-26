@@ -45,6 +45,7 @@ from ..errors import (
     UnreachableTableError,
 )
 from ..properties import effect_for, validate_properties
+from . import metadata as meta
 from .base import missing_method
 
 __all__ = ["DeltaRsEngine"]
@@ -1125,10 +1126,21 @@ class DeltaRsEngine:
             # Round up: keeping a little more history is the safe direction.
             retention_hours = math.ceil(retention_hours)
         _commit_kwargs(kwargs)
-        with _no_panics("vacuum"):
-            result: list[str] = self._open(table, write=True).vacuum(
-                retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
-            )
+        try:
+            with _no_panics("vacuum"):
+                result: list[str] = self._open(table, write=True).vacuum(
+                    retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
+                )
+        except Exception as exc:
+            if "Invalid retention period" not in str(exc):
+                raise
+            # delta-rs named neither the table property nor the override.
+            raise InvalidArgumentError(
+                f"vacuum retention_hours={retention_hours} is below the table's "
+                "delta.deletedFileRetentionDuration, and files a reader of an older "
+                "version still needs could be deleted; pass enforce_retention_duration=False "
+                "to vacuum anyway, or lower the table property"
+            ) from exc
         return result
 
     def restore(self, table: ResolvedTable, target: Any, **kwargs: Any) -> dict[str, Any]:
@@ -1145,9 +1157,44 @@ class DeltaRsEngine:
             raise UnreachableTableError(
                 "restore", _RESTORE_DV_REASON, "perform the restore from Databricks"
             )
+        dt = self._open(table, write=True)
+        self._check_restored_column_mapping(dt, target)
         with _no_panics("restore"):
-            result: dict[str, Any] = self._open(table, write=True).restore(target, **kwargs)
+            result: dict[str, Any] = dt.restore(target, **kwargs)
         return result
+
+    @staticmethod
+    def _check_restored_column_mapping(dt: Any, target: Any) -> None:
+        """Refuse a restore whose metadata would rewind column mapping.
+
+        delta-rs restores the target version's Metadata verbatim. Across the
+        commit that enabled column mapping it left mode none on a protocol
+        that still has the feature; across an ADD COLUMN it rolled
+        delta.columnMapping.maxColumnId back, so the next column added reused
+        a field id another column had held -- the protocol requires it never
+        decrease.
+        """
+        current = dt.metadata().configuration
+        mode = current.get("delta.columnMapping.mode", "none").lower()
+        if mode == "none" and "delta.columnMapping.maxColumnId" not in current:
+            return
+        from deltalake import DeltaTable
+
+        past = DeltaTable(dt.table_uri, storage_options=getattr(dt, "_storage_options", None))
+        with _no_panics("open the restore target"):
+            past.load_as_version(target)
+        restored = past.metadata().configuration
+        old_mode = restored.get("delta.columnMapping.mode", "none").lower()
+        now_max = int(current.get("delta.columnMapping.maxColumnId", "0") or 0)
+        old_max = int(restored.get("delta.columnMapping.maxColumnId", "0") or 0)
+        if old_mode != mode or old_max < now_max:
+            raise UnreachableTableError(
+                f"restore to {target}",
+                "the column-mapping metadata changed since then (mode "
+                f"{old_mode} -> {mode}, maxColumnId {old_max} -> {now_max}), and delta-rs "
+                "would restore the old values, rewinding the mode or the column ids",
+                "perform the restore from Databricks (allow_sql_fallback=True)",
+            )
 
     def repair(self, table: ResolvedTable, **kwargs: Any) -> dict[str, Any]:
         _commit_kwargs(kwargs)
@@ -1169,7 +1216,16 @@ class DeltaRsEngine:
                 "add the column as nullable, backfill it, then set NOT NULL",
             )
         _commit_kwargs(kwargs)
-        self._alter(table, "add columns", lambda dt: dt.alter.add_columns(converted, **kwargs))
+        as_json = [json.loads(f.to_json()) for f in converted]
+
+        def change(dt: Any) -> None:
+            # The kernel path's checks: without column mapping a name with a
+            # space or '=' is also its Parquet name, which Spark refuses, and
+            # delta-rs accepted; with CDF on, the feed's own column names.
+            meta.add_columns(_table_state(dt), as_json)
+            dt.alter.add_columns(converted, **kwargs)
+
+        self._alter(table, "add columns", change)
 
     #: Attempts for a metadata change that keeps losing to concurrent ones.
     metadata_commit_attempts = 5
@@ -1197,11 +1253,18 @@ class DeltaRsEngine:
     ) -> None:
         validate_properties(properties, EngineKind.DELTARS, Operation.SET_PROPERTIES)
         _commit_kwargs(kwargs)
-        self._alter(
-            table,
-            "set table properties",
-            lambda dt: dt.alter.set_table_properties(properties, **kwargs),
-        )
+
+        def change(dt: Any) -> None:
+            # delta-rs stores whatever it is given: targetFileSize=abc,
+            # isolationLevel=snapshot, stats columns that do not exist, a
+            # minWriterVersion that contradicts the protocol, and CDF on a
+            # table whose columns collide with the feed's own. The kernel
+            # path's checks are pure functions of the snapshot, so the same
+            # request is refused the same way whichever engine serves it.
+            meta.set_properties(_table_state(dt), properties)
+            dt.alter.set_table_properties(properties, **kwargs)
+
+        self._alter(table, "set table properties", change)
 
     def add_feature(self, table: ResolvedTable, feature: Any, **kwargs: Any) -> None:
         from deltalake import TableFeatures
@@ -1223,6 +1286,17 @@ class DeltaRsEngine:
         self, table: ResolvedTable, constraints: dict[str, str], **kwargs: Any
     ) -> None:
         _commit_kwargs(kwargs)
+        # delta-rs validates the existing rows on the snapshot it opened, then
+        # rebases the commit over any append that landed meanwhile without
+        # checking those rows: a racing append of id = -7 left "id > 0"
+        # committed and violated. With no retries its commit is a
+        # put-if-absent of exactly the version after the one it validated, so
+        # a concurrent commit fails it, and `_alter` validates again on a
+        # fresh snapshot.
+        properties = kwargs.pop("commit_properties", None)
+        kwargs["commit_properties"] = _commit_properties(
+            getattr(properties, "custom_metadata", None), None, 0
+        )
         self._alter(
             table, "add a constraint", lambda dt: dt.alter.add_constraint(constraints, **kwargs)
         )
@@ -1258,8 +1332,15 @@ class DeltaRsEngine:
 
     def drop_not_null(self, table: ResolvedTable, column: str) -> None:
         """DROP NOT NULL. A no-op on a column that is already nullable, as in Spark."""
+
+        def change(dt: Any) -> None:
+            # A column that is not there came back as a raw "No column with
+            # the name 'nosuch' in the schema"; refuse it as the kernel does.
+            meta.set_nullability(_table_state(dt), column, True)
+            dt.alter.drop_column_not_null(column)
+
         try:
-            self._alter(table, "drop NOT NULL", lambda dt: dt.alter.drop_column_not_null(column))
+            self._alter(table, "drop NOT NULL", change)
         except Exception as exc:
             if "already nullable" not in str(exc):
                 raise
@@ -1279,7 +1360,17 @@ class DeltaRsEngine:
             # table with nothing to compact.
             raise InvalidArgumentError(f"compact_logs range is inverted: start={start} > end={end}")
         dt = self._open(table, write=True)
-        first = 0 if start is None else start
+        # After cleanup_metadata() the log no longer starts at version 0, and
+        # delta-rs answered a range from 0 with a raw "Expected the first
+        # commit to have version 0, got Some(8)".
+        log = _DeltaLog.open(dt)
+        oldest = log.commits[0][0] if log is not None and log.commits else 0
+        if start is not None and start < oldest:
+            raise InvalidArgumentError(
+                f"cannot compact the log from version {start}: log retention removed it; "
+                f"the oldest commit still there is {oldest}"
+            )
+        first = oldest if start is None else start
         last = dt.version() if end is None else end
         if last <= first:
             return None
@@ -1324,6 +1415,23 @@ class DeltaRsEngine:
         """Turn a directory of Parquet into a Delta table in place."""
         from deltalake import convert_to_deltalake
 
+        partition_by = _partition_schema(partition_by)
+        partition_dirs = _hive_partition_dirs(location)
+        if partition_dirs and partition_by is None and partition_strategy == "hive":
+            # delta-rs said only "the schema of partition columns must be
+            # provided", naming neither the columns nor the argument.
+            columns = sorted({name.split("=", 1)[0] for name in partition_dirs})
+            raise InvalidArgumentError(
+                f"{location} is hive-partitioned by {columns}; pass their types as "
+                'partition_by, e.g. partition_by=[("region", "string")]'
+            )
+        escaped = sorted(name for name in partition_dirs if "%" in name)
+        if escaped:
+            raise UnreachableTableError(
+                f"convert {location} to Delta",
+                _CONVERT_ESCAPED_REASON.format(escaped[0]),
+                _CONVERT_ESCAPED_REMEDY,
+            )
         convert_to_deltalake(
             location,
             partition_by=partition_by,
@@ -1340,6 +1448,94 @@ class DeltaRsEngine:
 
     def execute_scan(self, table: ResolvedTable, splits: list[Any], **kwargs: Any) -> Any:
         raise NotImplementedError("see plan_scan")
+
+
+_CONVERT_ESCAPED_REASON = (
+    "the partition directory {!r} holds an escaped value, and delta-rs 1.x records its "
+    "name in the add action without URI-encoding it: every reader then decodes the path "
+    "to a file that does not exist, and the converted table cannot be read"
+)
+_CONVERT_ESCAPED_REMEDY = (
+    "rewrite the data as a Delta table instead (write_table() with partition_by=), or "
+    "run CONVERT TO DELTA from Databricks"
+)
+
+
+def _partition_schema(partition_by: Any) -> Any:
+    """`partition_by` as the `deltalake.Schema` that `convert_to_deltalake` insists on.
+
+    It raised "'Schema' object is not an instance of 'Schema'" for a pyarrow
+    schema, which is what every other deltaswamp call takes.
+    """
+    if partition_by is None:
+        return None
+    from deltalake import Field, Schema
+
+    if isinstance(partition_by, Schema):
+        return partition_by
+    if hasattr(partition_by, "__arrow_c_schema__"):
+        return Schema.from_arrow(partition_by)
+    if isinstance(partition_by, (list, tuple)) and partition_by:
+        fields = []
+        for item in partition_by:
+            if isinstance(item, Field):
+                fields.append(item)
+            elif hasattr(item, "name") and hasattr(item, "type"):
+                fields.append(Field.from_arrow(item))  # a pyarrow Field
+            elif isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str):
+                name, dtype = item
+                if hasattr(dtype, "__arrow_c_schema__") or not isinstance(dtype, str):
+                    import pyarrow as pa
+
+                    fields.append(Field.from_arrow(pa.field(name, dtype)))
+                else:
+                    delta_type = _SQL_TO_DELTA.get(dtype.lower(), dtype.lower())
+                    fields.append(
+                        Field.from_json(
+                            json.dumps(
+                                {"name": name, "type": delta_type, "nullable": True, "metadata": {}}
+                            )
+                        )
+                    )
+            else:
+                raise InvalidArgumentError(
+                    f"partition_by entry {item!r} has no type; give (name, type) pairs "
+                    'such as [("region", "string")], or a pyarrow schema'
+                )
+        return Schema(fields)
+    raise InvalidArgumentError(
+        "partition_by takes a pyarrow schema or a list of (name, type) pairs, not "
+        f"{type(partition_by).__name__}"
+    )
+
+
+#: SQL spellings of the types a hive partition value can hold.
+_SQL_TO_DELTA = {"int": "integer", "bigint": "long", "smallint": "short", "tinyint": "byte"}
+
+
+def _hive_partition_dirs(location: str) -> set[str]:
+    """The ``name=value`` directory names under `location`, where it can be listed.
+
+    Only a local directory is listed here; elsewhere the checks that need the
+    names are skipped rather than guessed.
+    """
+    path = location
+    if path.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+
+        path = unquote(urlparse(path).path)
+    elif "://" in path:
+        return set()
+    names: set[str] = set()
+    if not os.path.isdir(path):
+        return names
+    for root, dirs, _files in os.walk(path):
+        # The log and hidden directories are not partitions.
+        dirs[:] = [d for d in dirs if not d.startswith(("_", "."))]
+        names.update(d for d in dirs if "=" in d)
+        if root != path and "=" not in os.path.basename(root):
+            dirs[:] = []
+    return names
 
 
 #: Wire name -> member of `deltalake.TableFeatures`, which is all delta-rs's
@@ -2685,6 +2881,34 @@ def _duration_days(value: str) -> float | None:
     if number is not None or not seen:
         return None
     return total
+
+
+def _table_state(dt: Any) -> meta.TableState:
+    """The snapshot `dt` holds, as the state the kernel path's checks take."""
+    protocol = dt.protocol()
+    wire: dict[str, Any] = {
+        "minReaderVersion": protocol.min_reader_version,
+        "minWriterVersion": protocol.min_writer_version,
+    }
+    if protocol.reader_features is not None:
+        wire["readerFeatures"] = list(protocol.reader_features)
+    if protocol.writer_features is not None:
+        wire["writerFeatures"] = list(protocol.writer_features)
+    metadata = dt.metadata()
+    return meta.TableState(
+        version=dt.version(),
+        protocol=wire,
+        metadata={
+            "id": metadata.id,
+            "name": metadata.name,
+            "description": metadata.description,
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": dt.schema().to_json(),
+            "partitionColumns": list(metadata.partition_columns),
+            "configuration": dict(metadata.configuration),
+            "createdTime": metadata.created_time,
+        },
+    )
 
 
 def _deltars_fields(fields: Any) -> list[Any]:

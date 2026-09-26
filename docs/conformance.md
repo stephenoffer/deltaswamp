@@ -160,7 +160,9 @@ to the kernel automatically.
 | `delta.checkpoint.writeStatsAsStruct` | honored | honored | honored |
 | `delta.checkpointInterval` | honored | honored | honored |
 | `delta.checkpointPolicy` | stored, inert | stored, inert | honored |
+| `delta.checkpointRetentionDuration` *(Databricks-only)* | rejected | rejected | n/a |
 | `delta.columnMapping.mode` | honored | rejected | honored |
+| `delta.compatibility.symlinkFormatManifest.enabled` *(Databricks-only)* | rejected | rejected | n/a |
 | `delta.dataSkippingNumIndexedCols` | honored | honored | honored |
 | `delta.dataSkippingStatsColumns` | stored, inert | stored, inert | honored |
 | `delta.deletedFileRetentionDuration` | honored | honored | honored |
@@ -183,6 +185,15 @@ to the kernel automatically.
 | `delta.targetFileSize` | honored | honored | n/a |
 | `delta.tuneFileSizesForRewrites` *(Databricks-only)* | stored, inert | stored, inert | n/a |
 | `delta.universalFormat.enabledFormats` *(Databricks-only)* | rejected | rejected | n/a |
+
+On an existing table, set_properties checks values the same way whichever
+engine serves it: a delta-rs ALTER is first run through the kernel path's
+checks, so `delta.targetFileSize=abc`, `delta.isolationLevel=snapshot`, a
+`delta.dataSkippingStatsColumns` entry naming no column, a hand-set
+`delta.minWriterVersion`, or `delta.enableChangeDataFeed=true` on a table with a
+`_change_type`/`_commit_version`/`_commit_timestamp` column are refused before
+anything is committed. The two Databricks-only keys above are stored by the
+kernel's metadata path (delta-rs rejects them) for Databricks to act on.
 
 Keys with no row follow three rules. A `delta.feature.<name>` signal is
 rejected by delta-rs and accepted by the kernel for the sixteen features in

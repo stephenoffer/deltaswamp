@@ -22,6 +22,7 @@ from .credentials import Operation as CredentialOperation
 from .engine.base import TranslatingStream, translating_stream
 from .engine.deltars import DeltaRsEngine
 from .engine.kernel import KernelEngine
+from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
     SQL_FALLBACK_REMEDY,
     CorruptTableError,
@@ -142,6 +143,29 @@ def _columns_arg(columns: Any) -> list[str] | None:
         if not isinstance(name, str):
             raise InvalidArgumentError(f"column names must be strings, got {name!r}")
     return names
+
+
+def _column_path(column: Any, what: str) -> str:
+    """The column an ALTER names, as one string: dotted for a nested field.
+
+    A list is a nested path (``["s", "a"]``), as the SQL fallback always took
+    it; drop_column refused one and the kernel failed on it. A part holding
+    a dot is backtick-quoted so it stays one name.
+    """
+    if isinstance(column, str) and column:
+        return column
+    if (
+        isinstance(column, (list, tuple))
+        and column
+        and all(isinstance(part, str) and part for part in column)
+    ):
+        return ".".join(
+            "`" + part.replace("`", "``") + "`" if "." in part or "`" in part else part
+            for part in column
+        )
+    raise InvalidArgumentError(
+        f"{what} takes a column name or a nested path such as ['s', 'a'], not {column!r}"
+    )
 
 
 def _check_predicate(predicate: Any, what: str) -> None:
@@ -619,6 +643,18 @@ class Table:
             raise InvalidArgumentError(
                 f"{operation!r} is not an operation; one of {sorted(o.value for o in Operation)}"
             ) from None
+        method = _SHAPED_CALLS.get(op)
+        if method is not None:
+            # can("append", schema_mod="merge") answered for a plain append,
+            # so a typo preflighted fine and the call itself then did
+            # something else.
+            import inspect
+
+            known = frozenset(inspect.signature(getattr(Table, method)).parameters) - {
+                "self",
+                "data",
+            }
+            _check_options("can", shape, known)
         # Translate the call's arguments the way the call itself routes them.
         # Passing them through as a bare shape let `can("append",
         # schema_mode="merge")` answer for a plain APPEND (kernel: yes) while
@@ -1683,6 +1719,7 @@ class Table:
         if txn is not None and self._already_committed(txn):
             return
         raw = data
+        self._check_cdf_columns(data, schema_mode, "append")
         for attempt in range(_REALIGN_ATTEMPTS):
             data = self._align(raw, schema_mode)
             needs = self._write_needs(
@@ -1721,6 +1758,25 @@ class Table:
                 ):
                     raise
         self._invalidate()
+
+    def _check_cdf_columns(self, data: Any, schema_mode: str | None, what: str) -> None:
+        """Refuse a schema-evolving write that adds a column the change feed reserves.
+
+        add_column refused `_change_type` on a CDF table, but a write with
+        schema_mode= added it, and every DML and feed read failed afterwards.
+        """
+        if schema_mode is None:
+            return
+        schema = getattr(data, "schema", None)
+        names = getattr(schema, "names", None)
+        if names is None or callable(names):
+            return
+        current = {n.lower() for n in self.schema().names} if schema_mode == "merge" else set()
+        clash = cdf_name_clash(
+            [n for n in names if n.lower() not in current], self._enrich().properties
+        )
+        if clash:
+            raise cdf_clash_error(f"{what} with schema_mode={schema_mode!r}", clash)
 
     def _raced_append(
         self, write: Any, data: Any, txn: tuple[str, int] | None, retries: int | None
@@ -1783,6 +1839,12 @@ class Table:
             raise InvalidArgumentError(
                 f"schema_mode must be None, 'merge' or 'overwrite', not {schema_mode!r}"
             )
+        if partition_overwrite not in ("static", "dynamic"):
+            # It reached the router and came back as "no engine can overwrite
+            # with partition_overwrite='Dynamic'", as if the table were at fault.
+            raise InvalidArgumentError(
+                f"partition_overwrite must be 'static' or 'dynamic', not {partition_overwrite!r}"
+            )
         _check_predicate(predicate, "overwrite")
         _check_txn(txn)
         data = _write_data(data)
@@ -1799,6 +1861,7 @@ class Table:
             # to raise, failing any pipeline whose batch happened to be empty.
             return
         raw = data
+        self._check_cdf_columns(data, schema_mode, "overwrite")
         data = self._align(raw, schema_mode)
         needs = self._write_needs(
             schema_mode, commit_metadata, txn, writer_properties, partition_overwrite
@@ -1875,6 +1938,7 @@ class Table:
 
     def replace(self, data: Any, **kwargs: Any) -> None:
         """Replace the table's contents and schema. REPLACE TABLE / RTAS."""
+        _check_options("replace", kwargs, _REPLACE_OPTIONS)
         self.overwrite(data, schema_mode="overwrite", **kwargs)
 
     def _already_committed(self, txn: tuple[str, int]) -> bool:
@@ -2036,6 +2100,7 @@ class Table:
         """MERGE INTO. Returns a builder with the delta-rs clause API
         (``when_matched_update_all()`` ... ``execute()``) whichever engine serves it."""
         self._check_writable("merge")
+        _check_options("merge", kwargs, _MERGE_OPTIONS)
         if predicate is None:
             raise InvalidArgumentError("merge needs a join predicate")
         _check_predicate(predicate, "merge")
@@ -2063,6 +2128,7 @@ class Table:
         delta-rs takes ``partition_filters=`` instead.
         """
         self._check_writable("optimize")
+        _check_options("optimize", kwargs, _OPTIMIZE_OPTIONS)
         if isinstance(zorder_by, str):
             zorder_by = [zorder_by]
         if zorder_by:
@@ -2081,6 +2147,7 @@ class Table:
 
     def z_order(self, columns: list[str] | str, **kwargs: Any) -> dict[str, Any]:
         self._check_writable("z-order")
+        _check_options("z_order", kwargs, _OPTIMIZE_OPTIONS)
         columns = [columns] if isinstance(columns, str) else list(columns or [])
         if not columns:
             raise InvalidArgumentError("z_order needs at least one column")
@@ -2120,6 +2187,7 @@ class Table:
         `lite=True` considers only files the log records as removed (VACUUM
         LITE), which is cheaper than listing storage for orphans.
         """
+        _check_options("vacuum", kwargs, _VACUUM_OPTIONS)
         if retention_hours is not None and (
             isinstance(retention_hours, bool) or not isinstance(retention_hours, (int, float))
         ):
@@ -2140,6 +2208,7 @@ class Table:
     def restore(self, target: Any, **kwargs: Any) -> dict[str, Any]:
         """RESTORE to a version (int) or a timestamp (datetime or string)."""
         self._check_writable("restore")
+        _check_options("restore", kwargs, _RESTORE_OPTIONS)
         if target is None:
             raise InvalidArgumentError("restore needs a version or a timestamp")
         if str(self._enrich().properties.get("delta.appendOnly", "")).lower() == "true":
@@ -2151,6 +2220,12 @@ class Table:
                 "set delta.appendOnly to false first if the removal is intended",
             )
         target = target if isinstance(target, int) else _timestamp_arg(target, "restore target")
+        if not isinstance(target, (bool, int)):
+            # delta-rs resolved a timestamp before the first commit to version
+            # 0 and restored the empty table, and ignored in-commit timestamps.
+            # Resolve it the way a read does, so restore(ts) restores exactly
+            # the table that to_arrow(timestamp=ts) returns.
+            target = self._restore_version(target)
         if isinstance(target, (bool, int)):
             # -1 reached delta-rs as "either the version or datetime should
             # be provided"; True restored version 1.
@@ -2160,13 +2235,50 @@ class Table:
                 raise InvalidArgumentError(
                     f"cannot restore version {target}: the latest version is {latest}"
                 )
+            if latest is not None and target == latest:
+                # The table already is that version. delta-rs raised a raw
+                # "Version to restore 5 should be less then last available
+                # version 5"; restoring to where you are changes nothing.
+                return {"numRemovedFile": 0, "numRestoredFile": 0}
         result: dict[str, Any] = self._engine(Operation.RESTORE).restore(
             self._resolved, target, **kwargs
         )
         self._invalidate()
         return result
 
+    def _restore_version(self, timestamp: Any) -> Any:
+        """The version a restore to `timestamp` means: the one a read at it sees.
+
+        That is the latest commit at or before it (in-commit timestamps when
+        enabled); one before the first recreatable commit is refused, as a read
+        refuses it. Without a kernel that can open the table, the timestamp is
+        passed on for the engine to resolve.
+        """
+        from ._util import timestamp_ms
+
+        kernel = self._connection.router.engines.get(EngineKind.KERNEL)
+        if not isinstance(kernel, KernelEngine) or self._resolved.location is None:
+            return timestamp
+        try:
+            millis = timestamp_ms(timestamp)
+        except UnreachableTableError as exc:
+            raise InvalidArgumentError(f"restore target {timestamp!r}: {exc.reason}") from exc
+        try:
+            snapshot = kernel.snapshot(self._resolved, timestamp=millis)
+        except UnreachableTableError as exc:
+            if "earliest recreatable" in exc.reason or "out of range" in exc.reason:
+                raise InvalidArgumentError(
+                    f"cannot restore to {timestamp}: no version of the table exists at or "
+                    "before it (it is before the first commit, or before the oldest one "
+                    "log retention kept)"
+                ) from exc
+            return timestamp
+        except Exception:
+            return timestamp
+        return int(snapshot.version)
+
     def repair(self, **kwargs: Any) -> dict[str, Any]:
+        _check_options("repair", kwargs, _COMMIT_OPTIONS | {"dry_run"})
         # A dry run commits nothing, so the router may accept it on tables a
         # real REPAIR (which commits removes) cannot touch.
         result: dict[str, Any] = self._engine(
@@ -2181,6 +2293,7 @@ class Table:
         """Add columns. `fields` is a list of Arrow/Delta fields, or a
         {name: sql_type} mapping when the SQL fallback serves it."""
         self._check_writable("add a column")
+        _check_options("add_column", kwargs, _COMMIT_OPTIONS)
         if isinstance(fields, dict):
             new = list(fields)
         elif isinstance(fields, (list, tuple)):
@@ -2206,13 +2319,36 @@ class Table:
             if folded in seen:
                 raise InvalidArgumentError(f"add_column names {name!r} twice")
             seen.add(folded)
+        if isinstance(fields, dict):
+            required = [
+                n for n, t in fields.items() if isinstance(t, str) and "NOT NULL" in t.upper()
+            ]
+        else:
+            if hasattr(fields, "names") and hasattr(fields, "field"):  # an Arrow schema
+                items = [fields.field(i) for i in range(len(fields.names))]
+            elif isinstance(getattr(fields, "fields", None), list):  # a deltalake Schema
+                items = list(fields.fields)
+            elif isinstance(fields, (list, tuple)):
+                items = list(fields)
+            else:
+                items = [fields]
+            required = [f.name for f in items if getattr(f, "nullable", True) is False]
+        if required:
+            # delta-rs and the kernel refused this, but the warehouse's ADD
+            # COLUMNS was sent the column without NOT NULL: the call succeeded
+            # and the column came back nullable.
+            raise UnreachableTableError(
+                f"add NOT NULL column(s) {', '.join(map(str, required))}",
+                "existing rows have no value for a new column, so it must be nullable",
+                "add the column as nullable, backfill it, then set_not_null()",
+            )
         self._engine(Operation.ADD_COLUMN).add_columns(self._resolved, fields, **kwargs)
         self._invalidate()
 
-    def drop_column(self, column: str) -> dict[str, Any]:
+    def drop_column(self, column: str | list[str]) -> dict[str, Any]:
+        """Drop a column; a dotted name or a list is a field inside a struct."""
         self._check_writable("drop a column")
-        if not isinstance(column, str) or not column:
-            raise InvalidArgumentError(f"drop_column takes one column name, not {column!r}")
+        column = _column_path(column, "drop_column")
         names = list(self.schema().names)
         partitions = set(self._enrich().partition_columns)
         rest = [name for name in names if name != column]
@@ -2228,14 +2364,22 @@ class Table:
         self._invalidate()
         return _metrics(result)
 
-    def rename_column(self, old: str, new: str) -> dict[str, Any]:
+    def rename_column(self, old: str | list[str], new: str) -> dict[str, Any]:
+        """Rename a column; a dotted name or a list is a field inside a struct.
+
+        `new` is the new last part (it may repeat the struct path).
+        """
         self._check_writable("rename a column")
+        old = _column_path(old, "rename_column")
+        if not isinstance(new, str) or not new:
+            raise InvalidArgumentError(f"rename_column needs a new name, not {new!r}")
         result = self._engine(Operation.RENAME_COLUMN).rename_column(self._resolved, old, new)
         self._invalidate()
         return _metrics(result)
 
     def set_properties(self, properties: dict[str, str], **kwargs: Any) -> None:
         self._check_writable("set properties")
+        _check_options("set_properties", kwargs, _COMMIT_OPTIONS | {"raise_if_not_exists"})
         if properties is not None and not isinstance(properties, dict):
             raise InvalidArgumentError(
                 f"set_properties takes a {{key: value}} dict, not {type(properties).__name__}"
@@ -2253,6 +2397,9 @@ class Table:
 
     def add_feature(self, feature: Any, **kwargs: Any) -> None:
         self._check_writable("add a feature")
+        _check_options(
+            "add_feature", kwargs, _COMMIT_OPTIONS | {"allow_protocol_versions_increase"}
+        )
         names = list(feature) if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
         self._engine(Operation.ADD_FEATURE, features=names).add_feature(
             self._resolved, feature, **kwargs
@@ -2262,6 +2409,7 @@ class Table:
     def drop_feature(self, feature: str, **kwargs: Any) -> dict[str, Any]:
         """Drop a table feature. Databricks-only, so it needs the SQL fallback."""
         self._check_writable("drop a feature")
+        _check_options("drop_feature", kwargs, frozenset({"truncate_history"}))
         result: dict[str, Any] = self._engine(Operation.DROP_FEATURE).drop_feature(
             self._resolved, feature, **kwargs
         )
@@ -2270,6 +2418,7 @@ class Table:
 
     def add_constraint(self, constraints: dict[str, str], **kwargs: Any) -> None:
         self._check_writable("add a constraint")
+        _check_options("add_constraint", kwargs, _COMMIT_OPTIONS)
         if not isinstance(constraints, dict) or not constraints:
             raise InvalidArgumentError("add_constraint needs at least one {name: expression}")
         for cname, expression in constraints.items():
@@ -2307,15 +2456,16 @@ class Table:
         self._engine(Operation.SET_COMMENT).set_comment(self._resolved, comment)
         self._invalidate()
 
-    def set_column_comment(self, column: str, comment: str | None) -> None:
+    def set_column_comment(self, column: str | list[str], comment: str | None) -> None:
         self._check_writable("set a column comment")
+        column = _column_path(column, "set_column_comment")
         _check_comment(comment)
         self._engine(Operation.SET_COLUMN_COMMENT).set_column_comment(
             self._resolved, column, comment
         )
         self._invalidate()
 
-    def alter_column_type(self, column: str, new_type: str) -> None:
+    def alter_column_type(self, column: str | list[str], new_type: str) -> None:
         """Widen a column's type without rewriting data (type widening).
 
         Allowed: byte->short->int->long, float->double, byte/short/int->double,
@@ -2323,19 +2473,22 @@ class Table:
         shrink. The table needs ``delta.enableTypeWidening = true``.
         """
         self._check_writable("change a column type")
+        column = _column_path(column, "alter_column_type")
         self._engine(Operation.ALTER_COLUMN_TYPE).alter_column_type(
             self._resolved, column, new_type
         )
         self._invalidate()
 
-    def set_not_null(self, column: str) -> None:
+    def set_not_null(self, column: str | list[str]) -> None:
         """Add a NOT NULL constraint, after checking no existing row is null."""
         self._check_writable("set NOT NULL")
+        column = _column_path(column, "set_not_null")
         self._engine(Operation.SET_NOT_NULL).set_not_null(self._resolved, column)
         self._invalidate()
 
-    def drop_not_null(self, column: str) -> None:
+    def drop_not_null(self, column: str | list[str]) -> None:
         self._check_writable("drop NOT NULL")
+        column = _column_path(column, "drop_not_null")
         self._engine(Operation.DROP_NOT_NULL).drop_not_null(self._resolved, column)
         self._invalidate()
 
@@ -2356,9 +2509,14 @@ class Table:
 
     def checkpoint(self) -> None:
         self._engine(Operation.CHECKPOINT).checkpoint(self._resolved)
+        # The log changed shape under the cached state (a checkpoint, and on
+        # a catalog-managed table a published tail), as after any write.
+        self._invalidate()
 
     def compact_logs(self, start: int | None = None, end: int | None = None) -> Any:
-        return self._engine(Operation.LOG_COMPACTION).compact_logs(self._resolved, start, end)
+        result = self._engine(Operation.LOG_COMPACTION).compact_logs(self._resolved, start, end)
+        self._invalidate()
+        return result
 
     def cleanup_metadata(self) -> None:
         """Delete log files older than ``delta.logRetentionDuration``.
@@ -2367,6 +2525,7 @@ class Table:
         travel, so it is never done implicitly.
         """
         self._engine(Operation.CLEANUP_METADATA).cleanup_metadata(self._resolved)
+        self._invalidate()
 
     def analyze(self, *, columns: list[str] | None = None, delta_statistics: bool = False) -> Any:
         """ANALYZE TABLE. Databricks-only, so it needs the SQL fallback."""
@@ -2393,12 +2552,18 @@ class Table:
     def reorg(self, **kwargs: Any) -> dict[str, Any]:
         """REORG TABLE. Databricks-only, so it needs the SQL fallback."""
         self._check_writable("reorg")
+        _check_options("reorg", kwargs, frozenset({"purge", "iceberg_compat_version", "predicate"}))
         result: dict[str, Any] = self._engine(Operation.REORG).reorg(self._resolved, **kwargs)
         self._invalidate()
         return result
 
     def clone(self, target: str, **kwargs: Any) -> dict[str, Any]:
         """CLONE. Databricks-only, so it needs the SQL fallback."""
+        _check_options(
+            "clone",
+            kwargs,
+            frozenset({"shallow", "replace", "if_not_exists", "version", "timestamp"}),
+        )
         result: dict[str, Any] = self._engine(Operation.CLONE).clone(
             self._resolved, target, **kwargs
         )
@@ -2667,8 +2832,59 @@ def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
     return pa.table(columns)
 
 
+#: Operations whose `can()` shape is exactly the arguments of one call.
+_SHAPED_CALLS: dict[Operation, str] = {
+    Operation.APPEND: "append",
+    Operation.MERGE_SCHEMA: "append",
+    Operation.OVERWRITE: "overwrite",
+    Operation.REPLACE_WHERE: "overwrite",
+    Operation.SCAN: "scan",
+    Operation.TIME_TRAVEL: "scan",
+}
+
 #: The tuning options DELETE and UPDATE pass to the engine.
 _DML_OPTIONS = frozenset({"commit_metadata", "writer_properties", "max_commit_retries"})
+
+#: What every committing maintenance and ALTER call passes on: this library's
+#: commit options and delta-rs's own. A misspelt one was silently ignored when
+#: the kernel served the call and a TypeError naming a delta-rs signature
+#: when delta-rs did.
+_COMMIT_OPTIONS = frozenset(
+    {"commit_metadata", "max_commit_retries", "commit_properties", "post_commithook_properties"}
+)
+_OPTIMIZE_OPTIONS = _COMMIT_OPTIONS | {
+    "partition_filters",
+    "target_size",
+    "max_concurrent_tasks",
+    "max_spill_size",
+    "max_temp_directory_size",
+    "min_commit_interval",
+    "writer_properties",
+}
+_VACUUM_OPTIONS = _COMMIT_OPTIONS | {"enforce_retention_duration", "keep_versions"}
+_RESTORE_OPTIONS = _COMMIT_OPTIONS | {"ignore_missing_files", "protocol_downgrade_allowed"}
+_MERGE_OPTIONS = _COMMIT_OPTIONS | {
+    "source_alias",
+    "target_alias",
+    "merge_schema",
+    "error_on_type_mismatch",
+    "writer_properties",
+    "streamed_exec",
+    "max_spill_size",
+    "max_temp_directory_size",
+    "engine_info",
+}
+_REPLACE_OPTIONS = frozenset(
+    {
+        "predicate",
+        "partition_overwrite",
+        "target_file_size",
+        "writer_properties",
+        "commit_metadata",
+        "txn",
+        "max_commit_retries",
+    }
+)
 
 
 def _check_options(what: str, given: dict[str, Any], known: frozenset[str]) -> None:

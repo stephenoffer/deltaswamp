@@ -44,6 +44,14 @@ First release.
 
 ### Known limits
 
+- `convert_to_delta` refuses a hive-partitioned directory whose partition
+  values are escaped (`region=a%20b`): delta-rs records those paths unencoded
+  and the converted table cannot be read. Rewrite the data with `write_table`.
+- RESTORE through delta-rs is refused across a change to column-mapping
+  metadata (the mode, or `maxColumnId` after an ADD COLUMN): it would rewind
+  the mode or reuse column ids. Restore such tables from Databricks.
+- Adding a NOT NULL column is refused on every engine, as Databricks refuses
+  it: add it nullable, backfill, then `set_not_null()`.
 - On a kernel-only table without deletion vectors, DML is a whole-table
   rewrite bounded by `KernelEngine.rewrite_max_bytes` and refused on
   row-tracked tables, and MERGE needs the SQL fallback.
