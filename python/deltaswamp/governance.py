@@ -823,7 +823,13 @@ _STAGING_KEYS = {
     "s3.endpoint": "aws_endpoint",
     "azure.sas-token": "azure_storage_sas_key",
     "gcs.oauth-token": "google_bearer_token",
+    # The Iceberg REST spellings of the same credentials, which the UC Delta
+    # API may vend too; dropping them left the create on ambient credentials.
+    "client.region": "aws_region",
+    "gcs.oauth2.token": "google_bearer_token",
 }
+#: Iceberg names the Azure SAS per account: ``adls.sas-token.<account host>``.
+_STAGING_PREFIXED_KEYS = {"adls.sas-token.": "azure_storage_sas_key"}
 
 
 def staging_storage_options(
@@ -853,6 +859,17 @@ def staging_storage_options(
     chosen = max(creds, key=score)
     config = chosen.get("config") or {}
     options = {_STAGING_KEYS[k]: str(v) for k, v in config.items() if k in _STAGING_KEYS}
+    for key, value in config.items():
+        for prefix, name in _STAGING_PREFIXED_KEYS.items():
+            if str(key).startswith(prefix):
+                options.setdefault(name, str(value))
+    if config and not options:
+        # Nothing mapped, so the create would run on whatever ambient
+        # credentials this machine has -- another identity, or none.
+        raise DeltaSwampError(
+            f"the catalog vended a storage credential for {location} with config keys "
+            f"{sorted(config)}, none of which this layer knows how to use"
+        )
     if "azure_storage_sas_key" in options:
         from .credentials.databricks import azure_endpoint_for
 

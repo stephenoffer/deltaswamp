@@ -116,6 +116,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_table, m)?)?;
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::probe_put_if_absent, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;

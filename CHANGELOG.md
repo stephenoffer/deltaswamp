@@ -43,7 +43,27 @@ First release.
 - Hand-offs to DuckDB, Polars and Daft, and cross-catalog SQL through
   `Connection.sql`.
 
+- One storage-option merge for every engine: canonical keys, vended
+  credentials over the caller's, and the caller's region and endpoint over
+  vended guesses (docs/usage.md, "Storage options"). Azure sovereign clouds,
+  the kernel on fully qualified `abfss://` URLs without an endpoint option, and
+  the AWS China endpoint on the kernel now work.
+- Writes are refused, before any side effect, on S3-compatible stores that
+  ignore `If-None-Match` (a one-time probe; opt out with
+  `deltaswamp_skip_put_if_absent_probe`), with `aws_conditional_put=disabled`,
+  and with `AWS_S3_LOCKING_PROVIDER=dynamodb`.
+- `connect(iceberg_properties=...)`; `storage_options` reach PyIceberg and
+  Delta Sharing downloads.
+
 ### Known limits
+
+- Concurrent `create_table` on one path has exactly one winner; delta-rs used
+  to retry the loser at version 1 and replace the winner's schema. The loser
+  gets "a Delta table already exists there".
+- `wasb://` and `wasbs://` locations are refused; use `abfss://`.
+- A path table with a GCS OAuth bearer token in `storage_options` is served by
+  the kernel only: history, OPTIMIZE, VACUUM, RESTORE, MERGE and log cleanup,
+  which only delta-rs implements, are refused on it.
 
 - `convert_to_delta` refuses a hive-partitioned directory whose partition
   values are escaped (`region=a%20b`): delta-rs records those paths unencoded

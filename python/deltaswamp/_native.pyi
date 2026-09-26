@@ -130,6 +130,14 @@ def table_changes(
     not enabled at the range's endpoints or the schema changed across it.
     """
 
+def probe_put_if_absent(table_root: str, options: dict[str, str] | None = None) -> bool:
+    """Whether the store under `table_root` honours put-if-absent.
+
+    Puts one sentinel under ``_delta_log/`` twice with put-if-absent, then
+    deletes it: False if the second put succeeded (the store ignores the
+    condition) or the store has no conditional put at all.
+    """
+
 def commit_raw(
     table_root: str,
     version: int,

@@ -214,6 +214,18 @@ fn has_code(text: &str, code: &str) -> bool {
 /// input.
 pub fn classify_kernel_commit_error(err: delta_kernel::Error) -> NativeError {
     match err {
+        // object_store 0.13 can report a lost put-if-absent on Azure as a 412
+        // Precondition rather than AlreadyExists (object_store#829, fixed in
+        // 0.14). The kernel only maps AlreadyExists to a conflict, so a lost
+        // race surfaced as a raw I/O error and was never retried. Every put a
+        // commit makes is put-if-absent, so a failed precondition here means
+        // another writer took the version.
+        delta_kernel::Error::ObjectStore(delta_kernel::object_store::Error::Precondition {
+            ..
+        }) => NativeError::CommitConflict(format!(
+            "the version already exists: another writer committed it first (the store \
+             refused the put-if-absent: {err}). Re-read the snapshot and retry."
+        )),
         delta_kernel::Error::ObjectStore(_)
         | delta_kernel::Error::IOError(_)
         | delta_kernel::Error::FileNotFound(_) => NativeError::Kernel(err),
@@ -580,21 +592,33 @@ pub fn commit_raw(
     });
     match result {
         Ok(_) => Ok(version),
-        Err(delta_kernel::object_store::Error::AlreadyExists { .. }) => {
-            Err(NativeError::CommitConflict(format!(
+        Err(e) => Err(raw_put_error(e, version, table_root)),
+    }
+}
+
+/// What a failed put-if-absent of commit `version` means.
+fn raw_put_error(
+    err: delta_kernel::object_store::Error,
+    version: u64,
+    table_root: &url::Url,
+) -> NativeError {
+    use delta_kernel::object_store::Error;
+    match err {
+        // Precondition: Azure's answer to a lost put-if-absent under
+        // object_store 0.13 (object_store#829); see classify_kernel_commit_error.
+        Error::AlreadyExists { .. } | Error::Precondition { .. } => {
+            NativeError::CommitConflict(format!(
                 "version {version} already exists at {table_root}: another writer committed \
                  it first. Re-read the snapshot, recompute the actions against the new \
                  state, and commit at the next version."
-            )))
+            ))
         }
-        Err(delta_kernel::object_store::Error::NotImplemented { .. }) => {
-            Err(NativeError::Invalid(format!(
-                "the object store for {table_root} cannot do an atomic put-if-absent, so a \
-                 raw commit could silently overwrite another writer's. On S3 do not set \
-                 aws_conditional_put=disabled (the default, etag, sends If-None-Match)."
-            )))
-        }
-        Err(e) => Err(e.into()),
+        Error::NotImplemented { .. } => NativeError::Invalid(format!(
+            "the object store for {table_root} cannot do an atomic put-if-absent, so a \
+             raw commit could silently overwrite another writer's. On S3 do not set \
+             aws_conditional_put=disabled (the default, etag, sends If-None-Match)."
+        )),
+        e => e.into(),
     }
 }
 
@@ -1199,6 +1223,41 @@ mod raw_commit_tests {
         assert!(matches!(
             classify_commit_error("Invalid transaction state: append-only"),
             NativeError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn a_failed_put_precondition_is_a_commit_conflict() {
+        // object_store#829: Azure answers a lost put-if-absent with 412.
+        let err =
+            delta_kernel::Error::ObjectStore(delta_kernel::object_store::Error::Precondition {
+                path: "t/_delta_log/00000000000000000001.json".to_string(),
+                source: "412 Precondition Failed".into(),
+            });
+        assert!(matches!(
+            classify_kernel_commit_error(err),
+            NativeError::CommitConflict(_)
+        ));
+    }
+
+    #[test]
+    fn commit_raw_maps_a_failed_precondition_to_a_conflict() {
+        let root = url::Url::parse("az://c/t/").unwrap();
+        let precondition = delta_kernel::object_store::Error::Precondition {
+            path: "t/_delta_log/00000000000000000001.json".to_string(),
+            source: "412 Precondition Failed".into(),
+        };
+        assert!(matches!(
+            raw_put_error(precondition, 1, &root),
+            NativeError::CommitConflict(_)
+        ));
+        let exists = delta_kernel::object_store::Error::AlreadyExists {
+            path: "p".to_string(),
+            source: "exists".into(),
+        };
+        assert!(matches!(
+            raw_put_error(exists, 1, &root),
+            NativeError::CommitConflict(_)
         ));
     }
 

@@ -45,6 +45,7 @@ def connect(
     storage_options: dict[str, str] | None = None,
     default_catalog: str | None = None,
     default_schema: str | None = None,
+    iceberg_properties: dict[str, str] | None = None,
 ) -> Connection:
     """Open a connection.
 
@@ -67,6 +68,13 @@ def connect(
     deleted. It is off by default because
     that reroute changes latency and cost by orders of magnitude, and a silent
     reroute is exactly the kind of surprise this library exists to avoid.
+
+    `storage_options` reach every engine: the kernel and delta-rs take them as
+    object_store options (see docs/storage.md for how they merge with vended
+    credentials); Iceberg tables get their PyIceberg FileIO equivalents
+    (``s3.endpoint``, ``s3.region``, ``s3.proxy-uri``, ...), and Delta Sharing
+    downloads their ``proxy_url`` and ``timeout``. `iceberg_properties` are
+    PyIceberg catalog and FileIO properties passed verbatim, over those.
     """
     if not isinstance(allow_sql_fallback, bool):
         # The fallback costs money, so it is on only when asked for exactly.
@@ -93,13 +101,25 @@ def connect(
     # Engines for tables that are not reached by storage location. Each serves
     # only its own kind of table and refuses the rest, so registering them
     # costs nothing for a connection that never meets one.
+    from ._storage import canonical_options, http_settings, iceberg_fileio_properties
     from .engine.iceberg import IcebergEngine
     from .engine.sharing import SharingEngine
 
+    # Canonical up front, so a dict naming one setting twice is refused here
+    # rather than at the first table.
+    for cloud_scheme in ("s3://", "abfss://", "gs://"):
+        canonical_options(storage_options, cloud_scheme)
     if SharingEngine.available():
-        engines[EngineKind.SHARING] = SharingEngine()
+        http = http_settings(storage_options)
+        engines[EngineKind.SHARING] = SharingEngine(
+            proxy_url=http.get("proxy_url"),
+            **({"request_timeout": http["timeout"]} if "timeout" in http else {}),
+        )
     if IcebergEngine.available():
-        engines[EngineKind.ICEBERG] = IcebergEngine(token=token)
+        # connect()'s storage_options never reached PyIceberg: the proxy, CA,
+        # endpoint and region the other engines honour were silently ignored.
+        properties = {**iceberg_fileio_properties(storage_options), **(iceberg_properties or {})}
+        engines[EngineKind.ICEBERG] = IcebergEngine(token=token, properties=properties or None)
 
     if allow_sql_fallback:
         from .engine.sql import SqlEngine
@@ -860,7 +880,13 @@ class Connection:
             description=comment,
             engine_info=f"deltaswamp/{__version__}",
         )
-        options = {**self.storage_options, **staging.storage_options}
+        from ._storage import engine_options, store_options
+
+        # The engines' merge rule: a plain dict merge kept alias spellings side
+        # by side, and object_store chose between them at random.
+        options = store_options(
+            engine_options(self.storage_options, staging.storage_options, staging.location)
+        )
         _native.commit_raw(staging.location, 0, actions, options=options or None)
         try:
             body = json.loads(

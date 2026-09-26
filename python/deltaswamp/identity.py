@@ -30,8 +30,6 @@ _STORAGE_SCHEMES = frozenset(
         "abfss",
         "az",
         "adl",
-        "wasb",
-        "wasbs",
         "file",
         "memory",
     }
@@ -193,6 +191,13 @@ def parse_ref(
 
     if scheme in _CATALOG_SCHEMES:
         return _parse_catalog_uri(ref, scheme, default_catalog, default_schema)
+    if scheme in ("wasb", "wasbs"):
+        # Accepted here once, then refused by both engines with raw errors
+        # ("Unknown scheme: wasbs"): neither object store speaks the legacy
+        # WASB driver's scheme.
+        from ._storage import WASB_REMEDY
+
+        raise InvalidReferenceError(f"{ref!r}: {WASB_REMEDY}")
     if scheme in _STORAGE_SCHEMES:
         return TableRef(kind=RefKind.PATH, path=ref, scheme=scheme, raw=ref)
     if scheme is not None:

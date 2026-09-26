@@ -18,11 +18,13 @@ from typing import Any
 
 from .. import predicate as sqlpred
 from .._sdk import PRODUCT, sdk_version
+from .._storage import engine_options, location_refusal, store_options, write_refusal
 from .._util import commit_backoff, timestamp_ms
 from ..capability import (
     FEATURE_DEPENDENCIES,
     FEATURE_SUPPORT,
     METADATA_OPERATIONS,
+    READ_OPERATIONS,
     Capability,
     Operation,
     Support,
@@ -349,6 +351,18 @@ class KernelEngine:
                 ok=False,
                 reason="the table has no storage location, so there are no files to read",
             )
+
+        unreachable = location_refusal(table.location)
+        if unreachable is not None:
+            return Capability(operation, ok=False, reason=unreachable)
+
+        if operation not in READ_OPERATIONS and not table.is_catalog_managed:
+            unsafe = write_refusal(table.location, self._base_options, table.credential_provider)
+            if unsafe is not None:
+                # The remedy goes in the reason too: the router reports only
+                # the reasons when every engine refuses.
+                reason, remedy = unsafe
+                return Capability(operation, ok=False, reason=f"{reason}; {remedy}", remedy=remedy)
 
         # Writer-only features never block a read; only reader and
         # reader-writer features can. This asymmetry is the whole point.
@@ -1987,13 +2001,17 @@ class KernelEngine:
     expiry_warning_seconds: float = 300.0
 
     def _options(self, table: ResolvedTable, *, write: bool) -> dict[str, str]:
-        options = dict(self._base_options)
+        # Merged by the one rule every engine shares (_storage): a plain
+        # update() kept alias spellings side by side (AWS_REGION next to a
+        # vended aws_region), and object_store then chose between them in
+        # HashMap order.
+        vended = None
         if table.credential_provider is not None:
             op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
             credentials = table.credential_provider.credentials(op)
             self._warn_if_short_lived(credentials)
-            options.update(credentials.as_storage_options())
-        return options
+            vended = credentials.as_storage_options()
+        return store_options(engine_options(self._base_options, vended, table.location))
 
     def _warn_if_short_lived(self, credentials: Any) -> None:
         """Say so when the credential may not outlive the read it is about to serve.
