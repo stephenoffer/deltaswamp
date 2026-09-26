@@ -100,3 +100,9 @@ First release.
   non-UTC session zone are refused by the kernel and need the warehouse.
 - A time-travel timestamp after the latest commit reads the latest version on
   the direct engines; the warehouse refuses it.
+- VARIANT reads as JSON text on every engine and writes take JSON text. A
+  VARIANT nested in a struct or array is left in the engine's own form, and a
+  table with `delta.enableVariantShredding` (every new Databricks VARIANT
+  table) reads its VARIANT columns only through the warehouse.
+- A DEFAULT that is not a plain literal is evaluated only by Databricks, so a
+  write that leaves such a column out needs the SQL fallback.

@@ -183,6 +183,106 @@ def _column_path(column: Any, what: str) -> str:
     )
 
 
+def _column_default(field: Any) -> str | None:
+    """A column's DEFAULT expression, as Databricks records it in the field metadata."""
+    raw = (field.metadata or {}).get(b"CURRENT_DEFAULT")
+    return raw.decode() if raw is not None else None
+
+
+def _default_column(pa: Any, field: Any, rows: int) -> Any:
+    """The column's literal DEFAULT repeated `rows` times, or None if it is not one.
+
+    Only literals whose value does not depend on the session are evaluated:
+    strings, numbers, booleans, NULL and dates. A TIMESTAMP literal is read in
+    the session time zone, and a function call is Databricks' to evaluate.
+    """
+    from .predicate import Literal, PredicateError, parse_value
+
+    text = _column_default(field)
+    if text is None:
+        return None
+    try:
+        value = parse_value(text)
+    except PredicateError:
+        return None
+    if not isinstance(value, Literal) or value.type not in (
+        "string",
+        "long",
+        "decimal",
+        "boolean",
+        "null",
+        "date",
+    ):
+        return None
+    try:
+        return pa.array([value.value] * rows).cast(field.type, safe=True)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError, TypeError):
+        return None
+
+
+#: The features that let a table hold VARIANT columns.
+_VARIANT_FEATURES: frozenset[str] = frozenset({"variantType", "variantType-preview"})
+
+
+def _variant_text_stream(stream: Any) -> Any:
+    """A direct engine's stream with its VARIANT columns as JSON text."""
+    import pyarrow as pa
+
+    from ._variant import is_variant_struct, json_column
+
+    reader = (
+        stream.to_reader()
+        if isinstance(stream, pa.Table)
+        else stream
+        if isinstance(stream, pa.RecordBatchReader)
+        else pa.RecordBatchReader.from_stream(stream)
+    )
+    schema = reader.schema
+    indices = [i for i, f in enumerate(schema) if is_variant_struct(pa, f.type)]
+    if not indices:
+        return reader
+    target = schema
+    for i in indices:
+        target = target.set(i, pa.field(schema.field(i).name, pa.string()))
+
+    def batches() -> Any:
+        for batch in reader:
+            arrays = list(batch.columns)
+            for i in indices:
+                arrays[i] = json_column(pa, arrays[i])
+            yield pa.RecordBatch.from_arrays(arrays, schema=target)
+
+    return pa.RecordBatchReader.from_batches(target, batches())
+
+
+def _shredded_variant_error(exc: Exception) -> Exception | None:
+    """The kernel's failure on a shredded VARIANT file, as a refusal naming the way out."""
+    if "shredded" not in str(exc).lower():
+        return None
+    return EngineLimitError(
+        "read a VARIANT column",
+        "the file holds shredded VARIANT values, which neither direct engine decodes "
+        f"({type(exc).__name__}: {str(exc).splitlines()[0][:160]})",
+        "read the other columns (columns=[...]), or ds.connect(..., allow_sql_fallback=True) "
+        "to read through a SQL warehouse",
+    )
+
+
+def _is_plain_primitive(arrow_type: Any) -> bool:
+    """Not a struct, list or map: a type no collation can hide inside."""
+    import pyarrow as pa
+
+    t = pa.types
+    return not (
+        t.is_struct(arrow_type)
+        or t.is_list(arrow_type)
+        or t.is_large_list(arrow_type)
+        or t.is_map(arrow_type)
+        or getattr(t, "is_list_view", lambda _: False)(arrow_type)
+        or t.is_fixed_size_list(arrow_type)
+    )
+
+
 def _check_predicate(predicate: Any, what: str) -> None:
     """Refuse a blank predicate rather than let an engine read it as 'every row'.
 
@@ -750,7 +850,8 @@ class Table:
             needs |= self._expression_needs(get("predicate"), get("updates"))
         elif op in (Operation.SCAN, Operation.TIME_TRAVEL):
             if get("predicate") is not None:
-                needs.add("predicates")
+                needs |= self._predicate_needs(get("predicate"))
+            needs |= self._variant_needs(get("columns"), get("predicate"))
             if get("timestamp") is not None:
                 needs.add("timestamp_travel")
             if (
@@ -771,6 +872,91 @@ class Table:
             if isinstance(columns, str) and columns.lower() == "auto":
                 needs.add("auto_clustering")
         return op, frozenset(needs)
+
+    def _predicate_needs(self, predicate: Any) -> set[str]:
+        """``predicates``, and whether the predicate is clear of collated columns.
+
+        On a table with collations the router keeps predicates off the direct
+        engines, which compare bytes. That is only needed when the predicate
+        reads a collated column, so one that provably does not (``id = 1``) is
+        marked ``collation_free`` and may still be served directly. A column
+        nested in a struct, list or map counts as collated: the collation of a
+        nested field lives on its parent and does not reach the Arrow schema.
+        """
+        needs = {"predicates"}
+        table = self._enrich()
+        if not table.features & {"collations", "collations-preview"}:
+            return needs
+        from .predicate import columns_of, parse
+
+        try:
+            paths = columns_of(parse(predicate))
+            fields = {f.name.lower(): f for f in self.schema()}
+        except Exception:
+            # Unparseable here or no schema: keep the conservative answer, and
+            # let the engine that serves the call report its own error.
+            return needs
+        for path in paths:
+            field = fields.get(path[0].lower())
+            if field is None or len(path) > 1 or not _is_plain_primitive(field.type):
+                return needs
+            if b"__COLLATIONS" in (field.metadata or {}):
+                return needs
+        needs.add("collation_free")
+        return needs
+
+    def _variant_needs(self, columns: Any, predicate: Any) -> set[str]:
+        """``variant_free`` when a read on a variant-shredding table skips every VARIANT column.
+
+        Such a table is kept off the direct engines, which cannot decode a
+        shredded file; a read of its other columns never opens one, so a
+        ``count()`` or a projection still reads directly.
+        """
+        from .router import shreds_variants
+
+        if not isinstance(columns, list | tuple) or not shreds_variants(self._enrich()):
+            return set()
+        try:
+            variants = {n.lower() for n in self._variant_names(self._raw_schema())}
+            wanted = {str(c).lower() for c in columns}
+            if predicate is not None:
+                from .predicate import columns_of, parse
+
+                wanted |= {path[0].lower() for path in columns_of(parse(predicate))}
+        except Exception:
+            return set()
+        return set() if wanted & variants else {"variant_free"}
+
+    def _variant_input(self, engine: Any, data: Any) -> Any:
+        """JSON text bound for a VARIANT column, encoded for a direct engine.
+
+        Reads give VARIANT as JSON text, so that is what a write takes back.
+        The warehouse parses it itself (``parse_json``); the kernel and
+        delta-rs write the binary encoding, which is built here. Data already
+        in that binary shape passes through, and so does a stream.
+        """
+        if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
+            return data
+        if not self._enrich().features & _VARIANT_FEATURES:
+            return data
+        try:
+            import pyarrow as pa
+        except ImportError:
+            return data
+        if not isinstance(data, pa.Table):
+            return data
+        from ._variant import variant_column
+
+        variants = {n.lower() for n in self._variant_names(self._raw_schema())}
+        for index, field in enumerate(data.schema):
+            if field.name.lower() in variants and (
+                pa.types.is_string(field.type)
+                or pa.types.is_large_string(field.type)
+                or pa.types.is_null(field.type)
+            ):
+                column = variant_column(pa, data.column(index).cast(pa.string()))
+                data = data.set_column(index, pa.field(field.name, column.type), column)
+        return data
 
     def _engine(
         self,
@@ -888,9 +1074,10 @@ class Table:
         # so say so up front instead of letting one accept and then raise.
         needs = set()
         if predicate is not None:
-            needs.add("predicates")
+            needs |= self._predicate_needs(predicate)
         if timestamp is not None:
             needs.add("timestamp_travel")
+        needs |= self._variant_needs(columns, predicate)
 
         def scan(engine: Any) -> Any:
             stream = engine.scan(
@@ -903,12 +1090,15 @@ class Table:
             )
             if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
                 return stream
+            if self._enrich().features & _VARIANT_FEATURES:
+                # The warehouse sends VARIANT as JSON text; so does this.
+                stream = _variant_text_stream(stream)
             # A file VACUUM (or a manual delete) removed fails only once reading
             # reaches it, as a bare OSError/ArrowInvalid; name it instead.
             where = self._resolved.location or str(self._resolved.ref)
             at = version if version is not None else timestamp
             context = f"{where}" + (f" at {at}" if at is not None else "")
-            return translating_stream(stream, context)
+            return translating_stream(stream, context, _shredded_variant_error)
 
         return self._read(op, scan, frozenset(needs))
 
@@ -1065,15 +1255,53 @@ class Table:
         }
         missing = [f for f in target if f.name not in names and f.name not in computed]
         partitions = set(resolved.partition_columns)
+        # A left-out column with a DEFAULT gets the default, as in Databricks,
+        # not a null. A literal default is filled in here, for every engine; any
+        # other (current_timestamp()) is left out for the warehouse to apply,
+        # and `_default_needs` keeps such a write off the direct engines.
+        fills: dict[str, Any] = {}
+        for field in missing:
+            if _column_default(field) is not None:
+                fills[field.name] = _default_column(pa, field, data.num_rows)
+        missing = [f for f in missing if _column_default(f) is None]
         for field in missing:
             # A left-out partition column is almost always a mistake (and a
             # dynamic overwrite derives its partitions from the data), so it
             # is never filled; nor is a required column. The engine refuses.
             if not field.nullable or field.name in partitions:
                 return data
+        for field in target:
+            filled = fills.get(field.name)
+            if filled is not None:
+                data = data.append_column(field, filled)
         for field in missing:
             data = data.append_column(field, pa.nulls(data.num_rows, field.type))
         return data
+
+    def _default_needs(self, data: Any) -> frozenset[str]:
+        """``sql_column_defaults`` when the data leaves out a column only SQL can default.
+
+        `_align` fills in a literal DEFAULT; one still missing after it is not
+        a plain literal (``current_timestamp()``), or the batch could not be
+        aligned, and has to be evaluated by Databricks. A direct engine would
+        write a null in its place, so the write is refused there instead.
+        """
+        if not self._enrich().writer_features & {"allowColumnDefaults"}:
+            return frozenset()
+        names = getattr(data, "column_names", None)
+        if names is None:
+            return frozenset()
+        try:
+            target = self.schema()
+        except DeltaSwampError:
+            return frozenset()
+        present = {str(n).lower() for n in names}
+        if any(
+            field.name.lower() not in present and _column_default(field) is not None
+            for field in target
+        ):
+            return frozenset({"sql_column_defaults"})
+        return frozenset()
 
     def _check_writable(self, what: str) -> None:
         """Refuse a write through a handle opened at a past version.
@@ -1245,7 +1473,7 @@ class Table:
         version = self._travel_version(version, timestamp)
         needs = {"distributed_scan"}
         if predicate is not None:
-            needs.add("predicates")
+            needs |= self._predicate_needs(predicate)
         if timestamp is not None:
             needs.add("timestamp_travel")
         travelling = version is not None or timestamp is not None
@@ -1506,7 +1734,9 @@ class Table:
         ):
             return None
         try:
-            snapshot = getattr(self._engine(Operation.TIME_TRAVEL), "snapshot", None)
+            snapshot = getattr(
+                self._engine(Operation.TIME_TRAVEL, frozenset({"variant_free"})), "snapshot", None
+            )
             if snapshot is None:
                 return None
             high = end if end is not None else int(snapshot(self._resolved).version)
@@ -1605,9 +1835,49 @@ class Table:
     # -------------------------------------------------------------- metadata
 
     def schema(self) -> Any:
-        """The table's Arrow schema, as a ``pyarrow.Schema`` when pyarrow is installed."""
+        """The table's Arrow schema, as a ``pyarrow.Schema`` when pyarrow is installed.
+
+        A VARIANT column is ``string``: reads return it as JSON text on every
+        engine, and writes take JSON text (see `deltaswamp._variant`).
+        """
+        schema = self._raw_schema()
+        variants = self._variant_names(schema)
+        if not variants:
+            return schema
+        import pyarrow as pa
+
+        return pa.schema(
+            [f.with_type(pa.string()) if f.name in variants else f for f in schema],
+            metadata=schema.metadata,
+        )
+
+    def _variant_names(self, schema: Any) -> frozenset[str]:
+        """The top-level VARIANT columns of an Arrow schema the log produced.
+
+        The kernel gives a VARIANT column as a bare ``struct<metadata, value>``
+        with no marker of its own, so a column of that shape on a table with
+        the variantType feature is taken as one.
+        """
+        if not self._enrich().features & _VARIANT_FEATURES:
+            return frozenset()
+        try:
+            import pyarrow as pa
+        except ImportError:
+            return frozenset()
+        from ._variant import is_variant_struct
+
+        if not isinstance(schema, pa.Schema):
+            return frozenset()
+        return frozenset(f.name for f in schema if is_variant_struct(pa, f.type))
+
+    def _raw_schema(self) -> Any:
+        """The schema as the engines read and write it (VARIANT as its binary struct)."""
         pinned = self._version is not None
-        engine = self._engine(Operation.TIME_TRAVEL if pinned else Operation.SCAN)
+        # Learning the schema reads the log, not a data file, so a table whose
+        # VARIANT files are shredded still answers it directly.
+        engine = self._engine(
+            Operation.TIME_TRAVEL if pinned else Operation.SCAN, frozenset({"variant_free"})
+        )
         snapshot = getattr(engine, "snapshot", None)
         if snapshot is not None:
             schema = snapshot(self._resolved, version=self._version).schema()
@@ -1847,25 +2117,25 @@ class Table:
             needs = self._write_needs(
                 schema_mode, commit_metadata, txn, writer_properties, "static"
             )
-            needs |= self._data_needs(data, partition_by)
+            needs |= self._data_needs(data, partition_by) | self._default_needs(data)
             op = Operation.MERGE_SCHEMA if schema_mode == "merge" else Operation.APPEND
-            try:
-                self._raced_append(
-                    lambda data=data, op=op, needs=needs: self._engine(op, needs).append(
-                        self._resolved,
-                        data,
-                        schema_mode=schema_mode,
-                        partition_by=partition_by,
-                        target_file_size=target_file_size,
-                        writer_properties=writer_properties,
-                        commit_metadata=commit_metadata,
-                        txn=txn,
-                        max_commit_retries=max_commit_retries,
-                    ),
-                    data,
-                    txn,
-                    max_commit_retries,
+
+            def write(data: Any = data, op: Operation = op, needs: Any = needs) -> None:
+                engine = self._engine(op, needs)
+                engine.append(
+                    self._resolved,
+                    self._variant_input(engine, data),
+                    schema_mode=schema_mode,
+                    partition_by=partition_by,
+                    target_file_size=target_file_size,
+                    writer_properties=writer_properties,
+                    commit_metadata=commit_metadata,
+                    txn=txn,
+                    max_commit_retries=max_commit_retries,
                 )
+
+            try:
+                self._raced_append(write, data, txn, max_commit_retries)
                 break
             except Exception as exc:
                 # A column added by another writer between lining the batch up
@@ -1990,6 +2260,8 @@ class Table:
             schema_mode, commit_metadata, txn, writer_properties, partition_overwrite
         )
         needs |= self._data_needs(data) | self._expression_needs(predicate)
+        if schema_mode != "overwrite":
+            needs |= self._default_needs(data)
         op = (
             Operation.REPLACE_WHERE
             if (predicate is not None or partition_overwrite == "dynamic")
@@ -1998,22 +2270,24 @@ class Table:
         from .errors import CommitConflictError
 
         for attempt in range(_REALIGN_ATTEMPTS):
-            try:
-                self._backfilled(
-                    lambda data=data: self._engine(op, needs).overwrite(
-                        self._resolved,
-                        data,
-                        predicate=predicate,
-                        partition_overwrite=partition_overwrite,
-                        schema_mode=schema_mode,
-                        target_file_size=target_file_size,
-                        writer_properties=writer_properties,
-                        commit_metadata=commit_metadata,
-                        txn=txn,
-                        max_commit_retries=max_commit_retries,
-                    ),
-                    data,
+
+            def write(data: Any = data) -> None:
+                engine = self._engine(op, needs)
+                engine.overwrite(
+                    self._resolved,
+                    self._variant_input(engine, data),
+                    predicate=predicate,
+                    partition_overwrite=partition_overwrite,
+                    schema_mode=schema_mode,
+                    target_file_size=target_file_size,
+                    writer_properties=writer_properties,
+                    commit_metadata=commit_metadata,
+                    txn=txn,
+                    max_commit_retries=max_commit_retries,
                 )
+
+            try:
+                self._backfilled(write, data)
                 break
             except CommitConflictError:
                 # Lost to a writer that committed this very txn: already done.
@@ -2252,7 +2526,9 @@ class Table:
 
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
             engine = self._engine(Operation.MERGE, needs, exclude=exclude)
-            builder = engine.merge(self._resolved, source, predicate, **kwargs)
+            builder = engine.merge(
+                self._resolved, self._variant_input(engine, source), predicate, **kwargs
+            )
             return builder, getattr(engine, "kind", None)
 
         builder, kind = build(frozenset())
@@ -2916,6 +3192,7 @@ class Table:
 
 def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
     """The kernel's file listing in delta-rs's flattened, logical-name layout."""
+    import decimal
     import json
 
     names = set(files.column_names)
@@ -2937,7 +3214,13 @@ def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
                 leaves.append((p, ".".join(lg), field.type))
 
     walk(list(schema), (), ())
-    stats = [json.loads(s) if s else {} for s in files.column("stats").to_pylist()]
+    # Numbers are kept exact: a DECIMAL(38, 9) bound read as a float comes back
+    # rounded, and a 38-digit integer does not fit any Arrow integer at all.
+    # `typed` narrows them to the column's own type.
+    stats = [
+        json.loads(s, parse_float=decimal.Decimal) if s else {}
+        for s in files.column("stats").to_pylist()
+    ]
     missing = object()
 
     def lookup(entry: Any, path: tuple[str, ...]) -> Any:
@@ -2948,12 +3231,22 @@ def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
         return entry
 
     def typed(values: list[Any], wanted: Any) -> Any:
+        if pa.types.is_decimal(wanted):
+            try:
+                exact = [
+                    v if v is None or isinstance(v, str) else decimal.Decimal(v) for v in values
+                ]
+                return pa.array(exact, wanted)
+            except (pa.ArrowInvalid, pa.ArrowTypeError, decimal.InvalidOperation, ValueError):
+                pass
+        else:
+            values = [float(v) if isinstance(v, decimal.Decimal) else v for v in values]
         try:
             return pa.array(values).cast(wanted)
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError, OverflowError):
             try:
                 return pa.array(values)
-            except (pa.ArrowInvalid, pa.ArrowTypeError):
+            except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
                 return pa.array([None if v is None else str(v) for v in values], pa.string())
 
     columns: dict[str, Any] = {

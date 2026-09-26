@@ -706,7 +706,20 @@ class KernelEngine:
             # raise it mid-iteration, past the point of any retry.
             import pyarrow as pa
 
-            return pa.table(stream)
+            try:
+                return pa.table(stream)
+            except pa.ArrowInvalid as exc:
+                if "shredded" not in str(exc).lower():
+                    raise
+                # A limit of this engine, not of the request: Table moves on to
+                # the warehouse if there is one, and otherwise says why.
+                raise EngineLimitError(
+                    "read a VARIANT column",
+                    "a data file holds shredded VARIANT values, which the kernel does not "
+                    f"decode ({str(exc).splitlines()[0][:160]})",
+                    "read the other columns (columns=[...]), or ds.connect(..., "
+                    "allow_sql_fallback=True) to read through a SQL warehouse",
+                ) from exc
         return stream
 
     def _scan(
