@@ -31,11 +31,12 @@ ray = ["ray[data]>=2.58.0"]
 sql = ["pyarrow>=17"]   # the warehouse fallback speaks the Statement Execution API via databricks-sdk
 hms = ["pymetastore>=0.4.0"]
 glue = ["boto3>=1.35"]
-iceberg = ["pyiceberg>=0.12.0"]             # managed Iceberg via the UC IRC endpoint
+iceberg = ["pyiceberg>=0.12.0", "pyarrow>=17"]   # managed Iceberg via the UC IRC endpoint; scans are Arrow
 sharing = ["delta-sharing>=1.4.1"]
 pyarrow = ["pyarrow>=17"]
-pandas = ["pandas>=2"]
-polars = ["polars>=1.39"]
+# to_pandas/to_polars convert through a pyarrow Table.
+pandas = ["pandas>=2", "pyarrow>=17"]
+polars = ["polars>=1.39", "pyarrow>=17"]
 # pytz: DuckDB imports it to hand TIMESTAMP WITH TIME ZONE values to Python
 # (fetchall/fetchone), and fails "Required module 'pytz' failed to import"
 # on every tz-aware Delta timestamp column without it.

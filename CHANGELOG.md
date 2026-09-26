@@ -71,3 +71,17 @@ First release.
   deltaswamp is registered. Reads are unaffected.
 - Idempotent writes are checked against the last committed version before
   writing, so a concurrent writer can still commit in between.
+- Identity and default columns are created only through Databricks (a catalog
+  name with the SQL fallback); locally both engines refuse them, since neither
+  assigns the values. Generated columns are created by delta-rs, which
+  evaluates them; the kernel refuses to create or write them.
+- Tables written through delta-rs keep no min/max statistics for decimal
+  columns of more than 15 digits (or structs holding one): delta-rs would log
+  them as rounded doubles, which Databricks trusts for data skipping. Files
+  written before this change may still carry such stats.
+- A binary partition column is written by the kernel only, as UTF-8 text; a
+  value that is not valid UTF-8 is refused. An empty-string partition value is
+  written as null, as Spark does.
+- A local path containing `%xx` or a backslash is refused at create; one with
+  `[`, `]`, `|` or `^` is written through the kernel. Schema evolution on a
+  column-mapped table needs the warehouse.

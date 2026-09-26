@@ -197,6 +197,9 @@ class ResolvedTable:
     has_invariants: bool = False
     has_check_constraints: bool = False
     has_generated_columns: bool = False
+    #: A partition column of type binary. delta-rs serialises such values in
+    #: a form no other engine here reads back (b"ab" -> "\\u0061\\u0062").
+    has_binary_partitions: bool = False
 
     # Set when reading the log failed on every engine. The router then refuses
     # direct-storage operations with this as the reason, instead of routing on

@@ -40,7 +40,7 @@ from ..capability import (
     TableFeature,
     feature_from_wire,
 )
-from ..errors import UnreachableTableError
+from ..errors import DeltaSwampError, UnreachableTableError
 
 __all__ = [
     "Change",
@@ -275,6 +275,49 @@ def _walk(datatype: Any) -> Iterable[dict[str, Any]]:
     elif kind == "map":
         yield from _walk(datatype["keyType"])
         yield from _walk(datatype["valueType"])
+
+
+#: Column metadata keys (or key prefixes, ending in ".") and the writer
+#: feature a table whose schema carries one must support. Readers take the
+#: protocol, not the metadata, as the word on what a column means: a
+#: generation expression on a table without generatedColumns is just a
+#: string, so every writer is free to store any value in that column.
+_COLUMN_FEATURES: tuple[tuple[str, str], ...] = (
+    (_GENERATION, "generatedColumns"),
+    ("delta.identity.", "identityColumns"),
+    ("CURRENT_DEFAULT", "allowColumnDefaults"),
+    ("delta.invariants", "invariants"),
+)
+
+
+def column_features(schema: Mapping[str, Any]) -> set[str]:
+    """Writer features the column metadata of a Delta schema declares."""
+    found: set[str] = set()
+    for f in _walk(dict(schema)):
+        for key in f.get("metadata") or {}:
+            for marker, feature in _COLUMN_FEATURES:
+                if key == marker or (marker.endswith(".") and key.startswith(marker)):
+                    found.add(feature)
+    return found
+
+
+def create_schema_features(schema: Any) -> set[str] | None:
+    """Features a create's schema needs, from its types and column metadata.
+
+    None when the schema cannot be inspected here (no pyarrow, or a Delta
+    schema object): the engine then works on it unchecked, as before.
+    """
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return None
+    if not isinstance(schema, pa.Schema):
+        return None
+    try:
+        delta = arrow_to_delta_schema(schema)
+    except DeltaSwampError:
+        return None
+    return column_features(delta) | _type_features(delta)
 
 
 def _physical_name(f: Mapping[str, Any]) -> str:
@@ -639,6 +682,15 @@ def _require_column_mapping(state: TableState, operation: str) -> None:
             "without it the column's name is also its name in every Parquet file",
             "set_properties({'delta.columnMapping.mode': 'name'}) first",
         )
+    if "columnMapping" not in supported_features(state.protocol):
+        # The property without the feature: writers keep logical names in the
+        # data files, so a rename would orphan the column's data.
+        raise _refuse(
+            operation,
+            "the table sets delta.columnMapping.mode, but its protocol does not support "
+            "the columnMapping feature, so its data files are keyed by logical column names",
+            "rewrite the table into a new one created with column mapping",
+        )
 
 
 # ------------------------------------------------------------------ operations
@@ -955,6 +1007,129 @@ _TYPE_ALIASES = {
     "numeric": "decimal",
     "dec": "decimal",
 }
+
+
+#: SQL and Arrow spellings of Delta's primitive types, for `{name: type}`.
+_TYPE_NAME_ALIASES = {
+    **_TYPE_ALIASES,
+    "bool": "boolean",
+    "varchar": "string",
+    "char": "string",
+    "text": "string",
+    "int64": "long",
+    "int32": "integer",
+    "int16": "short",
+    "int8": "byte",
+    "float32": "float",
+    "float64": "double",
+    "utf8": "string",
+    "large_string": "string",
+    "timestampntz": "timestamp_ntz",
+    "date32": "date",
+}
+
+_DELTA_PRIMITIVE_NAMES = frozenset(
+    {
+        "string",
+        "long",
+        "integer",
+        "short",
+        "byte",
+        "float",
+        "double",
+        "boolean",
+        "binary",
+        "date",
+        "timestamp",
+        "timestamp_ntz",
+        "variant",
+    }
+)
+
+
+def _split_top(text: str, sep: str) -> list[str]:
+    """Split on `sep` outside <...> and (...)."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts]
+
+
+def sql_type_to_delta(text: str) -> Any:
+    """A type as written in SQL (``bigint``, ``varchar(10)``, ``array<int>``,
+    ``struct<a:int>``) or Delta's own spelling, as Delta schema JSON.
+
+    Raises ValueError naming the part it cannot read. Shared by every engine,
+    so a `{name: type}` argument means the same thing wherever it is served.
+    """
+    raw = text
+    text = text.strip()
+    lowered = text.lower()
+    for kind in ("array", "map", "struct"):
+        if lowered.startswith(kind) and lowered[len(kind) :].lstrip().startswith("<"):
+            inner = text[text.index("<") + 1 :]
+            if not inner.endswith(">"):
+                raise ValueError(f"{raw!r} has unbalanced < >")
+            inner = inner[:-1].strip()
+            if kind == "array":
+                return {
+                    "type": "array",
+                    "elementType": sql_type_to_delta(inner),
+                    "containsNull": True,
+                }
+            if kind == "map":
+                pair = _split_top(inner, ",")
+                if len(pair) != 2:
+                    raise ValueError(f"{raw!r}: a map takes a key type and a value type")
+                return {
+                    "type": "map",
+                    "keyType": sql_type_to_delta(pair[0]),
+                    "valueType": sql_type_to_delta(pair[1]),
+                    "valueContainsNull": True,
+                }
+            fields = []
+            for member in _split_top(inner, ","):
+                name, colon, member_type = member.partition(":")
+                if not colon:
+                    # `struct<a int>` is also accepted by Spark.
+                    name, _, member_type = member.partition(" ")
+                name = name.strip().strip("`")
+                if not name or not member_type.strip():
+                    raise ValueError(f"{raw!r}: struct member {member!r} needs a name and a type")
+                fields.append(
+                    {
+                        "name": name,
+                        "type": sql_type_to_delta(member_type),
+                        "nullable": True,
+                        "metadata": {},
+                    }
+                )
+            return {"type": "struct", "fields": fields}
+    compact = lowered.replace(" ", "")
+    head, paren, args = compact.partition("(")
+    head = _TYPE_NAME_ALIASES.get(head, head)
+    if head == "decimal":
+        if not paren:
+            return "decimal(10,0)"
+        match = re.fullmatch(r"(\d+)(?:,(\d+))?\)", args)
+        if match is None:
+            raise ValueError(f"{raw!r} is not a decimal type")
+        precision, scale = int(match.group(1)), int(match.group(2) or 0)
+        if not 0 < precision <= 38 or scale > precision:
+            raise ValueError(f"{raw!r} is outside Delta's decimal range (precision 1-38)")
+        return f"decimal({precision},{scale})"
+    if paren and head == "string":
+        return "string"  # varchar(n) / char(n): Delta stores a plain string
+    if not paren and head in _DELTA_PRIMITIVE_NAMES:
+        return head
+    raise ValueError(f"{raw!r} is not a Delta or SQL type")
 
 
 def _normalise_type(name: str) -> str:
@@ -1772,6 +1947,9 @@ def initial_actions(
     column_mapping = config.get(_CM_MODE, "none").lower() in ("name", "id")
     _check_names(_fields(schema), "create the table", column_mapping=column_mapping)
     features |= _type_features(schema)
+    # Generated, identity and default columns (and invariants) only mean
+    # anything under their feature; left out, the next writer stores any value.
+    features |= column_features(schema)
     if column_mapping:
         features.add("columnMapping")
         last = _assign_ids(_fields(schema), 1, physical=lambda _f: f"col-{uuid.uuid4()}")

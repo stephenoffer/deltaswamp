@@ -387,6 +387,12 @@ class Router:
             if missing:
                 reasons.append(f"{kind.value}: does not support {', '.join(missing)}")
                 continue
+            # A need the engine has in general but not for this table.
+            need_refusal = getattr(engine, "need_refusal", None)
+            refused = need_refusal(needs, table) if needs and need_refusal else None
+            if refused is not None:
+                reasons.append(f"{kind.value}: {refused}")
+                continue
 
             if "predicates" in needs and kind in _DIRECT_ENGINES and table.features & _COLLATIONS:
                 # A wrong answer, not an error: both engines compare bytes, so

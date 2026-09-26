@@ -439,8 +439,11 @@ class IcebergEngine:
 
     @staticmethod
     def available() -> bool:
+        # pyarrow too: PyIceberg installs without it, and every scan then
+        # failed with a raw ModuleNotFoundError after supports() said yes.
         try:
             importlib.import_module("pyiceberg.catalog")
+            importlib.import_module("pyarrow")
         except ImportError:
             return False
         return True
@@ -450,7 +453,7 @@ class IcebergEngine:
             return Capability(
                 operation,
                 ok=False,
-                reason="the pyiceberg package is not installed",
+                reason="the pyiceberg package (with pyarrow) is not installed",
                 remedy="pip install 'deltaswamp[iceberg]'",
             )
 

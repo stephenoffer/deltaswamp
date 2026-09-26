@@ -154,6 +154,13 @@ _USAGE_GATED: dict[TableFeature, tuple[str, str]] = {
     ),
 }
 
+#: Features a create's column metadata can call for that the kernel's
+#: CREATE TABLE refuses to declare (`delta.feature.X` is rejected at create,
+#: and invariants fail schema validation).
+_CREATE_UNDECLARABLE: frozenset[str] = frozenset(
+    {"generatedColumns", "identityColumns", "allowColumnDefaults", "invariants"}
+)
+
 _IMPLEMENTED: frozenset[Operation] = frozenset(
     {
         Operation.SCAN,
@@ -525,6 +532,22 @@ class KernelEngine:
                     reason=(
                         "the kernel cannot handle these table properties at create: "
                         + ", ".join(sorted(unusable))
+                    ),
+                )
+            declared = sorted(
+                (meta.create_schema_features(shape.get("schema")) or set()) & _CREATE_UNDECLARABLE
+            )
+            if declared:
+                # delta-kernel 0.28 refuses these features at CREATE, and left
+                # to itself committed the column metadata without them: a
+                # table whose generation expressions nothing enforces.
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason=(
+                        "the schema's column metadata needs the "
+                        + ", ".join(declared)
+                        + " feature, which the kernel cannot declare when it creates a table"
                     ),
                 )
 
@@ -1361,6 +1384,17 @@ class KernelEngine:
                 reason="the table has the change data feed enabled, and the kernel cannot "
                 "write the CDC files a commit that removes data must carry",
             )
+        if table.has_generated_columns:
+            # Normally refused by the generatedColumns feature itself; this
+            # covers the tables an earlier create left with the expressions but
+            # not the feature, where the kernel wrote whatever it was given.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table schema declares generated columns, whose values the "
+                "kernel writer neither computes nor checks",
+                remedy="write through delta-rs, which evaluates them",
+            )
         if (writer == 2 or "invariants" in table.writer_features) and self._has_invariants(table):
             return Capability(
                 operation,
@@ -1808,6 +1842,24 @@ class KernelEngine:
                 ),
                 remedy="t.set_properties({'delta.columnMapping.mode': 'name'}) first",
             )
+        if (
+            operation in (Operation.DROP_COLUMN, Operation.RENAME_COLUMN)
+            and "columnMapping" not in table.effective_writer_features
+        ):
+            # The mode alone is not column mapping: a protocol without the
+            # feature tells every writer to use logical names in the Parquet
+            # files (delta-rs's create once wrote exactly such tables), and a
+            # rename then read the renamed column back as NULL.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table sets delta.columnMapping.mode, but its protocol does not "
+                    "support the columnMapping feature, so its data files are keyed by "
+                    "logical column names and renaming or dropping one would lose its data"
+                ),
+                remedy="rewrite the table into a new one created with column mapping",
+            )
 
         if operation is Operation.CLUSTER_BY and table.partition_columns:
             return Capability(
@@ -2035,7 +2087,9 @@ class KernelEngine:
         if it has been written to since. Files the predicate's statistics rule
         out are not planned at all.
         """
-        import pyarrow as pa
+        from ..table import _require
+
+        pa = _require("pyarrow", "pyarrow", "plan_scan")
 
         from .base import DeletionVectorDescriptor, ScanSplit
 
@@ -2609,6 +2663,10 @@ def _library_commit_errors() -> Iterator[None]:
 _BAD_DATA_MARKERS = (
     "that are not in the table schema",
     "cannot be written as the table's type",
+    # A null in a NOT NULL column.
+    "Found unmasked nulls for non-nullable",
+    # Kernel writes binary partition values as text, so they must be UTF-8.
+    "binary partition value is not valid UTF-8",
 )
 
 
@@ -2689,6 +2747,7 @@ def _feature_usage(snapshot: Any) -> dict[str, bool]:
         "has_invariants": False,
         "has_check_constraints": False,
         "has_generated_columns": False,
+        "has_binary_partitions": False,
     }
     properties = snapshot.table_properties() or {}
     usage["has_check_constraints"] = any(
@@ -2707,6 +2766,14 @@ def _feature_usage(snapshot: Any) -> dict[str, bool]:
     found = _field_metadata_keys(schema.get("fields") or [])
     usage["has_invariants"] = "delta.invariants" in found
     usage["has_generated_columns"] = "delta.generationExpression" in found
+    columns = metadata.get("partitionColumns") or metadata.get("partition_columns") or []
+    partitions = {str(c).lower() for c in columns}
+    usage["has_binary_partitions"] = any(
+        isinstance(f, dict)
+        and str(f.get("name", "")).lower() in partitions
+        and f.get("type") == "binary"
+        for f in schema.get("fields") or []
+    )
     return usage
 
 
@@ -2764,68 +2831,23 @@ def _delta_fields(fields: Any) -> list[dict[str, Any]]:
     return out
 
 
-_DELTA_PRIMITIVES = frozenset(
-    {
-        "string",
-        "long",
-        "integer",
-        "short",
-        "byte",
-        "float",
-        "double",
-        "boolean",
-        "binary",
-        "date",
-        "timestamp",
-        "timestamp_ntz",
-    }
-)
-_SQL_ALIASES = {
-    "bigint": "long",
-    "int": "integer",
-    "smallint": "short",
-    "tinyint": "byte",
-    "bool": "boolean",
-    "real": "float",
-    "varchar": "string",
-    "char": "string",
-    "text": "string",
-    "int64": "long",
-    "int32": "integer",
-    "int16": "short",
-    "int8": "byte",
-    "float32": "float",
-    "float64": "double",
-    "utf8": "string",
-    "large_string": "string",
-    "timestampntz": "timestamp_ntz",
-    "date32": "date",
-}
-
-
 def _delta_type(name: str, dtype: Any) -> Any:
     """A Delta schema type from a `{name: type}` value, or a refusal."""
-    import re
-
     if isinstance(dtype, dict):
         return dtype  # already Delta JSON (struct, array, map)
     if not isinstance(dtype, str):
         from .metadata import arrow_to_delta_type
 
         return arrow_to_delta_type(dtype)
-    text = dtype.strip().lower()
-    text = _SQL_ALIASES.get(text, text)
-    decimal = re.fullmatch(r"(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", text)
-    if decimal:
-        return f"decimal({int(decimal.group(1))},{int(decimal.group(2))})"
-    if text in _DELTA_PRIMITIVES:
-        return text
-    raise UnreachableTableError(
-        f"add column {name}",
-        f"{dtype!r} is not a Delta type",
-        "use a Delta primitive (long, integer, string, double, decimal(p,s), ...), "
-        "a pyarrow type, or a Delta JSON type",
-    )
+    try:
+        return meta.sql_type_to_delta(dtype)
+    except ValueError as exc:
+        raise UnreachableTableError(
+            f"add column {name}",
+            f"{dtype!r} is not a Delta type ({exc})",
+            "use a Delta or SQL type (long, bigint, string, decimal(p,s), array<int>, ...), "
+            "a pyarrow type, or a Delta JSON type",
+        ) from exc
 
 
 def _require_pyarrow(what: str) -> None:

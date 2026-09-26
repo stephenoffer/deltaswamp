@@ -31,17 +31,21 @@ pip install deltaswamp
 
 The base install pulls in `deltalake` and `databricks-sdk` and nothing else.
 Data leaves through the Arrow PyCapsule interface, so pyarrow is optional.
+Without it, creating a table from an Arrow-exporting schema (arro3, for
+example), appends, merges, unfiltered scans, schema, history and table
+maintenance all work; the calls in the `pyarrow` row below raise an
+`ImportError` naming the extra.
 
 | Extra | Adds | You need it for |
 |---|---|---|
-| `pyarrow` | pyarrow | `to_arrow`, predicates on the kernel path, the SQL fallback |
-| `pandas` | pandas | `to_pandas` |
-| `polars` | Polars | `to_polars`, `Connection.sql(engine="polars")` |
+| `pyarrow` | pyarrow | `to_arrow`, `count`, `head`, `plan_scan`, predicates on the kernel path, `delete`/`update`/predicate `overwrite`, `create_table` with a list or dict schema, the SQL fallback |
+| `pandas` | pandas, pyarrow | `to_pandas` |
+| `polars` | Polars, pyarrow | `to_polars`, `Connection.sql(engine="polars")` |
 | `duckdb` | DuckDB | `to_duckdb`, `Connection.sql` |
 | `daft` | Daft | `to_daft` |
 | `ray` | Ray Data | `to_ray_dataset` |
 | `sql` | pyarrow | the SQL warehouse fallback (the warehouse itself is reached through `databricks-sdk`) |
-| `iceberg` | PyIceberg | Iceberg tables through Unity Catalog's Iceberg REST endpoint |
+| `iceberg` | PyIceberg, pyarrow | Iceberg tables through Unity Catalog's Iceberg REST endpoint |
 | `sharing` | `delta-sharing` | Delta Sharing |
 | `hms` | `pymetastore` | Hive Metastore catalogs |
 | `glue` | boto3 | AWS Glue catalogs |
@@ -631,6 +635,20 @@ reached.
 - The change feed of a catalog-managed table needs the warehouse.
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.
+- Identity and default columns are created only through Databricks (a catalog
+  name with the SQL fallback); locally both engines refuse them, since neither
+  assigns the values. Generated columns are created by delta-rs, which
+  evaluates them; the kernel refuses to create or write them.
+- Tables written through delta-rs keep no min/max statistics for decimal
+  columns of more than 15 digits (or structs holding one): delta-rs would log
+  them as rounded doubles, which Databricks trusts for data skipping. Files
+  written before this change may still carry such stats.
+- A binary partition column is written by the kernel only, as UTF-8 text; a
+  value that is not valid UTF-8 is refused. An empty-string partition value is
+  written as null, as Spark does.
+- A local path containing `%xx` or a backslash is refused at create; one with
+  `[`, `]`, `|` or `^` is written through the kernel. Schema evolution on a
+  column-mapped table needs the warehouse.
 - A `Table` captures catalog-managed commit state when it resolves. Re-open it
   to see commits made elsewhere.
 - External writes to UC managed Delta are Public Preview on Databricks, and
