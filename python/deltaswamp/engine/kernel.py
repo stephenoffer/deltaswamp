@@ -375,6 +375,11 @@ class KernelEngine:
             if refusal is not None:
                 return refusal
 
+        if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
+            refusal = self._add_feature_refusal(table, shape["features"])
+            if refusal is not None:
+                return refusal
+
         if operation is Operation.MERGE:
             refusal = self._merge_refusal(table)
             if refusal is not None:
@@ -2098,9 +2103,36 @@ class KernelEngine:
             table, lambda s: meta.unset_properties(s, keys, if_exists=if_exists)
         )
 
+    @staticmethod
+    def _add_feature_refusal(table: ResolvedTable, features: Any) -> Capability | None:
+        """The features this path cannot add, decided before the call as the call decides.
+
+        One the protocol already supports -- named, or implied by a legacy
+        version (writer 4 implies generatedColumns, (2, 5) columnMapping) --
+        needs nothing added, so it never blocks.
+        """
+        names = features if isinstance(features, (list, tuple, set, frozenset)) else [features]
+        have = table.effective_writer_features | table.effective_reader_features
+        blocked = []
+        for name in names:
+            wire = meta._canonical_feature(str(getattr(name, "value", name)))
+            if wire in have:
+                continue
+            if wire in meta._NOT_ADDABLE:
+                blocked.append(f"{wire} ({meta._NOT_ADDABLE[wire]})")
+            elif wire not in meta._ADDABLE_FEATURES:
+                blocked.append(f"{wire} (not a feature a metadata commit here can add)")
+        if not blocked:
+            return None
+        return Capability(
+            Operation.ADD_FEATURE,
+            ok=False,
+            reason="the kernel path cannot add " + "; ".join(blocked),
+        )
+
     def add_feature(self, table: ResolvedTable, feature: Any, **_: Any) -> int:
         names = feature if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
-        wires = {str(getattr(n, "value", n)) for n in names}
+        wires = {meta._canonical_feature(str(getattr(n, "value", n))) for n in names}
         # A feature arrives with what it depends on (rowTracking needs
         # domainMetadata), or the commit is one other engines reject.
         pending = list(wires)
@@ -2112,7 +2144,12 @@ class KernelEngine:
                     pending.append(dep.value)
 
         def mutate(state: Any) -> Any:
-            props = {f"delta.feature.{n}": "supported" for n in sorted(wires)}
+            # A feature the protocol already supports, by name or by legacy
+            # version, is a no-op, as Spark treats it -- not a refusal.
+            have = meta.supported_features(state.protocol) | set(
+                state.protocol.get("readerFeatures") or ()
+            )
+            props = {f"delta.feature.{n}": "supported" for n in sorted(wires - have)}
             return meta.set_properties(state, props)
 
         return self._commit_metadata(table, mutate)

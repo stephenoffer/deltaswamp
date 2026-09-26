@@ -208,3 +208,83 @@ class TestDeletionVectorDmlSurvivesBlindAppends:
         _race(monkeypatch, lambda: other.open_table(path).append(pa.table({"id": [1]})))
         with pytest.raises(CommitConflictError):
             conn.open_table(path).delete("id = 1")
+
+
+def _legacy_cdf_table(conn: Any, path: str) -> Any:
+    t = conn.create_table(path, pa.schema([("id", pa.int64()), ("city", pa.string())]))
+    t.append(pa.table({"id": [1], "city": ["a"]}))
+    t.set_properties({"delta.enableChangeDataFeed": "true"})
+    t = conn.open_table(path)
+    assert t.protocol() == (1, 4)
+    return t
+
+
+class TestNoAlterStrandsALegacyTable:
+    """One ALTER moved a writer-4 change-feed table to writer 7 listing
+    checkConstraints and generatedColumns (as Databricks lists them), which the
+    kernel refuses, plus a feature delta-rs cannot write: no local engine could
+    append to it again."""
+
+    @pytest.mark.parametrize(
+        "alter, shape",
+        [
+            ("cluster_by", {}),
+            ("set_properties", {"properties": {"delta.enableTypeWidening": "true"}}),
+            ("add_feature", {"features": ["typeWidening"]}),
+        ],
+    )
+    def test_refused_before_anything_is_committed(
+        self, conn: Any, tmp_path: Any, alter: str, shape: dict[str, Any]
+    ) -> None:
+        from deltaswamp.errors import UnreachableTableError
+
+        path = str(tmp_path / "t")
+        t = _legacy_cdf_table(conn, path)
+        verdict = t.can(alter, **shape)
+        assert not verdict.ok
+        assert "no local engine could write" in verdict.reason
+        with pytest.raises(UnreachableTableError, match="no local engine could write"):
+            if alter == "cluster_by":
+                t.cluster_by(["city"])
+            elif alter == "set_properties":
+                t.set_properties(shape["properties"])
+            else:
+                t.add_feature(shape["features"])
+        t = conn.open_table(path)
+        assert t.protocol() == (1, 4)
+        t.append(pa.table({"id": [2], "city": ["b"]}))
+        assert t.count() == 2
+
+    def test_a_feature_delta_rs_writes_is_still_allowed(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "t")
+        t = _legacy_cdf_table(conn, path)
+        assert t.can("add_feature", features=["deletionVectors"]).ok
+        t.add_feature("deletionVectors")
+        conn.open_table(path).append(pa.table({"id": [2], "city": ["b"]}))
+
+
+class TestAddFeatureCapabilityAgrees:
+    """can("add_feature", features=["generatedColumns"]) said "via kernel", and
+    the call refused -- even where the legacy protocol already implied it."""
+
+    def test_implied_feature_is_a_no_op(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "t")
+        t = _legacy_cdf_table(conn, path)
+        before = t.version
+        assert t.can("add_feature", features=["generatedColumns"]).ok
+        t.add_feature("generatedColumns")
+        t = conn.open_table(path)
+        assert (t.version, t.protocol()) == (before, (1, 4))
+
+    @pytest.mark.parametrize("feature", ["generatedColumns", "columnMapping"])
+    def test_unaddable_feature_is_refused_by_can(
+        self, conn: Any, tmp_path: Any, feature: str
+    ) -> None:
+        from deltaswamp.errors import UnreachableTableError
+
+        path = str(tmp_path / "t")
+        t = conn.create_table(path, pa.schema([("id", pa.int64())]))
+        verdict = t.can("add_feature", features=[feature])
+        assert not verdict.ok
+        with pytest.raises(UnreachableTableError):
+            t.add_feature(feature)
