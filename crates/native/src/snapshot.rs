@@ -453,6 +453,24 @@ impl PySnapshot {
         PyTable::try_new(vec![batch], schema)
     }
 
+    /// Which of `files` (`(path, size)` pairs, paths as `files()` reports
+    /// them) hold values a reader that does not rebase would misread: written
+    /// by Spark in its legacy hybrid calendar, or storing INT96 timestamps.
+    /// Reads only each file's footer.
+    fn legacy_calendar_files(
+        &self,
+        py: Python<'_>,
+        files: Vec<(String, u64)>,
+    ) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| -> Result<Vec<String>> {
+            Ok(crate::rebase::legacy_calendar_files(
+                &self.engine,
+                self.inner.table_root(),
+                &files,
+            )?)
+        })?)
+    }
+
     /// The current `metaData` action, as Delta-protocol JSON.
     fn metadata_json(&self) -> PyResult<String> {
         serde_json::to_string(self.inner.table_configuration().metadata())

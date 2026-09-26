@@ -733,6 +733,19 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version, timestamp=timestamp)
         return _planned_read(snapshot, columns, predicate)
 
+    def legacy_calendar_files(self, table: ResolvedTable) -> tuple[str, ...] | None:
+        """Live files a reader that does not rebase would misread; None if unknowable.
+
+        Files Spark wrote in its legacy hybrid calendar with a value the rebase
+        moves, or with INT96 timestamps old enough to overflow as nanoseconds.
+        See `engine/calendar.py`.
+        """
+        if not self.available() or not _native_has("legacy_calendar_files"):
+            return None
+        from .calendar import legacy_calendar_files
+
+        return legacy_calendar_files(self.snapshot(table))
+
     def files(
         self,
         table: ResolvedTable,
@@ -2783,6 +2796,7 @@ def _feature_usage(snapshot: Any) -> dict[str, bool]:
         "has_check_constraints": False,
         "has_generated_columns": False,
         "has_binary_partitions": False,
+        "has_datetime_columns": True,
     }
     properties = snapshot.table_properties() or {}
     usage["has_check_constraints"] = any(
@@ -2798,6 +2812,9 @@ def _feature_usage(snapshot: Any) -> dict[str, bool]:
             return usage
     if not isinstance(schema, dict):
         return usage
+    from .calendar import has_datetime_columns
+
+    usage["has_datetime_columns"] = has_datetime_columns(schema)
     found = _field_metadata_keys(schema.get("fields") or [])
     usage["has_invariants"] = "delta.invariants" in found
     usage["has_generated_columns"] = "delta.generationExpression" in found

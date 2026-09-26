@@ -176,7 +176,15 @@ Dates and timestamps before 1582-10-15 that Databricks or Spark wrote in the
 legacy hybrid calendar (Parquet files marked `org.apache.spark.legacyDateTime`)
 are rebased on the kernel path exactly as Spark rebases them, so they read as
 the warehouse shows them. Timestamps written in a session time zone other than
-UTC are refused before 1582 rather than guessed. delta-rs does not rebase.
+UTC, or in a file that does not record its zone (Spark 2.x, which Spark reads
+in the reader's session zone), are refused before 1900-01-01T00:00:00Z rather
+than guessed: until then Spark rebases them with each zone's own historical
+offsets. INT96 timestamps are decoded at microsecond precision, so values
+before 1677 read correctly. delta-rs does not rebase, so operations through
+which it would rewrite such files -- DELETE, UPDATE, MERGE, replaceWhere,
+OPTIMIZE, Z-ORDER -- are routed elsewhere (the kernel, the warehouse) or
+refused when a file holds a value the rebase moves; `can()` says so. The check
+reads a file's footer only when its statistics allow such a value.
 
 A VARIANT column reads as JSON text (`string`), as Databricks' `to_json`
 renders it, whichever engine serves the read: the warehouse can send nothing

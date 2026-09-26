@@ -299,6 +299,20 @@ _ACCESS_POLICY_FORBIDS: frozenset[Operation] = frozenset(
 )
 
 
+#: Operations through which delta-rs rewrites existing data files, copying the
+#: rows it did not change as it read them.
+_FILE_REWRITES: frozenset[Operation] = frozenset(
+    {
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.MERGE,
+        Operation.REPLACE_WHERE,
+        Operation.OPTIMIZE,
+        Operation.ZORDER,
+    }
+)
+
+
 #: DML that the kernel writes as deletion vectors when a table enables them.
 _DV_DML: frozenset[Operation] = frozenset(
     {Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE, Operation.MERGE}
@@ -474,6 +488,13 @@ class Router:
 
             judged = _exempted(kind, operation, table, shape)
             result: Capability = engine.supports(operation, judged, **shape)  # type: ignore[attr-defined]
+            if result.ok and kind is EngineKind.DELTARS and operation in _FILE_REWRITES:
+                # Asked only once delta-rs would otherwise serve: the check
+                # lists the table's files, which is wasted on a refusal.
+                shifted = self._calendar_refusal(table)
+                if shifted is not None:
+                    reasons.append(f"{kind.value}: {shifted}")
+                    continue
             if result.ok:
                 return result
             reasons.append(f"{kind.value}: {result.reason}")
@@ -492,6 +513,40 @@ class Router:
             ok=False,
             reason="; ".join(reasons) if reasons else "no engine can serve this operation",
             remedy=remedy,
+        )
+
+    def _calendar_refusal(self, table: ResolvedTable) -> str | None:
+        """Why delta-rs must not rewrite this table's files, if it must not.
+
+        delta-rs reads a file Spark wrote in its legacy hybrid calendar without
+        rebasing it, and INT96 timestamps as overflowing nanoseconds; its DML
+        and compaction then copy the rows they did not touch into new files,
+        shifted, without the footer that said so. The kernel's reads rebase
+        (and it finds the files), so its write paths and the warehouse serve
+        these tables instead.
+        """
+        if not table.has_datetime_columns:
+            return None
+        kernel = self.engines.get(EngineKind.KERNEL)
+        check = getattr(kernel, "legacy_calendar_files", None)
+        if check is None:
+            return None
+        try:
+            found = check(table)
+        except Exception as exc:
+            # Unknown is not "none": a wrong guess rewrites the table shifted.
+            return (
+                "could not check whether its data files were written in Spark's legacy "
+                f"hybrid calendar ({type(exc).__name__}: {str(exc)[:160]}), and a rewrite "
+                "through delta-rs shifts the values of any that were"
+            )
+        if not found:
+            return None
+        return (
+            f"{len(found)} data file(s) (such as {found[0]}) hold dates before 1582-10-15 or "
+            "timestamps before 1900 that Spark wrote in its legacy hybrid calendar (or as "
+            "INT96), which delta-rs reads without rebasing; this operation would copy them "
+            "into new files shifted by days, corrupting the table"
         )
 
     def engine_for(

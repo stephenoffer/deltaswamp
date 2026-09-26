@@ -200,6 +200,9 @@ class ResolvedTable:
     #: A partition column of type binary. delta-rs serialises such values in
     #: a form no other engine here reads back (b"ab" -> "\\u0061\\u0062").
     has_binary_partitions: bool = False
+    #: A DATE or TIMESTAMP column anywhere in the schema, which a file Spark
+    #: wrote in its legacy calendar may hold shifted. True until known.
+    has_datetime_columns: bool = True
 
     # Set when reading the log failed on every engine. The router then refuses
     # direct-storage operations with this as the reason, instead of routing on

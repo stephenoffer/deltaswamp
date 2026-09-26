@@ -55,6 +55,7 @@ pub const FEATURES: &[&str] = &[
     "uc_create_table_request",
     "checkpoint",
     "file_restricted_scan",
+    "legacy_calendar_files",
     // Distributed writes: workers produce data files, a coordinator commits
     // them as one transaction.
     "distributed_write",

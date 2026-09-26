@@ -726,6 +726,7 @@ class Table:
                 has_check_constraints=bool(detail.get("has_check_constraints")),
                 has_generated_columns=bool(detail.get("has_generated_columns")),
                 has_binary_partitions=bool(detail.get("has_binary_partitions")),
+                has_datetime_columns=bool(detail.get("has_datetime_columns", True)),
             )
             self._enriched = getattr(self, "_generation", 0) == generation
             return self._resolved

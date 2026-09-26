@@ -96,8 +96,14 @@ First release.
   `[`, `]`, `|` or `^` is written through the kernel. Schema evolution on a
   column-mapped table needs the warehouse.
 - delta-rs does not rebase pre-1582 dates and timestamps in files Spark wrote
-  in its legacy hybrid calendar; the kernel does. Such timestamps written in a
-  non-UTC session zone are refused by the kernel and need the warehouse.
+  in its legacy hybrid calendar; the kernel does. Timestamps before 1900 in
+  such a file written in a non-UTC session zone, or in one that records no
+  zone (Spark 2.x), are refused by the kernel and need the warehouse: Spark
+  rebases them with per-zone tables this library does not carry. DELETE,
+  UPDATE, MERGE, replaceWhere, OPTIMIZE and Z-ORDER never go to delta-rs on a
+  table holding such values (or pre-1900 INT96 timestamps), since it would
+  rewrite them shifted; they take the kernel's deletion-vector or whole-table
+  rewrite paths, or the warehouse, or are refused.
 - A time-travel timestamp after the latest commit reads the latest version on
   the direct engines; the warehouse refuses it.
 - VARIANT reads as JSON text on every engine and writes take JSON text. A

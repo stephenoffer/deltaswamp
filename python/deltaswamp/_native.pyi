@@ -13,7 +13,7 @@ FEATURES: list[str]
 
 One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
-"uc_create_table_request", "checkpoint", "file_restricted_scan",
+"uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
@@ -290,6 +290,13 @@ class Snapshot:
         if present, rows in the file are deleted and must be masked) and
         `num_records` (int64 from stats, nullable; counts rows *before* the
         deletion vector). `predicate` skips files exactly as in `scan`.
+        """
+
+    def legacy_calendar_files(self, files: list[tuple[str, int]]) -> list[str]:
+        """Which of `files` (`(path, size)`, paths as `files()` reports them)
+        a reader that does not rebase would misread: written by Spark in its
+        legacy hybrid calendar, or storing INT96 timestamps. Requires the
+        "legacy_calendar_files" feature; reads only each file's footer.
         """
 
     def metadata_json(self) -> str:

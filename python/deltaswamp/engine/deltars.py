@@ -49,6 +49,7 @@ from ..errors import (
 from ..properties import effect_for, validate_properties
 from . import metadata as meta
 from .base import merge_clause, missing_method
+from .calendar import has_datetime_columns
 
 __all__ = ["DeltaRsEngine"]
 
@@ -553,6 +554,7 @@ class DeltaRsEngine:
             "writer_features": list(protocol.writer_features or []),
             "properties": dict(metadata.configuration),
             "partition_columns": list(metadata.partition_columns),
+            "has_datetime_columns": has_datetime_columns(_delta_schema(dt)),
         }
 
     def cdf(

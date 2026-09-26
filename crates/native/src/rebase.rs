@@ -27,23 +27,44 @@
 //!   which is nearly every value in practice.
 //! * A timestamp's rebase depends on the time zone the writer used
 //!   (`org.apache.spark.timeZone`). It is computed here for UTC -- what
-//!   Databricks writes -- and a file written in any other zone that holds a
-//!   timestamp before the switch is refused rather than shifted by a guess.
+//!   Databricks writes. In any other zone Spark rebases with per-zone switch
+//!   tables that run until about 1900 (local mean time, which
+//!   `java.util.TimeZone` does not model), so a file written in another zone,
+//!   or one that does not record its zone at all (Spark reads those in the
+//!   reader's session zone), is refused if it holds a timestamp before
+//!   1900-01-01T00:00:00Z -- the same bound Spark's own warning names --
+//!   rather than shifted by a guess.
+//!
+//! INT96 timestamps are also read here at microsecond precision, whatever
+//! wrote them. Arrow decodes INT96 as nanoseconds by default, and an `i64` of
+//! nanoseconds overflows before 1677-09-21: a year-1500 value came back as
+//! 2085, so neither the value nor its rebase could be right.
 
 use std::future::Future;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, LargeListArray, ListArray, MapArray, RecordBatch, StructArray,
 };
-use arrow::datatypes::{DataType, Date32Type, TimeUnit, TimestampMicrosecondType};
+use arrow::datatypes::{
+    DataType, Date32Type, Field, FieldRef, Schema, TimeUnit, TimestampMicrosecondType,
+};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+use delta_kernel::engine::arrow_utils::{
+    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, ReorderIndex,
+    RowIndexBuilder,
+};
+use delta_kernel::engine::reader_options;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
 // ParquetObjectReader is deprecated upstream in favour of a hand-written
 // AsyncFileReader, but it is what the kernel's own default engine reads with.
+use delta_kernel::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader};
 #[allow(deprecated)]
-use delta_kernel::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+use delta_kernel::parquet::arrow::async_reader::{
+    AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+};
 use delta_kernel::parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use delta_kernel::parquet::file::metadata::ParquetMetaData;
 use delta_kernel::schema::{DataType as KernelType, PrimitiveType, SchemaRef};
@@ -66,6 +87,13 @@ const DIFF_DAYS: [i32; 14] = [2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, 
 /// 1582-10-15: from here on both calendars agree.
 const LAST_SWITCH_DAY: i32 = -141427;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
+/// 1900-01-01T00:00:00Z. Before it Spark's rebase of a timestamp written in a
+/// zone other than UTC follows that zone's own switch table; from it on, no
+/// zone's rebase moves a value (Spark warns of "timestamps before
+/// 1900-01-01T00:00:00Z" for the same reason).
+const ZONED_REBASE_LIMIT_MICROS: i64 = -2_208_988_800_000_000;
+/// Rows per batch of a file read here rather than by the kernel's reader.
+const BATCH_SIZE: usize = 1024;
 
 /// Footer keys Spark writes (see Spark's `package.scala` in `sql`).
 const SPARK_VERSION_KEY: &str = "org.apache.spark.version";
@@ -98,18 +126,39 @@ pub fn julian_to_gregorian_micros_utc(micros: i64) -> i64 {
     i64::from(rebased) * MICROS_PER_DAY + micros.rem_euclid(MICROS_PER_DAY)
 }
 
+/// The time zone a legacy file's timestamps were written in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WriterZone {
+    /// UTC, whose rebase is computed here.
+    #[default]
+    Utc,
+    /// Any other zone, by the name the footer gives.
+    Named(String),
+    /// The footer names none (Spark before 3.2): Spark rebases these in the
+    /// reader's session time zone, which a file cannot tell us.
+    Unknown,
+}
+
 /// How one file's values must be rebased.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RebaseSpec {
     pub dates: bool,
     pub timestamps: bool,
-    /// The writer's time zone when it is not UTC (timestamps only).
-    pub zone: Option<String>,
+    /// The writer's time zone (timestamps only).
+    pub zone: WriterZone,
+    /// The file stores timestamps as INT96, which must be decoded at
+    /// microsecond precision to survive values before 1677.
+    pub int96_micros: bool,
 }
 
 impl RebaseSpec {
     fn any(&self) -> bool {
         self.dates || self.timestamps
+    }
+
+    /// Whether the file must be read here rather than by the kernel's reader.
+    fn own_read(&self) -> bool {
+        self.any() || self.int96_micros
     }
 
     /// What Spark's `DataSourceUtils.datetimeRebaseSpec` / `int96RebaseSpec`
@@ -121,15 +170,8 @@ impl RebaseSpec {
                 .and_then(|kvs| kvs.iter().find(|kv| kv.key == key))
                 .map(|kv| kv.value.clone().unwrap_or_default())
         };
-        // No Spark version: not written by Spark, and so proleptic Gregorian.
-        let Some(version) = kv(SPARK_VERSION_KEY) else {
-            return Ok(Self::default());
-        };
-        // Spark compares the version strings lexicographically; so do we.
-        let legacy_datetime = version.as_str() < "3.0.0" || kv(LEGACY_DATETIME_KEY).is_some();
-        let legacy_int96 = version.as_str() < "3.1.0" || kv(LEGACY_INT96_KEY).is_some();
 
-        let (mut dates, mut int96, mut int64_ts) = (false, false, false);
+        let (mut dates, mut int96, mut int64_ts, mut int64_nanos) = (false, false, false, false);
         for column in metadata.file_metadata().schema_descr().columns() {
             match column.physical_type() {
                 PhysicalType::INT96 => int96 = true,
@@ -145,10 +187,31 @@ impl RebaseSpec {
                             ConvertedType::TIMESTAMP_MICROS | ConvertedType::TIMESTAMP_MILLIS
                         ),
                     };
+                    int64_nanos |= matches!(
+                        column.logical_type_ref(),
+                        Some(LogicalType::Timestamp(t))
+                            if matches!(t.unit, delta_kernel::parquet::basic::TimeUnit::NANOS)
+                    );
                 }
                 _ => {}
             }
         }
+        // INT96 is read at micros by retyping the nanosecond timestamps Arrow
+        // infers for it; an INT64 nanosecond column would be retyped too, so a
+        // file with one is left to the kernel's reader (no Spark writes one).
+        let int96_micros = int96 && !int64_nanos;
+
+        // No Spark version: not written by Spark, and so proleptic Gregorian.
+        let Some(version) = kv(SPARK_VERSION_KEY) else {
+            return Ok(Self {
+                int96_micros,
+                ..Self::default()
+            });
+        };
+        // Spark compares the version strings lexicographically; so do we.
+        let legacy_datetime = version.as_str() < "3.0.0" || kv(LEGACY_DATETIME_KEY).is_some();
+        let legacy_int96 = version.as_str() < "3.1.0" || kv(LEGACY_INT96_KEY).is_some();
+
         if int96 && int64_ts && legacy_int96 != legacy_datetime {
             // One Arrow type (a zoned timestamp) for both, so the batch cannot
             // tell which column needs which rebase.
@@ -159,11 +222,16 @@ impl RebaseSpec {
             )));
         }
         let timestamps = (int96 && legacy_int96) || (int64_ts && legacy_datetime);
-        let zone = kv(TIME_ZONE_KEY).filter(|z| !is_utc(z));
+        let zone = match kv(TIME_ZONE_KEY) {
+            None => WriterZone::Unknown,
+            Some(z) if is_utc(&z) => WriterZone::Utc,
+            Some(z) => WriterZone::Named(z),
+        };
         Ok(Self {
             dates: dates && legacy_datetime,
             timestamps,
             zone,
+            int96_micros,
         })
     }
 }
@@ -216,16 +284,25 @@ fn rebase_array(array: &ArrayRef, spec: &RebaseSpec, location: &str) -> DeltaRes
         ),
         DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) if spec.timestamps => {
             let values = array.as_primitive::<TimestampMicrosecondType>();
-            if spec.zone.is_some() {
-                // Rebasing depends on the zone's offset rules; values after
-                // 1582-10-16 UTC need none in any zone (offsets are < 1 day).
-                let limit = (i64::from(LAST_SWITCH_DAY) + 1) * MICROS_PER_DAY;
-                if values.iter().flatten().any(|v| v < limit) {
+            if spec.zone != WriterZone::Utc {
+                // Rebasing depends on the zone's offset rules, down to its
+                // local mean time before about 1900 (Los Angeles moved a value
+                // of 1850 by 422 seconds); from 1900 on no zone's does.
+                if values
+                    .iter()
+                    .flatten()
+                    .any(|v| v < ZONED_REBASE_LIMIT_MICROS)
+                {
+                    let zone = match &spec.zone {
+                        WriterZone::Named(z) => format!("written in time zone {z:?}"),
+                        _ => "whose footer does not record the writer's time zone (Spark \
+                              reads those in its session time zone)"
+                            .to_string(),
+                    };
                     return Err(Error::generic(format!(
-                        "{location} stores timestamps before 1582-10-15 in Spark's legacy hybrid \
-                         calendar, written in time zone {:?}; deltaswamp rebases those only for \
-                         UTC. Read the table through the SQL warehouse",
-                        spec.zone.as_deref().unwrap_or_default()
+                        "{location} stores timestamps before 1900-01-01T00:00:00Z in Spark's \
+                         legacy hybrid calendar, {zone}; deltaswamp rebases those only for \
+                         UTC. Read the table through the SQL warehouse"
                     )));
                 }
                 return Ok(array.clone());
@@ -309,25 +386,186 @@ fn block<F: Future>(fut: F) -> F::Output {
     }
 }
 
+/// `schema` with every nanosecond timestamp retyped to microseconds: the read
+/// hint that makes Arrow decode INT96 without overflowing.
+fn int96_as_micros(schema: &Schema) -> Schema {
+    fn retype(t: &DataType) -> DataType {
+        match t {
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                DataType::Timestamp(TimeUnit::Microsecond, tz.clone())
+            }
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
+            DataType::List(f) => DataType::List(field(f)),
+            DataType::LargeList(f) => DataType::LargeList(field(f)),
+            DataType::Map(f, ordered) => DataType::Map(field(f), *ordered),
+            other => other.clone(),
+        }
+    }
+    fn field(f: &FieldRef) -> FieldRef {
+        Arc::new(Field::clone(f).with_data_type(retype(f.data_type())))
+    }
+    Schema::new_with_metadata(
+        schema.fields().iter().map(field).collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    )
+}
+
+/// One file read row group by row group with INT96 decoded at microseconds,
+/// then shaped to the requested schema exactly as the kernel's reader does.
+#[allow(deprecated)]
+struct Int96MicrosRead {
+    stream: ParquetRecordBatchStream<ParquetObjectReader>,
+    current: Option<ParquetRecordBatchReader>,
+    ordering: Vec<ReorderIndex>,
+    row_indexes: Option<std::iter::Flatten<std::vec::IntoIter<Range<i64>>>>,
+    schema: SchemaRef,
+    location: String,
+    done: bool,
+}
+
+impl Int96MicrosRead {
+    #[allow(deprecated)]
+    fn open(store: Arc<DynObjectStore>, file: &FileMeta, schema: SchemaRef) -> DeltaResult<Self> {
+        let path = Path::from_url_path(file.location.path())?;
+        let mut reader = ParquetObjectReader::new(store, path);
+        if file.size != 0 {
+            reader = reader.with_file_size(file.size);
+        }
+        let requested = schema.clone();
+        let (stream, ordering, row_indexes) = block(async move {
+            // Spelled out: parquet errors convert into more than one type.
+            let fail = |e: delta_kernel::parquet::errors::ParquetError| Error::from(e);
+            let inferred = ArrowReaderMetadata::load_async(&mut reader, reader_options())
+                .await
+                .map_err(fail)?;
+            let hinted = Arc::new(int96_as_micros(inferred.schema()));
+            let metadata = ArrowReaderMetadata::try_new(
+                inferred.metadata().clone(),
+                reader_options().with_schema(hinted),
+            )
+            .map_err(fail)?;
+            let (ordering, mask) = parquet_read_plan(&requested, &metadata)?;
+            let row_indexes = ordering_needs_row_indexes(&ordering)
+                .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()).build())
+                .transpose()?;
+            let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+                .with_batch_size(BATCH_SIZE);
+            if let Some(mask) = mask {
+                builder = builder.with_projection(mask);
+            }
+            Ok::<_, Error>((builder.build().map_err(fail)?, ordering, row_indexes))
+        })?;
+        Ok(Self {
+            stream,
+            current: None,
+            ordering,
+            row_indexes,
+            schema,
+            location: file.location.to_string(),
+            done: false,
+        })
+    }
+}
+
+impl Iterator for Int96MicrosRead {
+    type Item = DeltaResult<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(reader) = self.current.as_mut() {
+                match reader.next() {
+                    Some(Ok(batch)) => {
+                        return Some(
+                            fixup_parquet_read(
+                                batch,
+                                &self.ordering,
+                                self.row_indexes.as_mut(),
+                                Some(&self.location),
+                                Some(&self.schema),
+                            )
+                            .map(RecordBatch::from),
+                        );
+                    }
+                    Some(Err(e)) => {
+                        self.done = true;
+                        self.current = None;
+                        return Some(Err(e.into()));
+                    }
+                    None => self.current = None,
+                }
+            }
+            if self.done {
+                return None;
+            }
+            match block(self.stream.next_row_group()) {
+                Ok(Some(reader)) => self.current = Some(reader),
+                Ok(None) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e.into()));
+                }
+            }
+        }
+    }
+}
+
+/// The footer of one data file.
+#[allow(deprecated)]
+fn footer(store: Arc<DynObjectStore>, file: &FileMeta) -> DeltaResult<Arc<ParquetMetaData>> {
+    // Read only the footer: one extra range request per file with a
+    // date/timestamp column, which is what it costs to know.
+    let path = Path::from_url_path(file.location.path())?;
+    let mut reader = ParquetObjectReader::new(store, path);
+    if file.size != 0 {
+        reader = reader.with_file_size(file.size);
+    }
+    Ok(block(async move { reader.get_metadata(None).await })?)
+}
+
+/// Read the footer of one data file and decide how it must be read.
+fn file_spec(store: Arc<DynObjectStore>, file: &FileMeta) -> DeltaResult<RebaseSpec> {
+    RebaseSpec::from_footer(&*footer(store, file)?, file.location.as_str())
+}
+
+/// Which of `files` (`(path, size)`, the path relative to `table_root` as the
+/// log spells it) a reader that does not rebase would misread: files Spark
+/// wrote in its legacy hybrid calendar, and files storing INT96 timestamps,
+/// which such a reader decodes as nanoseconds. delta-rs is such a reader, and
+/// its DML and compaction write what it read back into new files.
+pub fn legacy_calendar_files(
+    engine: &SharedEngine,
+    table_root: &url::Url,
+    files: &[(String, u64)],
+) -> DeltaResult<Vec<String>> {
+    let Some(store) = engine.get_object_store_for_url(table_root) else {
+        return Err(Error::generic(format!(
+            "no object store is registered for {table_root}"
+        )));
+    };
+    let mut out = Vec::new();
+    for (path, size) in files {
+        let location = table_root.join(path).map_err(|e| {
+            Error::generic(format!("{path:?} is not a path under {table_root}: {e}"))
+        })?;
+        let file = FileMeta::new(location, 0, *size);
+        let metadata = footer(store.clone(), &file)?;
+        match RebaseSpec::from_footer(&metadata, file.location.as_str()) {
+            Ok(spec) if !spec.own_read() => {}
+            // A file the kernel cannot rebase either (INT96 and INT64
+            // timestamps in two modes) is no less legacy.
+            _ => out.push(path.clone()),
+        }
+    }
+    Ok(out)
+}
+
 /// A Parquet handler that rebases files Spark wrote in the hybrid calendar.
 struct RebasingParquet {
     inner: Arc<dyn ParquetHandler>,
     store: Arc<DynObjectStore>,
-}
-
-impl RebasingParquet {
-    #[allow(deprecated)]
-    fn spec(&self, file: &FileMeta) -> DeltaResult<RebaseSpec> {
-        // Read only the footer: one extra range request per file with a
-        // date/timestamp column, which is what it costs to know.
-        let path = Path::from_url_path(file.location.path())?;
-        let mut reader = ParquetObjectReader::new(self.store.clone(), path);
-        if file.size != 0 {
-            reader = reader.with_file_size(file.size);
-        }
-        let metadata = block(async move { reader.get_metadata(None).await })?;
-        RebaseSpec::from_footer(&metadata, file.location.as_str())
-    }
 }
 
 impl ParquetHandler for RebasingParquet {
@@ -344,9 +582,9 @@ impl ParquetHandler for RebasingParquet {
         }
         let mut specs = Vec::with_capacity(files.len());
         for file in files {
-            specs.push(self.spec(file)?);
+            specs.push(file_spec(self.store.clone(), file)?);
         }
-        if specs.iter().all(|s| !s.any()) {
+        if specs.iter().all(|s| !s.own_read()) {
             return self
                 .inner
                 .read_parquet_files(files, physical_schema, predicate);
@@ -356,7 +594,7 @@ impl ParquetHandler for RebasingParquet {
         // statistics are in the Julian calendar too.
         let mut out: Vec<FileDataReadResultIterator> = Vec::with_capacity(files.len());
         for (file, spec) in files.iter().zip(specs) {
-            if !spec.any() {
+            if !spec.own_read() {
                 out.push(self.inner.read_parquet_files(
                     std::slice::from_ref(file),
                     physical_schema.clone(),
@@ -365,15 +603,32 @@ impl ParquetHandler for RebasingParquet {
                 continue;
             }
             let location = file.location.to_string();
-            let batches = self.inner.read_parquet_files(
-                std::slice::from_ref(file),
-                physical_schema.clone(),
-                None,
-            )?;
-            out.push(Box::new(batches.map(move |data| {
-                let batch = data?.try_into_record_batch()?;
-                let rebased = rebase_batch(batch, &spec, &location)?;
-                Ok(Box::new(ArrowEngineData::new(rebased)) as Box<dyn EngineData>)
+            let batches: Box<dyn Iterator<Item = DeltaResult<RecordBatch>> + Send> =
+                if spec.int96_micros {
+                    Box::new(Int96MicrosRead::open(
+                        self.store.clone(),
+                        file,
+                        physical_schema.clone(),
+                    )?)
+                } else {
+                    Box::new(
+                        self.inner
+                            .read_parquet_files(
+                                std::slice::from_ref(file),
+                                physical_schema.clone(),
+                                None,
+                            )?
+                            .map(|data| data?.try_into_record_batch()),
+                    )
+                };
+            out.push(Box::new(batches.map(move |batch| {
+                let batch = batch?;
+                let batch = if spec.any() {
+                    rebase_batch(batch, &spec, &location)?
+                } else {
+                    batch
+                };
+                Ok(Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
             })));
         }
         Ok(Box::new(out.into_iter().flatten()))
@@ -499,7 +754,7 @@ mod tests {
         let spec = RebaseSpec {
             dates: true,
             timestamps: true,
-            zone: None,
+            ..RebaseSpec::default()
         };
         let out = rebase_batch(batch, &spec, "f").unwrap();
         let d = out
@@ -523,7 +778,8 @@ mod tests {
         let spec = RebaseSpec {
             dates: false,
             timestamps: true,
-            zone: Some("America/Los_Angeles".into()),
+            zone: WriterZone::Named("America/Los_Angeles".into()),
+            ..RebaseSpec::default()
         };
         let modern = TimestampMicrosecondArray::from(vec![1704067200000000]).with_timezone("UTC");
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -534,8 +790,58 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(modern)]).unwrap();
         assert!(rebase_batch(batch, &spec, "f").is_ok());
         let old = TimestampMicrosecondArray::from(vec![-62135769600000000]).with_timezone("UTC");
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(old)]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(old)]).unwrap();
         let err = rebase_batch(batch, &spec, "f").unwrap_err();
         assert!(err.to_string().contains("America/Los_Angeles"), "{err}");
+
+        // After the calendar switch but before 1900 the zone's own offsets
+        // still differ (Spark stores 1850-06-01T19:00Z 422 s early in LA).
+        let lmt = TimestampMicrosecondArray::from(vec![-3773710378000000]).with_timezone("UTC");
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(lmt)]).unwrap();
+        assert!(rebase_batch(batch, &spec, "f").is_err());
+        let from_1900 =
+            TimestampMicrosecondArray::from(vec![ZONED_REBASE_LIMIT_MICROS]).with_timezone("UTC");
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(from_1900)]).unwrap();
+        assert!(rebase_batch(batch, &spec, "f").is_ok());
+
+        // No zone recorded: Spark would use its session zone, unknown here.
+        let unknown = RebaseSpec {
+            timestamps: true,
+            zone: WriterZone::Unknown,
+            ..RebaseSpec::default()
+        };
+        let old = TimestampMicrosecondArray::from(vec![-14816604303211000]).with_timezone("UTC");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(old)]).unwrap();
+        let err = rebase_batch(batch, &unknown, "f").unwrap_err();
+        assert!(err.to_string().contains("does not record"), "{err}");
+    }
+
+    #[test]
+    fn int96_hint_retypes_nanoseconds_only() {
+        use arrow::datatypes::Fields;
+
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let schema = Schema::new(vec![
+            Field::new("ts", nanos.clone(), true),
+            Field::new(
+                "st",
+                DataType::Struct(Fields::from(vec![Field::new("t", nanos.clone(), true)])),
+                true,
+            ),
+            Field::new_list("l", Field::new("item", nanos, true), true),
+            Field::new("d", DataType::Date32, true),
+        ]);
+        let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let hinted = int96_as_micros(&schema);
+        assert_eq!(hinted.field(0).data_type(), &micros);
+        assert_eq!(
+            hinted.field(1).data_type(),
+            &DataType::Struct(Fields::from(vec![Field::new("t", micros.clone(), true)]))
+        );
+        assert_eq!(
+            hinted.field(2).data_type(),
+            &DataType::List(Arc::new(Field::new("item", micros, true)))
+        );
+        assert_eq!(hinted.field(3).data_type(), &DataType::Date32);
     }
 }
