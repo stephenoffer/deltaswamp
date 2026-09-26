@@ -142,6 +142,17 @@ nested columns (`addr.zip`) and typed literals (`DATE '2026-01-01'`).
 Arithmetic and function calls are refused with a message; delta-rs and the
 warehouse accept full SQL.
 
+A VARIANT column reads as JSON text (`string`), as Databricks' `to_json`
+renders it, whichever engine serves the read: the warehouse can send nothing
+else, so the direct engines decode the binary encoding to match. Writes take
+that JSON text back (the warehouse runs it through `parse_json`; the direct
+engines encode it), so a read written back stores the same values. Databricks
+turns `delta.enableVariantShredding` on for every new VARIANT table, and
+neither direct engine decodes a shredded file, so on such a table reads that
+touch a VARIANT column go to the warehouse or are refused; `count()` and reads
+of the other columns stay direct. VARIANTs nested inside a struct or array are
+not converted.
+
 Timestamps honor in-commit timestamps where a table has them, and a timestamp
 earlier than the oldest reconstructable version is refused rather than
 silently clamped.
@@ -188,6 +199,15 @@ t.append(df, txn=("nightly-load", batch_id))  # idempotent
 
 `df` can be a pyarrow Table or RecordBatchReader, a Polars DataFrame, a pandas
 DataFrame, or anything else exporting the Arrow PyCapsule interface.
+
+A column the data leaves out gets what Databricks would give it: its DEFAULT, a
+generated or identity value, or a null. A literal DEFAULT (`'new'`, `42`,
+`true`, `DATE'2026-01-01'`) is filled in on every engine. Any other
+(`current_timestamp()`) only Databricks evaluates, so that write needs the SQL
+fallback. Through the warehouse, a replaceWhere names the data's columns
+(`INSERT INTO t (cols) REPLACE WHERE ...`) so the same holds there, and
+`when_not_matched_insert_all()` / `when_matched_update_all()` set the source's
+columns rather than `*`, as delta-rs does.
 
 Catalog-managed tables append through the kernel, which commits via the
 catalog. Partitioned tables are handled: rows are split by partition value and
@@ -238,6 +258,10 @@ t.update(new_values={"status": "archived"}, predicate="age > 365")  # plain valu
     .execute()
 )
 ```
+
+Through the warehouse, `update` sets a struct field by its dotted path
+(`{"s.a": 5}`) when no top-level column has that name, and `new_values` takes
+bytes, dicts (a struct) and lists (an array) as well as scalars.
 
 `merge` returns a builder with delta-rs's clause API, whichever engine serves
 it. When the warehouse serves it, the builder generates one `MERGE INTO`

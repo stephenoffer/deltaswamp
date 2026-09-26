@@ -303,6 +303,33 @@ def _stageable(table: Any) -> Any:
     return table if schema.equals(table.schema) else table.cast(schema)
 
 
+def _variant_text(table: Any, variants: frozenset[str]) -> Any:
+    """Columns bound for VARIANT targets, as JSON text `parse_json` can read.
+
+    The binary ``struct<metadata, value>`` a direct engine reads is decoded;
+    a column of nulls becomes a null string. The binary form cannot be staged
+    as it is: Parquet refuses its non-nullable children under a null row, and
+    Databricks would not cast the struct to VARIANT anyway.
+    """
+    if not variants:
+        return table
+    import pyarrow as pa
+
+    from .._variant import is_variant_struct, json_column
+
+    for index, field in enumerate(table.schema):
+        if field.name.lower() not in variants:
+            continue
+        if is_variant_struct(pa, field.type):
+            column = json_column(pa, table.column(index))
+        elif pa.types.is_null(field.type):
+            column = table.column(index).cast(pa.string())
+        else:
+            continue
+        table = table.set_column(index, pa.field(field.name, pa.string()), column)
+    return table
+
+
 def _parquet_bytes(table: Any) -> bytes:
     import pyarrow.parquet as pq
 
@@ -337,6 +364,8 @@ class SqlEngine:
     supports_timestamp_travel = True
     #: `INSERT WITH SCHEMA EVOLUTION` / `MERGE WITH SCHEMA EVOLUTION`.
     supports_schema_merge = True
+    #: A column left out of an INSERT gets its DEFAULT, whatever the expression.
+    supports_sql_column_defaults = True
     #: A statement cannot replace a table's schema without also discarding its
     #: properties, comments and grants, so this is refused rather than done.
     supports_schema_overwrite = False
@@ -496,10 +525,15 @@ class SqlEngine:
                     "pipeline; the warehouse refuses DESCRIBE HISTORY and DESCRIBE DETAIL on it"
                 ),
             )
-        widening = {"typeWidening", "typeWidening-preview"} & table.features or (
+        # The effective set, not the named one: a legacy protocol (writer
+        # version below 7) names no features at all, yet Databricks refuses
+        # these ALTERs on it just the same. An empty set here means the
+        # protocol is not known yet, and then nothing is refused.
+        features = table.effective_reader_features | table.effective_writer_features
+        widening = {"typeWidening", "typeWidening-preview"} & features or (
             table.properties.get("delta.enableTypeWidening", "").lower() == "true"
         )
-        if operation is Operation.ALTER_COLUMN_TYPE and table.features and not widening:
+        if operation is Operation.ALTER_COLUMN_TYPE and features and not widening:
             # Databricks answers DELTA_UNSUPPORTED_ALTER_TABLE_CHANGE_COL_OP even
             # for INT -> BIGINT until type widening is on.
             return Capability(
@@ -512,7 +546,7 @@ class SqlEngine:
         mapping = table.properties.get("delta.columnMapping.mode", "none").lower()
         if (
             operation in (Operation.DROP_COLUMN, Operation.RENAME_COLUMN)
-            and table.features
+            and features
             and mapping not in ("name", "id")
         ):
             # DELTA_UNSUPPORTED_DROP_COLUMN otherwise: without
@@ -820,10 +854,15 @@ class SqlEngine:
     # ------------------------------------------------------------ staging
 
     @contextlib.contextmanager
-    def _staged(self, data: Any) -> Iterator[tuple[str, Any]]:
+    def _staged(
+        self, data: Any, variants: frozenset[str] = frozenset()
+    ) -> Iterator[tuple[str, Any]]:
         """Upload `data` as Parquet to the staging volume; always delete it after.
 
         Yields the `read_files(...)` relation and the Arrow table uploaded.
+        `variants` names the target's VARIANT columns (lower-cased): one given
+        in the variant binary encoding is staged as JSON text, which is what
+        `_staged_select` parses back.
         """
         if self._staging_volume is None:
             raise UnreachableTableError(
@@ -831,7 +870,7 @@ class SqlEngine:
                 "no staging volume is configured",
                 "SqlEngine(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
-        arrow = _stageable(_to_arrow(data))
+        arrow = _variant_text(_stageable(_to_arrow(data)), variants)
         payload = _parquet_bytes(arrow)
         catalog, schema, volume = self._staging_volume
         path = f"/Volumes/{catalog}/{schema}/{volume}/{_STAGING_DIR}/{uuid.uuid4().hex}.parquet"
@@ -869,9 +908,56 @@ class SqlEngine:
         """
         return sq.columns(list(arrow.column_names))
 
+    @staticmethod
+    def _staged_select(arrow: Any, variants: frozenset[str], columns: Any = None) -> str:
+        """The staged columns as a SELECT list, JSON text parsed for VARIANT targets.
+
+        Spark casts a STRING into a VARIANT column as a string scalar, so the
+        JSON text a read returns for a VARIANT came back as ``"{\"a\":1}"``,
+        its objects gone. `parse_json` stores the value the text describes.
+        """
+        import pyarrow as pa
+
+        names = list(arrow.column_names) if columns is None else list(columns)
+        out = []
+        for name in names:
+            field = arrow.schema.field(name)
+            if name.lower() in variants and (
+                pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
+            ):
+                out.append(f"parse_json({sq.quote(name)}) AS {sq.quote(name)}")
+            else:
+                out.append(sq.quote(name))
+        return ", ".join(out)
+
+    def _variant_columns(self, table: ResolvedTable) -> frozenset[str]:
+        """The table's top-level VARIANT columns, lower-cased; asked only of a VARIANT table.
+
+        The warehouse's own result schema gives VARIANT as text, so DESCRIBE
+        is the one place that tells the two apart.
+        """
+        features = set(table.features) | {
+            key[len("delta.feature.") :]
+            for key in table.properties
+            if key.startswith("delta.feature.")
+        }
+        if not features & {"variantType", "variantType-preview"}:
+            return frozenset()
+        result = self._query(Operation.DETAIL, f"DESCRIBE TABLE {sq.name(table)}")
+        found = set()
+        for row in result.to_pylist():
+            name = str(row.get("col_name") or "")
+            if not name or name.startswith("#"):
+                break  # partition and clustering sections repeat the columns
+            if str(row.get("data_type") or "").strip().lower() == "variant":
+                found.add(name.lower())
+        return frozenset(found)
+
+    def _table_schema(self, table: ResolvedTable) -> Any:
+        return self._query(Operation.SCAN, f"SELECT * FROM {sq.name(table)} LIMIT 0").schema
+
     def _table_columns(self, table: ResolvedTable) -> list[str]:
-        result = self._query(Operation.SCAN, f"SELECT * FROM {sq.name(table)} LIMIT 0")
-        return list(result.schema.names)
+        return list(self._table_schema(table).names)
 
     # ------------------------------------------------------------------ write
 
@@ -886,11 +972,12 @@ class SqlEngine:
         """INSERT INTO ... BY NAME, so column order in the data does not matter."""
         self._check_write_args("append", schema_mode, kwargs)
         evolve = " WITH SCHEMA EVOLUTION" if schema_mode == "merge" else ""
-        with self._staged(data) as (source, arrow):
+        variants = self._variant_columns(table)
+        with self._staged(data, variants) as (source, arrow):
             self._run(
                 Operation.APPEND,
                 f"INSERT{evolve} INTO {sq.name(table)} BY NAME "
-                f"SELECT {self._staged_columns(arrow)} FROM {source}",
+                f"SELECT {self._staged_select(arrow, variants)} FROM {source}",
             )
 
     def overwrite(
@@ -925,41 +1012,54 @@ class SqlEngine:
         # schema_mode="merge" was accepted and then dropped, so new columns in
         # the data failed the overwrite instead of evolving the schema.
         evolve = " WITH SCHEMA EVOLUTION" if schema_mode == "merge" else ""
-        with self._staged(data) as (source, arrow):
+        variants = self._variant_columns(table)
+        with self._staged(data, variants) as (source, arrow):
             if partition_overwrite == "static" and predicate is None:
                 self._run(
                     Operation.OVERWRITE,
                     f"INSERT{evolve} OVERWRITE {name} BY NAME "
-                    f"SELECT {self._staged_columns(arrow)} FROM {source}",
+                    f"SELECT {self._staged_select(arrow, variants)} FROM {source}",
                 )
                 return
             binder = ParameterBinder()
             if predicate is None:
                 predicate = self._dynamic_predicate(table, arrow, binder)
-            # REPLACE WHERE takes no column list, so order the projection to
-            # match the table rather than trusting the data's column order.
             # Column names resolve case-insensitively on Databricks, so match
-            # them that way too, projecting the data's own spelling.
+            # them that way, projecting the data's own spelling.
             target = self._table_columns(table)
             by_lower = {c.lower(): c for c in arrow.column_names}
             target_lower = {c.lower() for c in target}
             missing = [c for c in target if c.lower() not in by_lower]
             extra = [c for c in arrow.column_names if c.lower() not in target_lower]
-            if missing or (extra and schema_mode != "merge"):
+            if extra and (missing or schema_mode != "merge"):
                 raise UnreachableTableError(
                     "overwrite with REPLACE WHERE",
                     "the data's columns do not match the table's"
                     + (f"; missing {', '.join(missing)}" if missing else "")
                     + (f"; unexpected {', '.join(extra)}" if extra else ""),
-                    "pass schema_mode='merge' to add new columns"
-                    if extra and not missing
-                    else None,
+                    "pass schema_mode='merge' to add new columns" if not missing else None,
                 )
-            projection = [by_lower[c.lower()] for c in target] + extra
+            if extra:
+                # New columns: a column list could not name them, so the
+                # projection follows the table's order, then the new ones.
+                projection = [by_lower[c.lower()] for c in target] + extra
+                self._run(
+                    Operation.REPLACE_WHERE,
+                    f"INSERT{evolve} INTO {name} REPLACE WHERE {predicate} "
+                    f"SELECT {self._staged_select(arrow, variants, projection)} FROM {source}",
+                    binder,
+                )
+                return
+            # A column list, as INSERT BY NAME has in effect: Databricks fills
+            # the columns the data leaves out -- a generated column, an
+            # identity column (which it refuses to take explicitly), a
+            # DEFAULT -- where requiring every column made replaceWhere fail
+            # on each of those tables.
+            present = [by_lower[c.lower()] for c in target if c.lower() in by_lower]
             self._run(
                 Operation.REPLACE_WHERE,
-                f"INSERT{evolve} INTO {name} REPLACE WHERE {predicate} "
-                f"SELECT {sq.columns(projection)} FROM {source}",
+                f"INSERT{evolve} INTO {name} ({sq.columns(present)}) REPLACE WHERE {predicate} "
+                f"SELECT {self._staged_select(arrow, variants, present)} FROM {source}",
                 binder,
             )
 
@@ -982,7 +1082,14 @@ class SqlEngine:
         # The catalog may spell a partition column differently from the data
         # ("Region" vs "region"); Databricks resolves names case-insensitively.
         source_cols = [by_lower[c.lower()] for c in partitions]
-        tuples = {tuple(r[c] for c in source_cols) for r in arrow.select(source_cols).to_pylist()}
+        # Databricks stores an empty-string partition value as the null
+        # partition, as Spark does, so a row with region '' lands where
+        # `region IS NULL`; `region = ''` would match nothing it wrote and the
+        # REPLACE WHERE check would refuse the row.
+        tuples = {
+            tuple(None if r[c] == "" else r[c] for c in source_cols)
+            for r in arrow.select(source_cols).to_pylist()
+        }
         if not tuples:
             raise UnreachableTableError(
                 "overwrite dynamically", "the data is empty, so no partitions are implied"
@@ -1052,15 +1159,15 @@ class SqlEngine:
         if not updates and not new_values:
             raise UnreachableTableError("update", "no updates given")
         binder = ParameterBinder()
+        target = self._assignment_targets(table, [*(updates or {}), *(new_values or {})])
         # A None expression is NULL; spliced as text it was the identifier `None`.
         assignments = [
-            f"{sq.quote(k)} = {'NULL' if v is None else v}" for k, v in (updates or {}).items()
+            f"{target[k]} = {'NULL' if v is None else v}" for k, v in (updates or {}).items()
         ]
         # None is written as the NULL literal: a STRING-typed NULL marker is
         # refused by ANSI store assignment into an INT/DATE/... column.
         assignments += [
-            f"{sq.quote(k)} = {'NULL' if v is None else binder.bind(v)}"
-            for k, v in (new_values or {}).items()
+            f"{target[k]} = {_value_sql(v, binder)}" for k, v in (new_values or {}).items()
         ]
         both = {str(k).lower() for k in (updates or {})} & {
             str(k).lower() for k in (new_values or {})
@@ -1074,6 +1181,42 @@ class SqlEngine:
         if sq.predicate(predicate) is not None:
             sql += f" WHERE {predicate}"
         return _dml_metrics(_first(self._query(Operation.UPDATE, sql, binder)), "num_updated_rows")
+
+    def _assignment_targets(self, table: ResolvedTable, keys: list[Any]) -> dict[Any, str]:
+        """Each UPDATE key as a quoted column, a nested field where it names one.
+
+        A tuple is a field path, ``("s", "a")``. A dotted string ``"s.a"`` is
+        the field `a` of struct `s` when the table has no top-level column of
+        that very name and `s` is a struct with such a field; quoted whole,
+        as it was, it named the column `s.a`, which does not exist.
+        """
+        import pyarrow as pa
+
+        out: dict[Any, str] = {}
+        schema = None
+        for key in keys:
+            if isinstance(key, tuple):
+                out[key] = sq.column([str(p) for p in key])
+                continue
+            text = str(key)
+            if "." not in text:
+                out[key] = sq.quote(text)
+                continue
+            if schema is None:
+                schema = self._table_schema(table)
+            out[key] = sq.quote(text)
+            if text.lower() in {n.lower() for n in schema.names}:
+                continue
+            parts = text.split(".")
+            fields = list(schema)
+            for part in parts:
+                match = next((f for f in fields if f.name.lower() == part.lower()), None)
+                if match is None:
+                    break
+                fields = list(match.type) if pa.types.is_struct(match.type) else []
+            else:
+                out[key] = sq.column(parts)
+        return out
 
     def merge(
         self,
@@ -1740,26 +1883,30 @@ class SqlMerger:
         cols = [c for c in source_columns if c.lower() not in excluded]
         if not cols:
             raise InvalidArgumentError("except_cols excludes every source column")
+        # `*` only under schema evolution, which needs it to add columns.
+        # Otherwise Databricks expands it to every *target* column, so a
+        # source without an identity or generated column failed with "cannot
+        # resolve id in INSERT clause"; delta-rs sets the source's columns.
         if verb == "UPDATE_ALL":
-            if not arg:
+            if not arg and self._merge_schema:
                 return "UPDATE SET *"
             return "UPDATE SET " + ", ".join(
                 f"{tgt}.{sq.quote(c)} = {src}.{sq.quote(c)}" for c in cols
             )
-        if not arg:
+        if not arg and self._merge_schema:
             return "INSERT *"
         names = ", ".join(sq.quote(c) for c in cols)
         values = ", ".join(f"{src}.{sq.quote(c)}" for c in cols)
         return f"INSERT ({names}) VALUES ({values})"
 
-    def statement(self, relation: str, source_columns: list[str]) -> str:
+    def statement(self, relation: str, source_columns: list[str], select: str | None = None) -> str:
         """The MERGE text for a source `relation`. Exposed for inspection and tests."""
         if not self._clauses:
             raise InvalidArgumentError("a MERGE needs at least one WHEN clause")
         evolve = " WITH SCHEMA EVOLUTION" if self._merge_schema else ""
         sql = (
             f"MERGE{evolve} INTO {sq.name(self._table)} AS {sq.quote(self._target_alias)} "
-            f"USING (SELECT {sq.columns(source_columns)} FROM {relation}) "
+            f"USING (SELECT {select or sq.columns(source_columns)} FROM {relation}) "
             f"AS {sq.quote(self._source_alias)} "
             f"ON {self._predicate}"
         )
@@ -1777,13 +1924,44 @@ class SqlMerger:
         """Stage the source, run the MERGE, delete the staged file. Returns metrics."""
         if not self._clauses:
             raise InvalidArgumentError("a MERGE needs at least one WHEN clause")
-        with self._engine._staged(self._source) as (relation, arrow):
-            sql = self.statement(relation, list(arrow.column_names))
+        variants = self._engine._variant_columns(self._table)
+        with self._engine._staged(self._source, variants) as (relation, arrow):
+            select = self._engine._staged_select(arrow, variants)
+            sql = self.statement(relation, list(arrow.column_names), select)
             result = self._engine._query(Operation.MERGE, sql)
         return _dml_metrics(_first(result), None)
 
 
 # ------------------------------------------------------------------ helpers
+
+
+def _value_sql(value: Any, binder: ParameterBinder) -> str:
+    """A plain Python value as SQL: a bound parameter where Databricks takes one.
+
+    A statement parameter carries only scalars, so bytes become an ``X'..'``
+    literal (hex digits cannot break out of it), a dict a ``named_struct`` and
+    a list an ``array``, each with its own values bound in turn. None is the
+    NULL literal: a STRING-typed NULL marker is refused by ANSI store
+    assignment into an INT/DATE/... column.
+    """
+    if value is None:
+        return "NULL"
+    if isinstance(value, bytes | bytearray | memoryview):
+        return f"X'{bytes(value).hex()}'"
+    if isinstance(value, Mapping):
+        if not value:
+            raise InvalidArgumentError("an empty dict cannot be set as a struct value")
+        return (
+            "named_struct("
+            + ", ".join(f"{sq.literal(str(k))}, {_value_sql(v, binder)}" for k, v in value.items())
+            + ")"
+        )
+    if isinstance(value, list | tuple):
+        return "array(" + ", ".join(_value_sql(v, binder) for v in value) + ")"
+    try:
+        return binder.bind(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidArgumentError(str(exc)) from None
 
 
 def _filter_sql(spec: tuple[str, str, Any], binder: ParameterBinder) -> str:

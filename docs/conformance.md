@@ -36,13 +36,22 @@ Delta with UniForm underneath.
 
 Collations are the one place a read goes quietly wrong rather than failing:
 neither engine knows collation order, so `name = 'oslo'` compares bytes and
-misses `'Oslo'` under `UTF8_LCASE`. Predicate scans on a collated table never
-route to a direct engine.
+misses `'Oslo'` under `UTF8_LCASE`. Predicate scans that read a collated
+column never route to a direct engine.
 
 Several features are readable but only up to a point. Databricks adds
-`variantShredding` to every VARIANT table; the kernel reads such a table until
-`delta.enableVariantShredding` is switched on, then fails on every shredded
-file, so that property routes reads away from it. `geospatial` is gated off in
+`variantShredding` and `delta.enableVariantShredding=true` to every VARIANT
+table, and shreds each file whose values share a shape; the kernel fails on a
+shredded file, and nothing in the log says which files are. So the property
+routes reads that touch a VARIANT column away from the direct engines (to the
+warehouse, or a refusal naming it), while `count()` and reads of other columns
+stay direct. A shredded file met anyway, with the property off, is an
+`EngineLimitError`. VARIANT itself reads as JSON text on every engine, since
+that is all the warehouse sends, and writes take JSON text back.
+
+Collated columns are matched by name: a predicate that reads no collated
+column is still served directly; one that does, or that reads a nested field
+(whose collation the Arrow schema does not carry), goes to the warehouse. `geospatial` is gated off in
 this kernel build, and its `geometry(...)` schema type breaks both engines' log
 parsing, so those tables read through the warehouse only.
 

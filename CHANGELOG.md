@@ -63,3 +63,9 @@ First release.
   deltaswamp is registered. Reads are unaffected.
 - Idempotent writes are checked against the last committed version before
   writing, so a concurrent writer can still commit in between.
+- VARIANT reads as JSON text on every engine and writes take JSON text. A
+  VARIANT nested in a struct or array is left in the engine's own form, and a
+  table with `delta.enableVariantShredding` (every new Databricks VARIANT
+  table) reads its VARIANT columns only through the warehouse.
+- A DEFAULT that is not a plain literal is evaluated only by Databricks, so a
+  write that leaves such a column out needs the SQL fallback.

@@ -415,8 +415,8 @@ def test_merge_clauses_are_emitted_in_grammar_order() -> None:
     )
     sql = m.statement("rel", ["id"])
     i_matched_delete = sql.index("WHEN MATCHED AND source.gone THEN DELETE")
-    i_matched_update = sql.index("WHEN MATCHED THEN UPDATE SET *")
-    i_insert = sql.index("WHEN NOT MATCHED THEN INSERT *")
+    i_matched_update = sql.index("WHEN MATCHED THEN UPDATE SET `target`.`id` = `source`.`id`")
+    i_insert = sql.index("WHEN NOT MATCHED THEN INSERT (`id`) VALUES (`source`.`id`)")
     assert i_matched_delete < i_matched_update < i_insert
 
 

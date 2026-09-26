@@ -655,6 +655,11 @@ pub(crate) fn begin_transaction(
         None => Box::new(FileSystemCommitter::new()),
     };
     let mut transaction = snapshot.transaction(committer, engine.as_ref())?;
+    // Kernel leaves column defaults to the connector and refuses to write
+    // until told they are handled. They are: every batch passes through
+    // `partition::conform_to_table`, which refuses one that leaves out a
+    // column with a default, and the Python side fills a literal default in.
+    transaction.ack_column_defaults();
     if let Some(info) = engine_info {
         transaction = transaction.with_engine_info(info);
     }

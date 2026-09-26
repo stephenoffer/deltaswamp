@@ -547,7 +547,7 @@ class TestStagedWrites:
         path = _staged_path(client)
         assert rec.sql == [
             f"SELECT * FROM {NAME} LIMIT 0",
-            f"INSERT INTO {NAME} REPLACE WHERE day = 'd1' SELECT `id`, `day` "
+            f"INSERT INTO {NAME} (`id`, `day`) REPLACE WHERE day = 'd1' SELECT `id`, `day` "
             f"FROM read_files('{path}', format => 'parquet')",
         ]
         assert client.files.deleted == [path]
@@ -607,7 +607,7 @@ class TestMerge:
             " WHEN MATCHED THEN UPDATE SET `t`.`id` = `s`.`id`, `t`.`v` = `s`.`v`"
             " WHEN MATCHED AND s.v IS NULL THEN DELETE"
             " WHEN NOT MATCHED AND s.id > 0 THEN INSERT (`id`, `v`) VALUES (s.id, s.v)"
-            " WHEN NOT MATCHED THEN INSERT *"
+            " WHEN NOT MATCHED THEN INSERT (`id`, `v`, `ts`) VALUES (`s`.`id`, `s`.`v`, `s`.`ts`)"
             " WHEN NOT MATCHED BY SOURCE THEN UPDATE SET `t`.`v` = 'gone'"
             " WHEN NOT MATCHED BY SOURCE THEN DELETE"
         )

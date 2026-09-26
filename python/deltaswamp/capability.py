@@ -457,8 +457,9 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             "reads unshredded files only. Databricks enables shredding on every VARIANT "
             "table, but shreds a file only when its values share a shape, so nothing in "
-            "the log says which tables fail; the kernel reads eagerly and a shredded file "
-            "hands the read to the next engine",
+            "the log says which files fail; delta.enableVariantShredding keeps reads of "
+            "VARIANT columns off the direct engines, and a shredded file met anyway hands "
+            "the read to the next engine",
         ),
         _row(
             TableFeature.VARIANT_SHREDDING_PREVIEW,
@@ -469,8 +470,9 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             "reads unshredded files only. Databricks enables shredding on every VARIANT "
             "table, but shreds a file only when its values share a shape, so nothing in "
-            "the log says which tables fail; the kernel reads eagerly and a shredded file "
-            "hands the read to the next engine",
+            "the log says which files fail; delta.enableVariantShredding keeps reads of "
+            "VARIANT columns off the direct engines, and a shredded file met anyway hands "
+            "the read to the next engine",
         ),
         # Both sit behind a kernel cargo feature this build does not
         # enable (see crates/native/Cargo.toml), so for *this* binary they are

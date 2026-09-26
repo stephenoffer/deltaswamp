@@ -251,6 +251,29 @@ def _exempted(
 #: SQL warehouse is not one: it runs inside Databricks.
 _DIRECT_ENGINES: frozenset[EngineKind] = frozenset({EngineKind.KERNEL, EngineKind.DELTARS})
 _COLLATIONS: frozenset[str] = frozenset({"collations", "collations-preview"})
+#: Needs that describe the request to the router rather than ask anything of an
+#: engine, so no engine is judged on them. ``collation_free``: the caller has
+#: checked the predicate against the schema and it touches no collated column.
+#: ``variant_free``: the read touches no VARIANT column.
+_ROUTER_HINTS: frozenset[str] = frozenset({"collation_free", "variant_free"})
+#: Reads that decode data files, so meet whatever a shredded variant file holds.
+_DATA_READS: frozenset[Operation] = frozenset(
+    {Operation.SCAN, Operation.TIME_TRAVEL, Operation.CDF, Operation.INCREMENTAL}
+)
+
+
+def shreds_variants(table: ResolvedTable) -> bool:
+    """Whether Databricks may have written shredded VARIANT files into this table.
+
+    Databricks sets ``delta.enableVariantShredding`` on every VARIANT table it
+    creates and then shreds any file whose values share a shape. Neither direct
+    engine decodes a shredded file (the kernel fails with an ArrowInvalid,
+    delta-rs refuses the feature), and nothing in the log says which files are
+    shredded, so the property is the only honest signal there is.
+    """
+    return table.properties.get("delta.enableVariantShredding", "").lower() == "true"
+
+
 _APPEND_ONLY_FORBIDS: frozenset[Operation] = frozenset(
     {Operation.DELETE, Operation.UPDATE, Operation.OVERWRITE, Operation.REPLACE_WHERE}
 )
@@ -317,7 +340,9 @@ class Router:
             # The request shape still applies: a share that cannot serve it must
             # say so here rather than accept and then drop the requirement.
             unmet = sorted(
-                need for need in needs if not getattr(sharing, f"supports_{need}", False)
+                need
+                for need in needs - _ROUTER_HINTS
+                if not getattr(sharing, f"supports_{need}", False)
             )
             if unmet:
                 return Capability(
@@ -382,19 +407,40 @@ class Router:
                 continue
 
             missing = sorted(
-                need for need in needs if not getattr(engine, f"supports_{need}", False)
+                need
+                for need in needs - _ROUTER_HINTS
+                if not getattr(engine, f"supports_{need}", False)
             )
             if missing:
                 reasons.append(f"{kind.value}: does not support {', '.join(missing)}")
                 continue
 
-            if "predicates" in needs and kind in _DIRECT_ENGINES and table.features & _COLLATIONS:
+            if (
+                "predicates" in needs
+                and "collation_free" not in needs
+                and kind in _DIRECT_ENGINES
+                and table.features & _COLLATIONS
+            ):
                 # A wrong answer, not an error: both engines compare bytes, so
                 # `name = 'oslo'` misses 'Oslo' in a UTF8_LCASE column, and file
                 # skipping on the same bounds can drop matching files outright.
                 reasons.append(
                     f"{kind.value}: the table has collated columns, and a direct engine "
                     "evaluates predicates by byte order rather than by the collation"
+                )
+                continue
+
+            if (
+                kind in _DIRECT_ENGINES
+                and operation in _DATA_READS
+                and "variant_free" not in needs
+                and shreds_variants(table)
+            ):
+                reasons.append(
+                    f"{kind.value}: the table shreds VARIANT values "
+                    "(delta.enableVariantShredding), and a direct engine cannot decode a "
+                    "shredded file; read columns other than the VARIANT ones, or use the "
+                    "warehouse"
                 )
                 continue
 
