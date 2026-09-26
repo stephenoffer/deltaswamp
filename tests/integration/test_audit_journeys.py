@@ -352,3 +352,46 @@ class TestMergeSchemaRouting:
         with pytest.raises(UnreachableTableError, match="flag"):
             merge.execute()
         assert conn.open_table(path).version == before
+
+
+class TestTxnOnCatalogManagedTables:
+    """txn_version() on a catalog-managed table the kernel does not write for
+    this principal (the warehouse writes it) fell back to delta-rs, which cannot
+    open such a table at all."""
+
+    def test_txn_version_reads_through_the_kernel(self, tmp_path: Any, monkeypatch: Any) -> None:
+        if not ds.has_native():
+            pytest.skip("native extension not built")
+        from deltaswamp import Connection
+        from deltaswamp.capability import Capability, Operation
+        from deltaswamp.catalog.ossuc import OSSUnityCatalog
+        from deltaswamp.engine.kernel import KernelEngine
+        from deltaswamp.errors import UnreachableTableError
+
+        from tests import helpers
+        from tests.fake_uc import FakeUnityCatalog
+
+        with FakeUnityCatalog(staging_root=str(tmp_path)) as uc:
+            conn = Connection(catalog=OSSUnityCatalog(uc.url), router=helpers.direct_router())
+            conn.create_catalog("main")
+            conn.create_schema("main.sales")
+            conn.create_table("main.sales.cm", pa.schema([("id", pa.int64())]))
+            conn.table("main.sales.cm").append(pa.table({"id": [1]}), txn=("nightly", 3))
+
+            real = KernelEngine.supports
+
+            def no_writes(self: Any, operation: Any, table: Any, **shape: Any) -> Any:
+                if operation is Operation.APPEND:
+                    return Capability(operation, ok=False, reason="writes withheld")
+                return real(self, operation, table, **shape)
+
+            monkeypatch.setattr(KernelEngine, "supports", no_writes)
+            t = conn.table("main.sales.cm")
+            assert t.txn_version("nightly") == 3
+            assert t.txn_version("other") is None
+            # The write itself is refused as can() refuses it, not by the check.
+            assert not t.can("append", txn=("nightly", 4)).ok
+            with pytest.raises(UnreachableTableError, match="cannot append"):
+                t.append(pa.table({"id": [2]}), txn=("nightly", 4))
+            # A replay of a committed batch is skipped, as Spark skips it.
+            t.append(pa.table({"id": [1]}), txn=("nightly", 3))

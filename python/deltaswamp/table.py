@@ -9,6 +9,7 @@ everything afterward routes on the complete picture.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import re
 import warnings
@@ -2526,29 +2527,42 @@ class Table:
         if not isinstance(app_id, str) or not app_id:
             # delta-rs raised a bare TypeError for None.
             raise InvalidArgumentError(f"app_id must be a non-empty string, not {app_id!r}")
+        engine: Any = None
         try:
             engine = self._engine(Operation.APPEND, frozenset({"idempotent_txn"}))
         except DeltaSwampError:
-            engine = self._engine(Operation.APPEND)
+            with contextlib.suppress(DeltaSwampError):
+                engine = self._engine(Operation.APPEND)
         if callable(getattr(engine, "txn_version", None)):
             version: int | None = engine.txn_version(self._resolved, app_id)
             return version
-        # The writing engine cannot read transaction ids (the kernel, the
-        # warehouse); ask delta-rs, which reads them from the same log.
-        fallback: Any = self._connection.router.engines.get(EngineKind.DELTARS)
-        reason = f"the {type(engine).__name__} engine cannot read transaction identifiers"
-        if fallback is not None and callable(getattr(fallback, "txn_version", None)):
+        # The writing engine cannot read transaction ids (the warehouse), or
+        # nothing here writes the table; reading them needs only the log. The
+        # kernel first: it reads a catalog-managed table with the catalog's
+        # commit tail, which delta-rs cannot open at all, so txn_version()
+        # there failed.
+        reason = (
+            f"the {type(engine).__name__} engine cannot read transaction identifiers"
+            if engine is not None
+            else "no engine here writes this table"
+        )
+        for kind in (EngineKind.KERNEL, EngineKind.DELTARS):
+            fallback: Any = self._connection.router.engines.get(kind)
+            if fallback is None or not callable(getattr(fallback, "txn_version", None)):
+                continue
             available = getattr(fallback, "available", None)
-            if available is None or available():
-                try:
-                    version = fallback.txn_version(self._resolved, app_id)
-                    return version
-                except Exception as exc:
-                    reason += f", and delta-rs could not read this table's log ({exc})"
+            if available is not None and not available():
+                continue
+            try:
+                version = fallback.txn_version(self._resolved, app_id)
+                return version
+            except Exception as exc:
+                reason += f", and {kind.value} could not read this table's log ({exc})"
         raise UnreachableTableError(
             f"check transaction {app_id!r}",
             reason,
-            "write without txn= and deduplicate yourself, or use a table delta-rs can read",
+            "write without txn= and deduplicate yourself, or use a table the kernel or "
+            "delta-rs can read",
         )
 
     def delete(self, predicate: str | None = None, **kwargs: Any) -> dict[str, Any]:

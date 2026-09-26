@@ -229,6 +229,16 @@ t.replace(df)  # new contents and schema (RTAS)
 t.append(df, txn=("nightly-load", batch_id))  # idempotent
 ```
 
+`txn=(app_id, version)` makes an append exactly-once, as Spark's
+`txnAppId`/`txnVersion` do: an append whose version is at or below the last
+one committed under `app_id` is skipped, and `t.txn_version(app_id)` says
+which that was. It is read from the log (through the kernel on a
+catalog-managed table, with the catalog's commit tail), so it answers even
+where the warehouse does the writing; the warehouse itself cannot record a
+txn, so there `txn=` is refused. `plan_write(txn=...)` refuses a committed
+version instead of skipping it, before any worker runs, since the job it
+plans would be work already done.
+
 `df` can be a pyarrow Table or RecordBatchReader, a Polars DataFrame, a pandas
 DataFrame, or anything else exporting the Arrow PyCapsule interface.
 
