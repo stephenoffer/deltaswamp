@@ -1688,12 +1688,30 @@ class Table:
             if key in kwargs:
                 kwargs[key] = _timestamp_arg(kwargs[key], key)
         given = _given(kwargs)
+        segments = self._feed_segments(start, end) if start is not None else None
+        if segments is not None and len(segments) > 1:
+            return self._stitched_cdf(given, segments)
+        return self._cdf_read(given, start, end)
+
+    def _cdf_read(self, given: dict[str, Any], start: int | None, end: int | None) -> Any:
+        """One change-feed read, its failures translated."""
         # A file VACUUM removed, or rows written under a schema a later commit
         # replaced, failed as a raw ArrowInvalid (with a Python traceback
         # embedded in its message) where a scan names the missing file.
         where = self._resolved.location or str(self._resolved.ref)
 
         def translate(exc: BaseException) -> Exception | None:
+            if "cannot skip miniblock" in str(exc):
+                # arrow-rs skips DELTA_BINARY_PACKED values only in 32- or
+                # 64-value miniblocks, and Photon writes 256.
+                return EngineLimitError(
+                    "read the change data feed",
+                    "the kernel's Parquet reader cannot skip within a DELTA_BINARY_PACKED "
+                    "page whose miniblocks hold 256 values, as Databricks writes them "
+                    f"({(str(exc).splitlines() or [''])[0][:200]})",
+                    "read a narrower version range, or ds.connect(..., "
+                    "allow_sql_fallback=True) to read it with table_changes()",
+                )
             return self._feed_schema_change(exc, start, end)
 
         try:
@@ -1709,6 +1727,111 @@ class Table:
                 raise
             raise translated from exc
         return translating_stream(stream, f"the change data feed of {where}", translate)
+
+    def _schema_reader(self) -> Any:
+        """`version -> [(name, type), ...]` from the log, or None without a snapshot engine."""
+        import json
+
+        snapshot = getattr(
+            self._engine(Operation.TIME_TRAVEL, frozenset({"variant_free"})), "snapshot", None
+        )
+        if snapshot is None:
+            return None
+
+        def fields(version: int | None) -> tuple[int, list[tuple[str, str]]]:
+            snap = snapshot(self._resolved, version=version)
+            metadata = json.loads(snap.metadata_json())
+            schema = json.loads(metadata.get("schemaString") or "{}")
+            # Name and type only: a comment or a dropped NOT NULL changes
+            # the metadata but not how an older row reads.
+            return int(snap.version), [
+                (f["name"], json.dumps(f["type"], sort_keys=True))
+                for f in schema.get("fields", [])
+            ]
+
+        return fields
+
+    def _feed_segments(self, start: int, end: int | None) -> list[tuple[int, int]] | None:
+        """`start..end` split where the table's schema changed, or None if unknown.
+
+        The kernel reads a change feed under one schema only (and a range
+        that crossed an ADD COLUMN failed with a Parquet decode error on
+        files Photon wrote), so a range spanning a schema change is read as
+        one range per schema. Only the ends are compared on the common path;
+        the change versions are found by bisection when they differ.
+        """
+        try:
+            fields = self._schema_reader()
+            if fields is None:
+                return None
+            high, last = fields(end)
+            if start >= high:
+                return None
+            first = fields(start)[1]
+            if first == last:
+                return [(start, high)]
+            segments: list[tuple[int, int]] = []
+            low, current = start, first
+            while True:
+                if fields(high)[1] == current:
+                    segments.append((low, high))
+                    return segments
+                # The first version after `low` whose schema differs.
+                lo, hi = low + 1, high
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if fields(mid)[1] == current:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                segments.append((low, lo - 1))
+                low, current = lo, fields(lo)[1]
+        except Exception:
+            # Unknown, not wrong: the single read below reports what fails.
+            return None
+
+    def _stitched_cdf(self, given: dict[str, Any], segments: list[tuple[int, int]]) -> Any:
+        """The change feed over several schemas, as Spark reads it: under the latest.
+
+        Rows written before an ADD COLUMN read the new column as null. A change
+        an older row cannot be read under (a column dropped, renamed or
+        retyped) is refused, as Spark refuses it
+        (DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE), naming the version
+        so a follower can resume after it.
+        """
+        from .errors import ChangeFeedSchemaChangeError
+
+        pa = _require("pyarrow", "pyarrow")
+        fields = self._schema_reader()
+        assert fields is not None  # _feed_segments found the segments with it
+        for low, _ in segments[1:]:
+            earlier = dict(fields(low - 1)[1])
+            later = dict(fields(low)[1])
+            lost = [n for n, t in earlier.items() if later.get(n) != t]
+            if lost:
+                error = ChangeFeedSchemaChangeError(
+                    "read the change data feed",
+                    f"the table's schema changed at version {low} in a way rows written "
+                    f"before it cannot be read under (column(s) {lost} dropped, renamed "
+                    "or retyped)",
+                    f"read the feed up to version {low - 1}, or from version {low} on",
+                )
+                error.version = low
+                raise error
+        parts = []
+        for low, high in segments:
+            part = self._cdf_read(
+                {**given, "starting_version": low, "ending_version": high}, low, high
+            )
+            parts.append(part.read_all() if isinstance(part, TranslatingStream) else pa.table(part))
+        tables = [_plain_views(t) for t in parts]
+        stitched = pa.concat_tables(tables, promote_options="default")
+        # New columns land where the latest schema has them, not at the end.
+        order = [n for n in tables[-1].column_names if n in stitched.column_names]
+        order += [n for n in stitched.column_names if n not in order]
+        return pa.RecordBatchReader.from_batches(
+            stitched.select(order).schema, stitched.select(order).to_batches()
+        )
 
     #: How many versions back `_feed_schema_change` looks for the change.
     _FEED_SCHEMA_SEARCH = 200
@@ -1729,8 +1852,17 @@ class Table:
 
         from .errors import ChangeFeedSchemaChangeError
 
-        if isinstance(exc, DeltaSwampError) or not re.search(
-            r"cast|datatype|data type|number of fields|schema", str(exc), re.IGNORECASE
+        # The first line, without the Python traceback the C stream embeds.
+        detail = (str(exc).strip().splitlines() or [""])[0].split(" Detail: Python")[0][:200]
+        # Only the error's own first line: a Parquet decode failure
+        # ("cannot skip miniblock of size 256") matched on words in the
+        # embedded traceback and was reported as a schema change.
+        if (
+            isinstance(exc, DeltaSwampError)
+            or not re.search(
+                r"cast|datatype|data type|number of fields|schema", detail, re.IGNORECASE
+            )
+            or re.search(r"parquet (argument )?error", detail, re.IGNORECASE)
         ):
             return None
         try:
@@ -1759,14 +1891,12 @@ class Table:
             return None
         if changed is None:
             return None
-        # The first line, without the Python traceback the C stream embeds.
-        detail = (str(exc).strip().splitlines() or [""])[0].split(" Detail: Python")[0][:200]
         error = ChangeFeedSchemaChangeError(
             "read the change data feed",
             f"the table's schema changed at version {changed}, and rows the feed returns "
             f"were written under the schema before it, which they cannot be read as "
             f"({type(exc).__name__}: {detail})",
-            f"read the feed from version {changed + 1} on, or up to version {changed - 1}",
+            f"read the feed from version {changed} on, or up to version {changed - 1}",
         )
         error.version = changed
         return error
@@ -1810,23 +1940,34 @@ class Table:
             current = self._connection._reresolve(self)
             latest = current.version
             if latest is not None and latest >= next_version:
-                feed = current.cdf(
-                    starting_version=next_version,
-                    ending_version=latest,
-                    columns=projection,
-                    predicate=predicate,
-                )
-                # read_all() keeps the typed error pa.table() would flatten.
-                changes = feed.read_all() if isinstance(feed, TranslatingStream) else pa.table(feed)
-                if changes.num_rows:
-                    changes = _plain_views(changes).sort_by("_commit_version")
-                    versions = changes.column("_commit_version").to_pylist()
-                    for version in sorted(set(versions)):
-                        mask = pa.compute.equal(changes.column("_commit_version"), version)
-                        chunk = changes.filter(mask)
-                        if columns is not None:
-                            chunk = chunk.select(columns)
-                        yield int(version), chunk
+                # One read per schema: each version is yielded under the
+                # schema it was written with. Read as one range, a range
+                # crossing a schema change failed on every poll, and the
+                # follower never got past it.
+                segments = current._feed_segments(next_version, latest) or [
+                    (next_version, latest)
+                ]
+                for low, high in segments:
+                    feed = current.cdf(
+                        starting_version=low,
+                        ending_version=high,
+                        columns=projection,
+                        predicate=predicate,
+                    )
+                    # read_all() keeps the typed error pa.table() would flatten.
+                    changes = (
+                        feed.read_all() if isinstance(feed, TranslatingStream) else pa.table(feed)
+                    )
+                    if changes.num_rows:
+                        changes = _plain_views(changes).sort_by("_commit_version")
+                        versions = changes.column("_commit_version").to_pylist()
+                        for version in sorted(set(versions)):
+                            mask = pa.compute.equal(changes.column("_commit_version"), version)
+                            chunk = changes.filter(mask)
+                            if columns is not None:
+                                chunk = chunk.select(columns)
+                            yield int(version), chunk
+                    next_version = high + 1
                 next_version = latest + 1
             if poll_interval is None:
                 return
