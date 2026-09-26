@@ -193,8 +193,11 @@ class Engine(Protocol):
 # ---------------------------------------------------------------------------
 
 #: object_store's NotFound, which both engines read through on every backend
-#: (a local ENOENT, an S3/GCS 404, an Azure BlobNotFound).
-_MISSING_FILE = re.compile(r"Object at location (?P<path>.+?) not found")
+#: (a local ENOENT, an S3/GCS 404, an Azure BlobNotFound); and the kernel's
+#: own error for a deletion vector file it cannot open.
+_MISSING_FILE = re.compile(
+    r"Object at location (?P<path>.+?) not found|File not found: (?P<file>\S+)"
+)
 
 
 def missing_file_error(exc: BaseException, context: str) -> Exception | None:
@@ -206,7 +209,7 @@ def missing_file_error(exc: BaseException, context: str) -> Exception | None:
     found = _MISSING_FILE.search(str(exc))
     if found is None:
         return None
-    path = found.group("path").strip()
+    path = (found.group("path") or found.group("file")).strip()
     return MissingDataFileError(
         path,
         f"reading {context} failed: the file {path} it references is missing from storage. "
@@ -302,3 +305,35 @@ def translating_stream(source: Any, context: str, translate: Any = None) -> Any:
     except ImportError:
         return source
     return TranslatingStream(source, context, translate)
+
+
+# ---------------------------------------------------------------------------
+# MERGE clauses
+# ---------------------------------------------------------------------------
+
+#: Clause methods whose first argument is the SET/INSERT mapping, so the
+#: condition is their second.
+_MAPPING_CLAUSES = frozenset(
+    {"when_matched_update", "when_not_matched_insert", "when_not_matched_by_source_update"}
+)
+
+
+def merge_clause(
+    name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[str, bool] | None:
+    """A MERGE builder call's clause kind and whether it has a condition.
+
+    The kind is ``matched``, ``not_matched`` or ``not_matched_by_source``;
+    None for a call that adds no clause.
+    """
+    if name.startswith("when_not_matched_by_source"):
+        kind = "not_matched_by_source"
+    elif name.startswith("when_not_matched"):
+        kind = "not_matched"
+    elif name.startswith("when_matched"):
+        kind = "matched"
+    else:
+        return None
+    position = 1 if name in _MAPPING_CLAUSES else 0
+    predicate = kwargs.get("predicate", args[position] if len(args) > position else None)
+    return kind, predicate is not None

@@ -40,13 +40,14 @@ from ..catalog import ResolvedTable
 from ..credentials import Operation as CredentialOperation
 from ..errors import (
     CommitConflictError,
+    EngineLimitError,
     EnginePanicError,
     InvalidArgumentError,
     UnreachableTableError,
 )
 from ..properties import effect_for, validate_properties
 from . import metadata as meta
-from .base import missing_method
+from .base import merge_clause, missing_method
 
 __all__ = ["DeltaRsEngine"]
 
@@ -132,6 +133,8 @@ class DeltaRsEngine:
     kind = EngineKind.DELTARS
     supports_distributed_scan = False
     supports_predicates = True
+    #: DML predicates and SET values are evaluated by DataFusion.
+    supports_sql_expressions = True
     supports_timestamp_travel = True
     supports_schema_merge = True
     supports_schema_overwrite = True
@@ -1064,6 +1067,13 @@ class DeltaRsEngine:
         _commit_kwargs(kwargs)
         if isinstance(kwargs.get("writer_properties"), dict):
             kwargs["writer_properties"] = _writer_properties(kwargs["writer_properties"])
+        # The kernel and the warehouse default the aliases to `source` and
+        # `target`; without them delta-rs could not tell the two sides' same-
+        # named columns apart ("duplicate qualified field name ?table?.id").
+        if kwargs.get("source_alias") is None:
+            kwargs["source_alias"] = "source"
+        if kwargs.get("target_alias") is None:
+            kwargs["target_alias"] = "target"
         dt = self._open(table, write=True)
         kwargs["writer_properties"] = _exact_stats(
             kwargs.get("writer_properties"), _delta_schema(dt)
@@ -1080,6 +1090,9 @@ class DeltaRsEngine:
             generated=_generated_columns(dt),
             source_alias=kwargs.get("source_alias"),
             target_alias=kwargs.get("target_alias"),
+            change_feed=str(table.properties.get("delta.enableChangeDataFeed", "false")).lower()
+            == "true",
+            computed=_computed_columns(dt),
         )
 
     # ------------------------------------------------------------ maintenance
@@ -1795,13 +1808,15 @@ def _datafusion_updates(dt: Any, updates: dict[str, str], *, rendered: bool) -> 
     out: dict[str, str] = {}
     for key, expression in zip(keys, updates.values(), strict=True):
         out[key] = expression
-        if rendered or schema.get_field_index(key) < 0:
+        # A name that is not a plain identifier arrives backticked.
+        name = key[1:-1].replace("``", "`") if len(key) > 1 and key[0] == key[-1] == "`" else key
+        if rendered or schema.get_field_index(name) < 0:
             continue
         try:
             value = sqlpred.parse_value(expression)
         except sqlpred.PredicateError:
             continue
-        text = sqlpred.to_datafusion_value(value, schema, schema.field(key).type)
+        text = sqlpred.to_datafusion_value(value, schema, schema.field(name).type)
         if text is not None:
             out[key] = text
     return out
@@ -2010,6 +2025,22 @@ def _generated_columns(dt: Any) -> dict[str, str]:
         if isinstance(expr, str) and expr.strip():
             out[f.name] = expr
     return out
+
+
+def _computed_columns(dt: Any) -> set[str]:
+    """Generated and identity column names, lower-cased."""
+    try:
+        fields = list(dt.schema().fields)
+    except Exception:
+        return set()
+    return {
+        f.name.lower()
+        for f in fields
+        if any(
+            k == "delta.generationExpression" or k.startswith("delta.identity.")
+            for k in (f.metadata or {})
+        )
+    }
 
 
 def _with_generated(
@@ -2621,6 +2652,8 @@ class _CheckedMerger:
         generated: dict[str, str] | None = None,
         source_alias: str | None = None,
         target_alias: str | None = None,
+        change_feed: bool = False,
+        computed: set[str] | None = None,
     ) -> None:
         self._merger = merger
         #: alias -> column names, for respelling clause SQL case-insensitively.
@@ -2630,6 +2663,44 @@ class _CheckedMerger:
         self._generated = generated or {}
         self._source_alias = source_alias
         self._target_alias = target_alias
+        self._change_feed = change_feed
+        #: Generated and identity columns (lower case), which Delta fills itself.
+        self._computed = computed or set()
+        #: (clause kind, whether it has a condition), in the order given.
+        self._clauses: list[tuple[str, bool]] = []
+
+    def _note(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        """Record a clause, for the checks `execute` makes."""
+        clause = merge_clause(name, args, kwargs)
+        if clause is not None:
+            self._clauses.append(clause)
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        not_matched = [conditional for kind, conditional in self._clauses if kind == "not_matched"]
+        if self._change_feed and not_matched and not_matched[-1]:
+            # delta-rs 1.6.5 writes an all-NULL row into the table for every
+            # source row that matches no target row and no NOT MATCHED
+            # clause's condition, when the change data feed is on (and counts
+            # none of them). Refused before anything is written, so another
+            # engine can serve it.
+            raise EngineLimitError(
+                "merge on delta-rs",
+                "the table has the change data feed enabled, and delta-rs 1.6.5 inserts an "
+                "all-NULL row for each source row a conditional WHEN NOT MATCHED clause "
+                "rejects",
+                "filter the source to the rows to insert and drop the clause's condition, "
+                "or ds.connect(..., allow_sql_fallback=True) to run it on Databricks",
+            )
+        kinds = {kind for kind, _ in self._clauses}
+        if "not_matched_by_source" in kinds and "matched" not in kinds:
+            # With no MATCHED clause, delta-rs 1.6.5 writes a target row back
+            # once per source row matching it, duplicating it in the table.
+            # Spark leaves it alone; a MATCHED clause that never applies makes
+            # delta-rs do the same.
+            with _no_panics("merge (when_matched_delete)"):
+                self._merger.when_matched_delete(predicate="false")
+        with _no_panics("merge (execute)"):
+            return self._merger.execute(*args, **kwargs)
 
     def _recompute(self, updates: dict[str, str]) -> dict[str, str]:
         """`updates` plus SETs recomputing the generated columns they feed.
@@ -2653,6 +2724,7 @@ class _CheckedMerger:
         return out
 
     def when_matched_update(self, updates: Any, predicate: str | None = None) -> _CheckedMerger:
+        self._clauses.append(("matched", predicate is not None))
         folded = self._fold(updates)
         if isinstance(folded, dict):
             folded = self._recompute(folded)
@@ -2684,6 +2756,7 @@ class _CheckedMerger:
 
         def call(*args: Any, **kwargs: Any) -> Any:
             if name.startswith("when_"):
+                self._note(name, args, kwargs)
                 args = tuple(self._fold(a) for a in args)
                 kwargs = {
                     k: self._fold(v) if k in ("updates", "predicate") else v
@@ -2712,10 +2785,33 @@ class _CheckedMerger:
             )
         return cols
 
+    def _check_star(self, except_cols: list[str] | None, what: str) -> None:
+        """Refuse `UPDATE SET *` / `INSERT *` when the source lacks a target column.
+
+        Databricks refuses both ([DELTA_MERGE_UNRESOLVED_EXPRESSION]), and so
+        does the kernel MERGE; delta-rs kept the target's value or wrote NULL.
+        Generated and identity columns are Delta's to fill.
+        """
+        source = self._columns.get((self._source_alias or "").lower())
+        if not source or not self._target:
+            return
+        have = {c.lower() for c in source} | {c.lower() for c in except_cols or []}
+        missing = [
+            c for c in self._target if c.lower() not in have and c.lower() not in self._computed
+        ]
+        if missing:
+            raise InvalidArgumentError(
+                f"{what} needs every target column in the source, which lacks "
+                f"{', '.join(missing)}; add them to the source, or spell the clause out"
+            )
+
     def when_matched_update_all(
         self, predicate: str | None = None, except_cols: Any = None
     ) -> _CheckedMerger:
         excluded = self._except(except_cols)
+        self._check_star(excluded, "UPDATE SET *")
+        if not self._generated:
+            self._clauses.append(("matched", predicate is not None))
         if self._generated:
             # Spelled out as explicit SETs so the generated columns the source
             # does not carry can be recomputed alongside (see _recompute).
@@ -2739,9 +2835,10 @@ class _CheckedMerger:
     def when_not_matched_insert_all(
         self, predicate: str | None = None, except_cols: Any = None
     ) -> _CheckedMerger:
-        self._merger.when_not_matched_insert_all(
-            self._fold(predicate), except_cols=self._except(except_cols)
-        )
+        self._clauses.append(("not_matched", predicate is not None))
+        excluded = self._except(except_cols)
+        self._check_star(excluded, "INSERT *")
+        self._merger.when_not_matched_insert_all(self._fold(predicate), except_cols=excluded)
         return self
 
 

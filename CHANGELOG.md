@@ -64,6 +64,12 @@ First release.
 - Commits the kernel writes, including distributed ones, record empty
   `operationParameters`: delta_kernel 0.28 overwrites whatever the engine
   supplies. `isBlindAppend` still tells an append from an overwrite.
+- A MERGE on a change-data-feed table whose last NOT MATCHED clause has a
+  condition is refused on delta-rs (1.6.5 inserts an all-NULL row per rejected
+  source row) and needs the SQL fallback.
+- DELETE/UPDATE/replaceWhere SQL beyond the kernel's predicate grammar
+  (arithmetic, function calls) needs delta-rs or the warehouse, so on a
+  catalog-managed table it needs the SQL fallback.
 - The change feed and history of a catalog-managed table need the warehouse.
 - Incremental reads without a change feed are not built.
 - Databricks allowlists which connectors may write through the Unity Catalog

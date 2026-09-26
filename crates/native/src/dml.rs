@@ -140,8 +140,8 @@ struct Touched {
 /// listing the rows: a DELETE with no predicate, or a file the caller is
 /// rewriting (its surviving rows are in `batches`). Such a file is removed; a
 /// full-file vector stands in where row tracking forbids removes, which needs
-/// the file's `numRecords`. A file without that statistic cannot take a
-/// vector at all, which is why the caller rewrites it instead.
+/// the file's `numRecords`. Where an add carries no such statistic, the row
+/// count comes from the file's Parquet footer.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_dml(
     snapshot: SnapshotRef,
@@ -195,6 +195,12 @@ pub fn commit_dml(
 
     // Decide every file's fate before any I/O, so bad input writes nothing.
     let allow_remove = removes_allowed(&snapshot);
+    // Files whose add carries no `numRecords` in its JSON stats, with the row
+    // count read from their Parquet footer instead. Databricks writes such
+    // adds as a matter of course: its tables default to
+    // `delta.checkpoint.writeStatsAsJson=false`, so every add in a checkpoint
+    // has only `stats_parsed`, which the kernel's scan files do not carry.
+    let mut unsized_files: HashMap<String, u64> = HashMap::new();
     let mut touched: BTreeMap<String, Touched> = BTreeMap::new();
     for path in &whole_files {
         let file = live.get(path).ok_or_else(|| {
@@ -208,7 +214,17 @@ pub fn commit_dml(
             Some(rows) => rows.len() as u64,
             None => 0,
         };
-        let num_records = file.stats.as_ref().map(|s| s.num_records);
+        // Without row tracking an unsized file is simply removed, so its row
+        // count is not worth a footer read; a full-file vector needs it.
+        let num_records = match file.stats.as_ref() {
+            Some(stats) => Some(stats.num_records),
+            None if allow_remove => None,
+            None => {
+                let n = footer_num_rows(&engine, &table_root, file)?;
+                unsized_files.insert(path.clone(), n);
+                Some(n)
+            }
+        };
         match num_records {
             Some(n) if n == already => continue, // nothing left to delete
             Some(n) => {
@@ -250,12 +266,14 @@ pub fn commit_dml(
                 snapshot.version()
             ))
         })?;
-        let num_records = file.stats.as_ref().map(|s| s.num_records).ok_or_else(|| {
-            NativeError::Invalid(format!(
-                "data file {path:?} has no numRecords statistic, which a deletion vector \
-                 requires (the protocol ties a DV's cardinality to it)"
-            ))
-        })?;
+        let num_records = match file.stats.as_ref() {
+            Some(stats) => stats.num_records,
+            None => {
+                let n = footer_num_rows(&engine, &table_root, file)?;
+                unsized_files.insert(path.clone(), n);
+                n
+            }
+        };
         if let Some(max) = rows.max() {
             if max >= num_records {
                 return Err(NativeError::Invalid(format!(
@@ -377,6 +395,14 @@ pub fn commit_dml(
                 })
                 .collect();
             if update.iter().any(|u| *u) {
+                // The kernel's DV update rewrites each add's JSON stats (it
+                // widens tightBounds) and refuses an add without numRecords,
+                // so an unsized file gets the count its footer gave.
+                let batch = if unsized_files.is_empty() {
+                    batch
+                } else {
+                    with_num_records(&batch, &paths, &unsized_files)?
+                };
                 dv_files.push(Ok(FilteredEngineData::try_new(
                     Box::new(ArrowEngineData::new(batch)),
                     update,
@@ -604,6 +630,91 @@ fn scan_file_paths(batch: &RecordBatch) -> Result<StringArray> {
         .downcast_ref::<StringArray>()
         .cloned()
         .ok_or_else(|| NativeError::Invalid("scan-file paths are not strings".to_string()))
+}
+
+/// A data file's row count, from its Parquet footer.
+///
+/// For adds whose JSON stats lack `numRecords`; one ranged read of the footer.
+fn footer_num_rows(engine: &SharedEngine, root: &url::Url, file: &ScanFile) -> Result<u64> {
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStoreExt;
+    use delta_kernel::parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
+
+    let unreadable = |why: String| {
+        NativeError::Invalid(format!(
+            "data file {:?} has no numRecords statistic, and its Parquet footer could not \
+             be read for the row count a deletion vector requires: {why}",
+            file.path
+        ))
+    };
+    let url = root.join(&file.path)?;
+    let store = engine
+        .get_object_store_for_url(&url)
+        .ok_or_else(|| NativeError::Invalid(format!("no object store is registered for {url}")))?;
+    let location = Path::from_url_path(url.path())
+        .map_err(|e| NativeError::Invalid(format!("invalid data file path {url}: {e}")))?;
+    runtime::block_on(async {
+        let size = match u64::try_from(file.size) {
+            Ok(size) if size > 0 => size,
+            _ => store.head(&location).await?.size,
+        };
+        if size < 8 {
+            return Err(unreadable(format!("the file is only {size} bytes")));
+        }
+        let tail = store.get_range(&location, size - 8..size).await?;
+        let tail: [u8; 8] = tail[..]
+            .try_into()
+            .map_err(|_| unreadable("short read".to_string()))?;
+        let footer = FooterTail::try_new(&tail).map_err(|e| unreadable(e.to_string()))?;
+        if footer.is_encrypted_footer() {
+            return Err(unreadable("the footer is encrypted".to_string()));
+        }
+        let length = footer.metadata_length() as u64;
+        if length + 8 > size {
+            return Err(unreadable("the footer length exceeds the file".to_string()));
+        }
+        let bytes = store
+            .get_range(&location, size - 8 - length..size - 8)
+            .await?;
+        let metadata = ParquetMetaDataReader::decode_metadata(&bytes)
+            .map_err(|e| unreadable(e.to_string()))?;
+        u64::try_from(metadata.file_metadata().num_rows())
+            .map_err(|_| unreadable("the footer reports a negative row count".to_string()))
+    })
+}
+
+/// `batch` (scan files) with `{"numRecords": n}` as the stats of each file in
+/// `counts` that has none.
+fn with_num_records(
+    batch: &RecordBatch,
+    paths: &StringArray,
+    counts: &HashMap<String, u64>,
+) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let index = schema.index_of("stats")?;
+    let original = batch.column(index);
+    let stats = arrow::compute::cast(original, &arrow::datatypes::DataType::Utf8)?;
+    let stats = stats
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| NativeError::Invalid("scan-file stats are not strings".to_string()))?;
+    let patched: StringArray = (0..batch.num_rows())
+        .map(|i| {
+            if !stats.is_null(i) {
+                return Some(stats.value(i).to_string());
+            }
+            if paths.is_null(i) {
+                return None;
+            }
+            counts
+                .get(paths.value(i))
+                .map(|n| format!("{{\"numRecords\":{n}}}"))
+        })
+        .collect();
+    let patched = arrow::compute::cast(&patched, original.data_type())?;
+    let mut columns = batch.columns().to_vec();
+    columns[index] = patched;
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 /// Write a new, uniquely named file under the table root.

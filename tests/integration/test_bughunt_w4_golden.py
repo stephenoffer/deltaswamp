@@ -459,14 +459,15 @@ def test_merge_insert_computes_generated_columns(tmp_path: Path) -> None:
     assert _by_id(t)[-1] == {"id": 3, "v": 1, "g": 6, "h": 4}
 
 
-def test_merge_generated_recompute_without_target_alias_is_refused(tmp_path: Path) -> None:
+def test_merge_generated_recompute_with_the_default_target_alias(tmp_path: Path) -> None:
+    # The target alias defaults to `target`, as on the kernel and the
+    # warehouse, so the generated columns can be recomputed without one.
     t = _generated_merge(tmp_path)
-    merger = t.merge(pa.table({"id": [2], "v": [5]}), "source.id = id", source_alias="source")
-    with pytest.raises(errors.InvalidArgumentError, match="target_alias"):
-        merger.when_matched_update(updates={"id": "source.id + 1"})
+    merger = t.merge(pa.table({"id": [2], "v": [5]}), "source.id = target.id")
+    merger.when_matched_update(updates={"id": "source.id + 1"}).execute()
     assert _by_id(t) == [
         {"id": 1, "v": 10, "g": 2, "h": 11},
-        {"id": 2, "v": 20, "g": 4, "h": 22},
+        {"id": 3, "v": 20, "g": 6, "h": 23},
     ]
 
 

@@ -39,6 +39,7 @@ from ..errors import (
     CommitConflictError,
     DeltaSwampError,
     EngineLimitError,
+    InvalidArgumentError,
     TransientCommitError,
     UnreachableTableError,
 )
@@ -287,6 +288,11 @@ class KernelEngine:
     #: history_manager resolves a timestamp to the latest recreatable version,
     #: honoring in-commit timestamps.
     supports_timestamp_travel = True
+    #: DELETE/UPDATE/replaceWhere evaluate their SQL here, and only the
+    #: predicate grammar (comparisons, IN, BETWEEN, LIKE, IS NULL, AND/OR/NOT
+    #: over columns and literals; SET values a literal or a column). Arithmetic
+    #: and function calls go to an engine that evaluates SQL.
+    supports_sql_expressions = False
 
     def __init__(self, *, storage_options: dict[str, str] | None = None) -> None:
         self._base_options = dict(storage_options or {})
@@ -1643,25 +1649,31 @@ class KernelEngine:
     ) -> int:
         """Commit `deletions` (path, row_index) as vectors plus `data`, in one transaction.
 
-        A touched file with no `numRecords` statistic cannot take a vector (its
-        cardinality is tied to that count), so it is rewritten instead, as
-        copy-on-write does: its surviving rows join `data` and the file is
-        removed in the same commit.
+        A touched file whose add has no `numRecords` statistic (every add in a
+        Databricks checkpoint: its tables write stats only as `stats_parsed`)
+        still takes a vector; the native commit reads the count from the
+        file's Parquet footer.
         """
-        deletions, data, whole_files = _rewrite_unsized_files(
-            table, snapshot, deletions, data, list(whole_files or [])
-        )
-        with _library_commit_errors():
-            version, _deleted, _dvs, _removed = snapshot.commit_dml(
-                deletions.to_reader(),
-                data=data.to_reader() if data is not None else None,
-                whole_files=whole_files or None,
-                uc=self._uc_commit_config(table),
-                engine_info=engine_info or _engine_info(),
-                operation=operation,
-                txn=txn,
-                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-            )
+        try:
+            with _library_commit_errors():
+                version, _deleted, _dvs, _removed = snapshot.commit_dml(
+                    deletions.to_reader(),
+                    data=data.to_reader() if data is not None else None,
+                    whole_files=whole_files or None,
+                    uc=self._uc_commit_config(table),
+                    engine_info=engine_info or _engine_info(),
+                    operation=operation,
+                    txn=txn,
+                    commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+                )
+        except ValueError as exc:
+            # Refused before anything is written; the request's mistake, not
+            # the engine's, so it is reported as one.
+            if isinstance(exc, InvalidArgumentError) or "non-nullable" not in str(exc):
+                raise
+            raise InvalidArgumentError(
+                f"{operation} would write NULL into a NOT NULL column: {exc}"
+            ) from exc
         if int(version) != int(snapshot.version):
             self._maybe_checkpoint(table, version, snapshot)
         return int(version)
@@ -1713,6 +1725,8 @@ class KernelEngine:
         import pyarrow as pa
         import pyarrow.compute as pc
 
+        from .kernel_merge import store_cast
+
         _refuse_options("update", unsupported)
         assignments: dict[str, Any] = dict(new_values or {})
         for column, expression in (updates or {}).items():
@@ -1742,10 +1756,18 @@ class KernelEngine:
                         )
                     what = f"update {column} from {value.path[0]}"
                     source_index = column_index(current.schema, value.path[0], what)
-                    source = current.column(source_index).cast(field.type)
+                    source = store_cast(current.column(source_index), field.type, field.name)
                 else:
+                    # Stored as Spark stores it: 12.345 rounds into a
+                    # DECIMAL(10,2), where Arrow's cast refused it.
                     raw = value.value if isinstance(value, sqlpred.Literal) else value
-                    source = pa.array([raw] * out.num_rows).cast(field.type)
+                    try:
+                        literal = pa.array([raw] * out.num_rows)
+                    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+                        raise InvalidArgumentError(
+                            f"update {column}: {raw!r} is not a value Arrow can hold: {exc}"
+                        ) from exc
+                    source = store_cast(literal, field.type, field.name)
                 new = pc.if_else(keep, out.column(index), source)
                 out = out.set_column(index, field, new)
             return out
@@ -2400,45 +2422,6 @@ def _refuse_changed_layout(snapshot: Any, fragments: list[bytes]) -> None:
                 "write the data again; the old fragments' files are unreferenced and "
                 "VACUUM removes them",
             )
-
-
-def _rewrite_unsized_files(
-    table: ResolvedTable, snapshot: Any, deletions: Any, data: Any, whole_files: list[str]
-) -> tuple[Any, Any, list[str]]:
-    """Move deletions from files without `numRecords` into a rewrite.
-
-    Returns the deletions left for vectors, the data with each such file's
-    surviving rows added, and the files to remove whole. Row tracking forbids
-    the remove, so there the native commit refuses with the reason instead.
-    """
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    if deletions.num_rows == 0 or _row_tracking_enabled(table):
-        return deletions, data, whole_files
-    files = pa.table(snapshot.files())
-    unsized = set(files.filter(pc.is_null(files.column("num_records"))).column("path").to_pylist())
-    touched = set(pc.unique(deletions.column("path")).to_pylist())
-    rewrite = sorted(unsized & touched)
-    if not rewrite:
-        return deletions, data, whole_files
-    in_rewrite = pc.is_in(deletions.column("path"), pa.array(rewrite, pa.string()))
-    gone = deletions.filter(in_rewrite)
-    rest = pa.table(snapshot.scan(files=rewrite, row_positions=True))
-    keys = pc.binary_join_element_wise(
-        rest.column(_FILE_COLUMN), pc.cast(rest.column(_ROW_INDEX_COLUMN), pa.string()), "\x00"
-    )
-    gone_keys = pc.binary_join_element_wise(
-        gone.column("path"), pc.cast(gone.column("row_index"), pa.string()), "\x00"
-    )
-    survivors = rest.filter(pc.invert(pc.is_in(keys, gone_keys))).drop_columns(
-        [_FILE_COLUMN, _ROW_INDEX_COLUMN]
-    )
-    if data is None:
-        data = survivors
-    elif survivors.num_rows:
-        data = pa.concat_tables([data, survivors.cast(data.schema)])
-    return deletions.filter(pc.invert(in_rewrite)), data, whole_files + rewrite
 
 
 #: The columns a positional scan (`row_positions=True`) adds to each row.

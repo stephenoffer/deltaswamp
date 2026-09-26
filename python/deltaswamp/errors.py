@@ -51,12 +51,15 @@ class PropertyNotSupportedError(UnreachableTableError):
 
 
 class EngineLimitError(UnreachableTableError):
-    """The engine serving a read found, only once it read the log, that it cannot.
+    """The engine serving a call found, only once it had it in hand, that it cannot.
 
     A limit of that engine, not of the request -- the kernel reads a change feed
-    across one schema only -- so another engine that serves the operation may
-    succeed, and `Table` tries it. A refusal about the request itself (no such
-    version, a timestamp before the history) is a plain `UnreachableTableError`.
+    across one schema only; delta-rs mishandles a conditional NOT MATCHED clause
+    on a change-feed table, which a MERGE shows only at execute -- so another
+    engine that serves the operation may succeed, and `Table` tries it. It is
+    raised before anything is written. A refusal about the request itself (no
+    such version, a timestamp before the history) is a plain
+    `UnreachableTableError`.
     """
 
 

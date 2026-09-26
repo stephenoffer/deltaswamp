@@ -19,6 +19,15 @@ Semantics follow Spark's MERGE:
   SOURCE clauses;
 * on a table with row tracking enabled, updated rows keep their row ids.
 
+Clause text is Spark SQL, as everywhere else in the API (and on the
+warehouse, which runs the same text). DuckDB evaluates it, so `_spark_sql`
+first rewrites what the two dialects spell differently: string literals with
+Spark's backslash escapes, `"text"` as a string, backtick identifiers, `<=>`,
+`nvl`/`nvl2`, `DIV`, typed numeric suffixes, LIKE's default `\\` escape, and
+`concat`, which is NULL when any argument is (DuckDB's skips NULLs). Values
+are stored into the target column as Spark's store assignment does: fractions
+truncate into an integer column and round half-up into a narrower decimal.
+
 Only the target files that can hold a match are read. The ON condition is
 parsed for `target.col = source.col` conjuncts, and the target is skipped
 with `col IN (<the source's values>)`, which the ON condition implies, so no
@@ -28,9 +37,10 @@ every target row, and turns skipping off.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from ..errors import InvalidArgumentError, UnreachableTableError
+from ..errors import EngineLimitError, InvalidArgumentError, UnreachableTableError
 
 __all__ = ["KernelMerger"]
 
@@ -40,6 +50,10 @@ _INDEX = "__deltaswamp_row_index"
 _ROW_ID = "__deltaswamp_row_id"
 #: Our own row number for source rows.
 _SRC_ROW = "__deltaswamp_source_row"
+#: The touched rows' positions in the evaluated SELECTs. Reserved names, so a
+#: target column called `path` or `row_index` cannot collide with them.
+_POS_FILE = "__deltaswamp_pos_file"
+_POS_INDEX = "__deltaswamp_pos_row_index"
 #: The most distinct join-key values turned into a skipping IN-list.
 _SKIP_VALUES_LIMIT = 10_000
 
@@ -91,6 +105,7 @@ class KernelMerger:
         self._table = table
         self._source = pa.table(source) if not isinstance(source, pa.Table) else source
         self._predicate = predicate
+        self._on = _spark_sql(predicate)
         self._passthrough = passthrough
         # (kind, condition, verb, argument)
         self._clauses: list[tuple[str, str | None, str, Any]] = []
@@ -100,6 +115,17 @@ class KernelMerger:
     def _add(self, kind: str, predicate: str | None, verb: str, arg: Any) -> KernelMerger:
         if verb in ("UPDATE", "INSERT") and not arg:
             raise InvalidArgumentError(f"a MERGE {verb} clause needs at least one column to set")
+        if any(k == kind and c is None for k, c, _, _ in self._clauses):
+            # Spark refuses this at parse time; taking the first silently
+            # dropped every later clause of the kind.
+            raise InvalidArgumentError(
+                f"a {_KIND_NAMES[kind]} clause follows an unconditional one, which takes "
+                "every row; only the last clause of a kind may omit its condition"
+            )
+        if predicate is not None:
+            predicate = _spark_sql(predicate)
+        if verb in ("UPDATE", "INSERT"):
+            arg = {key: _spark_sql(_expression(value)) for key, value in arg.items()}
         self._clauses.append((kind, predicate, verb, arg))
         return self
 
@@ -164,6 +190,20 @@ class KernelMerger:
             con.register("__target", target)
             con.register("__source", source)
             result = self._evaluate(con, schema, target, row_ids)
+        except (
+            duckdb.ParserException,
+            duckdb.BinderException,
+            duckdb.CatalogException,
+            duckdb.NotImplementedException,
+        ) as exc:
+            # SQL this dialect bridge does not cover (a Spark function DuckDB
+            # lacks, say). Nothing is written yet, so another engine may try.
+            raise EngineLimitError(
+                "merge on the kernel",
+                f"DuckDB, which evaluates the kernel MERGE's clauses, cannot run them: {exc}",
+                "delta-rs or the SQL warehouse (allow_sql_fallback=True) evaluate other "
+                "SQL; or rewrite the clause",
+            ) from exc
         finally:
             con.close()
         deletions, data, metrics = result
@@ -237,8 +277,11 @@ class KernelMerger:
         import pyarrow as pa
 
         t, s = _quote(self._target_alias), _quote(self._source_alias)
-        on = f"({self._predicate})"
-        positions = f"{t}.{_quote(_FILE)} AS path, {t}.{_quote(_INDEX)} AS row_index"
+        on = f"({self._on})"
+        positions = (
+            f"{t}.{_quote(_FILE)} AS {_quote(_POS_FILE)}, "
+            f"{t}.{_quote(_INDEX)} AS {_quote(_POS_INDEX)}"
+        )
         carried = f", {t}.{_quote(_ROW_ID)} AS {_quote(_ROW_ID)}" if row_ids else ""
         columns = [f.name for f in schema]
 
@@ -248,13 +291,21 @@ class KernelMerger:
         }
 
         # A target row matched by several source rows cannot be updated
-        # deterministically.
+        # deterministically. As in Spark, only the pairs some MATCHED clause
+        # would act on count: two source rows of which neither satisfies a
+        # clause condition leave the row alone, which is no conflict.
         matched = clauses["matched"]
         only_deletes = all(verb == "DELETE" and cond is None for _, cond, verb, _ in matched)
         if matched and not only_deletes:
+            conditions = [cond for _, cond, _, _ in matched]
+            acting = (
+                "TRUE"
+                if any(c is None for c in conditions)
+                else " OR ".join(f"COALESCE(({c}), FALSE)" for c in conditions)
+            )
             dup = con.execute(
                 f"SELECT count(*) FROM (SELECT {t}.{_quote(_FILE)}, {t}.{_quote(_INDEX)} "
-                f"FROM __target AS {t} JOIN __source AS {s} ON {on} "
+                f"FROM __target AS {t} JOIN __source AS {s} ON {on} WHERE {acting} "
                 f"GROUP BY 1, 2 HAVING count(*) > 1)"
             ).fetchone()[0]
             if dup:
@@ -265,6 +316,7 @@ class KernelMerger:
                 )
 
         deletions: list[Any] = []
+        deleted: list[Any] = []
         outputs: list[Any] = []
         counts = {"updated": 0, "deleted": 0, "inserted": 0}
 
@@ -291,13 +343,13 @@ class KernelMerger:
                 if verb == "DELETE":
                     part = _fetch(con, f"SELECT {positions} {sql_from}")
                     deletions.append(part)
-                    counts["deleted"] += part.num_rows
+                    deleted.append(part)
                     continue
                 exprs = self._assignments(verb, arg, columns, kind)
                 select = ", ".join(f"{e} AS {_quote(c)}" for c, e in exprs.items())
                 part = _fetch(con, f"SELECT {positions}{carried}, {select} {sql_from}")
-                deletions.append(part.select(["path", "row_index"]))
-                outputs.append(part.drop_columns(["path", "row_index"]))
+                deletions.append(part.select([_POS_FILE, _POS_INDEX]))
+                outputs.append(part.drop_columns([_POS_FILE, _POS_INDEX]))
                 counts["updated"] += part.num_rows
 
         not_matched = clauses["not_matched"]
@@ -315,12 +367,20 @@ class KernelMerger:
             outputs.append(part)
             counts["inserted"] += part.num_rows
 
+        positions_schema = pa.schema([(_POS_FILE, pa.string()), (_POS_INDEX, pa.int64())])
         deletion_schema = pa.schema([("path", pa.string()), ("row_index", pa.int64())])
         deletion_table = (
-            pa.concat_tables([d.cast(deletion_schema) for d in deletions])
+            pa.concat_tables([d.cast(positions_schema) for d in deletions]).rename_columns(
+                deletion_schema.names
+            )
             if deletions
             else deletion_schema.empty_table()
         )
+        if deleted:
+            # Several source rows may match one target row an unconditional
+            # DELETE takes; the row is deleted once.
+            rows = pa.concat_tables([d.cast(positions_schema) for d in deleted])
+            counts["deleted"] = rows.group_by([_POS_FILE, _POS_INDEX]).aggregate([]).num_rows
         data = None
         if outputs:
             target_schema = pa.schema(
@@ -360,12 +420,8 @@ class KernelMerger:
         # UPDATE_ALL: every column the source has, except `except_cols`.
         if kind != "matched":
             raise InvalidArgumentError("update_all is only valid for matched rows")
-        excluded = {str(c).lower() for c in arg}
-        sources = {n.lower(): n for n in self._source.column_names if n != _SRC_ROW}
-        for column in columns:
-            name = sources.get(column.lower())
-            if name is not None and column.lower() not in excluded:
-                exprs[column] = f"{s}.{_quote(name)}"
+        for column, name in self._star_columns(arg, columns, "UPDATE SET *").items():
+            exprs[column] = f"{s}.{_quote(name)}"
         return exprs
 
     def _insert_values(self, verb: str, arg: Any, columns: list[str]) -> dict[str, str]:
@@ -375,13 +431,27 @@ class KernelMerger:
             for key, value in arg.items():
                 exprs[self._target_column(key, columns)] = f"({value})"
             return exprs
-        excluded = {str(c).lower() for c in arg}
-        sources = {n.lower(): n for n in self._source.column_names if n != _SRC_ROW}
-        for column in columns:
-            name = sources.get(column.lower())
-            if name is not None and column.lower() not in excluded:
-                exprs[column] = f"{s}.{_quote(name)}"
+        for column, name in self._star_columns(arg, columns, "INSERT *").items():
+            exprs[column] = f"{s}.{_quote(name)}"
         return exprs
+
+    def _star_columns(self, except_cols: Any, columns: list[str], what: str) -> dict[str, str]:
+        """Target column -> source column for `UPDATE SET *` / `INSERT *`.
+
+        Databricks refuses either when the source lacks a target column that
+        `except_cols` does not name ([DELTA_MERGE_UNRESOLVED_EXPRESSION]);
+        filling it with NULL (or keeping the target's value) wrote rows the
+        warehouse would not have.
+        """
+        excluded = {str(c).lower() for c in except_cols}
+        sources = {n.lower(): n for n in self._source.column_names if n != _SRC_ROW}
+        missing = [c for c in columns if c.lower() not in sources and c.lower() not in excluded]
+        if missing:
+            raise InvalidArgumentError(
+                f"{what} needs every target column in the source, which lacks "
+                f"{', '.join(missing)}; add them to the source, or spell the clause out"
+            )
+        return {c: sources[c.lower()] for c in columns if c.lower() not in excluded}
 
 
 def _fetch(con: Any, sql: str) -> Any:
@@ -406,10 +476,44 @@ def _cast_to(data: Any, schema: Any) -> Any:
     columns = []
     for field in schema:
         if field.name in data.column_names:
-            columns.append(data.column(field.name).cast(field.type))
+            columns.append(store_cast(data.column(field.name), field.type, field.name))
         else:
             columns.append(pa.nulls(data.num_rows, field.type))
     return pa.Table.from_arrays(columns, schema=schema)
+
+
+def store_cast(column: Any, target: Any, name: str) -> Any:
+    """`column` as `target`, the way Spark stores a value into a column.
+
+    A bare NULL comes out of DuckDB typed INTEGER, which Arrow will not cast
+    to a timestamp, struct or binary. A fraction stored into an integer
+    column truncates and one stored into a narrower decimal rounds half-up,
+    where Arrow's safe cast refuses both. Anything else that does not fit is
+    the caller's mistake, reported as one.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if column.type == target:
+        return column
+    if column.null_count == len(column):
+        return pa.nulls(len(column), target)
+    try:
+        if pa.types.is_integer(target) and pa.types.is_floating(column.type):
+            column = pc.trunc(column)
+        elif pa.types.is_integer(target) and pa.types.is_decimal(column.type):
+            column = pc.round(column, ndigits=0, round_mode="towards_zero")
+        elif pa.types.is_decimal(target) and (
+            pa.types.is_floating(column.type)
+            or (pa.types.is_decimal(column.type) and column.type.scale > target.scale)
+        ):
+            column = pc.round(column, ndigits=target.scale, round_mode="half_up")
+        return column.cast(target)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+        raise InvalidArgumentError(
+            f"the value written to {name!r} is {column.type}, which cannot be stored in the "
+            f"column's type {target}: {exc}"
+        ) from exc
 
 
 def _quote_sql_ident(name: str) -> str:
@@ -433,3 +537,168 @@ def _sql_literal(value: Any) -> str | None:
     if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
         return f"DATE '{value.isoformat()}'"
     return None
+
+
+_KIND_NAMES = {
+    "matched": "WHEN MATCHED",
+    "not_matched": "WHEN NOT MATCHED",
+    "not_matched_by_source": "WHEN NOT MATCHED BY SOURCE",
+}
+
+
+def _expression(value: Any) -> str:
+    """A SET/INSERT value as SQL text; None is NULL, as on the warehouse."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    return str(value)
+
+
+_SQL_TOKEN = re.compile(
+    r"""
+      (?P<space>\s+)
+     |(?P<string>'(?:[^'\\]|\\.|'')*')
+     |(?P<dstring>"(?:[^"\\]|\\.|"")*")
+     |(?P<quoted>`(?:[^`]|``)*`)
+     |(?P<number>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?(?P<suffix>BD|[LSYDF])?(?!\w))
+     |(?P<nullsafe><=>)
+     |(?P<word>(?:[^\W\d]|_)\w*)
+     |(?P<other>.)
+    """,
+    re.VERBOSE | re.DOTALL | re.IGNORECASE,
+)
+
+
+def _spark_sql(text: str) -> str:
+    """Spark SQL clause text rewritten for DuckDB (see the module docstring)."""
+    from .. import predicate as sqlpred
+
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(text):
+        match = _SQL_TOKEN.match(text, pos)
+        if match is None:  # unterminated quote: DuckDB reports it
+            tokens.append(("other", text[pos:]))
+            break
+        kind = match.lastgroup or "other"
+        if kind == "suffix":
+            kind = "number"
+        raw = match.group(0)
+        pos = match.end()
+        if kind in ("string", "dstring"):
+            # Both are string literals in Spark; DuckDB takes '' doubling only.
+            value = sqlpred._unescape(raw)
+            tokens.append(("string", "'" + value.replace("'", "''") + "'"))
+        elif kind == "quoted":
+            name = raw[1:-1].replace("``", "`")
+            tokens.append(("ident", '"' + name.replace('"', '""') + '"'))
+        elif kind == "number":
+            suffix = (match.group("suffix") or "").upper()
+            digits = raw[: len(raw) - len(suffix)]
+            if suffix == "D":
+                digits = f"CAST({digits} AS DOUBLE)"
+            elif suffix == "F":
+                digits = f"CAST({digits} AS FLOAT)"
+            tokens.append(("number", digits))
+        elif kind == "nullsafe":
+            tokens.append(("op", " IS NOT DISTINCT FROM "))
+        else:
+            tokens.append((kind, raw))
+    out, _ = _rewrite(tokens, 0)
+    return out
+
+
+def _next_token(tokens: list[tuple[str, str]], i: int) -> int:
+    while i < len(tokens) and tokens[i][0] == "space":
+        i += 1
+    return i
+
+
+def _rewrite(tokens: list[tuple[str, str]], i: int, stop: bool = False) -> tuple[str, int]:
+    """Join tokens from `i`, rewriting calls; with `stop`, up to the closing paren."""
+    out: list[str] = []
+    while i < len(tokens):
+        kind, text = tokens[i]
+        if stop and kind == "other" and text in (")", ","):
+            return "".join(out), i
+        if kind == "other" and text == "(":
+            inner, i = _rewrite(tokens, i + 1, stop=True)
+            out.append("(" + inner)
+            while i < len(tokens) and tokens[i][1] == ",":
+                inner, i = _rewrite(tokens, i + 1, stop=True)
+                out.append("," + inner)
+            if i < len(tokens):
+                out.append(")")
+                i += 1
+            continue
+        if kind == "word":
+            call = _next_token(tokens, i + 1)
+            name = text.lower()
+            if name == "div" and not _qualified(tokens, i):
+                out.append(" // ")  # Spark's integral division
+                i += 1
+                continue
+            if (
+                name in _CALL_REWRITES
+                and call < len(tokens)
+                and tokens[call][1] == "("
+                and not _qualified(tokens, i)
+            ):
+                args: list[str] = []
+                j = call + 1
+                while True:
+                    arg, j = _rewrite(tokens, j, stop=True)
+                    args.append(arg)
+                    if j >= len(tokens) or tokens[j][1] == ")":
+                        break
+                    j += 1  # the comma
+                if len(args) == 1 and not args[0].strip():
+                    args = []
+                out.append(_CALL_REWRITES[name](args))
+                i = j + 1
+                continue
+            if name in ("like", "ilike"):
+                # Spark's LIKE escapes with a backslash by default; DuckDB's
+                # has no escape character unless one is named.
+                pattern = _next_token(tokens, i + 1)
+                after = _next_token(tokens, pattern + 1)
+                if (
+                    pattern < len(tokens)
+                    and tokens[pattern][0] == "string"
+                    and not (after < len(tokens) and tokens[after][1].upper() == "ESCAPE")
+                ):
+                    out.append(f"{text} {tokens[pattern][1]} ESCAPE '\\'")
+                    i = pattern + 1
+                    continue
+        out.append(text)
+        i += 1
+    return "".join(out), i
+
+
+def _qualified(tokens: list[tuple[str, str]], i: int) -> bool:
+    """Whether the word at `i` follows a `.` (a column named like a function)."""
+    j = i - 1
+    while j >= 0 and tokens[j][0] == "space":
+        j -= 1
+    return j >= 0 and tokens[j][1] == "."
+
+
+def _concat(args: list[str]) -> str:
+    # Spark's concat is NULL when any argument is; `||` is the same in DuckDB.
+    if not args:
+        return "''"
+    return "(" + " || ".join(f"({a})" for a in args) + ")"
+
+
+def _nvl2(args: list[str]) -> str:
+    if len(args) != 3:
+        raise InvalidArgumentError(f"nvl2 takes 3 arguments, got {len(args)}")
+    return f"(CASE WHEN ({args[0]}) IS NOT NULL THEN ({args[1]}) ELSE ({args[2]}) END)"
+
+
+_CALL_REWRITES = {
+    "concat": _concat,
+    "nvl": lambda args: "coalesce(" + ", ".join(args) + ")",
+    "nvl2": _nvl2,
+}
