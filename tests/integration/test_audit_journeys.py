@@ -108,11 +108,11 @@ class TestMiniblockErrorIsTyped:
 
         import deltaswamp.table as table_module
 
-        table_module.translating_stream = spy
+        setattr(table_module, "translating_stream", spy)  # noqa: B010
         try:
             conn.open_table(path).cdf(starting_version=0, ending_version=1)
         finally:
-            table_module.translating_stream = real
+            setattr(table_module, "translating_stream", real)  # noqa: B010
         error = captured["translate"](OSError("Parquet error: cannot skip miniblock of size 256"))
         assert isinstance(error, EngineLimitError)
         assert isinstance(error, DeltaSwampError)
@@ -433,9 +433,7 @@ class TestAppendsRefuseLossyCasts:
         path = str(tmp_path / "t")
         t = conn.write_table(
             path,
-            pa.table(
-                {"i": pa.array([1], pa.int64()), "f": pa.array([1.0]), "s": pa.array(["a"])}
-            ),
+            pa.table({"i": pa.array([1], pa.int64()), "f": pa.array([1.0]), "s": pa.array(["a"])}),
         )
         t.append(
             pa.table(
@@ -501,9 +499,7 @@ class TestSchemaArgumentsTakeSqlTypeNames:
 
 
 class TestSmallJourneyFixes:
-    def test_alter_column_type_to_its_own_type_is_a_no_op(
-        self, conn: Any, tmp_path: Any
-    ) -> None:
+    def test_alter_column_type_to_its_own_type_is_a_no_op(self, conn: Any, tmp_path: Any) -> None:
         path = str(tmp_path / "t")
         t = conn.create_table(path, pa.schema([("id", pa.int64())]))
         before = t.version
@@ -522,9 +518,7 @@ class TestSmallJourneyFixes:
             with pytest.raises(InvalidArgumentError):
                 t.overwrite(pa.table({"id": [5]}), predicate="id = 1")
 
-    def test_zoned_datetime_into_timestamp_ntz_is_refused(
-        self, conn: Any, tmp_path: Any
-    ) -> None:
+    def test_zoned_datetime_into_timestamp_ntz_is_refused(self, conn: Any, tmp_path: Any) -> None:
         import datetime as dt
 
         from deltaswamp.errors import InvalidArgumentError
@@ -575,9 +569,7 @@ class TestCreateAtAUriWithAFragment:
     through the returned handle landed there, while opening the URI refused."""
 
     @pytest.mark.parametrize("name", ["x#y", "q?r"])
-    def test_refused_before_anything_is_created(
-        self, conn: Any, tmp_path: Any, name: str
-    ) -> None:
+    def test_refused_before_anything_is_created(self, conn: Any, tmp_path: Any, name: str) -> None:
         import os
 
         from deltaswamp.errors import InvalidArgumentError

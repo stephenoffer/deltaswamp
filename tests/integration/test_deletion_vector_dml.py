@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 from deltaswamp.capability import Engine, Operation
-from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError
 
 pa = pytest.importorskip("pyarrow")
 deltalake = pytest.importorskip("deltalake")

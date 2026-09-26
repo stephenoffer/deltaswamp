@@ -262,7 +262,7 @@ def _features_added(operation: Operation, shape: dict[str, object]) -> set[str]:
             names.add(str(getattr(item, "value", item)))
     elif operation is Operation.SET_PROPERTIES:
         properties = shape.get("properties")
-        for key, value in (properties.items() if isinstance(properties, dict) else ()):
+        for key, value in properties.items() if isinstance(properties, dict) else ():
             lowered = str(key).lower()
             on = str(value).lower()
             if lowered.startswith("delta.feature.") and on in ("supported", "enabled"):

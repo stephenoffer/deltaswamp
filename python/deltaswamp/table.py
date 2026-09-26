@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import re
 import warnings
 from collections.abc import Callable
@@ -1463,12 +1464,13 @@ class Table:
         `predicate=` in SQL to have the engine skip files).
         """
         pl = _require("polars", "polars")
-        register = None
+        register: Any = None
         if lazy:
-            try:
-                from polars.io.plugins import register_io_source as register
-            except ImportError:
-                register = None
+            # An IO source is how Polars pushes a projection and a row limit
+            # into a scan; an older Polars without it gets the eager frame.
+            with contextlib.suppress(ImportError):
+                plugins = importlib.import_module("polars.io.plugins")
+                register = getattr(plugins, "register_io_source", None)
         if register is None:
             frame = pl.DataFrame(self.to_arrow(**kwargs))
             return frame.lazy() if lazy else frame
@@ -1904,8 +1906,7 @@ class Table:
             # Name and type only: a comment or a dropped NOT NULL changes
             # the metadata but not how an older row reads.
             return int(snap.version), [
-                (f["name"], json.dumps(f["type"], sort_keys=True))
-                for f in schema.get("fields", [])
+                (f["name"], json.dumps(f["type"], sort_keys=True)) for f in schema.get("fields", [])
             ]
 
         return fields
@@ -2103,9 +2104,7 @@ class Table:
                 # schema it was written with. Read as one range, a range
                 # crossing a schema change failed on every poll, and the
                 # follower never got past it.
-                segments = current._feed_segments(next_version, latest) or [
-                    (next_version, latest)
-                ]
+                segments = current._feed_segments(next_version, latest) or [(next_version, latest)]
                 for low, high in segments:
                     feed = current.cdf(
                         starting_version=low,

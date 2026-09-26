@@ -12,7 +12,6 @@ import time
 from typing import Any
 
 import pytest
-from deltaswamp.errors import UnreachableTableError
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
