@@ -10,6 +10,7 @@ import datetime as dt
 import json
 import pathlib
 import time
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 import pytest
@@ -52,7 +53,7 @@ def _days(*dates: dt.date) -> list[int]:
 
 def _ts_table(
     root: pathlib.Path,
-    micros: list[int | None],
+    micros: Sequence[int | None],
     meta: dict[str, str],
     *,
     int96: bool = False,
