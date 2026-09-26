@@ -223,11 +223,15 @@ class TestSupports:
         cap = engine.supports(Operation.SCAN, _resolved(data_source_format="DELTA"))
         assert not cap.ok and "without UniForm" in cap.reason and "Delta engines" in cap.remedy
 
-    @pytest.mark.parametrize(
-        "op", [Operation.SCAN, Operation.TIME_TRAVEL, Operation.HISTORY, Operation.DETAIL]
-    )
+    @pytest.mark.parametrize("op", [Operation.SCAN, Operation.TIME_TRAVEL, Operation.DETAIL])
     def test_uniform_reads(self, engine: IcebergEngine, op: Operation) -> None:
         assert engine.supports(op, _uniform()).ok
+
+    def test_uniform_history_is_the_delta_logs(self, engine: IcebergEngine) -> None:
+        # OC-3: the snapshot log carries no Delta versions, so history built
+        # from it had every version None.
+        cap = engine.supports(Operation.HISTORY, _uniform())
+        assert not cap.ok and "Delta versions" in cap.reason
 
     @pytest.mark.parametrize("op", [Operation.APPEND, Operation.OVERWRITE])
     def test_uniform_writes_are_refused(self, engine: IcebergEngine, op: Operation) -> None:

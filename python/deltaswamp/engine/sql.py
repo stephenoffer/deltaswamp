@@ -46,7 +46,12 @@ from typing import Any
 from ..capability import OPERATION_ENGINES, READ_OPERATIONS, Capability, Operation
 from ..capability import Engine as EngineKind
 from ..catalog import ResolvedTable, TableType
-from ..errors import InvalidArgumentError, SqlFallbackWarning, UnreachableTableError
+from ..errors import (
+    DeltaSwampError,
+    InvalidArgumentError,
+    SqlFallbackWarning,
+    UnreachableTableError,
+)
 from ..identity import RefKind, split_identifier
 from . import sql_text as sq
 from .base import missing_method
@@ -59,6 +64,7 @@ from .sql_backend import (
     _check_timeout,
     _check_wait_timeout,
     parameters_from_mapping,
+    sdk_error,
 )
 
 __all__ = ["SqlEngine", "SqlFallbackWarning", "SqlMerger", "SqlStatementError"]
@@ -408,6 +414,7 @@ class SqlEngine:
         )
         self._selection_error: str | None = None
         self._last_listing_error: str | None = None
+        self._warehouse_checked = False
 
     def __getstate__(self) -> dict[str, Any]:
         # The live WorkspaceClient (and the statement backend built on it) and
@@ -461,7 +468,7 @@ class SqlEngine:
                     f"{operation.value} through a SQL warehouse needs the data on the server, "
                     "and no staging volume is configured to upload it to"
                 ),
-                remedy="SqlEngine(..., staging_volume='<catalog>.<schema>.<volume>')",
+                remedy="ds.connect(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
         refusal = self._table_type_refusal(operation, table)
         if refusal is not None:
@@ -591,10 +598,10 @@ class SqlEngine:
         Never raises: a failure is recorded as the refusal reason instead,
         because `supports()` must answer rather than throw.
         """
-        if self._warehouse_id is not None:
-            return self._warehouse_id
         if self._selection_error is not None:
             return None
+        if self._warehouse_id is not None:
+            return self._checked_warehouse(self._warehouse_id)
         if not self._auto_select:
             self._selection_error = "no SQL warehouse configured"
             return None
@@ -615,6 +622,29 @@ class SqlEngine:
             f"chosen automatically as {why} because no warehouse_id was given"
         )
         return self._warehouse_id
+
+    def _checked_warehouse(self, warehouse_id: str) -> str | None:
+        """`warehouse_id`, once the workspace has confirmed it exists.
+
+        A mistyped id passed can() and then failed the call with the SDK's
+        raw NotFound. Checked once, on first use of the fallback; a failure
+        that says nothing about the id (a denial, throttling, a test double
+        without the API) lets it through, and the statement reports it.
+        """
+        if getattr(self, "_warehouse_checked", False):
+            return warehouse_id
+        try:
+            self._workspace().warehouses.get(warehouse_id)
+        except Exception as exc:
+            from ..credentials.databricks import _error_kind
+
+            if _error_kind(exc) == "not_found":
+                self._selection_error = (
+                    f"the SQL warehouse {warehouse_id!r} does not exist in this workspace ({exc})"
+                )
+                return None
+        self._warehouse_checked = True
+        return warehouse_id
 
     @property
     def warehouse_id(self) -> str | None:
@@ -842,7 +872,7 @@ class SqlEngine:
             raise UnreachableTableError(
                 "stage data for a SQL write",
                 "no staging volume is configured",
-                "SqlEngine(..., staging_volume='<catalog>.<schema>.<volume>')",
+                "ds.connect(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
         arrow = _stageable(_to_arrow(data))
         payload = _parquet_bytes(arrow)
@@ -851,10 +881,13 @@ class SqlEngine:
         files = self._workspace().files
         try:
             files.upload(path, io.BytesIO(payload), overwrite=False)
-        except BaseException:
+        except BaseException as exc:
             # A multipart upload that fails part-way can leave a partial file.
             with contextlib.suppress(Exception):
                 files.delete(path)
+            if isinstance(exc, Exception) and not isinstance(exc, DeltaSwampError):
+                where = f"the staging volume {'.'.join(self._staging_volume)}"
+                raise sdk_error(exc, where) from exc
             raise
         # Each statement projects the staged columns itself (`_staged_columns`):
         # read_files adds a `_rescued_data` column of its own.
@@ -1121,7 +1154,7 @@ class SqlEngine:
             raise UnreachableTableError(
                 "merge via SQL",
                 "the source has to be uploaded, and no staging volume is configured",
-                "SqlEngine(..., staging_volume='<catalog>.<schema>.<volume>')",
+                "ds.connect(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
         return SqlMerger(
             self,

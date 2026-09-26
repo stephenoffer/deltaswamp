@@ -258,6 +258,8 @@ class SharingCatalog:
     """Resolves ``share.schema.table`` against a Delta Sharing server."""
 
     name = "sharing"
+    #: The reference schemes this catalog serves; see `Connection._catalog_for`.
+    ref_schemes: frozenset[str] = frozenset({"deltasharing"})
 
     def __init__(self, profile: str | Path | dict[str, Any]) -> None:
         self._profile = profile_document(profile)

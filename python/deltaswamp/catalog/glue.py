@@ -92,6 +92,8 @@ class GlueCatalog:
     """Resolves Delta tables registered in AWS Glue."""
 
     name = "glue"
+    #: The reference schemes this catalog serves; see `Connection._catalog_for`.
+    ref_schemes: frozenset[str] = frozenset({"glue"})
 
     @classmethod
     def from_uri(cls, uri: str | None, **kwargs: Any) -> GlueCatalog:

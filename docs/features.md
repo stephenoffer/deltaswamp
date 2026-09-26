@@ -192,7 +192,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | pandas | `to_pandas` | |
 | Polars | `to_polars(lazy=...)` | works on tables `polars.scan_delta` cannot open |
 | DuckDB | `to_duckdb`, `Connection.sql` | the same, for DuckDB's delta extension |
-| Ray | `to_ray_dataset` | a Ray Data datasource; workers read byte-balanced groups of files and vend their own credentials |
+| Ray | `to_ray_dataset` | a Ray Data datasource; workers read byte-balanced groups of files with the plan's storage credential (or vend their own with `ship_catalog_auth=True`) |
 | Daft | `to_daft` | |
 | Cross-catalog SQL | `Connection.sql(query, tables=...)` | join a catalog-managed table with a Glue table and a path |
 

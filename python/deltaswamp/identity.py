@@ -291,6 +291,13 @@ def _parse_catalog_uri(
 
     if scheme in ("uc", "unity", "deltasharing"):
         # `uc://catalog.schema.table` -- the delta-rs precedent.
+        if "/" in _unquoted(body):
+            # `uc://main/sales/orders` parsed as one table part under the
+            # defaults and reached the catalog as `main.sales.main/sales/orders`.
+            raise InvalidReferenceError(
+                f"{ref!r}: a {scheme}:// table reference is dotted "
+                f"({scheme}://catalog.schema.table), not a path"
+            )
         parsed = _parse_name(body, default_catalog, default_schema, raw=ref)
         return TableRef(
             kind=RefKind.CATALOG,

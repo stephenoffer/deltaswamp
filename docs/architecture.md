@@ -106,12 +106,18 @@ per snapshot, so a single scan that streams past its credential's lifetime
 fails. Refreshing inside Rust needs an `object_store::CredentialProvider` that
 calls back into Python, which is not built. Until then, a scan that starts with
 less than `KernelEngine.expiry_warning_seconds` of credential life raises
-`CredentialExpiryWarning`. `plan_scan()` and `to_ray_dataset()` avoid the
-problem, since each worker vends its own credential for its own slice.
+`CredentialExpiryWarning`. `plan_scan()` and `to_ray_dataset()` split the read,
+but by default a plan carries one storage credential vended on the driver, and
+a worker refuses it within a minute of its expiry. With
+`ship_catalog_auth=True` the plan carries the credential provider instead, and
+each worker vends its own credential for its own slice.
 
-Providers are picklable and credentials are not. `__getstate__` drops the live
-client, the cached credential and the lock, so a worker receives configuration,
-never a token.
+Providers are picklable and credentials are not: `Credentials` raises
+`TypeError` when pickled, and only a plan's `ShippedCredentials` carries one on
+purpose. A provider's `__getstate__` drops the live client, the cached
+credential and the lock. It keeps the catalog configuration, which for a
+token-authenticated workspace includes the token; that is why plans do not
+ship providers unless asked.
 
 Vending is per-table with no batch endpoint. Discovery therefore makes one
 `ListTables` call per schema rather than one lookup per table.

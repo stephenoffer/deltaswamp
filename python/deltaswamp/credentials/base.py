@@ -121,6 +121,42 @@ class Credentials:
             f"expires_at={exp}, keys={sorted(self.secrets)})"
         )
 
+    def __reduce_ex__(self, protocol: object) -> tuple[object, ...]:
+        # The module docstring's rule, enforced: a pickled Credentials put the
+        # live secret key and session token into whatever carried the bytes
+        # (a task payload, a cache, a log). The one deliberate carrier, a
+        # plan's ShippedCredentials, opts in through `_state`.
+        raise TypeError(
+            "Credentials are not picklable: they hold live storage secrets. Ship the "
+            "table's credential provider (or a plan from plan_scan()/plan_write()) "
+            "instead, and vend where the credential is used."
+        )
+
+    def _state(self) -> dict[str, object]:
+        """The fields, for a carrier that ships a credential on purpose."""
+        return {
+            "cloud": self.cloud.value,
+            "url": self.url,
+            "expires_at": self.expires_at,
+            "secrets": dict(self.secrets),
+            "scope_prefix": self.scope_prefix,
+            "table_id": self.table_id,
+            "operation": None if self.operation is None else self.operation.value,
+        }
+
+    @classmethod
+    def _from_state(cls, state: dict[str, object]) -> Credentials:
+        operation = state.get("operation")
+        return cls(
+            cloud=Cloud(str(state["cloud"])),
+            url=str(state["url"]),
+            expires_at=state.get("expires_at"),  # type: ignore[arg-type]
+            secrets=dict(state.get("secrets") or {}),  # type: ignore[call-overload]
+            scope_prefix=state.get("scope_prefix"),  # type: ignore[arg-type]
+            table_id=state.get("table_id"),  # type: ignore[arg-type]
+            operation=None if operation is None else Operation(str(operation)),
+        )
+
 
 _AZURE_ENDPOINT_KEYS = frozenset({"azure_endpoint", "azure_storage_endpoint", "endpoint"})
 
@@ -215,6 +251,14 @@ class StaticCredentialProvider:
     def peek(self) -> Credentials:
         """The held credential, without the expiry check."""
         return self._credentials
+
+    def __getstate__(self) -> dict[str, object]:
+        # `Credentials` refuse pickling; a provider built around one carries it
+        # deliberately, as a plan's ShippedCredentials does.
+        return {"credentials": self._credentials._state()}
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self._credentials = Credentials._from_state(state["credentials"])  # type: ignore[arg-type]
 
     def __repr__(self) -> str:
         return f"StaticCredentialProvider({self._credentials!r})"

@@ -38,7 +38,8 @@ First release.
 - Unity Catalog governance: grants, tags, ownership, lineage, key constraints,
   catalogs, schemas, volumes and files.
 - Distributed reads (`plan_scan`, `to_ray_dataset`) and writes (`plan_write`),
-  with picklable credential providers so workers vend their own credentials.
+  shipping a short-lived storage credential by default, or the picklable
+  credential provider (`ship_catalog_auth=True`) so workers vend their own.
 - Hand-offs to DuckDB, Polars and Daft, and cross-catalog SQL through
   `Connection.sql`.
 
@@ -71,6 +72,9 @@ First release.
   (arithmetic, function calls) needs delta-rs or the warehouse, so on a
   catalog-managed table it needs the SQL fallback.
 - The change feed and history of a catalog-managed table need the warehouse.
+- Databricks managed Iceberg (`USING ICEBERG`) takes appends through the
+  Iceberg REST endpoint; overwrites need the warehouse, because the endpoint
+  takes one snapshot per commit.
 - Incremental reads without a change feed are not built.
 - Databricks allowlists which connectors may write through the Unity Catalog
   Delta API, so writes to managed tables go through the SQL fallback until

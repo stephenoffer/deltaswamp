@@ -96,7 +96,12 @@ Useful keyword arguments:
 Run `conn.preflight()` once against a new workspace. It returns a list of
 problems, empty when ready, and it checks the settings that block everything
 else: external data access on the metastore, which is off by default and needs
-an account admin.
+an account admin, and, when the connection has `default_catalog` and
+`default_schema`, EXTERNAL USE SCHEMA on that schema. With the SQL fallback on
+it also checks the warehouse and notes a missing `staging_volume`. It cannot
+see per-table limits: Unity Catalog accepts external writes only for some
+table kinds (external and catalog-managed tables), which `t.can("append")`
+reports table by table.
 
 ## Opening a table
 
@@ -120,6 +125,13 @@ Names may be backtick-quoted, so a dot inside an identifier works:
 | `glue://db.table`, `glue://<id>/db.table` | Glue |
 | `share.schema.table` on a sharing connection | Delta Sharing |
 | `s3://`, `gs://`, `abfss://`, `file://`, `/local/path` | storage directly |
+
+A `glue://` or `hms://host:port/...` reference is served by that catalog
+whatever the connection is bound to: the catalog is built on first use and
+kept on the connection, so `conn.sql(tables={"c": "glue://crm.customers"})`
+works on a Databricks connection. `uc://` and Delta Sharing names need their
+own connection, and a connection bound elsewhere refuses them rather than
+looking the name up in its own catalog.
 
 `dbfs:/` and `/mnt/...` paths are refused with an explanation, since they are
 unreachable from outside Databricks.
@@ -457,6 +469,16 @@ tables can also be read as Iceberg, but the Delta path remains the default for
 them. External writes to UniForm tables are refused, because they would leave
 the Iceberg metadata stale; `t.sync_iceberg()` regenerates it on Databricks.
 
+Databricks managed Iceberg (`CREATE TABLE ... USING ICEBERG`) is a special
+case: Unity Catalog reports it as Delta, with a catalog-managed Delta log
+beside the Iceberg metadata. deltaswamp recognises it (the
+`delta.enableIcebergWriterCompatV1` property on a catalog-managed table), reads
+it through the Delta path, and appends through the Iceberg REST endpoint.
+Overwrites are refused there, because the endpoint takes one snapshot per commit
+and an Iceberg overwrite commits two; `history()` is refused too, because the
+Iceberg snapshot log does not carry Delta versions. With
+`allow_sql_fallback=True` the warehouse serves both.
+
 ## Handing off to other engines
 
 ```python
@@ -489,7 +511,7 @@ is spent.
 ```python
 plan = t.plan_scan(columns=["id"], predicate="day >= '2026-09-01'")
 for group in plan.partitions(8):  # byte-balanced; pickle and ship each
-    part = plan.read(group)  # on a worker: same version, own credentials
+    part = plan.read(group)  # on a worker: same version, the plan's credential
 
 plan = t.plan_write(mode="append")  # driver: raises now if the table refuses it
 fragment = plan.write(batch)  # worker: durable, uncommitted files -> bytes
@@ -609,8 +631,11 @@ exponential backoff and no publish will wedge the table.
 Unity Catalog vends short-lived, per-table storage credentials. They expire
 on their own clock, separate from the catalog token the SDK refreshes, and are
 re-vended between operations. A single scan that streams past its
-credential's lifetime can still fail; `plan_scan()` avoids that by vending per
-worker. [Architecture](architecture.md#credentials) has the details.
+credential's lifetime can still fail. `plan_scan()` splits the read, but by
+default every worker uses the one storage credential the driver vended when
+the plan was pickled; a job that runs longer than that credential lives needs
+`plan_scan(ship_catalog_auth=True)`, so each worker re-vends its own.
+[Architecture](architecture.md#credentials) has the details.
 
 ```python
 creds = t.credentials()  # or credentials(write=True)
@@ -619,11 +644,21 @@ creds.expires_within(300)
 creds.redacted()  # safe to log
 ```
 
-Credential *providers* are picklable; credentials are not. Pickling a provider
-(or a `Table` or `Connection` holding one) carries its catalog configuration,
-which for a token-authenticated workspace includes the token, so a worker can
-re-vend. Distributed plans do not do this by default; see "Building a
-distributed connector" above. Azure
+Credential *providers* are picklable; credentials are not, and pickling one
+raises `TypeError`. Pickling a provider, or a `Table` holding one, carries the
+catalog configuration the driver resolved, which for a token-authenticated
+workspace includes the token, so a worker can re-vend. A pickled `Connection`
+carries only what `connect()` was given: an explicit `token=` or `config=`
+travels, but authentication the SDK found in the environment or
+`~/.databrickscfg` does not, so a worker needs its own. Distributed plans ship
+no catalog credentials by default; see "Distributed reads and writes" above.
+
+databricks-sdk logs every response body at DEBUG. deltaswamp installs a filter
+on the `databricks.sdk` logger that replaces the secret fields of vended
+credentials and OAuth tokens (`secret_access_key`, `session_token`,
+`sas_token`, `oauth_token`, `access_token`, ...) with `**REDACTED**`, so turning
+on DEBUG does not write them to the log. A handler that reads records from
+another logger the SDK uses is not covered. Azure
 user-delegation SAS is scoped to a path, so credentials are keyed by table, and
 Azure always gets an explicit endpoint.
 

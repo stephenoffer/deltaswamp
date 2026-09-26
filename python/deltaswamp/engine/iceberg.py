@@ -470,7 +470,7 @@ class IcebergEngine:
                 "open-source), which serves one",
             )
 
-        uniform = not table.is_iceberg
+        uniform = not table.is_managed_iceberg
         if uniform and not table.has_iceberg_compat:
             return Capability(
                 operation,
@@ -489,6 +489,23 @@ class IcebergEngine:
                 remedy=SQL_FALLBACK_REMEDY,
             )
 
+        if operation is Operation.HISTORY and not table.is_iceberg:
+            # The table has a Delta log, and Delta history is that log's. The
+            # Iceberg snapshot log records a Delta version only for some
+            # commits (for managed Iceberg, none), so history came back with
+            # every version None and the CREATE commit missing.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table's history is its Delta log's, and the Iceberg snapshot "
+                "log does not carry Delta versions",
+                remedy=(
+                    SQL_FALLBACK_REMEDY
+                    if table.is_catalog_managed
+                    else "the Delta engines serve it"
+                ),
+            )
+
         if operation in _WRITES:
             if uniform:
                 return Capability(
@@ -504,6 +521,19 @@ class IcebergEngine:
                     operation,
                     ok=False,
                     reason="the catalog reports no external-engine write support for this table",
+                    remedy=SQL_FALLBACK_REMEDY,
+                )
+            if operation is not Operation.APPEND and not table.is_iceberg:
+                # Databricks managed Iceberg (a Delta log beside the Iceberg
+                # metadata). PyIceberg commits an overwrite as a delete and an
+                # append snapshot together, and the endpoint refuses that:
+                # "Adding multiple snapshots in a single update is not
+                # supported". Seen live; nothing is written.
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason="Databricks' Iceberg REST endpoint takes one snapshot per commit, "
+                    "and an Iceberg overwrite commits two (a delete and an append)",
                     remedy=SQL_FALLBACK_REMEDY,
                 )
         elif operation not in _READS:
@@ -900,7 +930,7 @@ class IcebergEngine:
             "partition_columns": partition_columns,
             "sort_order": _as_json(iceberg.sort_order()),
             "properties": dict(metadata.properties),
-            "is_uniform": not table.is_iceberg,
+            "is_uniform": not table.is_managed_iceberg,
         }
 
     # ------------------------------------------------------------------ write
