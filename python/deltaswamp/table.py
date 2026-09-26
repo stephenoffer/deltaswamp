@@ -9,7 +9,9 @@ everything afterward routes on the complete picture.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import importlib
 import json
 import re
 import warnings
@@ -61,6 +63,46 @@ def _write_data(data: Any) -> Any:
     if data is None:
         raise InvalidArgumentError("no data given to write")
     return data
+
+
+def _library_error(exc: BaseException, what: str) -> Exception | None:
+    """An engine's raw error as this library's type, when it is one of the known kinds.
+
+    delta-rs reported data that does not fit the table as its own
+    SchemaMismatchError (or a bare Exception naming an Arrow cast), an
+    UPDATE SET of an unknown column as a DeltaError, and both engines a
+    storage failure as a bare OSError: none was caught by `except
+    DeltaSwampError`. None for anything else, which propagates as it is.
+    """
+    from .errors import StorageError
+
+    if isinstance(exc, DeltaSwampError):
+        return None
+    text = str(exc)
+    detail = " ".join(line.strip() for line in text.splitlines() if line.strip())[:400]
+    name = type(exc).__name__
+    if name == "SchemaMismatchError":
+        return InvalidArgumentError(f"{what}: the data does not fit the table's schema ({detail})")
+    if name in ("DeltaError", "Exception") and re.search(
+        r"No field named|Cast error|Schema error", text
+    ):
+        return InvalidArgumentError(f"{what}: {detail}")
+    if isinstance(exc, OSError) and not isinstance(exc, (FileNotFoundError, PermissionError)):
+        error = StorageError(f"{what}: the table's storage failed the request ({detail})")
+        error.errno = exc.errno
+        return error
+    return None
+
+
+def _translated(what: str, call: Callable[[], Any]) -> Any:
+    """`call()`, with a known raw engine error raised as this library's type."""
+    try:
+        return call()
+    except Exception as exc:
+        translated = _library_error(exc, what)
+        if translated is None:
+            raise
+        raise translated from exc
 
 
 #: Writes re-run after a concurrent schema or metadata change beat them.
@@ -355,6 +397,72 @@ def _looks_missing(error: str) -> bool:
             "no files in log segment",
         )
     )
+
+
+def _store_assignable(pa: Any, given: Any, wanted: Any) -> bool:
+    """Whether a column of type `given` may be written into one of type `wanted`.
+
+    What Delta's schema enforcement accepts without mergeSchema: the same
+    type, or a widening that keeps every value (int to a wider int or to a
+    double, float to double, a decimal to one holding all its digits). delta-rs
+    cast the rest safely-but-silently -- 4.7 became 4 in a BIGINT column, '12'
+    became 12 -- where Spark refuses the write. Nested types are left to the
+    engine, which checks them field by field.
+    """
+    t = pa.types
+    if given == wanted or t.is_null(given):
+        return True
+    if t.is_dictionary(given):
+        return _store_assignable(pa, given.value_type, wanted)
+    if t.is_nested(given) or t.is_nested(wanted):
+        return True
+    strings = (t.is_string, t.is_large_string, t.is_string_view)
+    binaries = (t.is_binary, t.is_large_binary, t.is_binary_view)
+    for family in (strings, binaries):
+        if any(f(given) for f in family) and any(f(wanted) for f in family):
+            return True
+    if t.is_integer(given):
+        if t.is_signed_integer(wanted):
+            # Delta has no unsigned types: an unsigned column is cast safely
+            # where it is aligned, which refuses a value out of range.
+            return bool(given.bit_width <= wanted.bit_width)
+        if t.is_float64(wanted):
+            return bool(given.bit_width <= 32)
+        if t.is_decimal(wanted):
+            digits = {8: 3, 16: 5, 32: 10, 64: 19}[given.bit_width]
+            return bool(wanted.precision - wanted.scale >= digits)
+        return False
+    if t.is_floating(given):
+        return bool(t.is_floating(wanted) and given.bit_width <= wanted.bit_width)
+    if t.is_decimal(given):
+        return bool(
+            t.is_decimal(wanted)
+            and wanted.scale >= given.scale
+            and wanted.precision - wanted.scale >= given.precision - given.scale
+        )
+    if t.is_timestamp(given):
+        # A unit or zone difference is how Arrow spells the same instant (a
+        # nanosecond is truncated to Delta's microsecond, as Spark does).
+        return bool(t.is_timestamp(wanted))
+    if t.is_date(given):
+        return bool(t.is_date(wanted))
+    return False
+
+
+def _refuse_lossy_types(pa: Any, schema: Any, by_name: dict[str, Any], canonical: Any) -> None:
+    """Raise InvalidArgumentError for a column Delta would not write as the table's type."""
+    bad = []
+    for field in schema:
+        wanted = by_name.get(canonical(field.name))
+        if wanted is not None and not _store_assignable(pa, field.type, wanted.type):
+            bad.append(f"{wanted.name} ({field.type} into {wanted.type})")
+    if bad:
+        raise InvalidArgumentError(
+            "the data does not fit the table's column types, and writing it would change "
+            f"values: {', '.join(bad)}. Delta refuses a write that narrows or reinterprets a "
+            "type; cast the data to the table's types first, or widen the column with "
+            "alter_column_type()"
+        )
 
 
 def _fill_stream(pa: Any, reader: Any, target: Any, canonical: Any, partitions: set[str]) -> Any:
@@ -838,6 +946,8 @@ class Table:
             needs |= self._expression_needs(get("predicate"), get("updates"))
             if op is Operation.UPDATE:
                 needs |= self._update_defaults(get("updates"))[1]
+        elif op is Operation.MERGE and get("merge_schema"):
+            needs.add("schema_merge")
         elif op in (Operation.SCAN, Operation.TIME_TRAVEL):
             if get("predicate") is not None:
                 needs |= self._predicate_needs(get("predicate"))
@@ -1020,6 +1130,9 @@ class Table:
                 except DeltaSwampError:
                     if refusals:
                         raise refusals[0] from refusals[0].__cause__
+                    translated = _library_error(exc, operation.value)
+                    if translated is not None:
+                        raise translated from exc
                     raise exc from None
                 warnings.warn(
                     f"{engine.kind.value} failed to serve {operation.value} "
@@ -1145,6 +1258,7 @@ class Table:
             return matches[0] if len(matches) == 1 else name
 
         if stream:
+            _refuse_lossy_types(pa, data.schema, by_name, canonical)
             return _fill_stream(pa, data, target, canonical, set(resolved.partition_columns))
         if is_pandas:
             # A named index is data (even one that looks like a range, which
@@ -1171,6 +1285,7 @@ class Table:
         elif isinstance(data, pa.RecordBatch):
             data = pa.Table.from_batches([data])
 
+        _refuse_lossy_types(pa, data.schema, by_name, canonical)
         names = [canonical(n) for n in data.column_names]
         if len(set(names)) != len(names):
             return data  # two columns fold to one name; let the engine refuse
@@ -1333,11 +1448,57 @@ class Table:
 
         The lazy form still reads through this library, so it works on the
         tables `polars.scan_delta` cannot open (catalog-managed, row-tracked,
-        vacuumProtocolCheck, ...).
+        vacuumProtocolCheck, ...). Nothing is read until it is collected, and
+        then only the columns the query uses, up to its row limit; Polars
+        applies its own filters to the batches as they arrive (pass
+        `predicate=` in SQL to have the engine skip files).
         """
         pl = _require("polars", "polars")
-        frame = pl.DataFrame(self.to_arrow(**kwargs))
-        return frame.lazy() if lazy else frame
+        register: Any = None
+        if lazy:
+            # An IO source is how Polars pushes a projection and a row limit
+            # into a scan; an older Polars without it gets the eager frame.
+            with contextlib.suppress(ImportError):
+                plugins = importlib.import_module("polars.io.plugins")
+                register = getattr(plugins, "register_io_source", None)
+        if register is None:
+            frame = pl.DataFrame(self.to_arrow(**kwargs))
+            return frame.lazy() if lazy else frame
+        pa = _require("pyarrow", "pyarrow")
+        limit = kwargs.pop("limit", None)
+        wanted = kwargs.pop("columns", None)
+        # The frame's schema, from a stream opened and closed unread.
+        empty = self.head(0, columns=wanted, **kwargs)
+
+        def source(
+            with_columns: list[str] | None, predicate: Any, n_rows: int | None, _batch: Any
+        ) -> Any:
+            columns = with_columns if with_columns is not None else wanted
+            # Polars' row limit applies after its filter, so it bounds the
+            # read only when there is none.
+            bounds = [r for r in (limit, n_rows if predicate is None else None) if r is not None]
+            if bounds:
+                reader: Any = self.head(min(bounds), columns=columns, **kwargs).to_batches()
+            else:
+                stream = self.scan(columns=columns, **kwargs)
+                reader = (
+                    stream
+                    if isinstance(stream, TranslatingStream)
+                    else pa.RecordBatchReader.from_stream(stream)
+                )
+            left = n_rows
+            for batch in reader:
+                frame = pl.from_arrow(_plain_views(pa.Table.from_batches([batch])))
+                if predicate is not None:
+                    frame = frame.filter(predicate)
+                if left is not None:
+                    frame = frame.head(left)
+                    left -= frame.height
+                yield frame
+                if left is not None and left <= 0:
+                    return
+
+        return register(source, schema=pl.from_arrow(_plain_views(empty)).schema)
 
     def to_duckdb(self, connection: Any = None, *, name: str | None = None, **kwargs: Any) -> Any:
         """A DuckDB relation over the table. With `name`, also a view of that name.
@@ -1657,6 +1818,10 @@ class Table:
 
         Rows carry `_change_type`, `_commit_version` and `_commit_timestamp`.
         """
+        return self._cdf(kwargs, split=True)
+
+    def _cdf(self, kwargs: dict[str, Any], *, split: bool) -> Any:
+        """`cdf()`; `split=False` for a range already known to cross no schema change."""
         unknown = sorted(set(kwargs) - _CDF_OPTIONS)
         if unknown:
             # A misspelt bound (start_version=) reached the engine as a bare
@@ -1680,18 +1845,45 @@ class Table:
             if key in kwargs:
                 kwargs[key] = _timestamp_arg(kwargs[key], key)
         given = _given(kwargs)
+        segments = self._feed_segments(start, end) if split and start is not None else None
+        if segments is not None and len(segments) > 1:
+            return self._stitched_cdf(given, segments)
+        return self._cdf_read(given, start, end)
+
+    def _cdf_read(self, given: dict[str, Any], start: int | None, end: int | None) -> Any:
+        """One change-feed read, its failures translated."""
         # A file VACUUM removed, or rows written under a schema a later commit
         # replaced, failed as a raw ArrowInvalid (with a Python traceback
         # embedded in its message) where a scan names the missing file.
         where = self._resolved.location or str(self._resolved.ref)
 
         def translate(exc: BaseException) -> Exception | None:
+            if "cannot skip miniblock" in str(exc):
+                # arrow-rs skips DELTA_BINARY_PACKED values only in 32- or
+                # 64-value miniblocks, and Photon writes 256.
+                return EngineLimitError(
+                    "read the change data feed",
+                    "the kernel's Parquet reader cannot skip within a DELTA_BINARY_PACKED "
+                    "page whose miniblocks hold 256 values, as Databricks writes them "
+                    f"({(str(exc).splitlines() or [''])[0][:200]})",
+                    "read a narrower version range, or ds.connect(..., "
+                    "allow_sql_fallback=True) to read it with table_changes()",
+                )
+            off = re.search(r"feed is unsupported for the table at version (\d+)", str(exc))
+            if off is not None:
+                # Raised by the kernel mid-stream, after the rows before it,
+                # as a raw ArrowInvalid that `except DeltaSwampError` missed.
+                return _feed_gap_error(int(off.group(1)))
             return self._feed_schema_change(exc, start, end)
 
+        served: dict[str, Any] = {}
+
+        def call(engine: Any) -> Any:
+            served["kind"] = getattr(engine, "kind", None)
+            return engine.cdf(self._resolved, **given)
+
         try:
-            stream = _cdf_types(
-                self._read(Operation.CDF, lambda engine: engine.cdf(self._resolved, **given))
-            )
+            stream = _cdf_types(self._read(Operation.CDF, call))
         except Exception as exc:
             from .engine.base import missing_file_error
 
@@ -1700,7 +1892,116 @@ class Table:
             if translated is None:
                 raise
             raise translated from exc
-        return translating_stream(stream, f"the change data feed of {where}", translate)
+        result = translating_stream(stream, f"the change data feed of {where}", translate)
+        if isinstance(result, TranslatingStream):
+            # changes() streams a feed that arrives commit by commit (the
+            # kernel's) instead of reading it whole.
+            result.engine_kind = served.get("kind")  # type: ignore[attr-defined]
+        return result
+
+    def _schema_reader(self) -> Any:
+        """`version -> [(name, type), ...]` from the log, or None without a snapshot engine."""
+        import json
+
+        snapshot = getattr(
+            self._engine(Operation.TIME_TRAVEL, frozenset({"variant_free"})), "snapshot", None
+        )
+        if snapshot is None:
+            return None
+
+        def fields(version: int | None) -> tuple[int, list[tuple[str, str]]]:
+            snap = snapshot(self._resolved, version=version)
+            metadata = json.loads(snap.metadata_json())
+            schema = json.loads(metadata.get("schemaString") or "{}")
+            # Name and type only: a comment or a dropped NOT NULL changes
+            # the metadata but not how an older row reads.
+            return int(snap.version), [
+                (f["name"], json.dumps(f["type"], sort_keys=True)) for f in schema.get("fields", [])
+            ]
+
+        return fields
+
+    def _feed_segments(self, start: int, end: int | None) -> list[tuple[int, int]] | None:
+        """`start..end` split where the table's schema changed, or None if unknown.
+
+        The kernel reads a change feed under one schema only (and a range
+        that crossed an ADD COLUMN failed with a Parquet decode error on
+        files Photon wrote), so a range spanning a schema change is read as
+        one range per schema. Only the ends are compared on the common path;
+        the change versions are found by bisection when they differ.
+        """
+        try:
+            fields = self._schema_reader()
+            if fields is None:
+                return None
+            high, last = fields(end)
+            if start >= high:
+                return None
+            first = fields(start)[1]
+            if first == last:
+                return [(start, high)]
+            segments: list[tuple[int, int]] = []
+            low, current = start, first
+            while True:
+                if fields(high)[1] == current:
+                    segments.append((low, high))
+                    return segments
+                # The first version after `low` whose schema differs.
+                lo, hi = low + 1, high
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if fields(mid)[1] == current:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                segments.append((low, lo - 1))
+                low, current = lo, fields(lo)[1]
+        except Exception:
+            # Unknown, not wrong: the single read below reports what fails.
+            return None
+
+    def _stitched_cdf(self, given: dict[str, Any], segments: list[tuple[int, int]]) -> Any:
+        """The change feed over several schemas, as Spark reads it: under the latest.
+
+        Rows written before an ADD COLUMN read the new column as null. A change
+        an older row cannot be read under (a column dropped, renamed or
+        retyped) is refused, as Spark refuses it
+        (DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE), naming the version
+        so a follower can resume after it.
+        """
+        from .errors import ChangeFeedSchemaChangeError
+
+        pa = _require("pyarrow", "pyarrow")
+        fields = self._schema_reader()
+        assert fields is not None  # _feed_segments found the segments with it
+        for low, _ in segments[1:]:
+            earlier = dict(fields(low - 1)[1])
+            later = dict(fields(low)[1])
+            lost = [n for n, t in earlier.items() if later.get(n) != t]
+            if lost:
+                error = ChangeFeedSchemaChangeError(
+                    "read the change data feed",
+                    f"the table's schema changed at version {low} in a way rows written "
+                    f"before it cannot be read under (column(s) {lost} dropped, renamed "
+                    "or retyped)",
+                    f"read the feed up to version {low - 1}, or from version {low} on",
+                )
+                error.version = low
+                raise error
+        parts = []
+        for low, high in segments:
+            part = self._cdf_read(
+                {**given, "starting_version": low, "ending_version": high}, low, high
+            )
+            parts.append(part.read_all() if isinstance(part, TranslatingStream) else pa.table(part))
+        tables = [_plain_views(t) for t in parts]
+        stitched = pa.concat_tables(tables, promote_options="default")
+        # New columns land where the latest schema has them, not at the end.
+        order = [n for n in tables[-1].column_names if n in stitched.column_names]
+        order += [n for n in stitched.column_names if n not in order]
+        return pa.RecordBatchReader.from_batches(
+            stitched.select(order).schema, stitched.select(order).to_batches()
+        )
 
     #: How many versions back `_feed_schema_change` looks for the change.
     _FEED_SCHEMA_SEARCH = 200
@@ -1721,8 +2022,17 @@ class Table:
 
         from .errors import ChangeFeedSchemaChangeError
 
-        if isinstance(exc, DeltaSwampError) or not re.search(
-            r"cast|datatype|data type|number of fields|schema", str(exc), re.IGNORECASE
+        # The first line, without the Python traceback the C stream embeds.
+        detail = (str(exc).strip().splitlines() or [""])[0].split(" Detail: Python")[0][:200]
+        # Only the error's own first line: a Parquet decode failure
+        # ("cannot skip miniblock of size 256") matched on words in the
+        # embedded traceback and was reported as a schema change.
+        if (
+            isinstance(exc, DeltaSwampError)
+            or not re.search(
+                r"cast|datatype|data type|number of fields|schema", detail, re.IGNORECASE
+            )
+            or re.search(r"parquet (argument )?error", detail, re.IGNORECASE)
         ):
             return None
         try:
@@ -1751,14 +2061,12 @@ class Table:
             return None
         if changed is None:
             return None
-        # The first line, without the Python traceback the C stream embeds.
-        detail = (str(exc).strip().splitlines() or [""])[0].split(" Detail: Python")[0][:200]
         error = ChangeFeedSchemaChangeError(
             "read the change data feed",
             f"the table's schema changed at version {changed}, and rows the feed returns "
             f"were written under the schema before it, which they cannot be read as "
             f"({type(exc).__name__}: {detail})",
-            f"read the feed from version {changed + 1} on, or up to version {changed - 1}",
+            f"read the feed from version {changed} on, or up to version {changed - 1}",
         )
         error.version = changed
         return error
@@ -1802,23 +2110,39 @@ class Table:
             current = self._connection._reresolve(self)
             latest = current.version
             if latest is not None and latest >= next_version:
-                feed = current.cdf(
-                    starting_version=next_version,
-                    ending_version=latest,
-                    columns=projection,
-                    predicate=predicate,
-                )
-                # read_all() keeps the typed error pa.table() would flatten.
-                changes = feed.read_all() if isinstance(feed, TranslatingStream) else pa.table(feed)
-                if changes.num_rows:
-                    changes = _plain_views(changes).sort_by("_commit_version")
-                    versions = changes.column("_commit_version").to_pylist()
-                    for version in sorted(set(versions)):
-                        mask = pa.compute.equal(changes.column("_commit_version"), version)
-                        chunk = changes.filter(mask)
-                        if columns is not None:
-                            chunk = chunk.select(columns)
-                        yield int(version), chunk
+                # One read per schema: each version is yielded under the
+                # schema it was written with. Read as one range, a range
+                # crossing a schema change failed on every poll, and the
+                # follower never got past it.
+                segments = current._feed_segments(next_version, latest) or [(next_version, latest)]
+
+                for low, high in segments:
+                    feed = current._cdf(
+                        {
+                            "starting_version": low,
+                            "ending_version": high,
+                            "columns": projection,
+                            "predicate": predicate,
+                        },
+                        split=False,
+                    )
+                    if getattr(feed, "engine_kind", None) is EngineKind.KERNEL:
+                        # The kernel produces the feed commit by commit, so
+                        # each version is yielded as soon as it is complete:
+                        # read whole, 5000 versions took 11 s and 1.8 GB
+                        # before the first was yielded. A version the feed
+                        # was off at fails the stream after the versions
+                        # before it, which are yielded first.
+                        yield from _stream_by_version(pa, feed, columns)
+                    else:
+                        # read_all() keeps the typed error pa.table() would flatten.
+                        changes = (
+                            feed.read_all()
+                            if isinstance(feed, TranslatingStream)
+                            else pa.table(feed)
+                        )
+                        yield from _by_version(pa, changes, columns)
+                    next_version = high + 1
                 next_version = latest + 1
             if poll_interval is None:
                 return
@@ -2162,6 +2486,9 @@ class Table:
                     _lost_to_metadata_change(exc, raw)
                     or self._schema_moved(exc, raw, data, schema_mode)
                 ):
+                    translated = _library_error(exc, "append")
+                    if translated is not None:
+                        raise translated from exc
                     raise
         self._invalidate()
 
@@ -2314,6 +2641,9 @@ class Table:
                 if attempt + 1 >= _REALIGN_ATTEMPTS or not self._schema_moved(
                     exc, raw, data, schema_mode
                 ):
+                    translated = _library_error(exc, "overwrite")
+                    if translated is not None:
+                        raise translated from exc
                     raise
                 data = self._align(raw, schema_mode)
         self._invalidate()
@@ -2397,29 +2727,42 @@ class Table:
         if not isinstance(app_id, str) or not app_id:
             # delta-rs raised a bare TypeError for None.
             raise InvalidArgumentError(f"app_id must be a non-empty string, not {app_id!r}")
+        engine: Any = None
         try:
             engine = self._engine(Operation.APPEND, frozenset({"idempotent_txn"}))
         except DeltaSwampError:
-            engine = self._engine(Operation.APPEND)
+            with contextlib.suppress(DeltaSwampError):
+                engine = self._engine(Operation.APPEND)
         if callable(getattr(engine, "txn_version", None)):
             version: int | None = engine.txn_version(self._resolved, app_id)
             return version
-        # The writing engine cannot read transaction ids (the kernel, the
-        # warehouse); ask delta-rs, which reads them from the same log.
-        fallback: Any = self._connection.router.engines.get(EngineKind.DELTARS)
-        reason = f"the {type(engine).__name__} engine cannot read transaction identifiers"
-        if fallback is not None and callable(getattr(fallback, "txn_version", None)):
+        # The writing engine cannot read transaction ids (the warehouse), or
+        # nothing here writes the table; reading them needs only the log. The
+        # kernel first: it reads a catalog-managed table with the catalog's
+        # commit tail, which delta-rs cannot open at all, so txn_version()
+        # there failed.
+        reason = (
+            f"the {type(engine).__name__} engine cannot read transaction identifiers"
+            if engine is not None
+            else "no engine here writes this table"
+        )
+        for kind in (EngineKind.KERNEL, EngineKind.DELTARS):
+            fallback: Any = self._connection.router.engines.get(kind)
+            if fallback is None or not callable(getattr(fallback, "txn_version", None)):
+                continue
             available = getattr(fallback, "available", None)
-            if available is None or available():
-                try:
-                    version = fallback.txn_version(self._resolved, app_id)
-                    return version
-                except Exception as exc:
-                    reason += f", and delta-rs could not read this table's log ({exc})"
+            if available is not None and not available():
+                continue
+            try:
+                version = fallback.txn_version(self._resolved, app_id)
+                return version
+            except Exception as exc:
+                reason += f", and {kind.value} could not read this table's log ({exc})"
         raise UnreachableTableError(
             f"check transaction {app_id!r}",
             reason,
-            "write without txn= and deduplicate yourself, or use a table delta-rs can read",
+            "write without txn= and deduplicate yourself, or use a table the kernel or "
+            "delta-rs can read",
         )
 
     def delete(self, predicate: str | None = None, **kwargs: Any) -> dict[str, Any]:
@@ -2428,10 +2771,13 @@ class Table:
         _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
         needs = self._expression_needs(predicate)
-        result: dict[str, Any] = self._backfilled(
-            lambda: self._engine(Operation.DELETE, needs).delete(
-                self._resolved, predicate, **_given(kwargs)
-            )
+        result: dict[str, Any] = _translated(
+            "delete",
+            lambda: self._backfilled(
+                lambda: self._engine(Operation.DELETE, needs).delete(
+                    self._resolved, predicate, **_given(kwargs)
+                )
+            ),
         )
         self._invalidate()
         return result
@@ -2473,10 +2819,14 @@ class Table:
             updates = self._update_targets(updates, deltars)
         if new_values is not None:
             kwargs["new_values"] = self._update_targets(new_values, deltars)
-        result: dict[str, Any] = self._backfilled(
-            lambda: engine.update(
-                self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
-            )
+            self._refuse_zoned_ntz(kwargs["new_values"])
+        result: dict[str, Any] = _translated(
+            "update",
+            lambda: self._backfilled(
+                lambda: engine.update(
+                    self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
+                )
+            ),
         )
         self._invalidate()
         return result
@@ -2523,6 +2873,37 @@ class Table:
             else:
                 needs.add("sql_column_defaults")
         return out, frozenset(needs)
+
+    def _refuse_zoned_ntz(self, values: dict[str, Any]) -> None:
+        """Refuse a timezone-aware datetime for a TIMESTAMP_NTZ column.
+
+        It was turned into its UTC wall time without a word: 07:08 at +02:00
+        was stored as 05:08. A TIMESTAMP_NTZ holds no zone, so which wall time
+        was meant is the caller's to say.
+        """
+        import datetime
+
+        try:
+            import pyarrow as pa
+
+            fields = {f.name: f for f in self.schema()}
+        except (ImportError, DeltaSwampError):
+            return
+        for name, value in values.items():
+            field = fields.get(name.strip("`"))
+            if (
+                field is not None
+                and isinstance(value, datetime.datetime)
+                and value.tzinfo is not None
+                and pa.types.is_timestamp(field.type)
+                and field.type.tz is None
+            ):
+                raise InvalidArgumentError(
+                    f"update {name}: the column is TIMESTAMP_NTZ, which holds no time zone, "
+                    f"and {value.isoformat()} carries one; pass a naive datetime (for "
+                    "example value.replace(tzinfo=None), or the value converted to the zone "
+                    "you mean first)"
+                )
 
     def _update_targets(self, targets: dict[str, Any], deltars: bool) -> dict[str, Any]:
         """Resolve UPDATE's SET targets against the table's columns.
@@ -2589,6 +2970,10 @@ class Table:
         _check_predicate(predicate, "merge")
         source = _write_data(source)
         needs = self._data_needs(source)
+        if kwargs.get("merge_schema"):
+            # The kernel MERGE cannot evolve the schema; routed without the
+            # need, can() said "via kernel" and the call then refused.
+            needs = needs | {"schema_merge"}
 
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
             engine = self._engine(Operation.MERGE, needs, exclude=exclude)
@@ -2765,6 +3150,21 @@ class Table:
             return timestamp
         except Exception:
             return timestamp
+        try:
+            latest = kernel.snapshot(self._resolved)
+            after_latest = int(snapshot.version) == int(latest.version) and millis > int(
+                latest.timestamp()
+            )
+        except Exception:
+            after_latest = False
+        if after_latest:
+            # It resolved to the latest version, so the restore was a silent
+            # no-op. Spark refuses it (DELTA_TIMESTAMP_GREATER_THAN_COMMIT):
+            # nothing is committed at that time yet.
+            raise InvalidArgumentError(
+                f"cannot restore to {timestamp}: it is after the latest commit (version "
+                f"{int(latest.version)}), so there is no version of the table at that time"
+            )
         return int(snapshot.version)
 
     def repair(self, **kwargs: Any) -> dict[str, Any]:
@@ -3430,6 +3830,74 @@ _CDF_OPTIONS = frozenset(
     }
 )
 _CDF_META = ("_change_type", "_commit_version", "_commit_timestamp")
+
+
+def _feed_gap_error(version: int) -> UnreachableTableError:
+    """The change feed was off at `version`; `.version` names it, as a schema change does."""
+    error = UnreachableTableError(
+        "read the change data feed",
+        f"the change data feed was not enabled at version {version}, which the requested "
+        "range includes",
+        f"read up to version {version - 1}, or from the version the feed was enabled again",
+    )
+    error.version = version  # type: ignore[attr-defined]
+    return error
+
+
+def _by_version(pa: Any, changes: Any, columns: list[str] | None) -> Any:
+    """`(version, rows)` for each commit in a change-feed table, in order."""
+    if not changes.num_rows:
+        return
+    changes = _plain_views(changes).sort_by("_commit_version")
+    counts = pa.compute.value_counts(changes.column("_commit_version")).to_pylist()
+    offset = 0
+    # Sorted, so each version is one contiguous slice: no pass over the
+    # whole table per version.
+    for entry in counts:
+        chunk = changes.slice(offset, entry["counts"])
+        offset += entry["counts"]
+        yield int(entry["values"]), chunk.select(columns) if columns is not None else chunk
+
+
+def _stream_by_version(pa: Any, feed: Any, columns: list[str] | None) -> Any:
+    """`(version, rows)` from a feed whose batches arrive in commit order.
+
+    A version is yielded once a batch of a later one arrives, or the feed
+    ends. A batch that goes back to a version already yielded would split
+    it, so that is refused rather than yielded twice.
+    """
+    buffered: list[Any] = []
+    top = done = -1
+    batches = iter(feed)
+    while True:
+        try:
+            batch = next(batches)
+        except StopIteration:
+            break
+        except UnreachableTableError as exc:
+            # The feed was off at `version`, which the kernel reaches only
+            # after every commit before it: those are complete, so yield
+            # them before refusing, and a follower resumes from there.
+            gap = getattr(exc, "version", None)
+            if buffered and isinstance(gap, int) and gap > top:
+                yield from _by_version(pa, pa.Table.from_batches(buffered), columns)
+            raise
+        if not batch.num_rows:
+            continue
+        versions = batch.column(batch.schema.get_field_index("_commit_version"))
+        low = int(pa.compute.min(versions).as_py())
+        if low <= done:
+            raise CorruptTableError(
+                f"the change data feed returned rows of version {low} after later versions; "
+                "read it with cdf() instead"
+            )
+        if buffered and low > top:
+            yield from _by_version(pa, pa.Table.from_batches(buffered), columns)
+            buffered, done = [], top
+        buffered.append(batch)
+        top = max(top, int(pa.compute.max(versions).as_py()))
+    if buffered:
+        yield from _by_version(pa, pa.Table.from_batches(buffered), columns)
 
 
 def _cdf_types(stream: Any) -> Any:

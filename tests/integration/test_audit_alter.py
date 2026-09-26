@@ -96,11 +96,13 @@ class TestRestoreByTimestamp:
         assert _ids(t) == [0, 1, 2]
         assert t.version == 3
 
-    def test_a_future_timestamp_is_the_current_table(self, conn: Any, tmp_path: Any) -> None:
-        # delta-rs raised "Version to restore 3 should be less then last available".
+    def test_a_future_timestamp_is_refused(self, conn: Any, tmp_path: Any) -> None:
+        # delta-rs raised "Version to restore 3 should be less then last available";
+        # Spark refuses it as DELTA_TIMESTAMP_GREATER_THAN_COMMIT.
         t, _ = _history_table(conn, tmp_path)
         future = dt.datetime.now(dt.UTC) + dt.timedelta(days=1)
-        assert t.restore(future) == {"numRemovedFile": 0, "numRestoredFile": 0}
+        with pytest.raises(InvalidArgumentError, match="after the latest commit"):
+            t.restore(future)
         assert t.restore(t.version) == {"numRemovedFile": 0, "numRestoredFile": 0}
         assert t.version == 3
 

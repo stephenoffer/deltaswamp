@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 from deltaswamp.capability import Engine, Operation
-from deltaswamp.errors import UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError
 
 pa = pytest.importorskip("pyarrow")
 deltalake = pytest.importorskip("deltalake")
@@ -179,7 +179,7 @@ class TestUpdate:
             pa.table({"id": [3, 30], "city": ["c", "cc"]}), predicate="id >= 3 AND id <= 30"
         )
         assert _values(conn, path, "id") == [1, 2, 3, 30]
-        with pytest.raises(UnreachableTableError, match="do not satisfy the predicate"):
+        with pytest.raises(InvalidArgumentError, match="do not satisfy the predicate"):
             conn.open_table(path).overwrite(
                 pa.table({"id": [99], "city": ["z"]}), predicate="id < 10"
             )

@@ -238,6 +238,91 @@ def _operation_blocker(
     return None
 
 
+#: Properties whose true value turns a feature on (metadata._ENABLING).
+_ENABLING_PROPERTIES = {
+    "delta.enablechangedatafeed": "changeDataFeed",
+    "delta.enabledeletionvectors": "deletionVectors",
+    "delta.enabletypewidening": "typeWidening",
+    "delta.enableincommittimestamps": "inCommitTimestamp",
+    "delta.enablerowtracking": "rowTracking",
+}
+
+
+def _features_added(operation: Operation, shape: dict[str, object]) -> set[str]:
+    """The table features a metadata change of this shape turns on, with dependencies."""
+    from .capability import FEATURE_DEPENDENCIES
+
+    names: set[str] = set()
+    if operation is Operation.CLUSTER_BY:
+        names.add("clustering")
+    elif operation is Operation.ADD_FEATURE:
+        features = shape.get("features")
+        items = [features] if isinstance(features, str) else features
+        for item in items if isinstance(items, (list, tuple, set, frozenset)) else ():
+            names.add(str(getattr(item, "value", item)))
+    elif operation is Operation.SET_PROPERTIES:
+        properties = shape.get("properties")
+        for key, value in properties.items() if isinstance(properties, dict) else ():
+            lowered = str(key).lower()
+            on = str(value).lower()
+            if lowered.startswith("delta.feature.") and on in ("supported", "enabled"):
+                names.add(str(key)[len("delta.feature.") :])
+            elif lowered in _ENABLING_PROPERTIES and on == "true":
+                names.add(_ENABLING_PROPERTIES[lowered])
+            elif lowered == "delta.checkpointpolicy" and on == "v2":
+                names.add("v2Checkpoint")
+            elif lowered == "delta.columnmapping.mode" and on in ("name", "id"):
+                names.add("columnMapping")
+    pending = list(names)
+    while pending:
+        feature = feature_from_wire(pending.pop())
+        for dep in FEATURE_DEPENDENCIES.get(feature, ()) if feature is not None else ():
+            if dep.value not in names:
+                names.add(dep.value)
+                pending.append(dep.value)
+    return names
+
+
+def _strands_legacy_table(
+    operation: Operation, table: ResolvedTable, shape: dict[str, object]
+) -> str | None:
+    """Why a direct engine must not make this change: no local engine could write the result.
+
+    Moving a legacy writer-3..6 protocol to table features keeps every feature
+    the old version implied listed -- Databricks lists appendOnly, invariants,
+    checkConstraints and (from 4) generatedColumns too, used or not. The
+    kernel writes no table that lists checkConstraints, so what is left is
+    delta-rs; a feature it cannot write (clustering, typeWidening, ...)
+    left a change-feed table that no local engine could append to again.
+    """
+    if operation not in METADATA_OPERATIONS:
+        return None
+    writer = table.min_writer_version or 0
+    if not 3 <= writer <= 6:
+        return None
+    from .engine.metadata import _LEGACY_WRITER
+
+    implied = set(_LEGACY_WRITER.get(writer, ()))
+    added = _features_added(operation, shape) - implied
+    unwritable = sorted(
+        name
+        for name in added
+        if (feature := feature_from_wire(name)) is None
+        or FEATURE_SUPPORT[feature].deltars_write is Support.NO
+    )
+    if not unwritable:
+        return None
+    kept = ", ".join(n for n in ("checkConstraints", "generatedColumns") if n in implied)
+    return (
+        f"the table is at the legacy writer version {writer}, and turning on "
+        f"{', '.join(unwritable)} moves it to table features that must keep listing {kept} "
+        "(as Databricks keeps them). The kernel writes no table listing those, and delta-rs "
+        f"cannot write {', '.join(unwritable)}, so no local engine could write the table "
+        "afterwards. Make this change from Databricks, which can go on writing it, or copy "
+        "the data into a table created with table features"
+    )
+
+
 def _exempted(
     kind: EngineKind, operation: Operation, table: ResolvedTable, shape: dict[str, object]
 ) -> ResolvedTable:
@@ -391,7 +476,9 @@ class Router:
 
         # Refusals `_catalog_level_block` waived only because the warehouse can
         # still serve the table. They still hold for every direct engine.
-        direct_refusal = self._direct_refusal(operation, table)
+        direct_refusal = self._direct_refusal(operation, table) or _strands_legacy_table(
+            operation, table, shape
+        )
 
         for kind in _preference(operation, table, routing.engines):
             if kind in exclude:

@@ -242,8 +242,33 @@ t.replace(df)  # new contents and schema (RTAS)
 t.append(df, txn=("nightly-load", batch_id))  # idempotent
 ```
 
+`txn=(app_id, version)` makes an append exactly-once, as Spark's
+`txnAppId`/`txnVersion` do: an append whose version is at or below the last
+one committed under `app_id` is skipped, and `t.txn_version(app_id)` says
+which that was. It is read from the log (through the kernel on a
+catalog-managed table, with the catalog's commit tail), so it answers even
+where the warehouse does the writing; the warehouse itself cannot record a
+txn, so there `txn=` is refused. `plan_write(txn=...)` refuses a committed
+version instead of skipping it, before any worker runs, since the job it
+plans would be work already done.
+
 `df` can be a pyarrow Table or RecordBatchReader, a Polars DataFrame, a pandas
 DataFrame, or anything else exporting the Arrow PyCapsule interface.
+
+A column's data must fit the table's type as Delta's schema enforcement
+decides it: the same type, or a widening that keeps every value (a narrower
+integer, int to double, float to double, a decimal with room for all its
+digits). A write that would change values -- 4.7 into a BIGINT, '12' into an
+INT, a DECIMAL(15,3) into a DECIMAL(10,2) -- raises `InvalidArgumentError`, as
+Spark refuses it, where delta-rs cast it silently. Cast the data first, or
+widen the column with `alter_column_type()`.
+
+A Delta timestamp holds microseconds. A nanosecond timestamp (pandas'
+`datetime64[ns]`, `pa.timestamp("ns")`) creates a microsecond column, as Spark
+does, and its values are truncated to microseconds on the way in, as every
+append into a timestamp column truncates them. delta-rs would otherwise create
+a `timestamp_nanos` column behind its non-standard `timestampNanos` feature,
+which DuckDB, Spark and Databricks cannot read.
 
 A column the data leaves out gets what Databricks would give it: its DEFAULT, a
 generated or identity value, or a null. A literal DEFAULT (`'new'`, `42`,
@@ -284,6 +309,11 @@ vends for creating tables, then registered, so the catalog and the log agree.
 Both catalog shapes need Unity Catalog (Databricks or open source). On any
 other catalog they are refused, because writing a log alone would leave it
 orphaned while the call appeared to succeed.
+
+A schema is an Arrow schema, or a `{name: type}` dict or `[(name, type)]` list
+whose types are Arrow types or type names -- pyarrow's (`int64`) or the SQL
+and Delta names Spark uses (`bigint`, `long`, `timestamp`, `decimal(10,2)`,
+`array<string>`).
 
 `properties=` accepts nearly the whole Delta property surface, including
 `delta.feature.*` signals, row tracking and in-commit timestamps. When delta-rs
@@ -332,7 +362,14 @@ works on row-tracked tables too: surviving rows keep their `baseRowId`, and
 rows an UPDATE or MERGE rewrites keep their row ids through the table's
 materialized row-id column. Only the files the predicate cannot skip are read,
 and the commit is staged against the snapshot that was read, so a concurrent
-writer makes it conflict rather than be lost. A data file whose add carries
+writer makes it conflict rather than be lost. As in Delta's default
+WriteSerializable isolation, a conflict with writers that only appended (and
+changed neither the schema nor the protocol, nor removed or re-vectored a file
+this commit touched) is re-committed on top of them, up to
+`KernelEngine.dml_commit_retries` (15) times: rows those appends added are
+not deleted or updated, since the statement never read them. Under
+`delta.isolationLevel=Serializable`, and on catalog-managed tables, every
+conflict is raised. A data file whose add carries
 no `numRecords` statistic (every file in a Databricks checkpoint, which keeps
 statistics only as `stats_parsed`) takes a vector too; its row count is read
 from the Parquet footer.
@@ -477,8 +514,12 @@ conn.convert_to_delta("s3://bucket/parquet-dir")
 ```
 
 `vacuum` defaults to a dry run because the real thing deletes files. `lite=True`
-considers only files the log records as removed. Three operations refuse rather
-than misbehave:
+considers only files the log records as removed. On a table with deletion
+vectors, a full VACUUM through delta-rs keeps every `deletion_vector_*.bin`:
+delta-rs does not count the vector files live data files reference and would
+delete them, so its list of unreferenced files is taken without them and the
+rest deleted here. Unreferenced vector files stay until Databricks vacuums the
+table. Three operations refuse rather than misbehave:
 
 - `vacuum` on a shallow clone, which borrows the source's files.
 - `restore` through delta-rs on a table with deletion vectors, where delta-rs
@@ -593,9 +634,16 @@ conn.sql("SELECT * FROM system.access.audit LIMIT 10", engine="warehouse")
 ```
 
 Each hand-off reads through this library, so it works on tables the target
-engine's own Delta reader cannot open. `Connection.sql` runs on DuckDB by
-default (or `engine="polars"`), and can join tables from different catalogs.
-`engine="warehouse"` sends the query to Databricks as it stands.
+engine's own Delta reader cannot open. `to_polars(lazy=True)` reads nothing
+until the frame is collected, and then only the columns the query uses, up to
+its row limit; Polars applies its filters to the batches as they arrive, so
+pass `predicate=` (SQL) as well to have the engine skip files. `to_duckdb()`
+and `Connection.sql` hand DuckDB or Polars each table read in full, in
+memory: nothing in the query is pushed down, so select what you need with
+`t.to_arrow(columns=..., predicate=...)` first when a table is large.
+`Connection.sql` runs on DuckDB by default (or `engine="polars"`), and can join
+tables from different catalogs. `engine="warehouse"` sends the query to
+Databricks as it stands.
 
 ## Distributed reads and writes
 
@@ -711,6 +759,7 @@ All inherit from `DeltaSwampError`.
 | `MetadataChangedError` | a `CommitConflictError`: a concurrent commit changed the schema, partitioning or column mapping, so the write must be planned again rather than retried |
 | `TransientCommitError` | a commit failed for a transient reason; the table is unchanged, so retry it as is |
 | `BackfillRequiredError` | the catalog wants staged commits published |
+| `StorageError` | the table's storage failed a request (unreachable, throttled, no such bucket); an `OSError` too |
 | `CorruptTableError` | on-disk state failed a correctness check |
 | `MissingDataFileError` | a `CorruptTableError`: a file the snapshot references was removed (VACUUM, manual delete); `.path` names it |
 | `ChangeFeedSchemaChangeError` | an `UnreachableTableError`: the change feed range crosses a schema change its rows cannot be read across; `.version` names the commit that changed it |
@@ -804,6 +853,16 @@ reached.
   in such files written in a non-UTC session zone need the warehouse.
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.
+- A MERGE with `merge_schema=True` whose SET or INSERT assigns a column the
+  source does not have (closing an SCD2 row) is refused on delta-rs, which
+  fails it, and needs the SQL fallback; the kernel MERGE does not evolve the
+  schema at all.
+- On a table at a legacy writer version 3 to 6 (every change-data-feed table
+  created before table features), a change that turns on a feature delta-rs
+  cannot write (clustering, type widening, in-commit timestamps) is refused
+  locally: the upgraded protocol keeps listing checkConstraints and
+  generatedColumns, as Databricks keeps them, which the kernel cannot write,
+  so no local engine could write the table afterwards.
 - Identity and default columns are created only through Databricks (a catalog
   name with the SQL fallback); locally both engines refuse them, since neither
   assigns the values. Generated columns are created by delta-rs, which

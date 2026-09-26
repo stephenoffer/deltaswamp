@@ -59,9 +59,20 @@ First release.
 - The kernel cannot write CDC files, so UPDATE and MERGE on a change-data-feed
   table it alone can write need the SQL fallback. DELETE through deletion
   vectors needs none.
-- The change feed fails when the range crosses an incompatible schema change,
-  with `ChangeFeedSchemaChangeError` naming the version. Start the range after
-  the change, or read it through the warehouse.
+- The change feed fails when the range crosses an incompatible schema change
+  (a dropped, renamed or retyped column), with `ChangeFeedSchemaChangeError`
+  naming the version. Start the range at the change, or read it through the
+  warehouse. An added column reads as null in older rows, and `changes()`
+  yields each version under the schema it was written with. A range crossing
+  a version with the feed off raises `UnreachableTableError` naming it
+  (`.version`); `changes()` yields the versions before it first.
+- A MERGE with `merge_schema=True` that assigns a column only the target has
+  is refused on delta-rs (1.6.5 fails it) and needs the SQL fallback.
+- On a legacy writer-3-to-6 table, enabling a feature delta-rs cannot write
+  (clustering, type widening) is refused locally, since no local engine could
+  write the upgraded table.
+- Nanosecond timestamps are written as microseconds (truncated), as Spark
+  writes them.
 - Commits the kernel writes, including distributed ones, record empty
   `operationParameters`: delta_kernel 0.28 overwrites whatever the engine
   supplies. `isBlindAppend` still tells an append from an overwrite.
@@ -105,7 +116,12 @@ First release.
   rewrite them shifted; they take the kernel's deletion-vector or whole-table
   rewrite paths, or the warehouse, or are refused.
 - A time-travel timestamp after the latest commit reads the latest version on
-  the direct engines; the warehouse refuses it.
+  the direct engines; the warehouse refuses it. A RESTORE to one is refused
+  everywhere, as Spark refuses it.
+- A table URI (`file://`, `s3://`, ...) containing `?` or `#` is refused at
+  create: a URL reads them as a query or fragment. Percent-encode them.
+- delta-rs writes no statistics at all (null counts included) for decimal
+  columns of more than 15 digits; Parquet offers no null-count-only level.
 - VARIANT reads as JSON text on every engine and writes take JSON text,
   nested in structs too. A VARIANT inside an array or map is left in the
   engine's own form, and a table with `delta.enableVariantShredding` (every

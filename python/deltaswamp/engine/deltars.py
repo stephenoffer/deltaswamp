@@ -58,15 +58,6 @@ _RESTORE_DV_REASON = (
     "changes -- it reports success and leaves the rows deleted (delta-rs#4613)"
 )
 
-_VACUUM_DV_REASON = (
-    "the table has deletion vectors, and delta-rs's full VACUUM does not count the "
-    "deletion-vector files live data files reference: it deletes them, and the table "
-    "can no longer be read"
-)
-_VACUUM_DV_REMEDY = (
-    "vacuum(lite=True) removes only files the log records as removed, or run VACUUM "
-    "from Databricks (allow_sql_fallback=True)"
-)
 
 #: delta-rs 1.6.5: "Schema evolution on column-mapped tables is not yet supported".
 _CM_SCHEMA_EVOLUTION = (
@@ -383,14 +374,6 @@ class DeltaRsEngine:
                     "sets properties on a table-features (reader version 3) protocol"
                 ),
                 remedy="this routes to the kernel, which commits the change itself",
-            )
-        if (
-            operation is Operation.VACUUM
-            and "deletionVectors" in table.effective_reader_features
-            and not shape.get("lite")
-        ):
-            return Capability(
-                operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY
             )
         if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
             refusal = _add_feature_refusal(table, shape["features"])
@@ -1146,6 +1129,7 @@ class DeltaRsEngine:
             change_feed=str(table.properties.get("delta.enableChangeDataFeed", "false")).lower()
             == "true",
             computed=_computed_columns(dt),
+            merge_schema=bool(kwargs.get("merge_schema")),
         )
 
     # ------------------------------------------------------------ maintenance
@@ -1311,9 +1295,13 @@ class DeltaRsEngine:
             # Round up: keeping a little more history is the safe direction.
             retention_hours = math.ceil(retention_hours)
         _commit_kwargs(kwargs)
+        dv_table = "deletionVectors" in table.effective_reader_features
         try:
+            dt = self._open(table, write=True)
+            if dv_table and not lite:
+                return self._vacuum_keeping_vectors(dt, retention_hours, dry_run, kwargs)
             with _no_panics("vacuum"):
-                result: list[str] = self._open(table, write=True).vacuum(
+                result: list[str] = dt.vacuum(
                     retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
                 )
         except Exception as exc:
@@ -1327,6 +1315,43 @@ class DeltaRsEngine:
                 "to vacuum anyway, or lower the table property"
             ) from exc
         return result
+
+    @staticmethod
+    def _vacuum_keeping_vectors(
+        dt: Any, retention_hours: int | None, dry_run: bool, kwargs: dict[str, Any]
+    ) -> list[str]:
+        """A full VACUUM of a deletion-vector table that never deletes a vector file.
+
+        delta-rs's full VACUUM does not count the deletion-vector files live
+        data files reference: it deletes them, and the table can no longer be
+        read. Its dry run still finds the orphans (the files of crashed or
+        abandoned writes, and removed files past retention), so that list is
+        taken, every `deletion_vector_*.bin` is kept out of it -- a vector
+        may be referenced by a live file or by a tombstone a time-travel
+        reader still needs -- and the rest is deleted here through the
+        table's own store. Unreferenced vector files are left behind, which
+        costs a little storage and loses nothing.
+        """
+        with _no_panics("vacuum"):
+            candidates: list[str] = dt.vacuum(
+                retention_hours=retention_hours, dry_run=True, full=True, **kwargs
+            )
+        removable = [
+            path
+            for path in candidates
+            if not re.fullmatch(r"deletion_vector_[0-9a-fA-F-]+\.bin", path.rsplit("/", 1)[-1])
+        ]
+        if dry_run or not removable:
+            return removable
+        from deltalake._internal import DeltaFileSystemHandler
+
+        handler = DeltaFileSystemHandler.from_table(
+            dt._table, getattr(dt, "_storage_options", None), None
+        )
+        for path in removable:
+            with contextlib.suppress(FileNotFoundError):
+                handler.delete_file(path)
+        return removable
 
     def restore(self, table: ResolvedTable, target: Any, **kwargs: Any) -> dict[str, Any]:
         if isinstance(target, bool) or not isinstance(target, (Integral, str, datetime, date)):
@@ -2870,12 +2895,16 @@ class _CheckedMerger:
         computed: set[str] | None = None,
         kinds: Mapping[str, str] | None = None,
         refusal: EngineLimitError | None = None,
+        merge_schema: bool = False,
     ) -> None:
         self._merger = merger
         #: Numeric kinds of the columns, for translating `/`.
         self._kinds = kinds
         #: Clause SQL DataFusion cannot be made to evaluate as Spark does.
         self._refusal = refusal
+        self._merge_schema = merge_schema
+        #: Every column a SET or INSERT clause assigns, as given.
+        self._assigned: list[str] = []
         #: alias -> column names, for respelling clause SQL case-insensitively.
         self._columns = columns or {}
         self._target = target or []
@@ -2894,10 +2923,31 @@ class _CheckedMerger:
         clause = merge_clause(name, args, kwargs)
         if clause is not None:
             self._clauses.append(clause)
+            mapping = args[0] if args else kwargs.get("updates")
+            if isinstance(mapping, dict):
+                self._assigned.extend(str(k) for k in mapping)
 
     def execute(self, *args: Any, **kwargs: Any) -> Any:
         if self._refusal is not None:
             raise self._refusal
+        source = {c.lower() for c in self._columns.get(self._source_alias, [])}
+        target_only = sorted(
+            {k for k in self._assigned if k.strip("`").lower() not in source}
+            if self._merge_schema and source
+            else set()
+        )
+        if target_only:
+            # delta-rs 1.6.5 resolves every assignment of a schema-evolving
+            # MERGE against the source alone: "No field named valid_to",
+            # the SCD2 pattern of closing a row. Refused before anything is
+            # written, so another engine can serve it.
+            raise EngineLimitError(
+                "merge with merge_schema on delta-rs",
+                f"delta-rs 1.6.5 fails a schema-evolving MERGE that assigns {target_only}, "
+                "which the source does not have",
+                "add those columns to the source, or ds.connect(..., "
+                "allow_sql_fallback=True) to run it on Databricks",
+            )
         not_matched = [conditional for kind, conditional in self._clauses if kind == "not_matched"]
         if self._change_feed and not_matched and not_matched[-1]:
             # delta-rs 1.6.5 writes an all-NULL row into the table for every
@@ -2947,6 +2997,8 @@ class _CheckedMerger:
 
     def when_matched_update(self, updates: Any, predicate: str | None = None) -> _CheckedMerger:
         self._clauses.append(("matched", predicate is not None))
+        if isinstance(updates, dict):
+            self._assigned.extend(str(k) for k in updates)
         folded = self._fold(updates)
         if isinstance(folded, dict):
             folded = self._recompute(folded)

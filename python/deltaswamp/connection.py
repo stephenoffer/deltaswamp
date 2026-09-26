@@ -182,7 +182,7 @@ def _schema_arg(schema: Any) -> Any:
                 return schema  # a Delta schema object; the engine reads it
         else:
             try:
-                schema = pa.schema(schema)
+                schema = pa.schema(_sql_typed(schema))
             except (TypeError, ValueError, pa.ArrowInvalid) as exc:
                 raise InvalidArgumentError(f"not a table schema: {schema!r} ({exc})") from exc
     if len(schema) == 0:
@@ -192,9 +192,40 @@ def _schema_arg(schema: Any) -> Any:
     return _widen_unsigned(schema)
 
 
+def _sql_typed(schema: Any) -> Any:
+    """A `{name: type}` or `[(name, type)]` schema with SQL type names read as Delta reads them.
+
+    pyarrow knows only its own aliases, so ``{"id": "bigint"}``, ``"long"``,
+    ``"timestamp"`` or ``"decimal(10,2)"`` -- the names Spark, Databricks and
+    the Delta log use -- were refused. A name neither reads is left for
+    pyarrow, which names what it cannot read.
+    """
+    from .engine.metadata import sql_type_to_delta
+    from .engine.sharing import _delta_type_to_arrow
+
+    def arrow(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return _delta_type_to_arrow(sql_type_to_delta(value))
+        except (ValueError, DeltaSwampError):
+            return value
+
+    if isinstance(schema, dict):
+        return {name: arrow(value) for name, value in schema.items()}
+    if isinstance(schema, list):
+        return [
+            (item[0], arrow(item[1]), *item[2:])
+            if isinstance(item, tuple) and len(item) >= 2
+            else item
+            for item in schema
+        ]
+    return schema
+
+
 def _widen_unsigned(schema: Any) -> Any:
     """Map unsigned integers to the signed type that holds all their values,
-    and zoned timestamps to UTC.
+    nanosecond timestamps to microseconds and zoned timestamps to UTC.
 
     Delta has no unsigned types, and the create mapped uint8 to byte: the
     table was created, then the first write failed with "Can't cast value 200
@@ -213,6 +244,13 @@ def _widen_unsigned(schema: Any) -> Any:
     def widen(t: Any, where: str) -> Any:
         if t in wider:
             return wider[t]
+        if pa.types.is_timestamp(t) and t.unit == "ns":
+            # pandas' datetime64[ns] (and pa.timestamp("ns")) created a
+            # timestamp_nanos column behind delta-rs's non-standard
+            # timestampNanos feature, which DuckDB, Spark and Databricks
+            # cannot read. A Delta timestamp is microseconds, as Spark
+            # writes it; the data is cast on the way in, as appends cast it.
+            t = pa.timestamp("us", t.tz)
         if pa.types.is_timestamp(t) and t.tz is not None and t.tz.upper() not in ("UTC", "+00:00"):
             # A Delta timestamp is an instant stored in UTC; the zone is only
             # how the caller's frame displays it. Appends already convert, and
@@ -298,7 +336,17 @@ def _check_local_create_path(name: str) -> None:
     it afterwards.
     """
     if "://" in name:
-        return  # a URL, file:// included, whose escapes are meant as escapes
+        # A URL, file:// included, whose escapes are meant as escapes. But a
+        # URL reads `?` and `#` as a query and a fragment: the table went to
+        # `.../x` for "file://.../x#y", and every write through the returned
+        # handle landed there too, while opening the URI was refused.
+        if "?" in name or "#" in name:
+            raise InvalidArgumentError(
+                f"the table URI {name!r} contains '?' or '#', which a URL reads as a query "
+                "or fragment, so the table would be created at a different path; nothing "
+                "was created. Percent-encode them (%3F, %23) or choose a name without them"
+            )
+        return
     bad = _PERCENT_ESCAPE.search(name)
     if bad is not None or (os.sep == "/" and "\\" in name):
         what = repr(bad.group(0)) if bad is not None else "a backslash"
@@ -615,6 +663,11 @@ class Connection:
                     or "exist" not in str(exc).lower()
                     or not self.table_exists(name)
                 ):
+                    from .table import _library_error
+
+                    translated = _library_error(exc, f"create {name}")
+                    if translated is not None:
+                        raise translated from exc
                     raise
                 if mode == "ignore":
                     return self.table(name)
