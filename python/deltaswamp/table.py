@@ -10,6 +10,7 @@ everything afterward routes on the complete picture.
 from __future__ import annotations
 
 import dataclasses
+import re
 import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -19,7 +20,7 @@ from .capability import READ_OPERATIONS as _READ_OPERATIONS
 from .capability import Engine as EngineKind
 from .catalog import ResolvedTable, TableType
 from .credentials import Operation as CredentialOperation
-from .engine.base import TranslatingStream, translating_stream
+from .engine.base import TranslatingStream, merge_clause, translating_stream
 from .engine.deltars import DeltaRsEngine
 from .engine.kernel import KernelEngine
 from .errors import (
@@ -650,6 +651,10 @@ class Table:
                 get("predicate") is not None or partition_overwrite == "dynamic"
             ):
                 op = Operation.REPLACE_WHERE
+            if op is Operation.REPLACE_WHERE:
+                needs |= self._expression_needs(get("predicate"))
+        elif op in (Operation.DELETE, Operation.UPDATE):
+            needs |= self._expression_needs(get("predicate"), get("updates"))
         elif op in (Operation.SCAN, Operation.TIME_TRAVEL):
             if get("predicate") is not None:
                 needs.add("predicates")
@@ -1532,6 +1537,31 @@ class Table:
                 return frozenset({"negative_decimal_partition_values"})
         return frozenset()
 
+    @staticmethod
+    def _expression_needs(
+        predicate: str | None, updates: dict[str, Any] | None = None
+    ) -> frozenset[str]:
+        """``sql_expressions`` when DML SQL goes beyond the kernel's grammar.
+
+        The kernel evaluates DELETE/UPDATE/replaceWhere SQL itself and reads
+        only comparisons, IN, BETWEEN, LIKE, IS NULL and AND/OR/NOT over columns
+        and literals, with a SET value a literal or a column. Arithmetic or a
+        function call (`id % 3 = 0`, `lower(s) = 'a'`, `x + 1`) goes to an engine
+        that evaluates SQL instead of failing on the kernel mid-call.
+        """
+        from . import predicate as sqlpred
+
+        try:
+            if isinstance(predicate, str) and predicate.strip():
+                sqlpred.parse(predicate)
+            if isinstance(updates, dict):
+                for value in updates.values():
+                    if isinstance(value, str):
+                        sqlpred.parse_value(value)
+        except sqlpred.PredicateError:
+            return frozenset({"sql_expressions"})
+        return frozenset()
+
     def _update_needs(self, targets: Any, literal: bool) -> frozenset[str]:
         """`_data_needs` for UPDATE's SET list.
 
@@ -1726,7 +1756,7 @@ class Table:
         needs = self._write_needs(
             schema_mode, commit_metadata, txn, writer_properties, partition_overwrite
         )
-        needs |= self._data_needs(data)
+        needs |= self._data_needs(data) | self._expression_needs(predicate)
         op = (
             Operation.REPLACE_WHERE
             if (predicate is not None or partition_overwrite == "dynamic")
@@ -1872,8 +1902,9 @@ class Table:
         self._check_writable("delete")
         _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
+        needs = self._expression_needs(predicate)
         result: dict[str, Any] = self._backfilled(
-            lambda: self._engine(Operation.DELETE).delete(
+            lambda: self._engine(Operation.DELETE, needs).delete(
                 self._resolved, predicate, **_given(kwargs)
             )
         )
@@ -1898,15 +1929,16 @@ class Table:
         if not updates and not new_values:
             raise InvalidArgumentError("update needs at least one column to set")
         needs = self._update_needs(updates, False) | self._update_needs(new_values, True)
+        needs |= self._expression_needs(predicate, updates)
         engine = self._engine(Operation.UPDATE, needs)
         # delta-rs skips a SET target it cannot find -- an unknown name, a
         # different case, a nested field -- and still rewrites every matched
         # file, reporting the rows as updated while changing nothing.
-        strict = isinstance(engine, DeltaRsEngine)
+        deltars = isinstance(engine, DeltaRsEngine)
         if updates is not None:
-            updates = self._update_targets(updates, strict)
+            updates = self._update_targets(updates, deltars)
         if new_values is not None:
-            kwargs["new_values"] = self._update_targets(new_values, strict)
+            kwargs["new_values"] = self._update_targets(new_values, deltars)
         result: dict[str, Any] = self._backfilled(
             lambda: engine.update(
                 self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
@@ -1915,13 +1947,22 @@ class Table:
         self._invalidate()
         return result
 
-    def _update_targets(self, targets: dict[str, Any], strict: bool) -> dict[str, Any]:
+    def _update_targets(self, targets: dict[str, Any], deltars: bool) -> dict[str, Any]:
         """Resolve UPDATE's SET targets against the table's columns.
 
-        Delta column names are case-insensitive, so a case-only mismatch maps
-        to the real column. A name that matches nothing is refused; so is a
-        nested path when `strict` (delta-rs cannot set struct fields).
+        One rule for every engine: a key names a top-level column when one is
+        spelled exactly so (`a.b` is the column called that, when there is
+        one; backticks around the key are optional), else case-insensitively;
+        only then is a dotted key a nested field path. A name that matches
+        nothing is refused; so is a nested path on delta-rs, which cannot set
+        struct fields.
+
+        The kernel takes the column's name as it is. delta-rs parses a key as
+        SQL, so a name that is not a plain identifier goes to it backticked:
+        bare, `a.b` was read as field `b` of a struct `a`, which it skipped
+        while reporting the rows updated.
         """
+        strict = deltars
         if not isinstance(targets, dict):
             raise InvalidArgumentError(
                 f"update targets must be a {{column: value}} mapping, not {type(targets).__name__}"
@@ -1934,12 +1975,18 @@ class Table:
         for key, value in targets.items():
             if not isinstance(key, str):
                 raise InvalidArgumentError(f"update column names must be strings, got {key!r}")
-            bare = key[1:-1] if len(key) > 1 and key[0] == key[-1] == "`" else key
+            quoted = len(key) > 1 and key[0] == key[-1] == "`"
+            bare = key[1:-1].replace("``", "`") if quoted else key
+            column: str | None = None
             if bare in names:
-                target = key
+                column = bare
             elif len(folded.get(bare.lower(), ())) == 1:
-                target = folded[bare.lower()][0]
-            elif "." in bare and not strict:
+                column = folded[bare.lower()][0]
+            if column is not None:
+                target = column
+                if deltars and not _PLAIN_IDENTIFIER.fullmatch(column):
+                    target = "`" + column.replace("`", "``") + "`"
+            elif "." in bare and not quoted and not strict:
                 target = key  # a struct field path; the warehouse resolves it
             else:
                 hint = (
@@ -1964,10 +2011,16 @@ class Table:
         _check_predicate(predicate, "merge")
         source = _write_data(source)
         needs = self._data_needs(source)
-        builder = self._engine(Operation.MERGE, needs).merge(
-            self._resolved, source, predicate, **kwargs
-        )
-        return _InvalidatingMerger(builder, self._invalidate)
+
+        def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
+            engine = self._engine(Operation.MERGE, needs, exclude=exclude)
+            builder = engine.merge(self._resolved, source, predicate, **kwargs)
+            return builder, getattr(engine, "kind", None)
+
+        builder, kind = build(frozenset())
+        # A consumed stream cannot be offered to a second engine.
+        rebuild = None if _consumable(source) else build
+        return _InvalidatingMerger(builder, self._invalidate, rebuild, kind)
 
     # ------------------------------------------------------------ maintenance
 
@@ -2593,6 +2646,9 @@ def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
 #: The tuning options DELETE and UPDATE pass to the engine.
 _DML_OPTIONS = frozenset({"commit_metadata", "writer_properties", "max_commit_retries"})
 
+#: A column name delta-rs reads as itself when not backticked.
+_PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 
 def _check_options(what: str, given: dict[str, Any], known: frozenset[str]) -> None:
     """Refuse an option no engine takes (a typo, usually).
@@ -2692,27 +2748,61 @@ class _InvalidatingMerger:
     A MERGE runs at `execute()`, not when the builder is created, so
     invalidating any earlier would let a read in between re-cache the
     pre-merge protocol and properties.
+
+    It also checks clause order for every engine, and records the clauses: an
+    engine that finds at `execute()` that it cannot run them (an
+    `EngineLimitError`, raised before anything is written) hands the MERGE to
+    the next engine that serves the table, with the clauses replayed.
     """
 
-    def __init__(self, builder: Any, invalidate: Any) -> None:
+    _OWN = ("_builder", "_invalidate", "_rebuild", "_kind", "_calls", "_unconditional")
+
+    def __init__(
+        self,
+        builder: Any,
+        invalidate: Any,
+        rebuild: Callable[[frozenset[EngineKind]], tuple[Any, EngineKind | None]] | None = None,
+        kind: EngineKind | None = None,
+    ) -> None:
         self._builder = builder
         self._invalidate = invalidate
+        self._rebuild = rebuild
+        self._kind = kind
+        self._calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self._unconditional: set[str] = set()
 
     def __getattr__(self, name: str) -> Any:
         # Only reached for names not set in __init__. Before __init__ runs
         # (copy, pickle) `_builder` itself lands here, and looking it up on
         # itself recursed until RecursionError.
-        if name.startswith("__") or name in ("_builder", "_invalidate"):
+        if name.startswith("__") or name in self._OWN:
             raise AttributeError(name)
         attr = getattr(self._builder, name)
         if not callable(attr):
             return attr
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            result = attr(*args, **kwargs)
             if name == "execute":
+                result = self._execute(attr, args, kwargs)
                 self._invalidate()
                 return result
+            clause = merge_clause(name, args, kwargs)
+            if clause is not None:
+                kind, conditional = clause
+                if kind in self._unconditional:
+                    # Spark refuses this when it parses the MERGE; the engines
+                    # here took the first such clause and silently dropped the
+                    # rest.
+                    raise InvalidArgumentError(
+                        f"a {name}() clause follows an unconditional clause of the same kind, "
+                        "which takes every row; only the last clause of a kind may omit "
+                        "its condition"
+                    )
+                if not conditional:
+                    self._unconditional.add(kind)
+            result = attr(*args, **kwargs)
+            if clause is not None:
+                self._calls.append((name, args, kwargs))
             # Clause methods return the builder; keep the wrapper in the chain.
             if result is self._builder or type(result) is type(self._builder):
                 self._builder = result
@@ -2720,3 +2810,31 @@ class _InvalidatingMerger:
             return result
 
         return call
+
+    def _execute(self, execute: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        tried: set[EngineKind] = set()
+        refusals: list[EngineLimitError] = []
+        while True:
+            try:
+                return execute(*args, **kwargs)
+            except EngineLimitError as exc:
+                if self._rebuild is None or self._kind is None:
+                    raise
+                refusals.append(exc)
+                tried.add(self._kind)
+            try:
+                builder, kind = self._rebuild(frozenset(tried))
+            except DeltaSwampError:
+                raise refusals[0] from refusals[0].__cause__
+            warnings.warn(
+                f"{self._kind.value if self._kind else 'the engine'} cannot run this MERGE "
+                f"({refusals[-1].reason}); trying {kind.value if kind else 'the next engine'}",
+                EngineFallbackWarning,
+                stacklevel=4,
+            )
+            for name, call_args, call_kwargs in self._calls:
+                result = getattr(builder, name)(*call_args, **call_kwargs)
+                if result is not None and type(result) is type(builder):
+                    builder = result
+            self._builder, self._kind = builder, kind
+            execute = builder.execute

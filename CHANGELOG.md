@@ -50,6 +50,12 @@ First release.
 - The kernel cannot write CDC files, so UPDATE and MERGE on a change-data-feed
   table it alone can write need the SQL fallback. DELETE through deletion
   vectors needs none.
+- A MERGE on a change-data-feed table whose last NOT MATCHED clause has a
+  condition is refused on delta-rs (1.6.5 inserts an all-NULL row per rejected
+  source row) and needs the SQL fallback.
+- DELETE/UPDATE/replaceWhere SQL beyond the kernel's predicate grammar
+  (arithmetic, function calls) needs delta-rs or the warehouse, so on a
+  catalog-managed table it needs the SQL fallback.
 - The kernel's change feed fails mid-stream when the range crosses a schema
   change. Start the range after the change, or read it through the warehouse.
 - The change feed and history of a catalog-managed table need the warehouse.

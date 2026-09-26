@@ -252,10 +252,34 @@ works on row-tracked tables too: surviving rows keep their `baseRowId`, and
 rows an UPDATE or MERGE rewrites keep their row ids through the table's
 materialized row-id column. Only the files the predicate cannot skip are read,
 and the commit is staged against the snapshot that was read, so a concurrent
-writer makes it conflict rather than be lost. A MERGE evaluates its clauses
-with DuckDB (`pip install 'deltaswamp[duckdb]'`), skips target files using the
-source's join keys, and refuses a target row matched by more than one source
-row, as Spark does.
+writer makes it conflict rather than be lost. A data file whose add carries
+no `numRecords` statistic (every file in a Databricks checkpoint, which keeps
+statistics only as `stats_parsed`) takes a vector too; its row count is read
+from the Parquet footer.
+
+On this path the kernel evaluates DELETE, UPDATE and replaceWhere SQL itself,
+and reads comparisons, `IN`, `BETWEEN`, `LIKE`, `IS NULL` and `AND`/`OR`/`NOT`
+over columns and literals; a SET value is a literal or a column. A predicate or
+SET value beyond that (`id % 3 = 0`, `lower(s) = 'a'`, `x + 1`) goes to delta-rs
+as copy-on-write, or to the warehouse, and `t.can("update", updates=...,
+predicate=...)` says which.
+
+A MERGE evaluates its clauses with DuckDB (`pip install 'deltaswamp[duckdb]'`),
+after rewriting the Spark SQL spellings DuckDB reads differently: backslash
+escapes in string literals, `"text"` as a string, backtick identifiers, `<=>`,
+`nvl`, `nvl2`, `DIV`, `concat` (NULL when any argument is), numeric suffixes
+and LIKE's default `\` escape. Clause SQL DuckDB still cannot run moves the
+MERGE to delta-rs or the warehouse before anything is written. It skips target
+files using the source's join keys and refuses a target row that more than one
+source row would modify, as Spark does. Values are stored as Spark stores them:
+a fraction truncates into an integer column and rounds half-up into a narrower
+decimal.
+
+On every engine, as on Databricks: only the last clause of a kind may omit its
+condition; `when_matched_update_all()` / `when_not_matched_insert_all()` need
+every target column in the source, except those named in `except_cols` (and
+generated or identity columns); and the aliases default to `source` and
+`target`.
 
 Without deletion vectors, delta-rs serves DML as copy-on-write, rewriting the
 Parquet files that hold matching rows. On a table only the kernel can write,
@@ -264,7 +288,11 @@ whole table in one commit, bounded by `KernelEngine.rewrite_max_bytes` (1 GiB
 by default) and refused on row-tracked tables; on this path `update` takes
 plain values, or SQL that is a literal or a column name, and MERGE needs the
 warehouse. On a table with the change data feed enabled, the kernel serves only
-DELETE, because UPDATE and MERGE need CDC files it cannot write.
+DELETE, because UPDATE and MERGE need CDC files it cannot write. delta-rs
+1.6.5 inserts an all-NULL row for each source row a conditional
+`when_not_matched_insert` rejects on such a table, so that MERGE is refused
+there (and goes to the warehouse when the fallback is on); make the last NOT
+MATCHED clause unconditional, filtering the source first, to keep it local.
 
 ## Schema, properties and features
 

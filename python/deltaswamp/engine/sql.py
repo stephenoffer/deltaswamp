@@ -334,6 +334,8 @@ class SqlEngine:
     kind = EngineKind.SQL
     supports_distributed_scan = False
     supports_predicates = True
+    #: DML predicates and SET values are the warehouse's own Spark SQL.
+    supports_sql_expressions = True
     supports_timestamp_travel = True
     #: `INSERT WITH SCHEMA EVOLUTION` / `MERGE WITH SCHEMA EVOLUTION`.
     supports_schema_merge = True

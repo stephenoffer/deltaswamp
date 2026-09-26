@@ -418,7 +418,9 @@ class TestExistingVectorsAndFiles:
         assert add["deletionVector"]["storageType"] == "u"
         assert add["deletionVector"]["cardinality"] == 3
 
-    def test_files_without_statistics_are_rewritten(self, conn: Any, tmp_path: Any) -> None:
+    def test_files_without_statistics_take_vectors(self, conn: Any, tmp_path: Any) -> None:
+        # Databricks checkpoints carry no JSON stats; the row count a vector
+        # needs comes from the file's Parquet footer instead of a rewrite.
         from deltalake import write_deltalake
 
         path = str(tmp_path / "nostats")
@@ -434,9 +436,9 @@ class TestExistingVectorsAndFiles:
         assert conn.open_table(path).delete("id = 2")["num_deleted_rows"] == 1
         assert _values(conn, path, "id") == [1, 3, 4]
         assert _deltars_rows(path, "id") == [1, 3, 4]
-        actions = _last_commit(path)
-        assert any("remove" in a for a in actions)
-        assert all(not a["add"].get("deletionVector") for a in actions if "add" in a)
+        (add,) = [a["add"] for a in _last_commit(path) if "add" in a]
+        assert add["deletionVector"]["cardinality"] == 1
+        assert json.loads(add["stats"])["numRecords"] == 4
 
     def test_randomized_prefixes_put_the_vector_in_a_subdirectory(
         self, conn: Any, tmp_path: Any

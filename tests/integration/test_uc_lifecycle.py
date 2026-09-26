@@ -302,7 +302,9 @@ class TestCatalogManagedWithoutDatabricks:
         assert (1, "q") in self.rows(managed)
 
     def test_arbitrary_expressions_are_refused(self, managed: Any) -> None:
-        with pytest.raises(Exception, match="only a literal or a column"):
+        # Refused by the router, before the call: the kernel evaluates only
+        # literals and columns, and delta-rs cannot open a catalog-managed table.
+        with pytest.raises(Exception, match="kernel: does not support sql_expressions"):
             managed.table("main.sales.dml").update({"id": "id + 1"})
 
     def test_replace_where(self, managed: Any) -> None:
