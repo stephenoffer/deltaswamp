@@ -225,6 +225,42 @@ def _looks_missing(error: str) -> bool:
     )
 
 
+def _fill_stream(pa: Any, reader: Any, target: Any, canonical: Any, partitions: set[str]) -> Any:
+    """A stream with the nullable columns it leaves out added as nulls, lazily.
+
+    The kernel fills them and delta-rs refused the same stream ("number of
+    fields does not match"); in-memory data was already filled for both.
+    Batches are extended as they are read, so nothing is materialised here.
+    """
+    names = [canonical(n) for n in reader.schema.names]
+    if len(set(names)) != len(names):
+        return reader
+    computed = {
+        f.name
+        for f in target
+        if f.metadata
+        and any(
+            key.startswith((b"delta.generationExpression", b"delta.identity."))
+            for key in f.metadata
+        )
+    }
+    missing = [f for f in target if f.name not in names and f.name not in computed]
+    if not missing or any(not f.nullable or f.name in partitions for f in missing):
+        return reader
+    fields = [
+        pa.field(n, f.type, f.nullable, f.metadata)
+        for n, f in zip(names, reader.schema, strict=True)
+    ]
+    schema = pa.schema(fields + missing, metadata=reader.schema.metadata)
+
+    def batches() -> Any:
+        for batch in reader:
+            columns = list(batch.columns) + [pa.nulls(batch.num_rows, f.type) for f in missing]
+            yield pa.RecordBatch.from_arrays(columns, schema=schema)
+
+    return pa.RecordBatchReader.from_batches(schema, batches())
+
+
 def _has_map(pa: Any, wanted: Any) -> bool:
     """Whether a type contains a map anywhere."""
     if pa.types.is_map(wanted):
@@ -295,7 +331,7 @@ def _given(kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
-def _require(module: str, extra: str) -> Any:
+def _require(module: str, extra: str, what: str = "this conversion") -> Any:
     """Import an optional dependency, or say which extra provides it.
 
     Without this the failure surfaces as a ModuleNotFoundError raised from deep
@@ -310,7 +346,7 @@ def _require(module: str, extra: str) -> Any:
         return importlib.import_module(module)
     except ImportError as exc:
         raise ImportError(
-            f"{module} is needed for this conversion but is not installed. "
+            f"{module} is needed for {what} but is not installed. "
             f"Install it with: pip install 'deltaswamp[{extra}]'"
         ) from exc
 
@@ -544,6 +580,7 @@ class Table:
                 has_invariants=bool(detail.get("has_invariants")),
                 has_check_constraints=bool(detail.get("has_check_constraints")),
                 has_generated_columns=bool(detail.get("has_generated_columns")),
+                has_binary_partitions=bool(detail.get("has_binary_partitions")),
             )
             self._enriched = getattr(self, "_generation", 0) == generation
             return self._resolved
@@ -832,8 +869,8 @@ class Table:
         column the data leaves out with nulls. delta-rs does neither: "Field
         ID not found in schema", "number of fields does not match: 2 vs 3".
         pandas is converted with the table's types, so a map column (a list
-        of pairs in pandas) no longer fails inference. Streams are passed on
-        untouched -- aligning them would mean reading them here.
+        of pairs in pandas) no longer fails inference. A stream only has its
+        left-out nullable columns added, batch by batch as it is read.
         """
         if schema_mode is not None:
             return data
@@ -844,7 +881,8 @@ class Table:
             import pyarrow as pa
         except ImportError:
             return data
-        if not (is_pandas or is_polars or isinstance(data, (pa.Table, pa.RecordBatch))):
+        stream = isinstance(data, pa.RecordBatchReader)
+        if not (is_pandas or is_polars or stream or isinstance(data, (pa.Table, pa.RecordBatch))):
             return data
         resolved = self._enrich()
         # A left-out generated or identity column is the engine's to compute.
@@ -865,6 +903,8 @@ class Table:
             matches = folded.get(name.lower(), [])
             return matches[0] if len(matches) == 1 else name
 
+        if stream:
+            return _fill_stream(pa, data, target, canonical, set(resolved.partition_columns))
         if is_pandas:
             # A named index is data (even one that looks like a range, which
             # pyarrow would otherwise keep only as metadata); make it columns.
@@ -898,6 +938,35 @@ class Table:
         for index, name in enumerate(names):
             column_type = data.schema.field(index).type
             wanted = by_name[name].type if name in by_name else None
+            if pa.types.is_dictionary(column_type) and name in resolved.partition_columns:
+                # delta-rs cannot read a partition value out of a dictionary
+                # array ("failed to read partition column value as Scalar"),
+                # which is what a polars Categorical arrives as.
+                column_type = column_type.value_type
+                data = data.set_column(
+                    index,
+                    pa.field(name, column_type, data.schema.field(index).nullable),
+                    data.column(index).cast(column_type),
+                )
+            if (
+                name in resolved.partition_columns
+                and (pa.types.is_string(column_type) or pa.types.is_large_string(column_type))
+                and data.num_rows
+                and (name not in by_name or by_name[name].nullable)
+            ):
+                # Spark writes an empty-string partition value as null (a
+                # directory cannot be named ""). delta-rs recorded "", which
+                # DuckDB then read as null and this library as "".
+                import pyarrow.compute as pc
+
+                column = data.column(index)
+                empty = pc.equal(column, "")
+                if pc.any(empty).as_py():
+                    data = data.set_column(
+                        index,
+                        data.schema.field(index),
+                        pc.if_else(empty, pa.scalar(None, column_type), column),
+                    )
             if wanted is not None and column_type != wanted and _has_map(pa, wanted):
                 column = data.column(index)
                 chunks = [_maps_from_lists(pa, chunk, wanted) for chunk in column.chunks]

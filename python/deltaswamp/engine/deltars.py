@@ -17,7 +17,7 @@ import math
 import os
 import re
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from numbers import Integral
@@ -63,6 +63,53 @@ _VACUUM_DV_REMEDY = (
     "from Databricks (allow_sql_fallback=True)"
 )
 
+#: delta-rs 1.6.5: "Schema evolution on column-mapped tables is not yet supported".
+_CM_SCHEMA_EVOLUTION = (
+    "the table uses column mapping, and delta-rs cannot change the schema of a "
+    "column-mapped table during a write"
+)
+
+
+def _column_mapped(table: ResolvedTable) -> bool:
+    mode = str(table.properties.get("delta.columnMapping.mode", "none")).lower()
+    return mode not in ("", "none")
+
+
+#: Writes that go through delta-rs's log store, which re-parses the path as a URL.
+_LOGSTORE_WRITE_OPS: frozenset[Operation] = frozenset(
+    {
+        Operation.APPEND,
+        Operation.OVERWRITE,
+        Operation.REPLACE_WHERE,
+        Operation.MERGE_SCHEMA,
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.MERGE,
+    }
+)
+
+
+def _url_hostile_local_path(location: str) -> bool:
+    if "://" in location and not location.startswith("file://"):
+        return False
+    return any(c in location for c in "[]|^")
+
+
+#: Operations that write data files, and so serialise partition values.
+_DATA_WRITE_OPS: frozenset[Operation] = frozenset(
+    {
+        Operation.APPEND,
+        Operation.OVERWRITE,
+        Operation.REPLACE_WHERE,
+        Operation.MERGE_SCHEMA,
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.MERGE,
+        Operation.OPTIMIZE,
+        Operation.ZORDER,
+    }
+)
+
 _READ_ONLY_OPS: frozenset[Operation] = frozenset(
     {
         Operation.SCAN,
@@ -100,6 +147,13 @@ class DeltaRsEngine:
         self._base_options = dict(storage_options or {})
 
     # ----------------------------------------------------------- capabilities
+
+    @staticmethod
+    def need_refusal(needs: frozenset[str], table: ResolvedTable) -> str | None:
+        """Why a request need this engine has in general fails on `table`."""
+        if needs & {"schema_merge", "schema_overwrite"} and _column_mapped(table):
+            return _CM_SCHEMA_EVOLUTION
+        return None
 
     def supports(self, operation: Operation, table: ResolvedTable, **shape: Any) -> Capability:
         if os.getpid() not in _FORKED_RUNTIME and not self.available():
@@ -139,6 +193,19 @@ class DeltaRsEngine:
                 operation,
                 ok=False,
                 reason="the table has no storage location, so there are no files to read",
+            )
+
+        if operation in _LOGSTORE_WRITE_OPS and _url_hostile_local_path(table.location):
+            # delta-rs builds its write log store from the path as a URL, and
+            # panics on these characters ("Invalid object store url:
+            # InvalidDomainCharacter") -- after create had succeeded, so the
+            # table took reads but no writes.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table's local path contains one of [ ] | ^, which delta-rs "
+                "cannot write through (it panics building the object-store URL)",
+                remedy="this routes to the kernel, which handles such paths",
             )
 
         if not table.is_delta:
@@ -242,6 +309,20 @@ class DeltaRsEngine:
                 remedy="reads route to the kernel engine; writes need the SQL fallback",
             )
 
+        if operation in _DATA_WRITE_OPS and table.has_binary_partitions:
+            # delta-rs writes b"ab" as the partition value "\\u0061\\u0062",
+            # which the kernel, DuckDB and Spark all read back as those twelve
+            # characters: the table's data changed with every write.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is partitioned by a binary column, and delta-rs writes "
+                    "binary partition values in an escaped form other readers take "
+                    "literally"
+                ),
+                remedy="this routes to the kernel, which writes them as UTF-8 text",
+            )
         if operation is Operation.CREATE and shape.get("cluster_by"):
             return Capability(
                 operation,
@@ -249,6 +330,13 @@ class DeltaRsEngine:
                 reason="delta-rs cannot create a liquid-clustered table",
                 remedy="the kernel sets clustering through its data layout",
             )
+        if operation is Operation.MERGE_SCHEMA and _column_mapped(table):
+            return Capability(operation, ok=False, reason=_CM_SCHEMA_EVOLUTION)
+        if operation is Operation.CREATE:
+            create_refusal = _create_refusal(shape)
+            if create_refusal is not None:
+                reason, remedy = create_refusal
+                return Capability(operation, ok=False, reason=reason, remedy=remedy)
 
         if operation is Operation.FILES and "deletionVectors" in table.effective_reader_features:
             # get_add_actions() carries no deletion-vector descriptor, so each
@@ -294,7 +382,9 @@ class DeltaRsEngine:
             and "deletionVectors" in table.effective_reader_features
             and not shape.get("lite")
         ):
-            return Capability(operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY)
+            return Capability(
+                operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY
+            )
         if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
             refusal = _add_feature_refusal(table, shape["features"])
             if refusal is not None:
@@ -707,6 +797,30 @@ class DeltaRsEngine:
         ]
         return " OR ".join(clauses)
 
+    def _stats_schema(self, table: ResolvedTable, data: Any) -> dict[str, Any] | None:
+        """The schema `_exact_stats` needs for a write, read only when it matters.
+
+        The table's own schema gives column-mapping physical names; columns
+        the data adds (a schema merge) are taken from the data.
+        """
+        incoming = _data_delta_schema(data)
+        if incoming is None:
+            return None
+        if not any(
+            _too_precise(f.get("type")) or _nested_too_precise(f.get("type"))
+            for f in incoming["fields"]
+        ):
+            return None
+        try:
+            existing = _delta_schema(self._open(table))
+        except Exception:
+            existing = None  # a table this write creates
+        if existing is None:
+            return incoming
+        known = {f["name"].lower() for f in existing.get("fields") or []}
+        added = [f for f in incoming["fields"] if f["name"].lower() not in known]
+        return {**existing, "fields": [*existing.get("fields", []), *added]}
+
     def _write(
         self,
         table: ResolvedTable,
@@ -750,7 +864,7 @@ class DeltaRsEngine:
             "schema_mode": schema_mode,
             "partition_by": partition_by,
             "target_file_size": target_file_size,
-            "writer_properties": _writer_properties(writer_properties),
+            "writer_properties": _exact_stats(writer_properties, self._stats_schema(table, data)),
             "commit_properties": _commit_properties(commit_metadata, txn, max_commit_retries),
             "storage_options": _object_store_options(self._storage_options(table, write=True)),
         }
@@ -865,7 +979,7 @@ class DeltaRsEngine:
             dt = self._open(table, write=True)
             result: dict[str, Any] = dt.delete(
                 _datafusion_predicate(dt, predicate, dml="delete"),
-                writer_properties=_writer_properties(writer_properties),
+                writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
                 commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
             )
         if "num_deleted_rows" not in result:
@@ -909,7 +1023,7 @@ class DeltaRsEngine:
             result: dict[str, Any] = dt.update(
                 updates=updates,
                 predicate=_datafusion_predicate(dt, predicate, dml="update"),
-                writer_properties=_writer_properties(writer_properties),
+                writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
                 error_on_type_mismatch=error_on_type_mismatch,
                 commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
             )
@@ -930,6 +1044,9 @@ class DeltaRsEngine:
         if isinstance(kwargs.get("writer_properties"), dict):
             kwargs["writer_properties"] = _writer_properties(kwargs["writer_properties"])
         dt = self._open(table, write=True)
+        kwargs["writer_properties"] = _exact_stats(
+            kwargs.get("writer_properties"), _delta_schema(dt)
+        )
         data = _respell_source(_plain_data(source), _column_names(dt))
         columns = _merge_columns(dt, data, kwargs)
         if isinstance(predicate, str):
@@ -998,6 +1115,10 @@ class DeltaRsEngine:
         with _rewrite_lock(table.location or ""):
             dt = self._open(table, write=True)
             before = int(dt.version())
+            # A compaction rewrites files, and writes their stats afresh.
+            kwargs["writer_properties"] = _exact_stats(
+                kwargs.get("writer_properties"), _delta_schema(dt)
+            )
             with _no_panics(what):
                 result: dict[str, Any] = run(dt, kwargs)
             self._check_rewrite(table, before, tag, result, what)
@@ -1444,7 +1565,9 @@ def _datafusion_updates(dt: Any, updates: dict[str, str], *, rendered: bool) -> 
     cover pass through as DataFusion SQL; `rendered` values (from
     new_values=) are DataFusion already.
     """
-    import pyarrow as pa
+    from ..table import _require
+
+    pa = _require("pyarrow", "pyarrow", "an UPDATE through delta-rs")
 
     from .. import predicate as sqlpred
 
@@ -1611,7 +1734,9 @@ def _datafusion_predicate(
     """
     if predicate is None or not predicate.strip():
         return predicate
-    import pyarrow as pa
+    from ..table import _require
+
+    pa = _require("pyarrow", "pyarrow", "a predicate on a delta-rs write")
 
     from .. import predicate as sqlpred
 
@@ -2131,6 +2256,17 @@ def _commit_properties(
         return None
     from deltalake import CommitProperties, Transaction
 
+    from ..distributed import _RESERVED_COMMIT_KEYS
+
+    for key in commit_metadata or {}:
+        if not isinstance(key, str) or not key or key.lower() in _RESERVED_COMMIT_KEYS:
+            # The kernel path refuses these; delta-rs let a caller's
+            # "operation" or "timestamp" overwrite the commit's own.
+            raise InvalidArgumentError(
+                f"commit_metadata key {key!r} is empty or reserved by the Delta commitInfo "
+                "action; use a different key, e.g. userMetadata"
+            )
+
     app_transactions = None
     if txn is not None:
         app_id, version = txn
@@ -2155,6 +2291,14 @@ def _no_panics(what: str) -> Iterator[None]:
         conflict = _as_commit_conflict(exc)
         if conflict is not None:
             raise conflict from exc
+        if type(exc).__name__ == "DeltaError" and "failed validation check" in str(exc):
+            # NOT NULL, CHECK constraints, invariants and generated columns all
+            # refuse bad rows with this one DeltaError, which `except
+            # DeltaSwampError` did not catch; the kernel path already raises
+            # InvalidArgumentError for the same input.
+            raise InvalidArgumentError(
+                f"the data violates the table's constraints, so nothing was written: {exc}"
+            ) from exc
         raise
     except BaseException as exc:
         if type(exc).__name__ != "PanicException":
@@ -2383,6 +2527,133 @@ class _CheckedMerger:
             self._fold(predicate), except_cols=self._except(except_cols)
         )
         return self
+
+
+def _create_refusal(shape: dict[str, Any]) -> tuple[str, str] | None:
+    """Why delta-rs must not create a table of this shape, and what serves it."""
+    from .metadata import create_schema_features
+
+    features = create_schema_features(shape.get("schema")) or set()
+    unassigned = sorted(features & {"identityColumns", "allowColumnDefaults"})
+    if unassigned:
+        # delta-rs 1.6.5 commits the column metadata with neither feature and
+        # never fills the column: explicit duplicate ids went in unchecked,
+        # and no identity high-water mark was ever kept.
+        return (
+            "the schema declares identity or default columns ("
+            + ", ".join(unassigned)
+            + "), and delta-rs neither records the feature nor assigns the values",
+            "create the table through Databricks (a catalog name with "
+            "allow_sql_fallback=True), or drop the column metadata",
+        )
+    properties = shape.get("properties") or {}
+    mode = str(properties.get("delta.columnMapping.mode", "none")).lower()
+    if mode not in ("", "none") and (
+        features & {"timestampNtz", "variantType"}
+        or str(properties.get("delta.minWriterVersion", "")) == "7"
+    ):
+        # A table-features protocol from delta-rs's create lists only the type
+        # features and silently drops columnMapping, while the schema still
+        # carries physical names; data files then use logical names, and the
+        # first rename_column reads the column back as NULL.
+        return (
+            "delta-rs drops the columnMapping feature from a table-features protocol "
+            "(here forced by a timestamp_ntz or variant column), leaving column "
+            "mapping recorded but not in effect",
+            "this routes to the kernel, which declares both",
+        )
+    return None
+
+
+#: Significant digits every decimal of this precision keeps through a double.
+_DOUBLE_EXACT_DIGITS = 15
+
+_DECIMAL_TYPE = re.compile(r"decimal\((\d+),\s*\d+\)")
+
+
+def _too_precise(datatype: Any) -> bool:
+    match = _DECIMAL_TYPE.fullmatch(datatype) if isinstance(datatype, str) else None
+    return match is not None and int(match.group(1)) > _DOUBLE_EXACT_DIGITS
+
+
+def _nested_too_precise(datatype: Any) -> bool:
+    """A struct holding such a decimal at any depth (the only nesting with stats)."""
+    if not isinstance(datatype, dict) or datatype.get("type") != "struct":
+        return False
+    return any(
+        _too_precise(f.get("type")) or _nested_too_precise(f.get("type"))
+        for f in datatype.get("fields") or []
+    )
+
+
+def _exact_stats(writer_properties: Any, schema: Mapping[str, Any] | None) -> Any:
+    """Writer properties under which delta-rs writes no inexact decimal stats.
+
+    delta-rs 1.6.5 writes a decimal's min/max into the log as a JSON double.
+    Past 15 digits that rounds -- 9999999999999999.99 became 1e16 -- and
+    Databricks, which trusts the stats for data skipping, then skipped files
+    holding the rows a query asked for. The stats come from the Parquet
+    footer, so switching Parquet statistics off for those columns leaves them
+    out of the log: a column without stats is read, never wrongly skipped.
+    A nested one cannot be named here (delta-rs keys column properties by
+    top-level name only), so there every column's statistics are off except
+    the top-level ones known to be safe.
+    """
+    if not schema:
+        return _writer_properties(writer_properties)
+    fields = [f for f in schema.get("fields") or [] if isinstance(f, dict)]
+
+    def physical(f: Mapping[str, Any]) -> str:
+        return str((f.get("metadata") or {}).get("delta.columnMapping.physicalName") or f["name"])
+
+    top = [physical(f) for f in fields if _too_precise(f.get("type"))]
+    nested = any(_nested_too_precise(f.get("type")) for f in fields)
+    if not top and not nested:
+        return _writer_properties(writer_properties)
+    import copy
+
+    from deltalake import ColumnProperties, WriterProperties
+
+    base = _writer_properties(writer_properties)
+    out = copy.copy(base) if base is not None else WriterProperties()
+    columns = dict(out.column_properties or {})
+
+    def without_stats(existing: Any) -> Any:
+        props = copy.copy(existing) if existing is not None else ColumnProperties()
+        props.statistics_enabled = "NONE"
+        return props
+
+    if nested:
+        out.default_column_properties = without_stats(out.default_column_properties)
+        for f in fields:
+            name = physical(f)
+            if isinstance(f.get("type"), str) and name not in top and name not in columns:
+                columns[name] = ColumnProperties(statistics_enabled="PAGE")
+    for name in top:
+        columns[name] = without_stats(columns.get(name))
+    out.column_properties = columns
+    return out
+
+
+def _data_delta_schema(data: Any) -> dict[str, Any] | None:
+    """The Delta form of a write's data schema, when it is Arrow."""
+    from .metadata import arrow_to_delta_schema
+
+    arrow_schema = getattr(data, "schema", None)
+    if arrow_schema is None or not hasattr(arrow_schema, "names"):
+        return None
+    try:
+        return arrow_to_delta_schema(arrow_schema)
+    except Exception:
+        return None
+
+
+def _delta_schema(dt: Any) -> dict[str, Any] | None:
+    try:
+        schema: dict[str, Any] = json.loads(dt.schema().to_json())
+    except Exception:
+        return None
+    return schema
 
 
 def _writer_properties(value: Any) -> Any:
@@ -2677,9 +2948,20 @@ def _deltars_fields(fields: Any) -> list[Any]:
     from deltalake import Field, Schema
 
     if isinstance(fields, dict):
+        # The same type parser as the kernel path: "bigint" or "array<int>"
+        # used to raise delta-rs's "Unsupported Delta table type" here only.
+        from .kernel import _delta_type
+
         return [
             Field.from_json(
-                json.dumps({"name": name, "type": str(dtype), "nullable": True, "metadata": {}})
+                json.dumps(
+                    {
+                        "name": name,
+                        "type": _delta_type(name, dtype),
+                        "nullable": True,
+                        "metadata": {},
+                    }
+                )
             )
             for name, dtype in fields.items()
         ]

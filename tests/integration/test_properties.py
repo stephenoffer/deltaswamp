@@ -94,9 +94,7 @@ class TestProbesAgainstInstalledDeltaRs:
         from deltalake import DeltaTable, write_deltalake
 
         path = str(tmp_path / "t")
-        write_deltalake(
-            path, pa.table({"id": [1]}), configuration={"delta.checkpointPolicy": "v2"}
-        )
+        write_deltalake(path, pa.table({"id": [1]}), configuration={"delta.checkpointPolicy": "v2"})
         assert "v2Checkpoint" not in (DeltaTable(path).protocol().writer_features or []), (
             "delta-rs now adds v2Checkpoint; delta.checkpointPolicy can be honored on its "
             "create path again"

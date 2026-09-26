@@ -305,9 +305,11 @@ def arrow_to_sql(arrow_type: Any) -> str:
     if t.is_map(arrow_type):
         return f"MAP<{arrow_to_sql(arrow_type.key_type)}, {arrow_to_sql(arrow_type.item_type)}>"
     if t.is_struct(arrow_type):
+        # A nested field's NOT NULL is part of the type; without it the
+        # warehouse created every struct field nullable.
         inner = ", ".join(
-            f"{quote(arrow_type.field(i).name)}: {arrow_to_sql(arrow_type.field(i).type)}"
-            for i in range(arrow_type.num_fields)
+            f"{quote(f.name)}: {arrow_to_sql(f.type)}" + ("" if f.nullable else " NOT NULL")
+            for f in (arrow_type.field(i) for i in range(arrow_type.num_fields))
         )
         return f"STRUCT<{inner}>"
     raise UnreachableTableError("add columns via SQL", f"no SQL type for Arrow type {arrow_type}")

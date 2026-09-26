@@ -501,7 +501,8 @@ class TestStagedWrites:
         # which INSERT ... BY NAME rejects as an extra column.
         assert rec.last == (
             f"INSERT INTO {NAME} BY NAME SELECT `id`, `city` "
-            f"FROM read_files('{path}', format => 'parquet')"
+            f"FROM read_files('{path}', format => 'parquet', "
+            "datetimeRebaseMode => 'CORRECTED', int96RebaseMode => 'CORRECTED')"
         )
         assert client.files.deleted == [path]
 
@@ -548,7 +549,8 @@ class TestStagedWrites:
         assert rec.sql == [
             f"SELECT * FROM {NAME} LIMIT 0",
             f"INSERT INTO {NAME} REPLACE WHERE day = 'd1' SELECT `id`, `day` "
-            f"FROM read_files('{path}', format => 'parquet')",
+            f"FROM read_files('{path}', format => 'parquet', "
+            "datetimeRebaseMode => 'CORRECTED', int96RebaseMode => 'CORRECTED')",
         ]
         assert client.files.deleted == [path]
 
@@ -602,7 +604,8 @@ class TestMerge:
         assert rec.last == (
             f"MERGE INTO {NAME} AS `t` USING (SELECT `id`, `v`, `ts` "
             f"FROM read_files('{path}', format => "
-            "'parquet')) AS `s` ON t.id = s.id"
+            "'parquet', datetimeRebaseMode => 'CORRECTED', int96RebaseMode => 'CORRECTED')) "
+            "AS `s` ON t.id = s.id"
             " WHEN MATCHED AND s.ts > t.ts THEN UPDATE SET `t`.`v` = s.v"
             " WHEN MATCHED THEN UPDATE SET `t`.`id` = `s`.`id`, `t`.`v` = `s`.`v`"
             " WHEN MATCHED AND s.v IS NULL THEN DELETE"

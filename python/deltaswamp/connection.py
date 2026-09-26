@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 from typing import Any
 
 from .capability import Engine as EngineKind
@@ -161,6 +162,8 @@ def _schema_arg(schema: Any) -> Any:
     except ImportError:
         if hasattr(schema, "__arrow_c_schema__"):
             return schema
+        # A list or dict schema is built with pyarrow.schema().
+        _require("pyarrow", "pyarrow", "a list or dict schema (pass an Arrow schema object)")
         raise
     if not isinstance(schema, pa.Schema):
         if hasattr(schema, "__arrow_c_schema__") and not isinstance(schema, (list, dict)):
@@ -177,7 +180,8 @@ def _schema_arg(schema: Any) -> Any:
 
 
 def _widen_unsigned(schema: Any) -> Any:
-    """Map unsigned integers to the signed type that holds all their values.
+    """Map unsigned integers to the signed type that holds all their values,
+    and zoned timestamps to UTC.
 
     Delta has no unsigned types, and the create mapped uint8 to byte: the
     table was created, then the first write failed with "Can't cast value 200
@@ -196,6 +200,11 @@ def _widen_unsigned(schema: Any) -> Any:
     def widen(t: Any, where: str) -> Any:
         if t in wider:
             return wider[t]
+        if pa.types.is_timestamp(t) and t.tz is not None and t.tz.upper() not in ("UTC", "+00:00"):
+            # A Delta timestamp is an instant stored in UTC; the zone is only
+            # how the caller's frame displays it. Appends already convert, and
+            # a create with America/New_York failed with a bare Exception.
+            return pa.timestamp(t.unit, "UTC")
         if pa.types.is_struct(t):
             return pa.struct([f.with_type(widen(f.type, f"{where}.{f.name}")) for f in t])
         if pa.types.is_map(t):
@@ -261,6 +270,28 @@ def _check_layout(
         raise InvalidArgumentError(
             "every column is a partition column; a Delta table needs at least one "
             "non-partition column"
+        )
+
+
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _check_local_create_path(name: str) -> None:
+    """Refuse a local path neither engine can read back once it is created.
+
+    Both write version 0 at the literal path, then read the log through a URL
+    that decodes `%41` to `A` and treats `\\` as a separator: the create failed
+    with "File not found" after the table was written, and nothing could open
+    it afterwards.
+    """
+    if "://" in name:
+        return  # a URL, file:// included, whose escapes are meant as escapes
+    bad = _PERCENT_ESCAPE.search(name)
+    if bad is not None or (os.sep == "/" and "\\" in name):
+        what = repr(bad.group(0)) if bad is not None else "a backslash"
+        raise InvalidArgumentError(
+            f"the local path {name!r} contains {what}, which the engines read back as a "
+            "different path; nothing was created. Choose a directory name without it"
         )
 
 
@@ -403,6 +434,16 @@ class Connection:
             name, default_catalog=self.default_catalog, default_schema=self.default_schema
         )
         schema = _schema_arg(schema)
+        if _schema_names(schema) == []:
+            # Databricks creates a zero-column table; the kernel refuses one
+            # only after the catalog has allocated it.
+            raise InvalidArgumentError("a table needs at least one column")
+        if mode not in _CREATE_MODES:
+            # Checked for catalog names too, which blamed any unknown mode on
+            # "replacing a catalog table".
+            raise InvalidArgumentError(
+                f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
+            )
         partition_by = _names_arg(partition_by, "partition_by")
         cluster_by = _names_arg(cluster_by, "cluster_by")
         if partition_by and cluster_by:
@@ -421,6 +462,7 @@ class Connection:
                 raise InvalidArgumentError(
                     f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
                 )
+            _check_local_create_path(name)
             if mode in ("error", "create", "ignore") and self.table_exists(name):
                 if mode == "ignore":
                     # Nothing is created, so nothing (the comment included)
@@ -462,9 +504,11 @@ class Connection:
                 ) from exc
 
         lifecycle = self._lifecycle_catalog(f"create the catalog table {ref}")
+        exists = None
         if mode == "ignore":
             # CREATE TABLE IF NOT EXISTS: it was refused as a "replace".
-            if self.table_exists(name):
+            exists = self.table_exists(name)
+            if exists:
                 return self.table(name)
             mode = "error"
         if mode not in ("error", "create"):
@@ -472,6 +516,14 @@ class Connection:
                 f"create {ref} with mode={mode!r}",
                 "a catalog table is created once; replacing one is a different operation",
                 "drop_table() first, or write to it with mode='append' / 'overwrite'",
+            )
+        if exists is None and self.table_exists(name):
+            # The warehouse's raw TABLE_OR_VIEW_ALREADY_EXISTS otherwise, or a
+            # staging table allocated for nothing.
+            raise UnreachableTableError(
+                f"create {ref}",
+                "a table of that name already exists",
+                "pass mode='ignore' to keep it, or write to it with conn.table(...)",
             )
         if location is not None:
             return self._create_external(
@@ -509,8 +561,16 @@ class Connection:
         # Engines satisfy a structural protocol, so the router returns `object`.
         # Passing the properties lets a create delta-rs would reject fall
         # through to the kernel, which accepts most of the Delta spec.
+        # The schema too: its column metadata and types decide which engine
+        # can declare the features the table needs.
         engine: Any = self.router.engine_for(
-            Operation.CREATE, resolved, properties=properties, cluster_by=cluster_by, mode=mode
+            Operation.CREATE,
+            resolved,
+            properties=properties,
+            cluster_by=cluster_by,
+            mode=mode,
+            schema=schema,
+            partition_by=partition_by,
         )
         # delta-rs writes the comment into version 0; the kernel create takes
         # none, so there it is set by a follow-up commit rather than dropped.

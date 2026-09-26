@@ -243,6 +243,7 @@ class TestColumns:
         s = state(
             _field("id", **{"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "c"}),
             configuration={"delta.columnMapping.mode": "name"},
+            protocol={"minReaderVersion": 2, "minWriterVersion": 5},
         )
         with pytest.raises(UnreachableTableError, match="at least one column"):
             m.drop_column(s, "id")

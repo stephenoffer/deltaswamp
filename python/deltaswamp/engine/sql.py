@@ -318,10 +318,21 @@ def _parquet_bytes(table: Any) -> bytes:
             "cast them to STRING, BIGINT or TIMESTAMP first",
         )
 
+    import pyarrow as pa
+
     buffer = io.BytesIO()
     # Spark reads nanosecond Parquet timestamps badly. Coercing to micros raises
     # instead of truncating, so a real sub-microsecond value is never lost.
-    pq.write_table(table, buffer, coerce_timestamps="us")
+    try:
+        pq.write_table(table, buffer, coerce_timestamps="us")
+    except pa.ArrowInvalid as exc:
+        if "would lose data" not in str(exc):
+            raise
+        # A bare pyarrow error, which `except DeltaSwampError` did not catch.
+        raise InvalidArgumentError(
+            "a timestamp has sub-microsecond digits, which a Delta timestamp (microseconds) "
+            f"cannot hold; truncate it to microseconds first ({exc})"
+        ) from exc
     return buffer.getvalue()
 
 
@@ -845,7 +856,13 @@ class SqlEngine:
             raise
         # Each statement projects the staged columns itself (`_staged_columns`):
         # read_files adds a `_rescued_data` column of its own.
-        relation = f"read_files({sq.literal(path)}, format => 'parquet')"
+        # The file pyarrow writes is proleptic Gregorian but carries no Spark
+        # writer metadata, so without CORRECTED Databricks applies the legacy
+        # Julian rebase: date(1, 1, 1) was stored as 0001-01-03.
+        relation = (
+            f"read_files({sq.literal(path)}, format => 'parquet', "
+            "datetimeRebaseMode => 'CORRECTED', int96RebaseMode => 'CORRECTED')"
+        )
         try:
             yield relation, arrow
         finally:
@@ -1352,13 +1369,17 @@ class SqlEngine:
             raise UnreachableTableError(
                 f"create {full_name}", "a table is partitioned or clustered, not both"
             )
-        nullable = {}
+        fields: dict[str, Any] = {}
         if hasattr(schema, "names") and hasattr(schema, "field"):
-            nullable = {schema.field(i).name: schema.field(i).nullable for i in range(len(schema))}
-        columns = ", ".join(
-            f"{sq.quote(n)} {sq.sql_type(t)}" + ("" if nullable.get(n, True) else " NOT NULL")
-            for n, t in sq.column_types(schema)
-        )
+            fields = {schema.field(i).name: schema.field(i) for i in range(len(schema))}
+        # Each column's Delta metadata (generation expression, identity,
+        # default, comment) becomes its DDL clause. Emitting name and type
+        # alone created a table without any of them, and said nothing.
+        clauses = [_column_ddl(full_name, n, t, fields.get(n)) for n, t in sq.column_types(schema)]
+        columns = ", ".join(c for c, _ in clauses)
+        if any(defaults for _, defaults in clauses):
+            # Databricks refuses a DEFAULT clause unless the table supports it.
+            properties = {"delta.feature.allowColumnDefaults": "supported", **(properties or {})}
         sql = f"CREATE TABLE {sq.qualified(full_name)} ({columns}) USING DELTA"
         if partition_by:
             sql += f" PARTITIONED BY ({sq.columns(partition_by)})"
@@ -1622,6 +1643,62 @@ class SqlEngine:
 
 
 # ------------------------------------------------------------------ MERGE
+
+
+def _column_ddl(table: str, name: str, type_text: str, field: Any) -> tuple[str, bool]:
+    """One CREATE TABLE column definition, and whether it carries a DEFAULT.
+
+    The Delta column metadata an Arrow field may carry is rendered as the DDL
+    Databricks itself turns into that metadata.
+    """
+    what = f"create {table}"
+    metadata: dict[str, str] = {}
+    for key, value in (getattr(field, "metadata", None) or {}).items():
+        k = key.decode() if isinstance(key, bytes) else str(key)
+        metadata[k] = value.decode() if isinstance(value, bytes) else str(value)
+
+    def expression(key: str) -> str:
+        text = metadata[key].strip()
+        # Spliced into the statement, so it must not be able to end it.
+        if not text or ";" in text or "--" in text or "/*" in text:
+            raise InvalidArgumentError(
+                f"column {name!r}: {key} {metadata[key]!r} is not a single SQL expression"
+            )
+        return text
+
+    clause = f"{sq.quote(name)} {sq.sql_type(type_text)}"
+    if field is not None and not field.nullable:
+        clause += " NOT NULL"
+    if "delta.invariants" in metadata:
+        raise UnreachableTableError(
+            what,
+            f"column {name!r} carries a delta.invariants expression, which Databricks DDL "
+            "cannot declare",
+            "express it as a CHECK constraint with add_constraint() after creating the table",
+        )
+    identity = {k: v for k, v in metadata.items() if k.startswith("delta.identity.")}
+    if "delta.generationExpression" in metadata and identity:
+        raise InvalidArgumentError(f"column {name!r} is both generated and an identity column")
+    if "delta.generationExpression" in metadata:
+        clause += f" GENERATED ALWAYS AS ({expression('delta.generationExpression')})"
+    elif identity:
+        try:
+            start = int(identity.get("delta.identity.start", "1"))
+            step = int(identity.get("delta.identity.step", "1"))
+        except ValueError as exc:
+            raise InvalidArgumentError(
+                f"column {name!r}: identity start and step must be integers ({exc})"
+            ) from exc
+        explicit = identity.get("delta.identity.allowExplicitInsert", "false").lower() == "true"
+        kind = "BY DEFAULT" if explicit else "ALWAYS"
+        clause += f" GENERATED {kind} AS IDENTITY (START WITH {start} INCREMENT BY {step})"
+    has_default = "CURRENT_DEFAULT" in metadata
+    if has_default:
+        clause += f" DEFAULT {expression('CURRENT_DEFAULT')}"
+    comment = metadata.get("comment")
+    if comment:
+        clause += f" COMMENT {sq.literal(comment)}"
+    return clause, has_default
 
 
 def _name_list(names: str | Sequence[str] | None) -> list[str]:
