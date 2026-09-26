@@ -867,23 +867,29 @@ class KernelEngine:
                         start = after
                         continue
                 if off is not None:
-                    raise UnreachableTableError(
+                    error = UnreachableTableError(
                         "read the change data feed",
                         f"the change data feed was not enabled at version {off.group(1)}, "
                         "which the requested range includes",
                         "start the range after the feed was enabled",
-                    ) from exc
+                    )
+                    # Named, as a schema change names its version, so a
+                    # follower can read up to it.
+                    error.version = int(off.group(1))  # type: ignore[attr-defined]
+                    raise error from exc
                 if "Start and end version schemas are different" in message:
                     # Turning the feed off is a metadata change too, which the
                     # kernel reports as a schema change. Name the real cause.
                     gap = self._feed_gap(table, start or 0, ending_version)
                     if gap is not None:
-                        raise UnreachableTableError(
+                        error = UnreachableTableError(
                             "read the change data feed",
                             f"the change data feed was not enabled at version {gap}, "
                             "which the requested range includes",
                             "start the range after the feed was re-enabled",
-                        ) from exc
+                        )
+                        error.version = gap  # type: ignore[attr-defined]
+                        raise error from exc
                     raise EngineLimitError(
                         "read the change data feed",
                         "the table's schema changed within the requested range, and the "

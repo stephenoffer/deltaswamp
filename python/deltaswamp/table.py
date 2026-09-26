@@ -1826,6 +1826,10 @@ class Table:
 
         Rows carry `_change_type`, `_commit_version` and `_commit_timestamp`.
         """
+        return self._cdf(kwargs, split=True)
+
+    def _cdf(self, kwargs: dict[str, Any], *, split: bool) -> Any:
+        """`cdf()`; `split=False` for a range already known to cross no schema change."""
         unknown = sorted(set(kwargs) - _CDF_OPTIONS)
         if unknown:
             # A misspelt bound (start_version=) reached the engine as a bare
@@ -1849,7 +1853,7 @@ class Table:
             if key in kwargs:
                 kwargs[key] = _timestamp_arg(kwargs[key], key)
         given = _given(kwargs)
-        segments = self._feed_segments(start, end) if start is not None else None
+        segments = self._feed_segments(start, end) if split and start is not None else None
         if segments is not None and len(segments) > 1:
             return self._stitched_cdf(given, segments)
         return self._cdf_read(given, start, end)
@@ -1873,12 +1877,21 @@ class Table:
                     "read a narrower version range, or ds.connect(..., "
                     "allow_sql_fallback=True) to read it with table_changes()",
                 )
+            off = re.search(r"feed is unsupported for the table at version (\d+)", str(exc))
+            if off is not None:
+                # Raised by the kernel mid-stream, after the rows before it,
+                # as a raw ArrowInvalid that `except DeltaSwampError` missed.
+                return _feed_gap_error(int(off.group(1)))
             return self._feed_schema_change(exc, start, end)
 
+        served: dict[str, Any] = {}
+
+        def call(engine: Any) -> Any:
+            served["kind"] = getattr(engine, "kind", None)
+            return engine.cdf(self._resolved, **given)
+
         try:
-            stream = _cdf_types(
-                self._read(Operation.CDF, lambda engine: engine.cdf(self._resolved, **given))
-            )
+            stream = _cdf_types(self._read(Operation.CDF, call))
         except Exception as exc:
             from .engine.base import missing_file_error
 
@@ -1887,7 +1900,12 @@ class Table:
             if translated is None:
                 raise
             raise translated from exc
-        return translating_stream(stream, f"the change data feed of {where}", translate)
+        result = translating_stream(stream, f"the change data feed of {where}", translate)
+        if isinstance(result, TranslatingStream):
+            # changes() streams a feed that arrives commit by commit (the
+            # kernel's) instead of reading it whole.
+            result.engine_kind = served.get("kind")  # type: ignore[attr-defined]
+        return result
 
     def _schema_reader(self) -> Any:
         """`version -> [(name, type), ...]` from the log, or None without a snapshot engine."""
@@ -2105,26 +2123,33 @@ class Table:
                 # crossing a schema change failed on every poll, and the
                 # follower never got past it.
                 segments = current._feed_segments(next_version, latest) or [(next_version, latest)]
+
                 for low, high in segments:
-                    feed = current.cdf(
-                        starting_version=low,
-                        ending_version=high,
-                        columns=projection,
-                        predicate=predicate,
+                    feed = current._cdf(
+                        {
+                            "starting_version": low,
+                            "ending_version": high,
+                            "columns": projection,
+                            "predicate": predicate,
+                        },
+                        split=False,
                     )
-                    # read_all() keeps the typed error pa.table() would flatten.
-                    changes = (
-                        feed.read_all() if isinstance(feed, TranslatingStream) else pa.table(feed)
-                    )
-                    if changes.num_rows:
-                        changes = _plain_views(changes).sort_by("_commit_version")
-                        versions = changes.column("_commit_version").to_pylist()
-                        for version in sorted(set(versions)):
-                            mask = pa.compute.equal(changes.column("_commit_version"), version)
-                            chunk = changes.filter(mask)
-                            if columns is not None:
-                                chunk = chunk.select(columns)
-                            yield int(version), chunk
+                    if getattr(feed, "engine_kind", None) is EngineKind.KERNEL:
+                        # The kernel produces the feed commit by commit, so
+                        # each version is yielded as soon as it is complete:
+                        # read whole, 5000 versions took 11 s and 1.8 GB
+                        # before the first was yielded. A version the feed
+                        # was off at fails the stream after the versions
+                        # before it, which are yielded first.
+                        yield from _stream_by_version(pa, feed, columns)
+                    else:
+                        # read_all() keeps the typed error pa.table() would flatten.
+                        changes = (
+                            feed.read_all()
+                            if isinstance(feed, TranslatingStream)
+                            else pa.table(feed)
+                        )
+                        yield from _by_version(pa, changes, columns)
                     next_version = high + 1
                 next_version = latest + 1
             if poll_interval is None:
@@ -3739,6 +3764,74 @@ _CDF_OPTIONS = frozenset(
     }
 )
 _CDF_META = ("_change_type", "_commit_version", "_commit_timestamp")
+
+
+def _feed_gap_error(version: int) -> UnreachableTableError:
+    """The change feed was off at `version`; `.version` names it, as a schema change does."""
+    error = UnreachableTableError(
+        "read the change data feed",
+        f"the change data feed was not enabled at version {version}, which the requested "
+        "range includes",
+        f"read up to version {version - 1}, or from the version the feed was enabled again",
+    )
+    error.version = version  # type: ignore[attr-defined]
+    return error
+
+
+def _by_version(pa: Any, changes: Any, columns: list[str] | None) -> Any:
+    """`(version, rows)` for each commit in a change-feed table, in order."""
+    if not changes.num_rows:
+        return
+    changes = _plain_views(changes).sort_by("_commit_version")
+    counts = pa.compute.value_counts(changes.column("_commit_version")).to_pylist()
+    offset = 0
+    # Sorted, so each version is one contiguous slice: no pass over the
+    # whole table per version.
+    for entry in counts:
+        chunk = changes.slice(offset, entry["counts"])
+        offset += entry["counts"]
+        yield int(entry["values"]), chunk.select(columns) if columns is not None else chunk
+
+
+def _stream_by_version(pa: Any, feed: Any, columns: list[str] | None) -> Any:
+    """`(version, rows)` from a feed whose batches arrive in commit order.
+
+    A version is yielded once a batch of a later one arrives, or the feed
+    ends. A batch that goes back to a version already yielded would split
+    it, so that is refused rather than yielded twice.
+    """
+    buffered: list[Any] = []
+    top = done = -1
+    batches = iter(feed)
+    while True:
+        try:
+            batch = next(batches)
+        except StopIteration:
+            break
+        except UnreachableTableError as exc:
+            # The feed was off at `version`, which the kernel reaches only
+            # after every commit before it: those are complete, so yield
+            # them before refusing, and a follower resumes from there.
+            gap = getattr(exc, "version", None)
+            if buffered and isinstance(gap, int) and gap > top:
+                yield from _by_version(pa, pa.Table.from_batches(buffered), columns)
+            raise
+        if not batch.num_rows:
+            continue
+        versions = batch.column(batch.schema.get_field_index("_commit_version"))
+        low = int(pa.compute.min(versions).as_py())
+        if low <= done:
+            raise CorruptTableError(
+                f"the change data feed returned rows of version {low} after later versions; "
+                "read it with cdf() instead"
+            )
+        if buffered and low > top:
+            yield from _by_version(pa, pa.Table.from_batches(buffered), columns)
+            buffered, done = [], top
+        buffered.append(batch)
+        top = max(top, int(pa.compute.max(versions).as_py()))
+    if buffered:
+        yield from _by_version(pa, pa.Table.from_batches(buffered), columns)
 
 
 def _cdf_types(stream: Any) -> Any:

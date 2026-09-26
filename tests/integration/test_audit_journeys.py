@@ -595,3 +595,69 @@ class TestRestoreToAFutureTimestamp:
         with pytest.raises(InvalidArgumentError, match="after the latest commit"):
             t.restore(dt.datetime.now(dt.UTC) + dt.timedelta(days=1))
         assert conn.open_table(path).version == 2
+
+
+def _feed_with_a_gap(conn: Any, path: str) -> Any:
+    t = _cdf_table(conn, path)
+    for i in range(3):
+        t.append(pa.table({"id": [i]}))  # 1..3
+    t.set_properties({"delta.enableChangeDataFeed": "false"})  # 4
+    t.append(pa.table({"id": [10]}))  # 5
+    t.set_properties({"delta.enableChangeDataFeed": "true"})  # 6
+    t.append(pa.table({"id": [20]}))  # 7
+    return conn.open_table(path)
+
+
+class TestChangeFeedGapIsTyped:
+    """A range crossing a version with the feed off failed mid-stream with a raw
+    ArrowInvalid, after rows were delivered; changes() raised the same."""
+
+    def test_cdf_raises_a_library_error_naming_the_version(self, conn: Any, tmp_path: Any) -> None:
+        from deltaswamp.errors import UnreachableTableError
+
+        t = _feed_with_a_gap(conn, str(tmp_path / "t"))
+        with pytest.raises(UnreachableTableError) as caught:
+            for _ in t.cdf(starting_version=1, ending_version=7):
+                pass
+        assert getattr(caught.value, "version", None) == 4
+
+    def test_changes_yields_up_to_the_gap_then_refuses(self, conn: Any, tmp_path: Any) -> None:
+        from deltaswamp.errors import UnreachableTableError
+
+        t = _feed_with_a_gap(conn, str(tmp_path / "t"))
+        got = []
+        with pytest.raises(UnreachableTableError) as caught:
+            for version, rows in t.changes(1):
+                got.append((version, rows.num_rows))
+        assert got == [(1, 1), (2, 1), (3, 1)]
+        assert getattr(caught.value, "version", None) == 4
+        assert [v for v, _ in t.changes(6)] == [7]
+
+
+class TestChangesStreams:
+    """changes() read the whole range into memory, then filtered it once per
+    version: 5000 versions took 11 s and 1.8 GB before the first yield."""
+
+    def test_first_version_is_yielded_before_the_feed_is_read(
+        self, conn: Any, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        from deltaswamp.engine.base import TranslatingStream
+
+        path = str(tmp_path / "t")
+        t = _cdf_table(conn, path)
+        for i in range(5):
+            t.append(pa.table({"id": [i, i]}))
+        read_all_calls: list[int] = []
+        real = TranslatingStream.read_all
+
+        def spy(self: Any) -> Any:
+            read_all_calls.append(1)
+            return real(self)
+
+        monkeypatch.setattr(TranslatingStream, "read_all", spy)
+        follower = conn.open_table(path).changes(0)
+        first = next(follower)
+        assert first[0] == 1 and first[1].num_rows == 2
+        rest = [(v, b.num_rows) for v, b in follower]
+        assert rest == [(2, 2), (3, 2), (4, 2), (5, 2)]
+        assert read_all_calls == []

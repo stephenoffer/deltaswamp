@@ -63,7 +63,9 @@ First release.
   (a dropped, renamed or retyped column), with `ChangeFeedSchemaChangeError`
   naming the version. Start the range at the change, or read it through the
   warehouse. An added column reads as null in older rows, and `changes()`
-  yields each version under the schema it was written with.
+  yields each version under the schema it was written with. A range crossing
+  a version with the feed off raises `UnreachableTableError` naming it
+  (`.version`); `changes()` yields the versions before it first.
 - A MERGE with `merge_schema=True` that assigns a column only the target has
   is refused on delta-rs (1.6.5 fails it) and needs the SQL fallback.
 - On a legacy writer-3-to-6 table, enabling a feature delta-rs cannot write
