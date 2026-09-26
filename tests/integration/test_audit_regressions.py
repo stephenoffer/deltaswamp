@@ -47,14 +47,21 @@ class TestVacuumKeepsDeletionVectors:
         _age(path, 8)
         return t, path
 
-    def test_full_vacuum_is_refused(self, conn: Any, tmp_path: Any) -> None:
+    def test_full_vacuum_keeps_every_vector_file(self, conn: Any, tmp_path: Any) -> None:
+        # Refused outright before, dry runs included; now the orphans go and
+        # every deletion-vector file stays.
         t, path = self._table(conn, tmp_path)
-        assert not t.can("vacuum")
-        with pytest.raises(UnreachableTableError, match="deletion vectors"):
-            t.vacuum()
-        with pytest.raises(UnreachableTableError, match="deletion vectors"):
-            t.vacuum(dry_run=False)
-        assert list(pathlib.Path(path).rglob("deletion_vector_*.bin"))
+        orphan = pathlib.Path(path) / "part-00000-orphan.parquet"
+        orphan.write_bytes(b"left by a crashed write")
+        _age(path, 8)
+        vectors = sorted(pathlib.Path(path).rglob("deletion_vector_*.bin"))
+        assert t.can("vacuum")
+        planned = t.vacuum(retention_hours=0, enforce_retention_duration=False)
+        assert planned == ["part-00000-orphan.parquet"]
+        assert orphan.exists()
+        t.vacuum(retention_hours=0, enforce_retention_duration=False, dry_run=False)
+        assert not orphan.exists()
+        assert sorted(pathlib.Path(path).rglob("deletion_vector_*.bin")) == vectors
         assert sorted(conn.open_table(path).to_arrow().column("id").to_pylist()) == list(
             range(3, 10)
         )

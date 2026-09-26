@@ -446,8 +446,12 @@ conn.convert_to_delta("s3://bucket/parquet-dir")
 ```
 
 `vacuum` defaults to a dry run because the real thing deletes files. `lite=True`
-considers only files the log records as removed. Three operations refuse rather
-than misbehave:
+considers only files the log records as removed. On a table with deletion
+vectors, a full VACUUM through delta-rs keeps every `deletion_vector_*.bin`:
+delta-rs does not count the vector files live data files reference and would
+delete them, so its list of unreferenced files is taken without them and the
+rest deleted here. Unreferenced vector files stay until Databricks vacuums the
+table. Three operations refuse rather than misbehave:
 
 - `vacuum` on a shallow clone, which borrows the source's files.
 - `restore` through delta-rs on a table with deletion vectors, where delta-rs

@@ -57,15 +57,6 @@ _RESTORE_DV_REASON = (
     "changes -- it reports success and leaves the rows deleted (delta-rs#4613)"
 )
 
-_VACUUM_DV_REASON = (
-    "the table has deletion vectors, and delta-rs's full VACUUM does not count the "
-    "deletion-vector files live data files reference: it deletes them, and the table "
-    "can no longer be read"
-)
-_VACUUM_DV_REMEDY = (
-    "vacuum(lite=True) removes only files the log records as removed, or run VACUUM "
-    "from Databricks (allow_sql_fallback=True)"
-)
 
 #: delta-rs 1.6.5: "Schema evolution on column-mapped tables is not yet supported".
 _CM_SCHEMA_EVOLUTION = (
@@ -382,14 +373,6 @@ class DeltaRsEngine:
                     "sets properties on a table-features (reader version 3) protocol"
                 ),
                 remedy="this routes to the kernel, which commits the change itself",
-            )
-        if (
-            operation is Operation.VACUUM
-            and "deletionVectors" in table.effective_reader_features
-            and not shape.get("lite")
-        ):
-            return Capability(
-                operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY
             )
         if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
             refusal = _add_feature_refusal(table, shape["features"])
@@ -1291,9 +1274,13 @@ class DeltaRsEngine:
             # Round up: keeping a little more history is the safe direction.
             retention_hours = math.ceil(retention_hours)
         _commit_kwargs(kwargs)
+        dv_table = "deletionVectors" in table.effective_reader_features
         try:
+            dt = self._open(table, write=True)
+            if dv_table and not lite:
+                return self._vacuum_keeping_vectors(dt, retention_hours, dry_run, kwargs)
             with _no_panics("vacuum"):
-                result: list[str] = self._open(table, write=True).vacuum(
+                result: list[str] = dt.vacuum(
                     retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
                 )
         except Exception as exc:
@@ -1307,6 +1294,43 @@ class DeltaRsEngine:
                 "to vacuum anyway, or lower the table property"
             ) from exc
         return result
+
+    @staticmethod
+    def _vacuum_keeping_vectors(
+        dt: Any, retention_hours: int | None, dry_run: bool, kwargs: dict[str, Any]
+    ) -> list[str]:
+        """A full VACUUM of a deletion-vector table that never deletes a vector file.
+
+        delta-rs's full VACUUM does not count the deletion-vector files live
+        data files reference: it deletes them, and the table can no longer be
+        read. Its dry run still finds the orphans (the files of crashed or
+        abandoned writes, and removed files past retention), so that list is
+        taken, every `deletion_vector_*.bin` is kept out of it -- a vector
+        may be referenced by a live file or by a tombstone a time-travel
+        reader still needs -- and the rest is deleted here through the
+        table's own store. Unreferenced vector files are left behind, which
+        costs a little storage and loses nothing.
+        """
+        with _no_panics("vacuum"):
+            candidates: list[str] = dt.vacuum(
+                retention_hours=retention_hours, dry_run=True, full=True, **kwargs
+            )
+        removable = [
+            path
+            for path in candidates
+            if not re.fullmatch(r"deletion_vector_[0-9a-fA-F-]+\.bin", path.rsplit("/", 1)[-1])
+        ]
+        if dry_run or not removable:
+            return removable
+        from deltalake._internal import DeltaFileSystemHandler
+
+        handler = DeltaFileSystemHandler.from_table(
+            dt._table, getattr(dt, "_storage_options", None), None
+        )
+        for path in removable:
+            with contextlib.suppress(FileNotFoundError):
+                handler.delete_file(path)
+        return removable
 
     def restore(self, table: ResolvedTable, target: Any, **kwargs: Any) -> dict[str, Any]:
         if isinstance(target, bool) or not isinstance(target, (Integral, str, datetime, date)):
