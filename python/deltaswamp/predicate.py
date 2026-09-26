@@ -46,6 +46,7 @@ __all__ = [
     "filter_table",
     "parse",
     "parse_value",
+    "standard_string_literals",
 ]
 
 
@@ -84,8 +85,8 @@ _TOKEN = re.compile(
     r"""
     \s*(?:
       (?P<number>[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[LlDdFf]?)
-     |(?P<string>'(?:[^'\\]|\\.|'')*')
-     |(?P<dstring>"(?:[^"\\]|\\.|"")*")
+     |(?P<string>'(?:[^'\\]|\\.)*')
+     |(?P<dstring>"(?:[^"\\]|\\.)*")
      |(?P<quoted>`(?:[^`]|``)+`)
      |(?P<op><=>|<=|>=|<>|!=|==|=|<|>|\(|\)|,|\.)
      |(?P<word>(?:[^\W\d]|_)\w*)
@@ -246,6 +247,17 @@ class _Parser:
                 self.i += 1
                 items.append(self.value())
             self.expect_symbol(")")
+            if any(isinstance(i, Literal) and i.type == "double" for i in items):
+                # Spark compares an IN list in the common type of its items:
+                # one DOUBLE makes it `l IN (DOUBLE, DOUBLE)`, so
+                # `l IN (9007199254740992, 7D)` holds for 9007199254740993
+                # too. Item by item, the BIGINT one compared exactly.
+                items = [
+                    Literal(float(i.value), "double")
+                    if isinstance(i, Literal) and i.type in ("long", "decimal")
+                    else i
+                    for i in items
+                ]
             return Node("in", (left, *items), negated)
 
         if self.keyword("BETWEEN"):
@@ -317,8 +329,14 @@ class _Parser:
         if tok.kind == "number":
             return _number(tok.text)
         if tok.kind in ("string", "dstring"):
-            # Spark treats double quotes as a string literal by default.
-            return Literal(_unescape(tok.text), "string")
+            # Spark treats double quotes as a string literal by default, and
+            # concatenates adjacent literals: `'it''s'` is `'it' 's'`, which
+            # is `its` -- not the ANSI `it's`. The warehouse reads it that way,
+            # so every other engine has to as well.
+            text = _unescape(tok.text)
+            while (nxt := self.peek()) is not None and nxt.kind in ("string", "dstring"):
+                text += _unescape(self.take().text)
+            return Literal(text, "string")
         if tok.kind == "op" and tok.text == "(":
             inner = self.value()
             self.expect_symbol(")")
@@ -375,19 +393,16 @@ def _unescape(token: str) -> str:
     """The value of a quoted SQL string token, as Spark reads it.
 
     Spark processes backslash escapes in string literals (`'a\\b'` is `a\b`,
-    `'it\'s'` is `it's`), which is what the SQL warehouse evaluates; a doubled
-    quote is also accepted. The kernel and delta-rs paths used to take the
+    `'it\'s'` is `it's`), which is what the SQL warehouse evaluates. A doubled
+    quote is not an escape in Spark: it ends one literal and starts the next
+    (see `_Parser.value`). The kernel and delta-rs paths used to take the
     backslashes literally, so the same predicate matched different rows.
     """
-    quote, body = token[0], token[1:-1]
+    body = token[1:-1]
     out: list[str] = []
     i = 0
     while i < len(body):
         ch = body[i]
-        if ch == quote and i + 1 < len(body) and body[i + 1] == quote:
-            out.append(quote)
-            i += 2
-            continue
         if ch != "\\" or i + 1 >= len(body):
             out.append(ch)
             i += 1
@@ -403,6 +418,59 @@ def _unescape(token: str) -> str:
         else:
             out.append(_SPARK_ESCAPES.get(nxt, nxt))
             i += 2
+    return "".join(out)
+
+
+_SPARK_TEXT = re.compile(r"""('(?:[^'\\]|\\.)*')|("(?:[^"\\]|\\.)*"|`(?:[^`]|``)*`)|'""", re.S)
+
+
+def standard_string_literals(text: str) -> str:
+    """SQL text with each Spark string literal respelled as ANSI SQL spells it.
+
+    Text the parser cannot represent (functions, arithmetic, MERGE clauses) is
+    handed to DataFusion or DuckDB as written, and they read string literals
+    the ANSI way: `''` is an escaped quote and a backslash is just a
+    backslash. Spark -- and so the warehouse -- reads `'it''s'` as two
+    adjacent literals (`its`) and `'a\\'b'` as `a'b`. Each run of adjacent
+    single-quoted literals is decoded as Spark decodes it and written back
+    as one `'...'` with doubled quotes, so every engine sees the value the
+    warehouse would. Double-quoted and backquoted text is left alone: those
+    engines read it as an identifier. An unterminated quote is left as is,
+    for the engine to reject.
+    """
+    if not isinstance(text, str) or "'" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    #: The literals of the current run, and where the run ends.
+    run: list[str] = []
+    run_end = 0
+
+    def flush() -> None:
+        value = "".join(_unescape(t) for t in run)
+        out.append("'" + value.replace("'", "''") + "'")
+        run.clear()
+
+    for match in _SPARK_TEXT.finditer(text):
+        literal = match.group(1)
+        if literal is not None and run and not text[run_end : match.start()].strip():
+            run.append(literal)
+            run_end = match.end()
+            continue
+        if run:
+            flush()
+            pos = run_end
+        if literal is not None:
+            out.append(text[pos : match.start()])
+            run.append(literal)
+            run_end = match.end()
+        elif match.group(2) is None:
+            # An unterminated quote: nothing after it is a token.
+            break
+    if run:
+        flush()
+        pos = run_end
+    out.append(text[pos:])
     return "".join(out)
 
 
@@ -881,6 +949,31 @@ def _coerce(pa: Any, lit: Literal, target: Any) -> tuple[Any, Any]:
     if target is None:
         return None, _to_scalar(pa, value)
     types = pa.types
+    numeric_target = (
+        types.is_integer(target) or types.is_floating(target) or types.is_decimal(target)
+    )
+
+    if isinstance(value, (int, float, decimal.Decimal)) and not isinstance(value, bool):
+        if _is_text(pa, target):
+            # Spark casts the STRING column to the literal's type (`s = 1`
+            # matches '01' and ' 1', and fails on 'abc' under ANSI); Arrow
+            # compared text with text and matched only '1'. Rather than
+            # guess at a cast, ask for the comparison the user means.
+            raise PredicateError(
+                f"a STRING column is compared with the number {value!r}; Spark would cast "
+                "every value of the column to a number (and fail on text that is not one). "
+                f"Quote the literal to compare as text ('{value}'), or CAST the column in SQL"
+            )
+        if types.is_boolean(target):
+            raise PredicateError(
+                f"a BOOLEAN column cannot be compared with the number {value!r} "
+                "(Spark raises a type mismatch); compare it with TRUE or FALSE"
+            )
+    if isinstance(value, bool) and numeric_target:
+        raise PredicateError(
+            f"a {target} column cannot be compared with {str(value).upper()} "
+            "(Spark raises a type mismatch); compare it with a number"
+        )
 
     if isinstance(value, str) and not _is_text(pa, target):
         if types.is_date(target) or types.is_timestamp(target):
@@ -898,7 +991,14 @@ def _coerce(pa: Any, lit: Literal, target: Any) -> tuple[Any, Any]:
                 number = decimal.Decimal(value.strip())
             except decimal.InvalidOperation:
                 number = None
-            if number is None or not number.is_finite() or types.is_boolean(target):
+            if (
+                number is None
+                or not number.is_finite()
+                or types.is_boolean(target)
+                # Spark casts the string to the integral column's type, and
+                # under ANSI '7.0' is not a valid BIGINT: an error, not 7.
+                or (types.is_integer(target) and not re.fullmatch(r"[+-]?\d+", value.strip()))
+            ):
                 raise PredicateError(
                     f"string literal {value!r} cannot be compared with a {target} column: "
                     "it is not a valid value of that type"

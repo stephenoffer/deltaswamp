@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from .capability import Engine as EngineKind
@@ -952,6 +953,12 @@ class Connection:
         ``engine="warehouse"`` sends `query` verbatim to the SQL fallback, where
         names resolve in Unity Catalog and `tables` is not used.
         """
+        if tables is not None and not isinstance(tables, Mapping):
+            # A list failed with a bare AttributeError ('list' has no 'items').
+            raise InvalidArgumentError(
+                f"tables= maps the names the query uses to tables, e.g. {{'t': 'cat.sch.t'}}; "
+                f"got a {type(tables).__name__}"
+            )
         if engine == "warehouse":
             sql_engine: Any = self.router.engines.get(EngineKind.SQL)
             if sql_engine is None or not self.router.allow_sql_fallback:

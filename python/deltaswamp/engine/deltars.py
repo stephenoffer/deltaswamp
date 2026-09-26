@@ -39,6 +39,7 @@ from ..catalog import ResolvedTable
 from ..credentials import Operation as CredentialOperation
 from ..errors import (
     CommitConflictError,
+    DeltaSwampError,
     EnginePanicError,
     InvalidArgumentError,
     UnreachableTableError,
@@ -294,7 +295,9 @@ class DeltaRsEngine:
             and "deletionVectors" in table.effective_reader_features
             and not shape.get("lite")
         ):
-            return Capability(operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY)
+            return Capability(
+                operation, ok=False, reason=_VACUUM_DV_REASON, remedy=_VACUUM_DV_REMEDY
+            )
         if operation is Operation.ADD_FEATURE and shape.get("features") is not None:
             refusal = _add_feature_refusal(table, shape["features"])
             if refusal is not None:
@@ -381,9 +384,12 @@ class DeltaRsEngine:
                 "time travel by both version and timestamp",
                 "a read can be pinned to a version or to a timestamp, not both",
             )
-        dt = self._open(table, version=version)
         if timestamp is not None:
+            version = self._version_at(table, timestamp)
+        dt = self._open(table, version=version)
+        if timestamp is not None and version is None:
             dt.load_as_version(_timestamp_arg(timestamp))
+        _check_columns(dt, columns)
         # `scan()` is the only delta-rs read path that handles deletion vectors
         # and column mapping; to_pyarrow_dataset() hard-rejects both.
         stream = dt.scan(
@@ -391,6 +397,34 @@ class DeltaRsEngine:
             predicate=_datafusion_predicate(dt, predicate),
         )
         return _without_view_types(stream)
+
+    def _version_at(self, table: ResolvedTable, timestamp: Any) -> int | None:
+        """The version a read as of `timestamp` sees, resolved as the kernel does.
+
+        delta-rs's `load_as_version(timestamp)` orders commits by file
+        modification time, not by in-commit timestamp, so a copied or restored
+        log (every mtime "now") read as of an ICT matched the wrong version;
+        and a timestamp before the table existed was clamped to version 0
+        instead of refused. The kernel's resolver honors in-commit timestamps
+        and refuses a timestamp before the earliest recreatable commit, so
+        both direct engines give one answer. Without the extension, delta-rs
+        resolves it (None).
+        """
+        from .kernel import KernelEngine
+
+        if not KernelEngine.available():
+            return None
+        try:
+            snapshot = KernelEngine(storage_options=self._base_options).snapshot(
+                table, timestamp=timestamp
+            )
+        except DeltaSwampError:
+            # A refusal about the request (before the table's history).
+            raise
+        except Exception:
+            # The kernel cannot open this table at all; delta-rs may.
+            return None
+        return int(snapshot.version)
 
     def history(self, table: ResolvedTable, *, limit: int | None = None) -> list[dict[str, Any]]:
         if limit is not None and limit < 0:
@@ -933,7 +967,7 @@ class DeltaRsEngine:
         data = _respell_source(_plain_data(source), _column_names(dt))
         columns = _merge_columns(dt, data, kwargs)
         if isinstance(predicate, str):
-            predicate = _exact_decimals(_fold_case(predicate, columns))
+            predicate = _exact_decimals(_fold_case(_standard_string_literals(predicate), columns))
         merger = dt.merge(data, predicate, **kwargs)
         return _CheckedMerger(
             merger,
@@ -1456,7 +1490,11 @@ def _datafusion_updates(dt: Any, updates: dict[str, str], *, rendered: bool) -> 
     out: dict[str, str] = {}
     for key, expression in zip(keys, updates.values(), strict=True):
         out[key] = expression
-        if rendered or schema.get_field_index(key) < 0:
+        if rendered:
+            continue
+        # Spark SQL passed through: its string literals as DataFusion reads them.
+        out[key] = sqlpred.standard_string_literals(expression)
+        if schema.get_field_index(key) < 0:
             continue
         try:
             value = sqlpred.parse_value(expression)
@@ -1466,6 +1504,28 @@ def _datafusion_updates(dt: Any, updates: dict[str, str], *, rendered: bool) -> 
         if text is not None:
             out[key] = text
     return out
+
+
+def _check_columns(dt: Any, columns: list[str] | None) -> None:
+    """Refuse a projection naming a column the table does not have.
+
+    delta-rs raised its own DeltaError ("Schema error: No field named nope"),
+    which is not a DeltaSwampError, so `Table` treated it as an engine failure
+    and warned about falling back instead of reporting the typo.
+    """
+    if not columns:
+        return
+    try:
+        names = [f.name for f in dt.schema().fields]
+    except Exception:
+        return
+    lowered = {n.lower() for n in names}
+    missing = [c for c in columns if c.lower() not in lowered]
+    if missing:
+        raise InvalidArgumentError(
+            f"columns= names {', '.join(repr(c) for c in missing)}, which the table does "
+            f"not have; its columns are {names}"
+        )
 
 
 def _canonical_columns(dt: Any, columns: list[str] | None) -> list[str] | None:
@@ -1630,7 +1690,10 @@ def _datafusion_predicate(
         # in them still resolve case-insensitively, as in Delta.
         return _shield_stats(
             _exact_decimals(
-                _fold_case(_refuse_null_literals(predicate), {None: list(schema.names)})
+                _fold_case(
+                    _refuse_null_literals(sqlpred.standard_string_literals(predicate)),
+                    {None: list(schema.names)},
+                )
             ),
             schema,
         )
@@ -1650,7 +1713,10 @@ def _datafusion_predicate(
     if rendered is None:
         return _shield_stats(
             _exact_decimals(
-                _fold_case(_refuse_null_literals(predicate), {None: list(schema.names)})
+                _fold_case(
+                    _refuse_null_literals(sqlpred.standard_string_literals(predicate)),
+                    {None: list(schema.names)},
+                )
             ),
             schema,
         )
@@ -1839,6 +1905,13 @@ _SQL_NUMBER = re.compile(
     r"""('(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`)"""  # skipped: quoted text
     r"""|((?<![\w.])(?:\d+\.\d*|\.\d+)(?![\w.]))"""  # an unsuffixed decimal literal
 )
+
+
+def _standard_string_literals(expr: str) -> str:
+    """Spark string literals in `expr` spelled as DataFusion reads them."""
+    from .. import predicate as sqlpred
+
+    return sqlpred.standard_string_literals(expr)
 
 
 def _exact_decimals(expr: str) -> str:
@@ -2302,7 +2375,7 @@ class _CheckedMerger:
 
     def _fold(self, value: Any) -> Any:
         if isinstance(value, str):
-            return _exact_decimals(_fold_case(value, self._columns))
+            return _exact_decimals(_fold_case(_standard_string_literals(value), self._columns))
         if isinstance(value, dict):
             # SET/INSERT keys name target columns, unqualified.
             return {

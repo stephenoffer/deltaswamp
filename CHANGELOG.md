@@ -59,3 +59,8 @@ First release.
   deltaswamp is registered. Reads are unaffected.
 - Idempotent writes are checked against the last committed version before
   writing, so a concurrent writer can still commit in between.
+- delta-rs does not rebase pre-1582 dates and timestamps in files Spark wrote
+  in its legacy hybrid calendar; the kernel does. Such timestamps written in a
+  non-UTC session zone are refused by the kernel and need the warehouse.
+- A time-travel timestamp after the latest commit reads the latest version on
+  the direct engines; the warehouse refuses it.

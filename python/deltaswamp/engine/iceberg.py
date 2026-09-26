@@ -789,6 +789,16 @@ class IcebergEngine:
             else pa.schema([reader.schema.field(c) for c in columns])
         )
 
+        sqlpred = importlib.import_module("deltaswamp.predicate")
+        try:
+            residual_node = sqlpred.parse(residual)
+        except sqlpred.PredicateError:
+            residual_node = None
+        if residual_node is not None:
+            # Bound now, so a refused comparison (`name = 1` on a STRING
+            # column) raises from scan() rather than mid-stream.
+            sqlpred.to_arrow(residual_node, reader.schema)
+
         def batches() -> Iterator[Any]:
             remaining = limit
             if remaining == 0:

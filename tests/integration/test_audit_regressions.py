@@ -37,7 +37,9 @@ class TestVacuumKeepsDeletionVectors:
     def _table(self, conn: Any, tmp_path: Any) -> tuple[Any, str]:
         path = str(tmp_path / "t")
         t = conn.create_table(
-            path, pa.schema([("id", pa.int64())]), properties={"delta.enableDeletionVectors": "true"}
+            path,
+            pa.schema([("id", pa.int64())]),
+            properties={"delta.enableDeletionVectors": "true"},
         )
         t.append(pa.table({"id": pa.array(range(10), pa.int64())}))
         t.delete("id < 3")
@@ -92,7 +94,7 @@ class TestAddFeatureKeepsLegacyFeatures:
         assert before <= after.resolved.effective_writer_features
         assert after.to_arrow().to_pylist() == [{"id": 1, "v": 1}]
         if not properties:
-            with pytest.raises(Exception, match="(?i)constraint|invalid|violat"):
+            with pytest.raises(Exception, match=r"(?i)constraint|invalid|violat"):
                 after.append(pa.table({"id": [2], "v": [-5]}))
 
 

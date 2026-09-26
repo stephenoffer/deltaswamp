@@ -90,7 +90,9 @@ class KernelMerger:
         self._engine = engine
         self._table = table
         self._source = pa.table(source) if not isinstance(source, pa.Table) else source
-        self._predicate = predicate
+        # DuckDB evaluates the clauses, and reads string literals the ANSI
+        # way; respelled, `'it''s'` means `its` here, as on the warehouse.
+        self._predicate: str = _standard_text(predicate)
         self._passthrough = passthrough
         # (kind, condition, verb, argument)
         self._clauses: list[tuple[str, str | None, str, Any]] = []
@@ -100,7 +102,9 @@ class KernelMerger:
     def _add(self, kind: str, predicate: str | None, verb: str, arg: Any) -> KernelMerger:
         if verb in ("UPDATE", "INSERT") and not arg:
             raise InvalidArgumentError(f"a MERGE {verb} clause needs at least one column to set")
-        self._clauses.append((kind, predicate, verb, arg))
+        if verb in ("UPDATE", "INSERT"):
+            arg = {k: _standard(v) if isinstance(v, str) else v for k, v in arg.items()}
+        self._clauses.append((kind, _standard(predicate), verb, arg))
         return self
 
     def when_matched_update(
@@ -382,6 +386,17 @@ class KernelMerger:
             if name is not None and column.lower() not in excluded:
                 exprs[column] = f"{s}.{_quote(name)}"
         return exprs
+
+
+def _standard_text(text: str) -> str:
+    """Spark SQL `text` with its string literals spelled as DuckDB reads them."""
+    from .. import predicate as sqlpred
+
+    return sqlpred.standard_string_literals(text)
+
+
+def _standard(text: str | None) -> str | None:
+    return _standard_text(text) if isinstance(text, str) else text
 
 
 def _fetch(con: Any, sql: str) -> Any:

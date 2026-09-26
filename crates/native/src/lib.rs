@@ -13,6 +13,7 @@ mod files;
 mod functions;
 mod partition;
 mod predicate;
+mod rebase;
 mod runtime;
 mod scan;
 mod snapshot;

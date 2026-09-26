@@ -143,7 +143,8 @@ pub fn table_changes(
         .with_predicate(predicate.map(Arc::new))
         .build()?;
     let schema = scan.logical_schema().clone();
-    let iter = scan.execute(engine.clone() as Arc<dyn Engine>)?;
+    // Rebases Parquet files Spark wrote in its legacy hybrid calendar.
+    let iter = scan.execute(crate::rebase::reading_engine(&engine, url))?;
     Ok(KernelBatchReader::from_parts(schema.as_ref(), iter)?
         .without_column(crate::scan::ROW_COUNT_COLUMN))
 }
