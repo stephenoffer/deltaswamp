@@ -848,6 +848,8 @@ class Table:
                 needs |= self._expression_needs(get("predicate"))
         elif op in (Operation.DELETE, Operation.UPDATE):
             needs |= self._expression_needs(get("predicate"), get("updates"))
+        elif op is Operation.MERGE and get("merge_schema"):
+            needs.add("schema_merge")
         elif op in (Operation.SCAN, Operation.TIME_TRAVEL):
             if get("predicate") is not None:
                 needs |= self._predicate_needs(get("predicate"))
@@ -2664,6 +2666,10 @@ class Table:
         _check_predicate(predicate, "merge")
         source = _write_data(source)
         needs = self._data_needs(source)
+        if kwargs.get("merge_schema"):
+            # The kernel MERGE cannot evolve the schema; routed without the
+            # need, can() said "via kernel" and the call then refused.
+            needs = needs | {"schema_merge"}
 
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
             engine = self._engine(Operation.MERGE, needs, exclude=exclude)

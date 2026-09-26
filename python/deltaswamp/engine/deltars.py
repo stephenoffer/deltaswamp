@@ -1125,6 +1125,7 @@ class DeltaRsEngine:
             change_feed=str(table.properties.get("delta.enableChangeDataFeed", "false")).lower()
             == "true",
             computed=_computed_columns(dt),
+            merge_schema=bool(kwargs.get("merge_schema")),
         )
 
     # ------------------------------------------------------------ maintenance
@@ -2725,8 +2726,12 @@ class _CheckedMerger:
         target_alias: str | None = None,
         change_feed: bool = False,
         computed: set[str] | None = None,
+        merge_schema: bool = False,
     ) -> None:
         self._merger = merger
+        self._merge_schema = merge_schema
+        #: Every column a SET or INSERT clause assigns, as given.
+        self._assigned: list[str] = []
         #: alias -> column names, for respelling clause SQL case-insensitively.
         self._columns = columns or {}
         self._target = target or []
@@ -2745,8 +2750,29 @@ class _CheckedMerger:
         clause = merge_clause(name, args, kwargs)
         if clause is not None:
             self._clauses.append(clause)
+            mapping = args[0] if args else kwargs.get("updates")
+            if isinstance(mapping, dict):
+                self._assigned.extend(str(k) for k in mapping)
 
     def execute(self, *args: Any, **kwargs: Any) -> Any:
+        source = {c.lower() for c in self._columns.get(self._source_alias, [])}
+        target_only = sorted(
+            {k for k in self._assigned if k.strip("`").lower() not in source}
+            if self._merge_schema and source
+            else set()
+        )
+        if target_only:
+            # delta-rs 1.6.5 resolves every assignment of a schema-evolving
+            # MERGE against the source alone: "No field named valid_to",
+            # the SCD2 pattern of closing a row. Refused before anything is
+            # written, so another engine can serve it.
+            raise EngineLimitError(
+                "merge with merge_schema on delta-rs",
+                f"delta-rs 1.6.5 fails a schema-evolving MERGE that assigns {target_only}, "
+                "which the source does not have",
+                "add those columns to the source, or ds.connect(..., "
+                "allow_sql_fallback=True) to run it on Databricks",
+            )
         not_matched = [conditional for kind, conditional in self._clauses if kind == "not_matched"]
         if self._change_feed and not_matched and not_matched[-1]:
             # delta-rs 1.6.5 writes an all-NULL row into the table for every
@@ -2796,6 +2822,8 @@ class _CheckedMerger:
 
     def when_matched_update(self, updates: Any, predicate: str | None = None) -> _CheckedMerger:
         self._clauses.append(("matched", predicate is not None))
+        if isinstance(updates, dict):
+            self._assigned.extend(str(k) for k in updates)
         folded = self._fold(updates)
         if isinstance(folded, dict):
             folded = self._recompute(folded)

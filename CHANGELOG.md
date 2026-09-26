@@ -59,9 +59,18 @@ First release.
 - The kernel cannot write CDC files, so UPDATE and MERGE on a change-data-feed
   table it alone can write need the SQL fallback. DELETE through deletion
   vectors needs none.
-- The change feed fails when the range crosses an incompatible schema change,
-  with `ChangeFeedSchemaChangeError` naming the version. Start the range after
-  the change, or read it through the warehouse.
+- The change feed fails when the range crosses an incompatible schema change
+  (a dropped, renamed or retyped column), with `ChangeFeedSchemaChangeError`
+  naming the version. Start the range at the change, or read it through the
+  warehouse. An added column reads as null in older rows, and `changes()`
+  yields each version under the schema it was written with.
+- A MERGE with `merge_schema=True` that assigns a column only the target has
+  is refused on delta-rs (1.6.5 fails it) and needs the SQL fallback.
+- On a legacy writer-3-to-6 table, enabling a feature delta-rs cannot write
+  (clustering, type widening) is refused locally, since no local engine could
+  write the upgraded table.
+- Nanosecond timestamps are written as microseconds (truncated), as Spark
+  writes them.
 - Commits the kernel writes, including distributed ones, record empty
   `operationParameters`: delta_kernel 0.28 overwrites whatever the engine
   supplies. `isBlindAppend` still tells an append from an overwrite.

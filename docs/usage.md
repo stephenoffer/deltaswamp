@@ -232,6 +232,13 @@ t.append(df, txn=("nightly-load", batch_id))  # idempotent
 `df` can be a pyarrow Table or RecordBatchReader, a Polars DataFrame, a pandas
 DataFrame, or anything else exporting the Arrow PyCapsule interface.
 
+A Delta timestamp holds microseconds. A nanosecond timestamp (pandas'
+`datetime64[ns]`, `pa.timestamp("ns")`) creates a microsecond column, as Spark
+does, and its values are truncated to microseconds on the way in, as every
+append into a timestamp column truncates them. delta-rs would otherwise create
+a `timestamp_nanos` column behind its non-standard `timestampNanos` feature,
+which DuckDB, Spark and Databricks cannot read.
+
 A column the data leaves out gets what Databricks would give it: its DEFAULT, a
 generated or identity value, or a null. A literal DEFAULT (`'new'`, `42`,
 `true`, `DATE'2026-01-01'`) is filled in on every engine. Any other
@@ -749,6 +756,16 @@ reached.
   in such files written in a non-UTC session zone need the warehouse.
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.
+- A MERGE with `merge_schema=True` whose SET or INSERT assigns a column the
+  source does not have (closing an SCD2 row) is refused on delta-rs, which
+  fails it, and needs the SQL fallback; the kernel MERGE does not evolve the
+  schema at all.
+- On a table at a legacy writer version 3 to 6 (every change-data-feed table
+  created before table features), a change that turns on a feature delta-rs
+  cannot write (clustering, type widening, in-commit timestamps) is refused
+  locally: the upgraded protocol keeps listing checkConstraints and
+  generatedColumns, as Databricks keeps them, which the kernel cannot write,
+  so no local engine could write the table afterwards.
 - Identity and default columns are created only through Databricks (a catalog
   name with the SQL fallback); locally both engines refuse them, since neither
   assigns the values. Generated columns are created by delta-rs, which

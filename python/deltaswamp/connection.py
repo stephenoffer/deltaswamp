@@ -194,7 +194,7 @@ def _schema_arg(schema: Any) -> Any:
 
 def _widen_unsigned(schema: Any) -> Any:
     """Map unsigned integers to the signed type that holds all their values,
-    and zoned timestamps to UTC.
+    nanosecond timestamps to microseconds and zoned timestamps to UTC.
 
     Delta has no unsigned types, and the create mapped uint8 to byte: the
     table was created, then the first write failed with "Can't cast value 200
@@ -213,6 +213,13 @@ def _widen_unsigned(schema: Any) -> Any:
     def widen(t: Any, where: str) -> Any:
         if t in wider:
             return wider[t]
+        if pa.types.is_timestamp(t) and t.unit == "ns":
+            # pandas' datetime64[ns] (and pa.timestamp("ns")) created a
+            # timestamp_nanos column behind delta-rs's non-standard
+            # timestampNanos feature, which DuckDB, Spark and Databricks
+            # cannot read. A Delta timestamp is microseconds, as Spark
+            # writes it; the data is cast on the way in, as appends cast it.
+            t = pa.timestamp("us", t.tz)
         if pa.types.is_timestamp(t) and t.tz is not None and t.tz.upper() not in ("UTC", "+00:00"):
             # A Delta timestamp is an instant stored in UTC; the zone is only
             # how the caller's frame displays it. Appends already convert, and

@@ -288,3 +288,67 @@ class TestAddFeatureCapabilityAgrees:
         assert not verdict.ok
         with pytest.raises(UnreachableTableError):
             t.add_feature(feature)
+
+
+class TestNanosecondTimestampsAreMicroseconds:
+    """pandas datetime64[ns] created timestamp_nanos columns behind delta-rs's
+    non-standard timestampNanos feature, which DuckDB and Databricks cannot read."""
+
+    def test_write_table_from_pandas(self, conn: Any, tmp_path: Any) -> None:
+        pd = pytest.importorskip("pandas")
+        path = str(tmp_path / "t")
+        frame = pd.DataFrame(
+            {"ts": pd.date_range("2026-01-01", periods=3, freq="h").astype("datetime64[ns]")}
+        )
+        t = conn.write_table(path, frame, mode="overwrite")
+        assert "timestampNanos" not in t.features()
+        assert t.schema().field("ts").type == pa.timestamp("us")
+        assert t.count() == 3
+
+    def test_create_table_with_ns_schema(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "t")
+        t = conn.create_table(
+            path, pa.schema([("a", pa.timestamp("ns")), ("b", pa.timestamp("ns", "UTC"))])
+        )
+        assert "timestampNanos" not in t.features()
+        assert t.schema().field("a").type == pa.timestamp("us")
+        assert t.schema().field("b").type == pa.timestamp("us", "UTC")
+
+
+class TestMergeSchemaRouting:
+    def test_can_agrees_on_a_deletion_vector_table(self, conn: Any, tmp_path: Any) -> None:
+        # can("merge", merge_schema=True) said "via kernel"; the call raised
+        # "cannot merge with merge_schema on the kernel".
+        path = str(tmp_path / "t")
+        t = _dv_table(conn, path)
+        verdict = t.can("merge", merge_schema=True)
+        assert "kernel" not in str(verdict.engine)
+        source = pa.table({"id": [3, 4], "extra": ["x", "y"]})
+        (
+            conn.open_table(path)
+            .merge(source, "t.id = s.id", source_alias="s", target_alias="t", merge_schema=True)
+            .when_not_matched_insert_all()
+            .execute()
+        )
+        t = conn.open_table(path)
+        assert "extra" in t.schema().names
+        assert t.count() == 4
+
+    def test_target_only_assignment_is_refused_before_writing(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        # delta-rs fails "No field named flag" on a schema-evolving MERGE that
+        # sets a column only the target has -- the SCD2 close-out.
+        from deltaswamp.errors import UnreachableTableError
+
+        path = str(tmp_path / "t")
+        before = conn.write_table(path, pa.table({"id": [1, 2], "flag": [True, True]})).version
+        source = pa.table({"id": [1, 3], "tier": ["g", "s"]})
+        merge = (
+            conn.open_table(path)
+            .merge(source, "t.id = s.id", source_alias="s", target_alias="t", merge_schema=True)
+            .when_matched_update(updates={"flag": "false"})
+        )
+        with pytest.raises(UnreachableTableError, match="flag"):
+            merge.execute()
+        assert conn.open_table(path).version == before
