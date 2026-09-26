@@ -18,7 +18,11 @@ from deltaswamp.capability import Operation  # noqa: E402
 from deltaswamp.catalog.base import ResolvedTable  # noqa: E402
 from deltaswamp.credentials.base import CredentialProvider  # noqa: E402
 from deltaswamp.engine.kernel import KernelEngine  # noqa: E402
-from deltaswamp.errors import CommitConflictError, UnreachableTableError  # noqa: E402
+from deltaswamp.errors import (  # noqa: E402
+    CommitConflictError,
+    InvalidArgumentError,
+    UnreachableTableError,
+)
 from deltaswamp.identity import parse_ref  # noqa: E402
 
 
@@ -563,14 +567,14 @@ class TestAppendRetry:
 class TestReplaceWhereContract:
     def test_rows_outside_the_predicate_are_refused(self, plain: str) -> None:
         engine = KernelEngine()
-        with pytest.raises(UnreachableTableError, match="do not satisfy the predicate"):
+        with pytest.raises(InvalidArgumentError, match="do not satisfy the predicate"):
             engine.overwrite(
                 resolved(plain), pa.table({"id": [9], "city": ["z"]}), predicate="id = 1"
             )
         assert engine.snapshot(resolved(plain)).version == 0
 
     def test_null_predicate_result_is_refused(self, plain: str) -> None:
-        with pytest.raises(UnreachableTableError, match="do not satisfy"):
+        with pytest.raises(InvalidArgumentError, match="do not satisfy"):
             KernelEngine().overwrite(
                 resolved(plain), pa.table({"id": [None], "city": ["z"]}), predicate="id = 1"
             )

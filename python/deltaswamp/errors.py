@@ -145,6 +145,14 @@ class TransientCommitError(DeltaSwampError):
     """A commit failed for a transient reason; retrying the same commit is safe."""
 
 
+class StorageError(DeltaSwampError, OSError):
+    """The table's storage failed a request: unreachable, throttling, no such bucket.
+
+    An engine's raw OSError, which `except DeltaSwampError` did not catch. An
+    OSError too, so code that catches the builtin keeps working.
+    """
+
+
 class CorruptTableError(DeltaSwampError):
     """On-disk state failed a correctness check (e.g. DV cardinality mismatch)."""
 

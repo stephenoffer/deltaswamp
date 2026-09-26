@@ -395,3 +395,176 @@ class TestTxnOnCatalogManagedTables:
                 t.append(pa.table({"id": [2]}), txn=("nightly", 4))
             # A replay of a committed batch is skipped, as Spark skips it.
             t.append(pa.table({"id": [1]}), txn=("nightly", 3))
+
+
+class TestAppendsRefuseLossyCasts:
+    """An append cast 4.7 to 4 in a BIGINT column and '12' to 12; Spark refuses."""
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            pa.array([4.7]),
+            pa.array(["12"]),
+            pa.array([True]),
+        ],
+    )
+    def test_refused(self, conn: Any, tmp_path: Any, column: Any) -> None:
+        from deltaswamp.errors import InvalidArgumentError
+
+        path = str(tmp_path / "t")
+        t = conn.write_table(path, pa.table({"id": pa.array([1], pa.int64())}))
+        with pytest.raises(InvalidArgumentError, match="id"):
+            t.append(pa.table({"id": column}))
+        assert conn.open_table(path).to_arrow().column("id").to_pylist() == [1]
+
+    def test_decimal_that_would_lose_digits(self, conn: Any, tmp_path: Any) -> None:
+        # Surfaced as delta-rs's own SchemaMismatchError.
+        import decimal
+
+        from deltaswamp.errors import InvalidArgumentError
+
+        path = str(tmp_path / "t")
+        t = conn.write_table(path, pa.table({"amt": pa.array([None], pa.decimal128(10, 2))}))
+        data = pa.table({"amt": pa.array([decimal.Decimal("1.234")], pa.decimal128(15, 3))})
+        with pytest.raises(InvalidArgumentError):
+            t.append(data)
+
+    def test_safe_widening_still_writes(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "t")
+        t = conn.write_table(
+            path,
+            pa.table(
+                {"i": pa.array([1], pa.int64()), "f": pa.array([1.0]), "s": pa.array(["a"])}
+            ),
+        )
+        t.append(
+            pa.table(
+                {
+                    "i": pa.array([2], pa.int32()),
+                    "f": pa.array([2.5], pa.float32()),
+                    "s": pa.array(["b"], pa.large_string()),
+                }
+            )
+        )
+        assert conn.open_table(path).count() == 2
+
+
+class TestRawEngineErrorsAreTyped:
+    def test_extra_column_without_merge(self, conn: Any, tmp_path: Any) -> None:
+        # delta-rs's SchemaMismatchError, which `except DeltaSwampError` missed.
+        path = str(tmp_path / "t")
+        t = conn.write_table(path, pa.table({"id": [1]}))
+        with pytest.raises(DeltaSwampError):
+            t.append(pa.table({"id": [2], "extra": ["x"]}))
+
+    def test_update_to_an_unknown_column_reference(self, conn: Any, tmp_path: Any) -> None:
+        # A DeltaError: updates= takes SQL, so "zzz" is a column that is not there.
+        from deltaswamp.errors import InvalidArgumentError
+
+        path = str(tmp_path / "t")
+        t = conn.write_table(path, pa.table({"id": [1], "name": ["a"]}))
+        with pytest.raises(InvalidArgumentError, match="zzz"):
+            t.update({"name": "zzz"}, predicate="id = 1")
+
+    def test_storage_failure_is_a_storage_error(self) -> None:
+        from deltaswamp.errors import StorageError
+        from deltaswamp.table import _library_error
+
+        error = _library_error(OSError("Generic S3 error: 503 Slow Down"), "append")
+        assert isinstance(error, StorageError)
+        assert isinstance(error, OSError) and isinstance(error, DeltaSwampError)
+        assert _library_error(FileNotFoundError("x"), "append") is None
+
+
+class TestSchemaArgumentsTakeSqlTypeNames:
+    def test_dict_and_list_schemas(self, conn: Any, tmp_path: Any) -> None:
+        t = conn.create_table(
+            str(tmp_path / "a"),
+            {
+                "id": "bigint",
+                "n": "long",
+                "amt": "decimal(10,2)",
+                "ts": "timestamp",
+                "tn": "timestamp_ntz",
+                "tags": "array<string>",
+                "x": "int64",  # a pyarrow alias still works
+            },
+        )
+        schema = t.schema()
+        assert schema.field("id").type == pa.int64() == schema.field("n").type
+        assert schema.field("amt").type == pa.decimal128(10, 2)
+        assert schema.field("ts").type == pa.timestamp("us", "UTC")
+        assert schema.field("tn").type == pa.timestamp("us")
+        assert schema.field("tags").type.value_type == pa.string()
+        t = conn.create_table(str(tmp_path / "b"), [("id", "long"), ("s", "string")])
+        assert t.schema().names == ["id", "s"]
+
+
+class TestSmallJourneyFixes:
+    def test_alter_column_type_to_its_own_type_is_a_no_op(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        path = str(tmp_path / "t")
+        t = conn.create_table(path, pa.schema([("id", pa.int64())]))
+        before = t.version
+        t.alter_column_type("id", "bigint")
+        assert conn.open_table(path).version == before
+
+    def test_replace_where_violation_is_the_same_error_on_both_engines(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        from deltaswamp.errors import InvalidArgumentError
+
+        plain = conn.write_table(str(tmp_path / "p"), pa.table({"id": [1, 2]}))
+        dv = _dv_table(conn, str(tmp_path / "d"))
+        assert "kernel" in str(dv.can("overwrite", predicate="id = 1"))
+        for t in (plain, dv):
+            with pytest.raises(InvalidArgumentError):
+                t.overwrite(pa.table({"id": [5]}), predicate="id = 1")
+
+    def test_zoned_datetime_into_timestamp_ntz_is_refused(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        import datetime as dt
+
+        from deltaswamp.errors import InvalidArgumentError
+
+        path = str(tmp_path / "t")
+        t = conn.write_table(
+            path,
+            pa.table({"id": [1], "ts": pa.array([dt.datetime(2026, 1, 1)], pa.timestamp("us"))}),
+        )
+        zoned = dt.datetime(2027, 5, 6, 7, 8, 9, tzinfo=dt.timezone(dt.timedelta(hours=2)))
+        with pytest.raises(InvalidArgumentError, match="TIMESTAMP_NTZ"):
+            t.update(new_values={"ts": zoned}, predicate="id = 1")
+        assert conn.open_table(path).to_arrow().column("ts").to_pylist() == [
+            dt.datetime(2026, 1, 1)
+        ]
+
+
+class TestLazyPolarsPushesDown:
+    """to_polars(lazy=True) read the whole table before returning the frame."""
+
+    def test_projection_and_limit_reach_the_scan(
+        self, conn: Any, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        pl = pytest.importorskip("polars")
+        from deltaswamp.table import Table
+
+        path = str(tmp_path / "t")
+        conn.write_table(path, pa.table({"id": list(range(50)), "s": [str(i) for i in range(50)]}))
+        seen: list[dict[str, Any]] = []
+        real = Table.scan
+
+        def spy(self: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs)
+            return real(self, **kwargs)
+
+        monkeypatch.setattr(Table, "scan", spy)
+        lazy = conn.open_table(path).to_polars(lazy=True)
+        assert all(k.get("limit") == 0 for k in seen)  # only the schema so far
+        seen.clear()
+        got = lazy.select("id").filter(pl.col("id") > 45).collect()
+        assert got["id"].to_list() == [46, 47, 48, 49]
+        assert [k.get("columns") for k in seen] == [["id"]]
+        assert lazy.filter(pl.col("id") > 40).head(2).collect()["id"].to_list() == [41, 42]

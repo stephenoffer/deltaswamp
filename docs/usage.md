@@ -242,6 +242,14 @@ plans would be work already done.
 `df` can be a pyarrow Table or RecordBatchReader, a Polars DataFrame, a pandas
 DataFrame, or anything else exporting the Arrow PyCapsule interface.
 
+A column's data must fit the table's type as Delta's schema enforcement
+decides it: the same type, or a widening that keeps every value (a narrower
+integer, int to double, float to double, a decimal with room for all its
+digits). A write that would change values -- 4.7 into a BIGINT, '12' into an
+INT, a DECIMAL(15,3) into a DECIMAL(10,2) -- raises `InvalidArgumentError`, as
+Spark refuses it, where delta-rs cast it silently. Cast the data first, or
+widen the column with `alter_column_type()`.
+
 A Delta timestamp holds microseconds. A nanosecond timestamp (pandas'
 `datetime64[ns]`, `pa.timestamp("ns")`) creates a microsecond column, as Spark
 does, and its values are truncated to microseconds on the way in, as every
@@ -288,6 +296,11 @@ vends for creating tables, then registered, so the catalog and the log agree.
 Both catalog shapes need Unity Catalog (Databricks or open source). On any
 other catalog they are refused, because writing a log alone would leave it
 orphaned while the call appeared to succeed.
+
+A schema is an Arrow schema, or a `{name: type}` dict or `[(name, type)]` list
+whose types are Arrow types or type names -- pyarrow's (`int64`) or the SQL
+and Delta names Spark uses (`bigint`, `long`, `timestamp`, `decimal(10,2)`,
+`array<string>`).
 
 `properties=` accepts nearly the whole Delta property surface, including
 `delta.feature.*` signals, row tracking and in-commit timestamps. When delta-rs
@@ -566,9 +579,16 @@ conn.sql("SELECT * FROM system.access.audit LIMIT 10", engine="warehouse")
 ```
 
 Each hand-off reads through this library, so it works on tables the target
-engine's own Delta reader cannot open. `Connection.sql` runs on DuckDB by
-default (or `engine="polars"`), and can join tables from different catalogs.
-`engine="warehouse"` sends the query to Databricks as it stands.
+engine's own Delta reader cannot open. `to_polars(lazy=True)` reads nothing
+until the frame is collected, and then only the columns the query uses, up to
+its row limit; Polars applies its filters to the batches as they arrive, so
+pass `predicate=` (SQL) as well to have the engine skip files. `to_duckdb()`
+and `Connection.sql` hand DuckDB or Polars each table read in full, in
+memory: nothing in the query is pushed down, so select what you need with
+`t.to_arrow(columns=..., predicate=...)` first when a table is large.
+`Connection.sql` runs on DuckDB by default (or `engine="polars"`), and can join
+tables from different catalogs. `engine="warehouse"` sends the query to
+Databricks as it stands.
 
 ## Distributed reads and writes
 
@@ -684,6 +704,7 @@ All inherit from `DeltaSwampError`.
 | `MetadataChangedError` | a `CommitConflictError`: a concurrent commit changed the schema, partitioning or column mapping, so the write must be planned again rather than retried |
 | `TransientCommitError` | a commit failed for a transient reason; the table is unchanged, so retry it as is |
 | `BackfillRequiredError` | the catalog wants staged commits published |
+| `StorageError` | the table's storage failed a request (unreachable, throttled, no such bucket); an `OSError` too |
 | `CorruptTableError` | on-disk state failed a correctness check |
 | `MissingDataFileError` | a `CorruptTableError`: a file the snapshot references was removed (VACUUM, manual delete); `.path` names it |
 | `ChangeFeedSchemaChangeError` | an `UnreachableTableError`: the change feed range crosses a schema change its rows cannot be read across; `.version` names the commit that changed it |

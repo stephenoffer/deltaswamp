@@ -63,6 +63,46 @@ def _write_data(data: Any) -> Any:
     return data
 
 
+def _library_error(exc: BaseException, what: str) -> Exception | None:
+    """An engine's raw error as this library's type, when it is one of the known kinds.
+
+    delta-rs reported data that does not fit the table as its own
+    SchemaMismatchError (or a bare Exception naming an Arrow cast), an
+    UPDATE SET of an unknown column as a DeltaError, and both engines a
+    storage failure as a bare OSError: none was caught by `except
+    DeltaSwampError`. None for anything else, which propagates as it is.
+    """
+    from .errors import StorageError
+
+    if isinstance(exc, DeltaSwampError):
+        return None
+    text = str(exc)
+    detail = " ".join(line.strip() for line in text.splitlines() if line.strip())[:400]
+    name = type(exc).__name__
+    if name == "SchemaMismatchError":
+        return InvalidArgumentError(f"{what}: the data does not fit the table's schema ({detail})")
+    if name in ("DeltaError", "Exception") and re.search(
+        r"No field named|Cast error|Schema error", text
+    ):
+        return InvalidArgumentError(f"{what}: {detail}")
+    if isinstance(exc, OSError) and not isinstance(exc, (FileNotFoundError, PermissionError)):
+        error = StorageError(f"{what}: the table's storage failed the request ({detail})")
+        error.errno = exc.errno
+        return error
+    return None
+
+
+def _translated(what: str, call: Callable[[], Any]) -> Any:
+    """`call()`, with a known raw engine error raised as this library's type."""
+    try:
+        return call()
+    except Exception as exc:
+        translated = _library_error(exc, what)
+        if translated is None:
+            raise
+        raise translated from exc
+
+
 #: Writes re-run after a concurrent schema or metadata change beat them.
 _REALIGN_ATTEMPTS = 5
 
@@ -369,6 +409,72 @@ def _looks_missing(error: str) -> bool:
             "no files in log segment",
         )
     )
+
+
+def _store_assignable(pa: Any, given: Any, wanted: Any) -> bool:
+    """Whether a column of type `given` may be written into one of type `wanted`.
+
+    What Delta's schema enforcement accepts without mergeSchema: the same
+    type, or a widening that keeps every value (int to a wider int or to a
+    double, float to double, a decimal to one holding all its digits). delta-rs
+    cast the rest safely-but-silently -- 4.7 became 4 in a BIGINT column, '12'
+    became 12 -- where Spark refuses the write. Nested types are left to the
+    engine, which checks them field by field.
+    """
+    t = pa.types
+    if given == wanted or t.is_null(given):
+        return True
+    if t.is_dictionary(given):
+        return _store_assignable(pa, given.value_type, wanted)
+    if t.is_nested(given) or t.is_nested(wanted):
+        return True
+    strings = (t.is_string, t.is_large_string, t.is_string_view)
+    binaries = (t.is_binary, t.is_large_binary, t.is_binary_view)
+    for family in (strings, binaries):
+        if any(f(given) for f in family) and any(f(wanted) for f in family):
+            return True
+    if t.is_integer(given):
+        if t.is_signed_integer(wanted):
+            # Delta has no unsigned types: an unsigned column is cast safely
+            # where it is aligned, which refuses a value out of range.
+            return bool(given.bit_width <= wanted.bit_width)
+        if t.is_float64(wanted):
+            return bool(given.bit_width <= 32)
+        if t.is_decimal(wanted):
+            digits = {8: 3, 16: 5, 32: 10, 64: 19}[given.bit_width]
+            return bool(wanted.precision - wanted.scale >= digits)
+        return False
+    if t.is_floating(given):
+        return bool(t.is_floating(wanted) and given.bit_width <= wanted.bit_width)
+    if t.is_decimal(given):
+        return bool(
+            t.is_decimal(wanted)
+            and wanted.scale >= given.scale
+            and wanted.precision - wanted.scale >= given.precision - given.scale
+        )
+    if t.is_timestamp(given):
+        # A unit or zone difference is how Arrow spells the same instant (a
+        # nanosecond is truncated to Delta's microsecond, as Spark does).
+        return bool(t.is_timestamp(wanted))
+    if t.is_date(given):
+        return bool(t.is_date(wanted))
+    return False
+
+
+def _refuse_lossy_types(pa: Any, schema: Any, by_name: dict[str, Any], canonical: Any) -> None:
+    """Raise InvalidArgumentError for a column Delta would not write as the table's type."""
+    bad = []
+    for field in schema:
+        wanted = by_name.get(canonical(field.name))
+        if wanted is not None and not _store_assignable(pa, field.type, wanted.type):
+            bad.append(f"{wanted.name} ({field.type} into {wanted.type})")
+    if bad:
+        raise InvalidArgumentError(
+            "the data does not fit the table's column types, and writing it would change "
+            f"values: {', '.join(bad)}. Delta refuses a write that narrows or reinterprets a "
+            "type; cast the data to the table's types first, or widen the column with "
+            "alter_column_type()"
+        )
 
 
 def _fill_stream(pa: Any, reader: Any, target: Any, canonical: Any, partitions: set[str]) -> Any:
@@ -1038,6 +1144,9 @@ class Table:
                 except DeltaSwampError:
                     if refusals:
                         raise refusals[0] from refusals[0].__cause__
+                    translated = _library_error(exc, operation.value)
+                    if translated is not None:
+                        raise translated from exc
                     raise exc from None
                 warnings.warn(
                     f"{engine.kind.value} failed to serve {operation.value} "
@@ -1158,6 +1267,7 @@ class Table:
             return matches[0] if len(matches) == 1 else name
 
         if stream:
+            _refuse_lossy_types(pa, data.schema, by_name, canonical)
             return _fill_stream(pa, data, target, canonical, set(resolved.partition_columns))
         if is_pandas:
             # A named index is data (even one that looks like a range, which
@@ -1184,6 +1294,7 @@ class Table:
         elif isinstance(data, pa.RecordBatch):
             data = pa.Table.from_batches([data])
 
+        _refuse_lossy_types(pa, data.schema, by_name, canonical)
         names = [canonical(n) for n in data.column_names]
         if len(set(names)) != len(names):
             return data  # two columns fold to one name; let the engine refuse
@@ -1346,11 +1457,56 @@ class Table:
 
         The lazy form still reads through this library, so it works on the
         tables `polars.scan_delta` cannot open (catalog-managed, row-tracked,
-        vacuumProtocolCheck, ...).
+        vacuumProtocolCheck, ...). Nothing is read until it is collected, and
+        then only the columns the query uses, up to its row limit; Polars
+        applies its own filters to the batches as they arrive (pass
+        `predicate=` in SQL to have the engine skip files).
         """
         pl = _require("polars", "polars")
-        frame = pl.DataFrame(self.to_arrow(**kwargs))
-        return frame.lazy() if lazy else frame
+        register = None
+        if lazy:
+            try:
+                from polars.io.plugins import register_io_source as register
+            except ImportError:
+                register = None
+        if register is None:
+            frame = pl.DataFrame(self.to_arrow(**kwargs))
+            return frame.lazy() if lazy else frame
+        pa = _require("pyarrow", "pyarrow")
+        limit = kwargs.pop("limit", None)
+        wanted = kwargs.pop("columns", None)
+        # The frame's schema, from a stream opened and closed unread.
+        empty = self.head(0, columns=wanted, **kwargs)
+
+        def source(
+            with_columns: list[str] | None, predicate: Any, n_rows: int | None, _batch: Any
+        ) -> Any:
+            columns = with_columns if with_columns is not None else wanted
+            # Polars' row limit applies after its filter, so it bounds the
+            # read only when there is none.
+            bounds = [r for r in (limit, n_rows if predicate is None else None) if r is not None]
+            if bounds:
+                reader: Any = self.head(min(bounds), columns=columns, **kwargs).to_batches()
+            else:
+                stream = self.scan(columns=columns, **kwargs)
+                reader = (
+                    stream
+                    if isinstance(stream, TranslatingStream)
+                    else pa.RecordBatchReader.from_stream(stream)
+                )
+            left = n_rows
+            for batch in reader:
+                frame = pl.from_arrow(_plain_views(pa.Table.from_batches([batch])))
+                if predicate is not None:
+                    frame = frame.filter(predicate)
+                if left is not None:
+                    frame = frame.head(left)
+                    left -= frame.height
+                yield frame
+                if left is not None and left <= 0:
+                    return
+
+        return register(source, schema=pl.from_arrow(_plain_views(empty)).schema)
 
     def to_duckdb(self, connection: Any = None, *, name: str | None = None, **kwargs: Any) -> Any:
         """A DuckDB relation over the table. With `name`, also a view of that name.
@@ -2292,6 +2448,9 @@ class Table:
                     _lost_to_metadata_change(exc, raw)
                     or self._schema_moved(exc, raw, data, schema_mode)
                 ):
+                    translated = _library_error(exc, "append")
+                    if translated is not None:
+                        raise translated from exc
                     raise
         self._invalidate()
 
@@ -2444,6 +2603,9 @@ class Table:
                 if attempt + 1 >= _REALIGN_ATTEMPTS or not self._schema_moved(
                     exc, raw, data, schema_mode
                 ):
+                    translated = _library_error(exc, "overwrite")
+                    if translated is not None:
+                        raise translated from exc
                     raise
                 data = self._align(raw, schema_mode)
         self._invalidate()
@@ -2571,10 +2733,13 @@ class Table:
         _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
         needs = self._expression_needs(predicate)
-        result: dict[str, Any] = self._backfilled(
-            lambda: self._engine(Operation.DELETE, needs).delete(
-                self._resolved, predicate, **_given(kwargs)
-            )
+        result: dict[str, Any] = _translated(
+            "delete",
+            lambda: self._backfilled(
+                lambda: self._engine(Operation.DELETE, needs).delete(
+                    self._resolved, predicate, **_given(kwargs)
+                )
+            ),
         )
         self._invalidate()
         return result
@@ -2607,13 +2772,48 @@ class Table:
             updates = self._update_targets(updates, deltars)
         if new_values is not None:
             kwargs["new_values"] = self._update_targets(new_values, deltars)
-        result: dict[str, Any] = self._backfilled(
-            lambda: engine.update(
-                self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
-            )
+            self._refuse_zoned_ntz(kwargs["new_values"])
+        result: dict[str, Any] = _translated(
+            "update",
+            lambda: self._backfilled(
+                lambda: engine.update(
+                    self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
+                )
+            ),
         )
         self._invalidate()
         return result
+
+    def _refuse_zoned_ntz(self, values: dict[str, Any]) -> None:
+        """Refuse a timezone-aware datetime for a TIMESTAMP_NTZ column.
+
+        It was turned into its UTC wall time without a word: 07:08 at +02:00
+        was stored as 05:08. A TIMESTAMP_NTZ holds no zone, so which wall time
+        was meant is the caller's to say.
+        """
+        import datetime
+
+        try:
+            import pyarrow as pa
+
+            fields = {f.name: f for f in self.schema()}
+        except (ImportError, DeltaSwampError):
+            return
+        for name, value in values.items():
+            field = fields.get(name.strip("`"))
+            if (
+                field is not None
+                and isinstance(value, datetime.datetime)
+                and value.tzinfo is not None
+                and pa.types.is_timestamp(field.type)
+                and field.type.tz is None
+            ):
+                raise InvalidArgumentError(
+                    f"update {name}: the column is TIMESTAMP_NTZ, which holds no time zone, "
+                    f"and {value.isoformat()} carries one; pass a naive datetime (for "
+                    "example value.replace(tzinfo=None), or the value converted to the zone "
+                    "you mean first)"
+                )
 
     def _update_targets(self, targets: dict[str, Any], deltars: bool) -> dict[str, Any]:
         """Resolve UPDATE's SET targets against the table's columns.

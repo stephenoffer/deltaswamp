@@ -182,7 +182,7 @@ def _schema_arg(schema: Any) -> Any:
                 return schema  # a Delta schema object; the engine reads it
         else:
             try:
-                schema = pa.schema(schema)
+                schema = pa.schema(_sql_typed(schema))
             except (TypeError, ValueError, pa.ArrowInvalid) as exc:
                 raise InvalidArgumentError(f"not a table schema: {schema!r} ({exc})") from exc
     if len(schema) == 0:
@@ -190,6 +190,37 @@ def _schema_arg(schema: Any) -> Any:
         # write to; Delta needs at least one column.
         raise InvalidArgumentError("create_table needs a schema with at least one column")
     return _widen_unsigned(schema)
+
+
+def _sql_typed(schema: Any) -> Any:
+    """A `{name: type}` or `[(name, type)]` schema with SQL type names read as Delta reads them.
+
+    pyarrow knows only its own aliases, so ``{"id": "bigint"}``, ``"long"``,
+    ``"timestamp"`` or ``"decimal(10,2)"`` -- the names Spark, Databricks and
+    the Delta log use -- were refused. A name neither reads is left for
+    pyarrow, which names what it cannot read.
+    """
+    from .engine.metadata import sql_type_to_delta
+    from .engine.sharing import _delta_type_to_arrow
+
+    def arrow(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return _delta_type_to_arrow(sql_type_to_delta(value))
+        except (ValueError, DeltaSwampError):
+            return value
+
+    if isinstance(schema, dict):
+        return {name: arrow(value) for name, value in schema.items()}
+    if isinstance(schema, list):
+        return [
+            (item[0], arrow(item[1]), *item[2:])
+            if isinstance(item, tuple) and len(item) >= 2
+            else item
+            for item in schema
+        ]
+    return schema
 
 
 def _widen_unsigned(schema: Any) -> Any:
@@ -622,6 +653,11 @@ class Connection:
                     or "exist" not in str(exc).lower()
                     or not self.table_exists(name)
                 ):
+                    from .table import _library_error
+
+                    translated = _library_error(exc, f"create {name}")
+                    if translated is not None:
+                        raise translated from exc
                     raise
                 if mode == "ignore":
                     return self.table(name)

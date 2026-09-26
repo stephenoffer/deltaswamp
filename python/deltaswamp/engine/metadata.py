@@ -1146,6 +1146,11 @@ def _normalise_type(name: str) -> str:
 def alter_column_type(state: TableState, column: str, new_type: str) -> Change:
     """Widen a column's type without rewriting data (the typeWidening feature)."""
     config = state.configuration
+    current = _find(state.schema, _split(column))
+    if current[0][current[1]]["type"] == _normalise_type(new_type):
+        # The type it already has (`bigint` for a long): nothing to change,
+        # as Spark treats it, rather than a refusal to "change" it.
+        return Change("CHANGE COLUMN", {"column": column, "type": _normalise_type(new_type)})
     if config.get("delta.enableTypeWidening", "false").lower() != "true":
         raise _refuse(
             f"change the type of {column}",

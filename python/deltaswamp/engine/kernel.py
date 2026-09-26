@@ -1273,11 +1273,12 @@ class KernelEngine:
                 ok = pc.fill_null(_evaluate(new, sqlpred.to_arrow(node, new.schema)), False)
                 bad = new.num_rows - int(pc.sum(ok).as_py() or 0)
                 if bad:
-                    raise UnreachableTableError(
-                        f"overwrite where {predicate}",
-                        f"{bad} row(s) of the new data do not satisfy the predicate, so "
-                        "writing them would add rows outside the range being replaced",
-                        "filter the data to the predicate first",
+                    # The request's data, not the table: the type delta-rs raises
+                    # for it too, so one except clause catches both engines.
+                    raise InvalidArgumentError(
+                        f"overwrite where {predicate}: {bad} row(s) of the new data do not "
+                        "satisfy the predicate, so writing them would add rows outside the "
+                        "range being replaced; filter the data to the predicate first"
                     )
                 return pa.concat_tables([kept, new])
 
@@ -1583,11 +1584,12 @@ class KernelEngine:
                 ok = pc.fill_null(_evaluate(data, sqlpred.to_arrow(node, data.schema)), False)
                 bad = data.num_rows - int(pc.sum(ok).as_py() or 0)
                 if bad:
-                    raise UnreachableTableError(
-                        f"overwrite where {predicate}",
-                        f"{bad} row(s) of the new data do not satisfy the predicate, so "
-                        "writing them would add rows outside the range being replaced",
-                        "filter the data to the predicate first",
+                    # The request's data, not the table: the type delta-rs raises
+                    # for it too, so one except clause catches both engines.
+                    raise InvalidArgumentError(
+                        f"overwrite where {predicate}: {bad} row(s) of the new data do not "
+                        "satisfy the predicate, so writing them would add rows outside the "
+                        "range being replaced; filter the data to the predicate first"
                     )
             if data.num_rows == 0:
                 data = None

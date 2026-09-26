@@ -328,6 +328,8 @@ def test_txn_write_is_refused_when_no_engine_can_check(
     stub = _NoTxnEngine(conn.router.engines[Engine.DELTARS])
     monkeypatch.setattr(type(t), "_engine", lambda self, *a, **k: stub)
     monkeypatch.delitem(conn.router.engines, Engine.DELTARS)
+    # txn_version() also asks the kernel, which reads the same log.
+    monkeypatch.delitem(conn.router.engines, Engine.KERNEL)
     with pytest.raises(UnreachableTableError, match="transaction"):
         t.append(_data(), txn=("job", 1))
     monkeypatch.undo()

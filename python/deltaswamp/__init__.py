@@ -33,6 +33,7 @@ from .errors import (
     PreflightError,
     PropertyNotSupportedError,
     SqlFallbackWarning,
+    StorageError,
     TransientCommitError,
     UnreachableTableError,
 )
@@ -105,6 +106,7 @@ __all__ = [
     "ScanPlan",
     "SqlFallbackWarning",
     "SqlStatementError",
+    "StorageError",
     "Table",
     "TableFeature",
     "TableRef",
