@@ -1,9 +1,11 @@
 """Distributed reads and writes: plan on the driver, do the work on workers.
 
 A scan plan is a list of `ScanSplit`s pinned to one snapshot version. A worker
-receives the engine, the resolved table (with its credential provider, never a
-credential) and its splits, re-resolves that exact version and vends its own
-storage credentials. The Ray Data datasource makes one read task per
+receives the engine, the resolved table and its splits, and re-resolves that
+exact version. By default the table carries one short-lived storage credential
+vended on the driver (`ShippedCredentials`), never the catalog's credentials;
+with ``ship_catalog_auth=True`` it carries the credential provider, and each
+worker vends its own. The Ray Data datasource makes one read task per
 byte-balanced group of splits.
 
 Writes run in reverse. `WritePlan` checks on the driver that the commit can
@@ -538,6 +540,26 @@ class ShippedCredentials:
 
     def __repr__(self) -> str:
         return f"ShippedCredentials({self._credentials!r})"
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Shipping the storage credential is this class's whole purpose, so it
+        # opts in explicitly: `Credentials` itself refuses to pickle.
+        state = self.__dict__.copy()
+        credentials = state.pop("_credentials")
+        state["_credential_state"] = (
+            credentials._state() if hasattr(credentials, "_state") else None
+        )
+        if state["_credential_state"] is None:
+            state["_credentials"] = credentials
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        from .credentials import Credentials
+
+        carried = state.pop("_credential_state", None)
+        self.__dict__.update(state)
+        if carried is not None:
+            self._credentials = Credentials._from_state(carried)
 
 
 def _for_workers(table: Any, *, write: bool) -> Any:

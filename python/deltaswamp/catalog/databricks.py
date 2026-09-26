@@ -246,6 +246,36 @@ def _external(capabilities: frozenset[str] | None, flag: str, policy: str | None
     return None if capabilities is None else flag in capabilities
 
 
+#: Error codes by which Unity Catalog says a securable itself is missing.
+_SECURABLE_MISSING_CODES = frozenset(
+    {
+        "TABLE_DOES_NOT_EXIST",
+        "SCHEMA_DOES_NOT_EXIST",
+        "CATALOG_DOES_NOT_EXIST",
+        "VOLUME_DOES_NOT_EXIST",
+        "FUNCTION_DOES_NOT_EXIST",
+        "METASTORE_DOES_NOT_EXIST",
+        "TABLE_OR_VIEW_NOT_FOUND",
+        "SCHEMA_NOT_FOUND",
+        "CATALOG_NOT_FOUND",
+    }
+)
+
+
+def _names_securable(exc: Exception, code: str, full_name: str) -> bool:
+    """Whether a not-found error is about `full_name` itself.
+
+    A generic ``NOT_FOUND`` is used for a missing file, directory or
+    constraint as well as for a missing volume; only its message tells them
+    apart. An error with no code at all (an older SDK, a proxy) keeps the old
+    reading: the securable is missing.
+    """
+    if code in _SECURABLE_MISSING_CODES or not code:
+        return True
+    text = str(exc).casefold()
+    return bool(full_name) and full_name.casefold() in text
+
+
 class DatabricksUnityCatalog:
     """Resolves tables in a Databricks-hosted Unity Catalog metastore.
 
@@ -254,6 +284,8 @@ class DatabricksUnityCatalog:
     """
 
     name = "databricks"
+    #: The reference schemes this catalog serves; see `Connection._catalog_for`.
+    ref_schemes: frozenset[str] = frozenset({"uc"})
     #: Every governance method works here; see OSSUnityCatalog for the contrast.
     unsupported_operations: frozenset[str] = frozenset()
 
@@ -341,13 +373,19 @@ class DatabricksUnityCatalog:
 
     def _build_workspace(self) -> Any:
         if self._client is None:
-            self._client = workspace_client(
-                config=self._explicit_config,
-                profile=self._profile,
-                host=self._host,
-                token=self._token,
-                **self._config_kwargs,
-            )
+            # A pickled copy carries its Config's attributes (host, token, ...)
+            # in _config_kwargs. Passing those next to host= / token= failed
+            # with "got multiple values for keyword argument 'host'", so no
+            # worker could vend. An explicit argument wins over a carried one.
+            kwargs = dict(self._config_kwargs)
+            for key, value in (
+                ("profile", self._profile),
+                ("host", self._host),
+                ("token", self._token),
+            ):
+                if value:
+                    kwargs[key] = value
+            self._client = workspace_client(config=self._explicit_config, **kwargs)
         return self._client
 
     def _metastore_region(self) -> str | None:
@@ -556,10 +594,11 @@ class DatabricksUnityCatalog:
         if kind == "not_found" or (
             kind is None and ("404" in text or "does not exist" in text.lower())
         ):
+            # Resolution is by name, so a stale table_id cannot be the cause;
+            # the hint that said so appeared for tables that never existed.
             return InvalidReferenceError(
-                f"{ref.full_name} does not exist in Unity Catalog. If it was recently "
-                "dropped and re-created, re-resolve it: a cached table_id no longer "
-                f"matches. Underlying error: {exc}"
+                f"{ref.full_name} does not exist in Unity Catalog, or is not visible to "
+                f"this principal. Underlying error: {exc}"
             )
         if kind == "denied" or (
             kind is None
@@ -638,14 +677,32 @@ class DatabricksUnityCatalog:
             return PreflightError(
                 f"cannot {action}: Databricks allows writes through the Unity Catalog "
                 f"Delta API only from allowlisted connectors, and {PRODUCT!r} is not one "
-                "yet. Reads are unaffected. Use ds.connect(..., allow_sql_fallback=True) "
-                f"to write through a SQL warehouse. Underlying error: {exc}"
+                "yet. Reads are unaffected. Use ds.connect(..., allow_sql_fallback=True, "
+                "staging_volume='catalog.schema.volume') to write through a SQL warehouse "
+                f"(the volume stages appended data). Underlying error: {exc}"
             )
         if typed == "transient":
             return PreflightError(
                 f"cannot {action} ({full_name}): the workspace is throttling or temporarily "
                 f"unavailable; retry later. Underlying error: {exc}"
             )
+        code = str(getattr(exc, "error_code", "") or "").upper()
+        if code == "INVALID_PARAMETER_VALUE" or kind == "InvalidParameterValue":
+            # A bad argument (an unknown privilege or securable type). Its
+            # message mentions "RPC GetPermissions", which the text match
+            # below read as a permission denial.
+            return InvalidArgumentError(f"cannot {action} ({full_name}): {exc}")
+        if code == "PRINCIPAL_DOES_NOT_EXIST":
+            return InvalidArgumentError(
+                f"cannot {action} ({full_name}): the principal does not exist. "
+                f"Underlying error: {exc}"
+            )
+        if typed == "not_found" and not _names_securable(exc, code, full_name):
+            # Something inside the securable is missing -- a constraint, a
+            # column, a file in a volume -- and the SDK's message says which.
+            # Blaming the securable itself sent callers after a table or
+            # volume that was there all along.
+            return InvalidReferenceError(f"cannot {action} ({full_name}): {exc}")
         if typed == "not_found" or (
             typed is None
             and (
@@ -902,12 +959,22 @@ class DatabricksUnityCatalog:
 
     # ---------------------------------------------------------------- preflight
 
-    def preflight(self) -> list[str]:
-        """Check the two admin prerequisites that block credential vending.
+    def preflight(self, *, schema: str | None = None) -> list[str]:
+        """Check the prerequisites that block credential vending.
 
-        Returns a list of human-readable problems; empty means ready. These two
-        settings account for most first-contact failures, and both are gated on
-        someone other than the caller.
+        Returns a list of human-readable problems; empty means ready. It checks
+        exactly two things, both gated on someone other than the caller:
+
+        * external data access on the metastore (an account-admin setting,
+          off by default);
+        * EXTERNAL USE SCHEMA on `schema` (``catalog.schema``), when one is
+          given and its effective privileges can be read.
+
+        It cannot see whether a particular table accepts external writes
+        (Unity Catalog decides that per table kind: only external tables and
+        catalog-managed ones do), nor whether Databricks allowlists this client
+        for the Delta API's table creation; `Table.can()` and the first create
+        report those.
         """
         problems: list[str] = []
         try:
@@ -920,6 +987,15 @@ class DatabricksUnityCatalog:
                 )
         except Exception as exc:
             problems.append(f"could not read metastore settings: {exc}")
+        if schema:
+            held = self._held_privileges("SCHEMA", schema)
+            if held is not None and "EXTERNAL_USE_SCHEMA" not in held:
+                problems.append(
+                    f"this principal lacks EXTERNAL USE SCHEMA on {schema}, so no table in "
+                    "it can be read or written directly (credential vending refuses). "
+                    "The catalog owner must grant it explicitly; ALL PRIVILEGES does "
+                    "not include it."
+                )
         return problems
 
     # =============================================================== governance
@@ -1349,8 +1425,12 @@ class DatabricksUnityCatalog:
                 TableSummary.from_api(t)
                 for t in self.workspace.tables.list_summaries(
                     catalog_name=catalog,
-                    schema_name_pattern=schema_pattern,
-                    table_name_pattern=table_pattern,
+                    # Unity Catalog stores schema and table names in lower
+                    # case and resolves them case-insensitively, but its LIKE
+                    # is case-sensitive: "ORDERS" matched nothing, though
+                    # conn.table("MAIN.SALES.ORDERS") opens the table.
+                    schema_name_pattern=schema_pattern.lower() if schema_pattern else None,
+                    table_name_pattern=table_pattern.lower() if table_pattern else None,
                     include_manifest_capabilities=True,
                 )
             ],

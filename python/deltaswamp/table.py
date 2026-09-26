@@ -469,7 +469,7 @@ class Table:
         if ref.kind is not RefKind.CATALOG:
             return
         try:
-            fresh = self._connection.catalog.resolve(ref)
+            fresh = self._connection._catalog_for(ref).resolve(ref)
         except InvalidReferenceError:
             if before_write:
                 raise
@@ -1081,7 +1081,7 @@ class Table:
             commit_metadata=commit_metadata,
             ship_catalog_auth=bool(ship_catalog_auth),
             catalog=(
-                self._connection.catalog
+                self._connection._catalog_for(self._resolved.ref)
                 if self._resolved.is_catalog_managed and self._resolved.ref.kind is RefKind.CATALOG
                 else None
             ),
@@ -1103,7 +1103,9 @@ class Table:
 
         Ship the plan (or parts of it, via `plan.partitions(n)`) to workers and
         call `plan.read(splits)` there. Each worker re-resolves the same
-        snapshot version and vends its own credentials.
+        snapshot version and reads with the storage credential the driver
+        vended when the plan was pickled, which it refuses within a minute of
+        expiry; with ``ship_catalog_auth=True`` each worker vends its own.
         """
         from .distributed import ScanPlan
 
@@ -2343,7 +2345,15 @@ class Table:
     # ------------------------------------------------------------- governance
 
     def _governance(self, what: str) -> Any:
-        return _governed(self._connection.catalog, "GovernedCatalog", what)
+        ref = self._resolved.ref
+        # A table opened from another catalog (glue://, hms://) is governed
+        # there, not by the catalog the connection is bound to.
+        catalog = (
+            self._connection._catalog_for(ref)
+            if ref.kind is RefKind.CATALOG
+            else self._connection.catalog
+        )
+        return _governed(catalog, "GovernedCatalog", what)
 
     def info(self) -> Any:
         """The catalog's view of the table: owner, comment, columns, row filter,

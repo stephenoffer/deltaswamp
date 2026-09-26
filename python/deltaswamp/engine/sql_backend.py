@@ -75,6 +75,34 @@ class SqlStatementError(DeltaSwampError):
         super().__init__(f"{message} ({detail})" if detail else message)
 
 
+def sdk_error(exc: Exception, where: str) -> DeltaSwampError:
+    """A databricks-sdk error from the warehouse path, as a DeltaSwampError.
+
+    The SDK's own NotFound / PermissionDenied escaped raw from a mistyped
+    warehouse id, a missing staging volume or a bad token, though every
+    public error is documented to be a DeltaSwampError.
+    """
+    from ..credentials.databricks import _error_kind
+    from ..errors import CredentialError, PreflightError, UnreachableTableError
+
+    kind = _error_kind(exc)
+    if kind == "unauthenticated":
+        return CredentialError(
+            f"{where} rejected the Databricks credentials (expired or invalid token, "
+            f"or the wrong workspace host): {exc}"
+        )
+    if kind == "not_found":
+        return UnreachableTableError(
+            f"use {where}",
+            f"it does not exist, or is not visible to this principal: {exc}",
+            "check the warehouse_id= / staging_volume= passed to ds.connect()",
+        )
+    if kind == "denied":
+        return PreflightError(f"access to {where} was denied: {exc}")
+    code = str(getattr(exc, "error_code", "") or "") or None
+    return SqlStatementError(f"{where} failed: {type(exc).__name__}: {exc}", error_code=code)
+
+
 class _DownloadError(SqlStatementError):
     """Fetching a presigned result link failed (expired, network, 403)."""
 
@@ -283,15 +311,20 @@ class SdkStatementBackend:
         # The deadline starts before the first call: that call itself blocks
         # for up to `wait_timeout`, which must not outlast `timeout`.
         deadline = None if self._timeout is None else self._clock() + self._timeout
-        response = api.execute_statement(
-            statement=statement,
-            warehouse_id=self._warehouse_id,
-            format=Format.ARROW_STREAM,
-            disposition=Disposition.EXTERNAL_LINKS,
-            wait_timeout=_bounded_wait(self._wait_timeout, self._timeout),
-            on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE,
-            parameters=items or None,
-        )
+        try:
+            response = api.execute_statement(
+                statement=statement,
+                warehouse_id=self._warehouse_id,
+                format=Format.ARROW_STREAM,
+                disposition=Disposition.EXTERNAL_LINKS,
+                wait_timeout=_bounded_wait(self._wait_timeout, self._timeout),
+                on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE,
+                parameters=items or None,
+            )
+        except DeltaSwampError:
+            raise
+        except Exception as exc:
+            raise sdk_error(exc, f"warehouse {self._warehouse_id}") from exc
         statement_id = getattr(response, "statement_id", None)
         try:
             response = self._wait(response, deadline)
@@ -299,10 +332,12 @@ class SdkStatementBackend:
             if exc.state not in _TERMINAL:
                 self._cancel(statement_id)
             raise
-        except BaseException:
+        except BaseException as exc:
             # Ctrl-C, a failed poll, anything: the statement must not be left
             # running on the warehouse (and billing) after we stop watching it.
             self._cancel(statement_id)
+            if isinstance(exc, Exception) and not isinstance(exc, DeltaSwampError):
+                raise sdk_error(exc, f"warehouse {self._warehouse_id}") from exc
             raise
         if not fetch:
             return None

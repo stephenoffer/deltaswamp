@@ -319,6 +319,22 @@ class ResolvedTable:
         return (self.data_source_format or "").upper() == "ICEBERG"
 
     @property
+    def is_managed_iceberg(self) -> bool:
+        """An Iceberg table the catalog takes writes for through Iceberg REST.
+
+        Databricks' managed Iceberg (``CREATE TABLE ... USING ICEBERG``) is
+        reported by Unity Catalog as DELTA: it keeps a catalog-managed Delta
+        log written with ``icebergWriterCompatV1``, beside Iceberg metadata
+        the catalog maintains on every commit. Reading only the format made
+        it look like UniForm, whose Iceberg view is read-only, so appends were
+        refused although the catalog's Iceberg endpoint accepts them.
+        """
+        if self.is_iceberg:
+            return True
+        writer_compat = str(self.properties.get("delta.enableIcebergWriterCompatV1", ""))
+        return self.is_catalog_managed and writer_compat.strip().lower() == "true"
+
+    @property
     def is_view_like(self) -> bool:
         """Views, MVs, metric views and streaming tables have no writable file surface."""
         return self.table_type in (

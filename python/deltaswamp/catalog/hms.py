@@ -86,6 +86,8 @@ class HiveMetastoreCatalog:
     """Resolves Delta tables registered in a Hive Metastore."""
 
     name = "hive"
+    #: The reference schemes this catalog serves; see `Connection._catalog_for`.
+    ref_schemes: frozenset[str] = frozenset({"hms"})
 
     @classmethod
     def from_uri(cls, uri: str | None, **kwargs: Any) -> HiveMetastoreCatalog:

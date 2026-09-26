@@ -375,6 +375,8 @@ class OSSUnityCatalog:
     """Resolves tables in an open-source Unity Catalog server."""
 
     name = "unity"
+    #: The reference schemes this catalog serves; see `Connection._catalog_for`.
+    ref_schemes: frozenset[str] = frozenset({"uc"})
 
     @classmethod
     def from_uri(cls, uri: str | None, **kwargs: Any) -> OSSUnityCatalog:

@@ -128,9 +128,26 @@ _UNFIXABLE_OPEN_ERRORS: tuple[str, ...] = (
 )
 
 
+#: Open errors that are this process's Databricks authentication failing.
+#: The warehouse needs the same authentication, so the fallback cannot help.
+_AUTH_OPEN_ERRORS: tuple[str, ...] = (
+    "could not configure databricks authentication",
+    "the databricks credentials were rejected",
+    "cannot reach the databricks host",
+)
+
+
 def _open_error_remedy(table: ResolvedTable) -> str:
     """The remedy for a table whose Delta log could not be opened."""
     error = (table.open_error or "").lower()
+    if any(marker in error for marker in _AUTH_OPEN_ERRORS):
+        # A worker whose unpickled provider could not authenticate was told
+        # to enable the SQL fallback, which authenticates the same way.
+        return (
+            "fix the Databricks authentication this process uses (host=/token=, "
+            "DATABRICKS_HOST/DATABRICKS_TOKEN, a profile or OAuth settings); the SQL "
+            "warehouse fallback needs the same credentials"
+        )
     if any(marker in error for marker in _UNFIXABLE_OPEN_ERRORS):
         return (
             f"check that {table.location or 'the table location'} holds a readable Delta "

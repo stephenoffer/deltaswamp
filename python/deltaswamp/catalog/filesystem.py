@@ -23,6 +23,8 @@ class FilesystemCatalog:
     """
 
     name = "filesystem"
+    #: Paths only: every scheme-qualified catalog name goes elsewhere.
+    ref_schemes: frozenset[str] = frozenset()
 
     @classmethod
     def from_uri(cls, uri: str | None, **kwargs: Any) -> FilesystemCatalog:

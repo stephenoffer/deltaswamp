@@ -249,6 +249,11 @@ def _error_kind(exc: BaseException) -> str | None:
         return "not_found"
     if "Unauthenticated" in names or code == "UNAUTHENTICATED":
         return "unauthenticated"
+    # Databricks answers a bad or revoked PAT with a 403 PermissionDenied,
+    # not a 401, so it was reported as a missing privilege.
+    text = str(exc).lower()
+    if "invalid access token" in text or "token is expired" in text:
+        return "unauthenticated"
     if "PermissionDenied" in names or code == "PERMISSION_DENIED":
         return "denied"
     if names & _TRANSIENT_ERRORS or code in _TRANSIENT_CODES:
@@ -375,13 +380,19 @@ class DatabricksCredentialProvider:
 
     def _workspace_locked(self) -> Any:
         if self._client is None:
-            self._client = workspace_client(
-                config=self._explicit_config,
-                profile=self._profile,
-                host=self._host,
-                token=self._token,
-                **self._config_kwargs,
-            )
+            # A pickled copy carries its Config's attributes (host, token, ...)
+            # in _config_kwargs. Passing those next to host= / token= failed
+            # with "got multiple values for keyword argument 'host'", so no
+            # worker could vend. An explicit argument wins over a carried one.
+            kwargs = dict(self._config_kwargs)
+            for key, value in (
+                ("profile", self._profile),
+                ("host", self._host),
+                ("token", self._token),
+            ):
+                if value:
+                    kwargs[key] = value
+            self._client = workspace_client(config=self._explicit_config, **kwargs)
         return self._client
 
     def _margin_for(self, operation: Operation, cached: Credentials) -> float:
