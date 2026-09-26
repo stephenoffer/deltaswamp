@@ -95,3 +95,8 @@ First release.
 - A local path containing `%xx` or a backslash is refused at create; one with
   `[`, `]`, `|` or `^` is written through the kernel. Schema evolution on a
   column-mapped table needs the warehouse.
+- delta-rs does not rebase pre-1582 dates and timestamps in files Spark wrote
+  in its legacy hybrid calendar; the kernel does. Such timestamps written in a
+  non-UTC session zone are refused by the kernel and need the warehouse.
+- A time-travel timestamp after the latest commit reads the latest version on
+  the direct engines; the warehouse refuses it.

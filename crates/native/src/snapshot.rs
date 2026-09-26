@@ -413,7 +413,8 @@ impl PySnapshot {
             builder = builder.with_schema(schema);
 
             let scan = builder.build()?;
-            let engine = self.engine.clone() as Arc<dyn Engine>;
+            // Rebases Parquet files Spark wrote in its legacy hybrid calendar.
+            let engine = crate::rebase::reading_engine(&self.engine, self.inner.table_root());
             if row_positions {
                 let paths = files.map(|f| f.into_iter().collect());
                 return KernelBatchReader::try_new_positional(&scan, engine, paths);

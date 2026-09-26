@@ -12,6 +12,7 @@ from .capability import Capability, Engine, Operation, TableFeature
 from .connection import Connection, connect
 from .credentials import Cloud, CredentialProvider, Credentials
 from .distributed import ScanPlan, WritePlan
+from .engine.sql_backend import SqlStatementError
 from .errors import (
     BackfillRequiredError,
     ChangeFeedSchemaChangeError,
@@ -103,6 +104,7 @@ __all__ = [
     "Router",
     "ScanPlan",
     "SqlFallbackWarning",
+    "SqlStatementError",
     "Table",
     "TableFeature",
     "TableRef",

@@ -117,11 +117,23 @@ def filter_arrow_exact(table: Any, predicate: Any) -> Any:
     """
     if isinstance(predicate, _SandboxedSql):
         return _sandboxed_filter(table, predicate.text)
+    if isinstance(predicate, str):
+        try:
+            predicate_node = sqlpred.parse(predicate)
+        except sqlpred.PredicateError:
+            predicate_node = None
+        if predicate_node is not None:
+            # Parsed, so evaluated here: a comparison refused as not meaning
+            # what Spark means (`name = 1` on a STRING column) must stay
+            # refused, not be handed to DuckDB's different coercions.
+            return sqlpred.filter_table(table, predicate_node)
     try:
         return sqlpred.filter_table(table, predicate)
     except sqlpred.PredicateError:
         if not isinstance(predicate, str) or _duckdb() is None:
             raise
+        # DuckDB reads string literals the ANSI way; respell Spark's.
+        predicate = sqlpred.standard_string_literals(predicate)
         _screen_expression(predicate)
     return _sandboxed_filter(table, predicate)
 
@@ -214,6 +226,8 @@ def _parse_predicate(predicate: str | None) -> Any:
     except predicate_module.PredicateError:
         if _duckdb() is None:
             raise
+        # DuckDB reads string literals the ANSI way; respell Spark's.
+        predicate = predicate_module.standard_string_literals(predicate)
         _screen_expression(predicate)
         return _SandboxedSql(predicate)
 

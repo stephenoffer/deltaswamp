@@ -110,8 +110,14 @@ class TestIcebergPredicates:
         assert got == [3]
 
     def test_type_mismatched_literal_does_not_crash(self, loaded: IcebergEngine) -> None:
-        # PyIceberg raised TypeError binding `name = 1`; SQL coerces.
-        assert _ids(loaded.scan(_resolved(), predicate="name = 1")) == []
+        # PyIceberg raised TypeError binding `name = 1`. Spark would cast the
+        # STRING column to a number, so the comparison is refused as a
+        # PredicateError asking for a quoted literal, not guessed at.
+        from deltaswamp.predicate import PredicateError
+
+        with pytest.raises(PredicateError, match="Quote the literal"):
+            loaded.scan(_resolved(), predicate="name = 1")
+        assert _ids(loaded.scan(_resolved(), predicate="name = '1'")) == []
 
     def test_column_case_is_resolved_like_sql(self, loaded: IcebergEngine) -> None:
         assert _ids(loaded.scan(_resolved(), predicate="ID = 1")) == [1]

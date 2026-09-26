@@ -859,7 +859,7 @@ class TestRouted:
 
 class TestHints:
     def test_unexpressible_conjuncts_are_dropped(self) -> None:
-        hint = json_predicate_hints("(id = 1 OR id = 2) AND name = 'it''s'", SCHEMA_STRING)
+        hint = json_predicate_hints(r"(id = 1 OR id = 2) AND name = 'it\'s'", SCHEMA_STRING)
         assert hint is not None
         assert json.loads(hint) == {
             "op": "equal",

@@ -558,8 +558,8 @@ def _expression(value: Any) -> str:
 _SQL_TOKEN = re.compile(
     r"""
       (?P<space>\s+)
-     |(?P<string>'(?:[^'\\]|\\.|'')*')
-     |(?P<dstring>"(?:[^"\\]|\\.|"")*")
+     |(?P<string>'(?:[^'\\]|\\.)*')
+     |(?P<dstring>"(?:[^"\\]|\\.)*")
      |(?P<quoted>`(?:[^`]|``)*`)
      |(?P<number>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?(?P<suffix>BD|[LSYDF])?(?!\w))
      |(?P<nullsafe><=>)
@@ -587,9 +587,17 @@ def _spark_sql(text: str) -> str:
         raw = match.group(0)
         pos = match.end()
         if kind in ("string", "dstring"):
-            # Both are string literals in Spark; DuckDB takes '' doubling only.
+            # Both are string literals in Spark, and adjacent ones concatenate
+            # (`'it''s'` is `its`, as on the warehouse); DuckDB takes one
+            # literal with '' doubling only, so each run becomes one.
             value = sqlpred._unescape(raw)
-            tokens.append(("string", "'" + value.replace("'", "''") + "'"))
+            last = len(tokens) - 1
+            while last >= 0 and tokens[last][0] == "space":
+                last -= 1
+            if last >= 0 and tokens[last][0] == "string":
+                del tokens[last + 1 :]
+                value = tokens.pop()[1] + value
+            tokens.append(("string", value))
         elif kind == "quoted":
             name = raw[1:-1].replace("``", "`")
             tokens.append(("ident", '"' + name.replace('"', '""') + '"'))
@@ -605,6 +613,10 @@ def _spark_sql(text: str) -> str:
             tokens.append(("op", " IS NOT DISTINCT FROM "))
         else:
             tokens.append((kind, raw))
+    tokens = [
+        ("string", "'" + text.replace("'", "''") + "'") if kind == "string" else (kind, text)
+        for kind, text in tokens
+    ]
     out, _ = _rewrite(tokens, 0)
     return out
 

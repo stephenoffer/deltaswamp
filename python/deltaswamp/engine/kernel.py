@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import json
 import re
 from collections.abc import Iterator
@@ -2278,6 +2279,44 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
         return _planned_read(snapshot, columns, predicate, files=paths)
+
+
+def _library_input_errors(method: Any) -> Any:
+    """`method`, raising InvalidArgumentError where the extension refused its input.
+
+    The extension's `InvalidInputError` (a column that is not in the table, a
+    projection naming one twice, `set_not_null` on a missing column) is a
+    ValueError but not a DeltaSwampError. `Table` treats anything that is not
+    one of this library's errors as the engine breaking, so a typo in
+    `columns=` warned "kernel failed to serve scan", fell back to delta-rs,
+    and surfaced as delta-rs's own DeltaError. InvalidArgumentError is a
+    ValueError too, so `except ValueError` keeps working.
+    """
+    import functools
+
+    @functools.wraps(method)
+    def call(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(*args, **kwargs)
+        except ValueError as exc:
+            try:
+                from deltaswamp import _native
+            except ImportError:
+                raise exc from None
+            native = getattr(_native, "InvalidInputError", None)
+            if native is None or isinstance(exc, DeltaSwampError) or not isinstance(exc, native):
+                raise
+            from ..errors import InvalidArgumentError
+
+            raise InvalidArgumentError(str(exc)) from exc
+
+    return call
+
+
+for _name, _member in list(vars(KernelEngine).items()):
+    if not _name.startswith("_") and inspect.isfunction(_member):
+        setattr(KernelEngine, _name, _library_input_errors(_member))
+del _name, _member
 
 
 #: Fragment schema-metadata key: the table layout its files were written

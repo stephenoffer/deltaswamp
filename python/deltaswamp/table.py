@@ -15,6 +15,7 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from ._util import timestamp_ms
 from .capability import FEATURE_SUPPORT, Capability, FeatureKind, Operation, feature_from_wire
 from .capability import READ_OPERATIONS as _READ_OPERATIONS
 from .capability import Engine as EngineKind
@@ -143,6 +144,19 @@ def _columns_arg(columns: Any) -> list[str] | None:
     for name in names:
         if not isinstance(name, str):
             raise InvalidArgumentError(f"column names must be strings, got {name!r}")
+    seen: dict[str, str] = {}
+    for name in names:
+        if name.lower() not in seen:
+            seen[name.lower()] = name
+            continue
+        # Column names are case-insensitive, so `["id", "ID"]` names one column
+        # twice. The kernel returned it once and the warehouse twice; an Arrow
+        # table cannot hold both under one name anyway.
+        first = seen[name.lower()]
+        also = "twice" if first == name else f"and {name!r}, which are the same column"
+        raise InvalidArgumentError(
+            f"columns= names {first!r} {also} (names are case-insensitive); list each column once"
+        )
     return names
 
 
@@ -184,6 +198,12 @@ def _check_predicate(predicate: Any, what: str) -> None:
         )
     if not predicate.strip():
         raise InvalidArgumentError(f"{what}: the predicate is blank; pass None to mean every row")
+
+
+def _check_write_sizes(target_file_size: Any, max_commit_retries: Any) -> None:
+    """Refuse negative sizes here: delta-rs raised a bare OverflowError for them."""
+    _check_count(target_file_size, "target_file_size")
+    _check_count(max_commit_retries, "max_commit_retries")
 
 
 def _check_txn(txn: Any) -> None:
@@ -1810,6 +1830,7 @@ class Table:
         enforcement, because a concurrent writer could still commit in between.
         """
         self._check_writable("append")
+        _check_write_sizes(target_file_size, max_commit_retries)
         if schema_mode not in (None, "merge"):
             raise InvalidArgumentError(
                 f"append takes schema_mode=None or 'merge', not {schema_mode!r}; replacing "
@@ -1936,6 +1957,7 @@ class Table:
         `partitionOverwriteMode=dynamic`.
         """
         self._check_writable("overwrite")
+        _check_write_sizes(target_file_size, max_commit_retries)
         if schema_mode not in (None, "merge", "overwrite"):
             raise InvalidArgumentError(
                 f"schema_mode must be None, 'merge' or 'overwrite', not {schema_mode!r}"
@@ -2084,6 +2106,9 @@ class Table:
             if t.txn_version("nightly-load") != batch_id:
                 t.append(data, txn=("nightly-load", batch_id))
         """
+        if not isinstance(app_id, str) or not app_id:
+            # delta-rs raised a bare TypeError for None.
+            raise InvalidArgumentError(f"app_id must be a non-empty string, not {app_id!r}")
         try:
             engine = self._engine(Operation.APPEND, frozenset({"idempotent_txn"}))
         except DeltaSwampError:
@@ -2378,7 +2403,6 @@ class Table:
         refuses it. Without a kernel that can open the table, the timestamp is
         passed on for the engine to resolve.
         """
-        from ._util import timestamp_ms
 
         kernel = self._connection.router.engines.get(EngineKind.KERNEL)
         if not isinstance(kernel, KernelEngine) or self._resolved.location is None:

@@ -158,9 +158,25 @@ nested columns (`addr.zip`) and typed literals (`DATE '2026-01-01'`).
 Arithmetic and function calls are refused with a message; delta-rs and the
 warehouse accept full SQL.
 
-Timestamps honor in-commit timestamps where a table has them, and a timestamp
-earlier than the oldest reconstructable version is refused rather than
-silently clamped.
+Literals mean what they mean in Spark, whichever engine serves the call.
+Adjacent string literals concatenate, so `'it''s'` is `its` (write `'it\'s'`
+for `it's`), and backslash escapes are processed. A STRING column compared
+with a number (`s = 1`), or a number with a BOOLEAN (`i = true`), is refused
+with a `PredicateError`: Spark would cast every value of the column, so quote
+the literal to compare as text. An `IN` list holding a DOUBLE compares every
+item as a DOUBLE, as Spark does.
+
+Timestamps honor in-commit timestamps where a table has them, on delta-rs as
+on the kernel, and a timestamp earlier than the oldest reconstructable version
+is refused rather than silently clamped. A timestamp after the latest commit
+reads the latest version on the direct engines; the warehouse refuses it
+(`DELTA_TIMESTAMP_GREATER_THAN_COMMIT`).
+
+Dates and timestamps before 1582-10-15 that Databricks or Spark wrote in the
+legacy hybrid calendar (Parquet files marked `org.apache.spark.legacyDateTime`)
+are rebased on the kernel path exactly as Spark rebases them, so they read as
+the warehouse shows them. Timestamps written in a session time zone other than
+UTC are refused before 1582 rather than guessed. delta-rs does not rebase.
 
 Convenience wrappers sit on top:
 
@@ -620,6 +636,7 @@ All inherit from `DeltaSwampError`.
 | `MissingDataFileError` | a `CorruptTableError`: a file the snapshot references was removed (VACUUM, manual delete); `.path` names it |
 | `ChangeFeedSchemaChangeError` | an `UnreachableTableError`: the change feed range crosses a schema change its rows cannot be read across; `.version` names the commit that changed it |
 | `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
+| `SqlStatementError` | the SQL warehouse rejected or failed a statement; the message carries its error |
 | `EnginePanicError` | an engine panicked across the FFI boundary |
 
 A conflict means re-read the snapshot, recompute, then stage again at the next
@@ -696,6 +713,9 @@ reached.
   rewrite, and MERGE there needs the warehouse. With deletion vectors enabled,
   UPDATE and MERGE on a change-data-feed table need the warehouse too.
 - The change feed of a catalog-managed table needs the warehouse.
+- delta-rs reads pre-1582 dates and timestamps from Spark's legacy-calendar
+  files unrebased (2-10 days off); the kernel rebases them. Ancient timestamps
+  in such files written in a non-UTC session zone need the warehouse.
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.
 - Identity and default columns are created only through Databricks (a catalog
