@@ -112,3 +112,24 @@ class TestPropertiesOnTableFeatureProtocols:
             conn.open_table(path).set_properties(props)
             assert "variantType" not in conn.open_table(path).features()
         assert "v2Checkpoint" in conn.open_table(path).features()
+
+
+class TestMergeReadsStringLiteralsAsSpark:
+    """Kernel MERGE clauses run on DuckDB, which reads `''` as an escaped quote;
+    Spark (and so the warehouse) reads `'it''s'` as adjacent literals, `its`."""
+
+    def test_adjacent_literals_concatenate(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "t")
+        conn.create_table(
+            path,
+            pa.schema([("id", pa.int64()), ("v", pa.string())]),
+            properties={"delta.enableDeletionVectors": "true"},
+        )
+        conn.open_table(path).append(pa.table({"id": [1, 2], "v": ["it's", "its"]}))
+        (
+            conn.open_table(path)
+            .merge(pa.table({"id": [1, 2]}), "t.id = s.id", source_alias="s", target_alias="t")
+            .when_matched_delete("t.v = 'it''s'")
+            .execute()
+        )
+        assert conn.open_table(path).to_arrow().column("v").to_pylist() == ["it's"]
