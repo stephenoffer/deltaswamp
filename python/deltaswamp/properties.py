@@ -165,6 +165,18 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
             "UniForm metadata generation is a Databricks-side job",
         ),
         _prop("delta.parquet.compression.codec", _RJ, _RJ, _UN),
+        # Real Delta keys that delta-rs rejects ("Error parsing property");
+        # the kernel's metadata path stores them for Databricks to act on.
+        _prop(
+            "delta.compatibility.symlinkFormatManifest.enabled",
+            _RJ,
+            _RJ,
+            _UN,
+            True,
+            "Databricks regenerates the manifest on every write; writes from here do "
+            "not, so call generate() after them",
+        ),
+        _prop("delta.checkpointRetentionDuration", _RJ, _RJ, _UN, True),
         # --- protocol versions: never set these by hand
         _prop(
             "delta.minReaderVersion",

@@ -98,7 +98,8 @@ class TestDynamicPartitionOverwrite:
             )
 
     def test_unknown_mode_is_refused(self, partitioned: Any) -> None:
-        with pytest.raises(UnreachableTableError, match="'static' and 'dynamic'"):
+        # A malformed argument, not a table no engine can serve.
+        with pytest.raises(InvalidArgumentError, match="'static' or 'dynamic'"):
             partitioned.overwrite(
                 pa.table({"id": [1], "region": ["eu"]}), partition_overwrite="sideways"
             )

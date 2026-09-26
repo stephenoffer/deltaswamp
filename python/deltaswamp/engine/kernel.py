@@ -1981,6 +1981,10 @@ class KernelEngine:
         def precheck(snapshot: Any, state: Any) -> None:
             import pyarrow as pa
 
+            # The change's own refusals (no such column, a nested field) come
+            # first; the scan below answered them with a native "column is
+            # not in the table schema".
+            meta.set_nullability(state, column, False)
             nulls = 0
             # The metadata change matches names case-insensitively; the
             # native projection does not, and failed on `ID` for `id`.

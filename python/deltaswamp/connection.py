@@ -13,6 +13,7 @@ from .catalog.filesystem import FilesystemCatalog
 from .catalog.registry import catalog_for_uri
 from .engine.deltars import DeltaRsEngine
 from .engine.kernel import KernelEngine
+from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
     SQL_FALLBACK_REMEDY,
     DeltaSwampError,
@@ -410,6 +411,11 @@ class Connection:
                 "a table is either partitioned or liquid-clustered, not both"
             )
         _check_layout(schema, partition_by, cluster_by)
+        clash = cdf_name_clash(_schema_names(schema) or (), properties)
+        if clash:
+            # The kernel's create refused this; delta-rs's created the table,
+            # and every DML and change-feed read on it then failed.
+            raise cdf_clash_error(f"create {name}", clash)
         if ref.kind is RefKind.PATH:
             if location is not None:
                 # It was ignored: the table went to `name`, not `location`.

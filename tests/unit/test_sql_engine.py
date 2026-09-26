@@ -27,7 +27,7 @@ from deltaswamp.capability import (
 from deltaswamp.catalog import TableType
 from deltaswamp.engine.sql import SqlEngine, SqlFallbackWarning, SqlMerger
 from deltaswamp.engine.sql_backend import SqlStatementError
-from deltaswamp.errors import UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
 from deltaswamp.identity import RefKind, TableRef
 
 from tests.helpers import resolved_table as table
@@ -297,10 +297,18 @@ class TestDdl:
         assert rec.last == f"ALTER TABLE {NAME} ADD COLUMNS (`new col` DECIMAL(10,2))"
         eng.add_columns(table(), pa.schema([("a", pa.int64()), ("t", pa.list_(pa.string()))]))
         assert rec.last == f"ALTER TABLE {NAME} ADD COLUMNS (`a` BIGINT, `t` ARRAY<STRING>)"
+        # A dotted name is a nested path, as on the kernel path; backticks
+        # keep a dot inside one name.
         eng.drop_column(table(), "a.b")
+        assert rec.last == f"ALTER TABLE {NAME} DROP COLUMN `a`.`b`"
+        eng.drop_column(table(), "`a.b`")
         assert rec.last == f"ALTER TABLE {NAME} DROP COLUMN `a.b`"
         eng.rename_column(table(), "old", "n`ew")
         assert rec.last == f"ALTER TABLE {NAME} RENAME COLUMN `old` TO `n``ew`"
+        eng.rename_column(table(), ["s", "aa"], "s.x")
+        assert rec.last == f"ALTER TABLE {NAME} RENAME COLUMN `s`.`aa` TO `x`"
+        with pytest.raises(InvalidArgumentError, match="keeps the column in its struct"):
+            eng.rename_column(table(), "s.aa", "t.x")
 
     def test_features(self) -> None:
         eng, rec, _ = engine()

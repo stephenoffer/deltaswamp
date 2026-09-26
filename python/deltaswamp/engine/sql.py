@@ -1379,13 +1379,15 @@ class SqlEngine:
         return self._alter(Operation.ADD_COLUMN, table, f"ADD COLUMNS ({', '.join(pairs)})")
 
     def drop_column(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
-        return self._alter(Operation.DROP_COLUMN, table, f"DROP COLUMN {sq.column(column)}")
+        return self._alter(Operation.DROP_COLUMN, table, f"DROP COLUMN {sq.column_path(column)}")
 
-    def rename_column(self, table: ResolvedTable, old: str, new: str) -> dict[str, Any]:
+    def rename_column(
+        self, table: ResolvedTable, old: str | Sequence[str], new: str
+    ) -> dict[str, Any]:
         return self._alter(
             Operation.RENAME_COLUMN,
             table,
-            f"RENAME COLUMN {sq.column(old)} TO {sq.quote(new)}",
+            f"RENAME COLUMN {sq.column_path(old)} TO {sq.leaf_name(old, new)}",
         )
 
     def set_properties(
@@ -1474,7 +1476,7 @@ class SqlEngine:
         return self._alter(
             Operation.SET_COLUMN_COMMENT,
             table,
-            f"ALTER COLUMN {sq.column(column)} COMMENT {sq.literal(comment or '')}",
+            f"ALTER COLUMN {sq.column_path(column)} COMMENT {sq.literal(comment or '')}",
         )
 
     def alter_column_type(
@@ -1483,17 +1485,17 @@ class SqlEngine:
         return self._alter(
             Operation.ALTER_COLUMN_TYPE,
             table,
-            f"ALTER COLUMN {sq.column(column)} TYPE {sq.sql_type(sq.type_text(new_type))}",
+            f"ALTER COLUMN {sq.column_path(column)} TYPE {sq.sql_type(sq.type_text(new_type))}",
         )
 
     def set_not_null(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
         return self._alter(
-            Operation.SET_NOT_NULL, table, f"ALTER COLUMN {sq.column(column)} SET NOT NULL"
+            Operation.SET_NOT_NULL, table, f"ALTER COLUMN {sq.column_path(column)} SET NOT NULL"
         )
 
     def drop_not_null(self, table: ResolvedTable, column: str | Sequence[str]) -> dict[str, Any]:
         return self._alter(
-            Operation.DROP_NOT_NULL, table, f"ALTER COLUMN {sq.column(column)} DROP NOT NULL"
+            Operation.DROP_NOT_NULL, table, f"ALTER COLUMN {sq.column_path(column)} DROP NOT NULL"
         )
 
     def cluster_by(
