@@ -108,7 +108,12 @@ First release.
   in its legacy hybrid calendar; the kernel does. Such timestamps written in a
   non-UTC session zone are refused by the kernel and need the warehouse.
 - A time-travel timestamp after the latest commit reads the latest version on
-  the direct engines; the warehouse refuses it.
+  the direct engines; the warehouse refuses it. A RESTORE to one is refused
+  everywhere, as Spark refuses it.
+- A table URI (`file://`, `s3://`, ...) containing `?` or `#` is refused at
+  create: a URL reads them as a query or fragment. Percent-encode them.
+- delta-rs writes no statistics at all (null counts included) for decimal
+  columns of more than 15 digits; Parquet offers no null-count-only level.
 - VARIANT reads as JSON text on every engine and writes take JSON text. A
   VARIANT nested in a struct or array is left in the engine's own form, and a
   table with `delta.enableVariantShredding` (every new Databricks VARIANT

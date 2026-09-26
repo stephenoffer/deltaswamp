@@ -336,7 +336,17 @@ def _check_local_create_path(name: str) -> None:
     it afterwards.
     """
     if "://" in name:
-        return  # a URL, file:// included, whose escapes are meant as escapes
+        # A URL, file:// included, whose escapes are meant as escapes. But a
+        # URL reads `?` and `#` as a query and a fragment: the table went to
+        # `.../x` for "file://.../x#y", and every write through the returned
+        # handle landed there too, while opening the URI was refused.
+        if "?" in name or "#" in name:
+            raise InvalidArgumentError(
+                f"the table URI {name!r} contains '?' or '#', which a URL reads as a query "
+                "or fragment, so the table would be created at a different path; nothing "
+                "was created. Percent-encode them (%3F, %23) or choose a name without them"
+            )
+        return
     bad = _PERCENT_ESCAPE.search(name)
     if bad is not None or (os.sep == "/" and "\\" in name):
         what = repr(bad.group(0)) if bad is not None else "a backslash"

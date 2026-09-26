@@ -568,3 +568,38 @@ class TestLazyPolarsPushesDown:
         assert got["id"].to_list() == [46, 47, 48, 49]
         assert [k.get("columns") for k in seen] == [["id"]]
         assert lazy.filter(pl.col("id") > 40).head(2).collect()["id"].to_list() == [41, 42]
+
+
+class TestCreateAtAUriWithAFragment:
+    """create_table("file://.../x#y") created the table at .../x, and writes
+    through the returned handle landed there, while opening the URI refused."""
+
+    @pytest.mark.parametrize("name", ["x#y", "q?r"])
+    def test_refused_before_anything_is_created(
+        self, conn: Any, tmp_path: Any, name: str
+    ) -> None:
+        import os
+
+        from deltaswamp.errors import InvalidArgumentError
+
+        uri = "file://" + str(tmp_path / name)
+        with pytest.raises(InvalidArgumentError, match="query or fragment"):
+            conn.create_table(uri, pa.schema([("id", pa.int64())]))
+        with pytest.raises(InvalidArgumentError):
+            conn.write_table(uri, pa.table({"id": [1]}))
+        assert os.listdir(tmp_path) == []
+
+
+class TestRestoreToAFutureTimestamp:
+    def test_refused_like_spark(self, conn: Any, tmp_path: Any) -> None:
+        # It resolved to the latest version: a silent no-op.
+        import datetime as dt
+
+        from deltaswamp.errors import InvalidArgumentError
+
+        path = str(tmp_path / "t")
+        t = conn.write_table(path, pa.table({"id": [1]}))
+        t.append(pa.table({"id": [2]}))
+        with pytest.raises(InvalidArgumentError, match="after the latest commit"):
+            t.restore(dt.datetime.now(dt.UTC) + dt.timedelta(days=1))
+        assert conn.open_table(path).version == 2

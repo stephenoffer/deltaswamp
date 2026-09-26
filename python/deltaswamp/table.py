@@ -3060,6 +3060,21 @@ class Table:
             return timestamp
         except Exception:
             return timestamp
+        try:
+            latest = kernel.snapshot(self._resolved)
+            after_latest = int(snapshot.version) == int(latest.version) and millis > int(
+                latest.timestamp()
+            )
+        except Exception:
+            after_latest = False
+        if after_latest:
+            # It resolved to the latest version, so the restore was a silent
+            # no-op. Spark refuses it (DELTA_TIMESTAMP_GREATER_THAN_COMMIT):
+            # nothing is committed at that time yet.
+            raise InvalidArgumentError(
+                f"cannot restore to {timestamp}: it is after the latest commit (version "
+                f"{int(latest.version)}), so there is no version of the table at that time"
+            )
         return int(snapshot.version)
 
     def repair(self, **kwargs: Any) -> dict[str, Any]:
