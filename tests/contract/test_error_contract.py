@@ -362,8 +362,6 @@ _FINDINGS: dict[str, tuple[str, ...]] = {
         "write_table_str",
     ),
     "E3: data not matching the schema or partitioning escapes as a raw delta-rs error": (
-        "append_wrong_type",
-        "append_missing_columns",
         "append_partition_by_mismatch",
     ),
     "E4: a malformed SQL predicate/expression on the delta-rs path escapes as a raw DeltaError": (
@@ -371,7 +369,6 @@ _FINDINGS: dict[str, tuple[str, ...]] = {
         "delete_predicate_garbage",
         "update_bad_expression",
         "update_predicate_garbage",
-        "update_wrong_type_value",
         "add_constraint_garbage",
     ),
     "E5: a list/int where a dict/str is expected escapes as a raw Python error": (
