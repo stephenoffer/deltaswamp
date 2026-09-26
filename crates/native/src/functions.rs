@@ -77,6 +77,22 @@ pub fn commit_raw(
     Ok(committed)
 }
 
+/// Whether the object store under `table_root` honours put-if-absent.
+///
+/// Writes (and deletes) a sentinel under `_delta_log/`; see
+/// `store::probe_put_if_absent`.
+#[pyfunction]
+#[pyo3(signature = (table_root, options = None))]
+pub fn probe_put_if_absent(
+    py: Python<'_>,
+    table_root: &str,
+    options: Option<HashMap<String, String>>,
+) -> PyResult<bool> {
+    let url = PySnapshot::table_root_url(table_root)?;
+    let options = options.unwrap_or_default();
+    Ok(py.detach(|| store::probe_put_if_absent(&url, &options))?)
+}
+
 /// The UC `CreateTableRequest` body for a freshly committed version 0, as JSON.
 ///
 /// Step three of the managed-table creation flow: after staging the table in

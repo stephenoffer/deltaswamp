@@ -23,6 +23,15 @@ from decimal import Decimal
 from numbers import Integral
 from typing import Any, Literal
 
+from .._storage import (
+    azure_store_location,
+    canonical_options,
+    cloud_of,
+    engine_options,
+    location_refusal,
+    store_options,
+    write_refusal,
+)
 from .._util import commit_backoff
 from ..capability import (
     FEATURE_DEPENDENCIES,
@@ -206,6 +215,10 @@ class DeltaRsEngine:
                 reason="the table has no storage location, so there are no files to read",
             )
 
+        unreachable = location_refusal(table.location)
+        if unreachable is not None:
+            return Capability(operation, ok=False, reason=unreachable)
+
         if operation in _LOGSTORE_WRITE_OPS and _url_hostile_local_path(table.location):
             # delta-rs builds its write log store from the path as a URL, and
             # panics on these characters ("Invalid object store url:
@@ -228,9 +241,23 @@ class DeltaRsEngine:
                 reason=f"the table is {table.data_source_format}, not Delta",
             )
 
-        if table.location.split("://", 1)[0].lower() in ("gs", "gcs") and _may_vend_gcs_bearer(
-            table.credential_provider
+        if cloud_of(table.location) == "gcs" and _bearer_in_options(
+            self._base_options, table.location
         ):
+            # A path table's own storage_options: delta-rs dropped the token
+            # (under any alias but one, which it refused mid-call) and fell
+            # back to ambient credentials -- possibly a different identity.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the storage options carry a GCS OAuth bearer token, which delta-rs's "
+                    "object store has no option for (it would fall back to ambient "
+                    "credentials)"
+                ),
+                remedy="this routes to the kernel engine, whose store accepts bearer tokens",
+            )
+        if cloud_of(table.location) == "gcs" and _may_vend_gcs_bearer(table.credential_provider):
             # Catalog-vended GCS credentials are OAuth bearer tokens, and the
             # installed delta-rs object store has no option that accepts one.
             return Capability(
@@ -279,6 +306,14 @@ class DeltaRsEngine:
             )
 
         writing = operation not in _READ_ONLY_OPS
+
+        if writing and not table.is_catalog_managed:
+            unsafe = write_refusal(table.location, self._base_options, table.credential_provider)
+            if unsafe is not None:
+                # The remedy goes in the reason too: the router reports only
+                # the reasons when every engine refuses.
+                reason, remedy = unsafe
+                return Capability(operation, ok=False, reason=f"{reason}; {remedy}", remedy=remedy)
 
         if writing and table.has_iceberg_compat:
             return Capability(
@@ -431,12 +466,26 @@ class DeltaRsEngine:
     # --------------------------------------------------------------- internals
 
     def _storage_options(self, table: ResolvedTable, *, write: bool) -> dict[str, str]:
-        options = dict(self._base_options)
+        # One merge rule for every engine (_storage): canonical keys, vended
+        # secrets over the caller's, the caller's region/endpoint over a
+        # vended guess, and an explicit S3 endpoint.
+        vended = None
         if table.credential_provider is not None:
             op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
-            options.update(table.credential_provider.credentials(op).as_storage_options())
-            _pin_s3_endpoint(options)
-        return options
+            vended = table.credential_provider.credentials(op).as_storage_options()
+        return store_options(engine_options(self._base_options, vended, table.location))
+
+    def _store(self, table: ResolvedTable, *, write: bool) -> tuple[str, dict[str, str] | None]:
+        """The URI and storage_options delta-rs opens `table` with.
+
+        A sovereign-cloud abfss:// URL is rewritten to the az:// form, which
+        object_store can parse (see `azure_store_location`).
+        """
+        if table.location is None:
+            raise UnreachableTableError("open", "the table has no storage location")
+        options = self._storage_options(table, write=write)
+        uri, options = azure_store_location(table.location, options)
+        return uri, _object_store_options(options)
 
     def _open(
         self,
@@ -448,11 +497,9 @@ class DeltaRsEngine:
         """Open a fresh DeltaTable. Never cached -- see the module docstring."""
         from deltalake import DeltaTable
 
-        if table.location is None:
-            raise UnreachableTableError("open", "the table has no storage location")
-        options = _object_store_options(self._storage_options(table, write=write))
+        uri, options = self._store(table, write=write)
         with _no_panics("open the table"):
-            dt = DeltaTable(table.location, version=version, storage_options=options)
+            dt = DeltaTable(uri, version=version, storage_options=options)
         return dt
 
     # ------------------------------------------------------------------- read
@@ -543,7 +590,9 @@ class DeltaRsEngine:
             # it a dropped-and-recreated table went unnoticed on this engine.
             "metadata_id": metadata.id,
             "version": dt.version(),
-            "location": dt.table_uri,
+            # The table's own location: delta-rs may have been handed the
+            # az:// form of a sovereign-cloud URL.
+            "location": table.location or dt.table_uri,
             "min_reader_version": protocol.min_reader_version,
             "min_writer_version": protocol.min_writer_version,
             "reader_features": list(protocol.reader_features or []),
@@ -902,8 +951,8 @@ class DeltaRsEngine:
             "writer_properties": _exact_stats(writer_properties, self._stats_schema(table, data)),
             "commit_properties": _commit_properties(commit_metadata, txn, max_commit_retries),
             "post_commithook_properties": _hooks(table),
-            "storage_options": _object_store_options(self._storage_options(table, write=True)),
         }
+        uri, common["storage_options"] = self._store(table, write=True)
         extra: dict[str, Any] = {"predicate": predicate} if mode == "overwrite" else {}
         if mode == "overwrite" and max_commit_retries is None:
             # delta-rs's rebase misses a concurrent compaction's removes: an
@@ -927,7 +976,7 @@ class DeltaRsEngine:
             for attempt in range(attempts):
                 try:
                     with _no_panics(f"{mode} to the table"):
-                        write_deltalake(table.location, data, mode=mode, **common, **extra)
+                        write_deltalake(uri, data, mode=mode, **common, **extra)
                 except CommitConflictError as exc:
                     if attempt + 1 >= attempts or "changed since last commit" in str(exc):
                         raise
@@ -1000,17 +1049,33 @@ class DeltaRsEngine:
         # Check first: delta-rs reports every property problem with one opaque
         # message, and panics on delta.minReaderVersion.
         validate_properties(properties, EngineKind.DELTARS, Operation.CREATE)
-        with _no_panics("create the table"):
-            DeltaTable.create(
-                table.location,
-                schema,
-                mode=mode,
-                partition_by=partition_by,
-                name=name or (table.ref.table if table.ref.kind.value == "catalog" else None),
-                description=description,
-                configuration=properties,
-                storage_options=_object_store_options(self._storage_options(table, write=True)),
-            )
+        uri, options = self._store(table, write=True)
+        # delta-rs retries a CREATE that lost version 0 at version 1, with no
+        # metadata conflict check: of two concurrent creates both "succeeded",
+        # and the second replaced the first one's schema. A create that must
+        # not replace anything commits exactly once.
+        once = mode in ("error", "ignore")
+        try:
+            with _no_panics("create the table"):
+                DeltaTable.create(
+                    uri,
+                    schema,
+                    mode=mode,
+                    partition_by=partition_by,
+                    name=name or (table.ref.table if table.ref.kind.value == "catalog" else None),
+                    description=description,
+                    configuration=properties,
+                    storage_options=options,
+                    commit_properties=_commit_properties(None, None, 0) if once else None,
+                )
+        except CommitConflictError as exc:
+            if not once:
+                raise
+            raise UnreachableTableError(
+                "create the table",
+                "a Delta table already exists there (another writer created it first)",
+                "pass mode='ignore' to keep it or mode='overwrite' to replace it",
+            ) from exc
 
     def delete(
         self,
@@ -1348,7 +1413,8 @@ class DeltaRsEngine:
                 "version still needs could be deleted; pass enforce_retention_duration=False "
                 "to vacuum anyway, or lower the table property"
             ) from exc
-        return result
+        # Only a full vacuum that deletes reports bucket-relative paths.
+        return _table_relative(result, table.location or "", full=not lite and not dry_run)
 
     @staticmethod
     def _vacuum_keeping_vectors(
@@ -1688,16 +1754,23 @@ class DeltaRsEngine:
                 _CONVERT_ESCAPED_REASON.format(escaped[0]),
                 _CONVERT_ESCAPED_REMEDY,
             )
-        convert_to_deltalake(
-            location,
-            partition_by=partition_by,
-            partition_strategy=partition_strategy,
-            # Merged, not duplicated: a caller's storage_options= raised
-            # "got multiple values for keyword argument".
-            storage_options={**self._base_options, **(kwargs.pop("storage_options", None) or {})}
-            or None,
-            **kwargs,
-        )
+        # Merged, not duplicated: a caller's storage_options= raised "got
+        # multiple values for keyword argument". Canonical keys, as everywhere.
+        options = canonical_options(self._base_options, location)
+        options.update(canonical_options(kwargs.pop("storage_options", None), location))
+        uri, options = azure_store_location(location, store_options(options))
+        if "commit_properties" not in kwargs:
+            # As for create: delta-rs retried a convert that lost version 0 at
+            # version 1, committing the whole directory a second time.
+            kwargs["commit_properties"] = _commit_properties(None, None, 0)
+        with _no_panics("convert to Delta"):
+            convert_to_deltalake(
+                uri,
+                partition_by=partition_by,
+                partition_strategy=partition_strategy,
+                storage_options=_object_store_options(options),
+                **kwargs,
+            )
 
     def plan_scan(self, table: ResolvedTable, **kwargs: Any) -> list[Any]:
         raise NotImplementedError("the delta-rs engine has no split-planning surface")
@@ -1871,30 +1944,37 @@ def _vends_gcs_bearer_token(table: ResolvedTable) -> bool:
     if isinstance(provider, StaticCredentialProvider):
         # Held, not minted, so reading it costs nothing -- and an expired one
         # must not turn a routing question into a raise.
-        return "google_bearer_token" in provider.peek().secrets
+        return _bearer_in_options(provider.peek().secrets, location)
     return True
 
 
-_S3_ENDPOINT_KEYS = frozenset({"aws_endpoint", "aws_endpoint_url", "endpoint", "endpoint_url"})
+def _table_relative(paths: list[str], location: str, *, full: bool = True) -> list[str]:
+    """Vacuumed paths relative to the table root, whatever the store.
 
-
-def _pin_s3_endpoint(options: dict[str, str]) -> None:
-    """Give vended S3 keys an explicit regional endpoint.
-
-    With no endpoint, delta-rs treats the store as real AWS and builds an AWS SDK
-    config via `aws_config::from_env()`, whose region chain ignores the
-    `aws_region` we pass and ends at EC2 instance metadata. Off EC2 that costs
-    three one-second connect timeouts on the first open in every process, and
-    the SDK config is pointless here: the credentials are already static. An
-    endpoint makes delta-rs hand the keys straight to object_store instead.
+    delta-rs's full vacuum reported absolute filesystem paths on a local
+    table, table-relative ones on S3, and container/bucket-relative ones on
+    Azure and GCS ("t/part-..."), while lite and dry runs were table-relative
+    everywhere. One call now means one form: relative to the table root.
     """
-    region = options.get("aws_region")
-    if not region or "aws_access_key_id" not in options:
-        return
-    if any(k.lower() in _S3_ENDPOINT_KEYS for k in options):
-        return
-    suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
-    options["aws_endpoint"] = f"https://s3.{region}.{suffix}"
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(location)
+    local_root: str | None = None
+    if "://" not in location:
+        local_root = os.path.abspath(location)
+    elif parsed.scheme == "file":
+        local_root = unquote(parsed.path)
+    in_bucket = parsed.path.strip("/") if full and cloud_of(location) in ("azure", "gcs") else ""
+    out = []
+    for path in paths:
+        if local_root is not None and os.path.isabs(path):
+            path = os.path.relpath(path, local_root)
+        elif "://" in path and path.startswith(location.rstrip("/") + "/"):
+            path = path[len(location.rstrip("/")) + 1 :]
+        elif in_bucket and path.startswith(in_bucket + "/"):
+            path = path[len(in_bucket) + 1 :]
+        out.append(path)
+    return out
 
 
 def _sql_literal(value: Any) -> str:
@@ -3643,8 +3723,17 @@ def _may_vend_gcs_bearer(provider: Any) -> bool:
     static = getattr(provider, "_credentials", None)
     secrets = getattr(static, "secrets", None)
     if isinstance(secrets, dict):
-        return "google_bearer_token" in secrets
+        return _bearer_in_options(secrets, "gs://")
     return True
+
+
+def _bearer_in_options(options: Mapping[str, str] | None, location: str | None) -> bool:
+    """Whether `options` carry a GCS bearer token under any alias or case."""
+    try:
+        canonical = canonical_options(dict(options or {}), location or "gs://")
+    except InvalidArgumentError:
+        return True  # conflicting token keys: certainly not for delta-rs
+    return bool(canonical.get("google_bearer_token"))
 
 
 def _object_store_options(options: dict[str, str] | None) -> dict[str, str] | None:
@@ -3657,14 +3746,17 @@ def _object_store_options(options: dict[str, str] | None) -> dict[str, str] | No
     """
     if not options:
         return None
-    if "google_bearer_token" in options:
+    if options.get("google_bearer_token"):
+        # Keys are canonical by now, so every alias (gcp_oauth_token,
+        # bearer_token, any case) lands here rather than being dropped.
         raise UnreachableTableError(
             "open a GCS table with delta-rs",
-            "the catalog vended a GCS OAuth bearer token, which delta-rs's object store "
-            "has no option for (it only takes a service-account key)",
-            "reads route to the kernel engine; or supply google_service_account_key",
+            "the storage options carry a GCS OAuth bearer token (from the catalog or the "
+            "connection), which delta-rs's object store has no option for (it only takes "
+            "a service-account key) and would replace with ambient credentials",
+            "operations route to the kernel engine; or supply google_service_account_key",
         )
-    endpoint = options.get("aws_endpoint") or options.get("aws_endpoint_url") or ""
+    endpoint = options.get("aws_endpoint") or ""
     if "r2.cloudflarestorage.com" in endpoint and "aws_conditional_put" not in options:
         # R2 supports If-None-Match; make the commit's put-if-absent explicit
         # rather than depending on object_store's default.

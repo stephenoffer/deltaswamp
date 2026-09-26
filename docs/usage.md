@@ -89,7 +89,8 @@ Useful keyword arguments:
 | `allow_sql_fallback=True` | permits routing through a SQL warehouse; off by default |
 | `warehouse_id="..."` | which warehouse the fallback uses; chosen automatically when omitted |
 | `staging_volume="cat.schema.vol"` | lets the warehouse serve writes and MERGE, staging data in that volume |
-| `storage_options={...}` | extra object-store settings, merged under vended credentials |
+| `storage_options={...}` | object-store settings for every engine; see "Storage options" below |
+| `iceberg_properties={...}` | PyIceberg catalog and FileIO properties, passed verbatim |
 | `default_catalog`, `default_schema` | let you write `conn.table("orders")` |
 | `catalog=MyCatalog()` | supply a catalog object directly and skip URI dispatch |
 
@@ -102,6 +103,55 @@ it also checks the warehouse and notes a missing `staging_volume`. It cannot
 see per-table limits: Unity Catalog accepts external writes only for some
 table kinds (external and catalog-managed tables), which `t.can("append")`
 reports table by table.
+
+### Storage options
+
+`storage_options` are object_store settings (`aws_region`, `aws_endpoint`,
+`azure_storage_account_key`, `google_service_account_key`, `proxy_url`,
+`timeout`, ...). Keys are case-insensitive and every object_store alias is
+accepted; before merging, each is rewritten to one canonical name per cloud
+(`AWS_ENDPOINT_URL`, `endpoint_url` and `aws_endpoint` are one setting on
+`s3://`), and a dict that sets one setting twice with different values is
+refused. The kernel and delta-rs then get the same options, merged with a
+table's vended credentials in this order:
+
+1. Vended credentials (keys, session tokens, SAS, OAuth tokens). When the
+   catalog vends any, every credential key you passed for that cloud is dropped.
+2. An S3 endpoint the catalog vended (an access point, R2), together with its
+   region and addressing style.
+3. Everything else you passed: region, endpoint, proxy, timeouts, TLS. So
+   `aws_region` fixes a UC external table whose bucket is in another region
+   than the metastore, and `azure_storage_endpoint` reroutes through private
+   link. A region in a different AWS partition from the vended one (us-east-1
+   against a cn-north-1 credential) is ignored.
+4. Other vended settings.
+
+S3 keys with a region and no endpoint get an explicit one,
+`https://s3.<region>.amazonaws.com` (`.amazonaws.com.cn` in China regions).
+Azure sovereign clouds work with the URL alone:
+`abfss://c@acct.dfs.core.chinacloudapi.cn/t` (or `usgovcloudapi.net`) derives
+the endpoint `https://acct.blob.<suffix>`, as a public-cloud `abfss://` URL
+does; only a host-less `az://container/...` needs `azure_storage_endpoint`.
+`wasb://` and `wasbs://` are refused; use the `abfss://` form. A GCS OAuth
+token (`google_bearer_token`, `gcp_oauth_token` or `bearer_token`) is used by
+the kernel only; delta-rs cannot take one, so operations only delta-rs
+implements are refused on such a table.
+
+Every commit is a put-if-absent of the next log file. Writes are refused when
+that cannot hold: with `aws_conditional_put=disabled`, with
+`AWS_S3_LOCKING_PROVIDER=dynamodb` (neither engine coordinates through
+DynamoDB, and a Spark `S3DynamoDBLogStore` writer ignores conditional puts),
+and on an S3-compatible endpoint that ignores `If-None-Match`. For any custom
+`aws_endpoint` that is not AWS or R2, the first write in a process probes the
+store with two put-if-absent calls on a sentinel under `_delta_log/` (deleted
+afterwards). If this process is a table's only writer, pass
+`storage_options={"deltaswamp_skip_put_if_absent_probe": "true"}` to skip it.
+
+Iceberg tables get the PyIceberg FileIO equivalents of `storage_options`
+(`s3.endpoint`, `s3.region`, `s3.proxy-uri`, `s3.connect-timeout`,
+`adls.account-name`, `gcs.oauth2.token`, ...), with `iceberg_properties` over
+them and the catalog's vended credentials over both. Delta Sharing downloads
+use `proxy_url` and `timeout`.
 
 ## Opening a table
 
@@ -519,7 +569,11 @@ vectors, a full VACUUM through delta-rs keeps every `deletion_vector_*.bin`:
 delta-rs does not count the vector files live data files reference and would
 delete them, so its list of unreferenced files is taken without them and the
 rest deleted here. Unreferenced vector files stay until Databricks vacuums the
-table. Three operations refuse rather than misbehave:
+table. `vacuum` returns the paths it deleted (or would delete) relative to the
+table root, on every store. A dry run after a lite vacuum still lists the files
+the lite run removed, because delta-rs keeps their tombstones in the log.
+
+Three operations refuse rather than misbehave:
 
 - `vacuum` on a shallow clone, which borrows the source's files.
 - `restore` through delta-rs on a table with deletion vectors, where delta-rs

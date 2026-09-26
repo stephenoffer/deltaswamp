@@ -734,11 +734,21 @@ class SharingEngine:
     supports_writer_properties = False
     supports_dynamic_overwrite = False
 
-    def __init__(self, *, request_timeout: float = 300.0, num_retries: int = 10) -> None:
+    def __init__(
+        self,
+        *,
+        request_timeout: float = 300.0,
+        num_retries: int = 10,
+        proxy_url: str | None = None,
+    ) -> None:
         """`request_timeout` bounds each presigned-file download, in seconds.
-        `num_retries` is passed to the client, which retries 429s and 5xxs."""
+        `num_retries` is passed to the client, which retries 429s and 5xxs.
+        `proxy_url` routes the downloads through a proxy (connect() passes the
+        connection's storage_options proxy_url, which the other engines'
+        object stores honour); without it the environment's proxy applies."""
         self._timeout = request_timeout
         self._num_retries = num_retries
+        self._proxy_url = proxy_url
 
     # ----------------------------------------------------------- capabilities
 
@@ -909,10 +919,16 @@ class SharingEngine:
             if isinstance(dv, dict) and dv.get("storageType") == "p":
                 cls._check_url(str(dv.get("pathOrInlineDv", "")))
 
+    def _urlopen(self, url: str) -> Any:
+        if not self._proxy_url:
+            return urllib.request.urlopen(url, timeout=self._timeout)
+        proxy = urllib.request.ProxyHandler({"http": self._proxy_url, "https": self._proxy_url})
+        return urllib.request.build_opener(proxy).open(url, timeout=self._timeout)
+
     def _download(self, url: str) -> bytes:
         self._check_url(url)
         try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as response:
+            with self._urlopen(url) as response:
                 body: bytes = response.read()
                 return body
         except urllib.error.HTTPError as exc:

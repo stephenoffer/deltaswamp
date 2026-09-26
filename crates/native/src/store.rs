@@ -14,7 +14,17 @@
 //!
 //! **Azure endpoints.** We never rely on account-name inference. It happens to
 //! work for `*.blob.core.windows.net` and silently breaks Azurite, private-link
-//! DNS, and the sovereign clouds.
+//! DNS, and the sovereign clouds. A fully qualified
+//! `abfss://container@account.dfs.<suffix>/` URL names its host, so the
+//! endpoint is taken from it (`https://account.blob.<suffix>`); only a host-less
+//! `az://container/` URL needs one passed.
+//!
+//! **Sovereign-cloud URLs.** object_store's URL parser knows only the
+//! `core.windows.net` and Fabric hosts; `abfss://c@a.dfs.core.chinacloudapi.cn/`
+//! (or `usgovcloudapi.net`) failed with "URL did not match any known pattern".
+//! Such a URL is handed to object_store as `az://c/<path>` with the account
+//! named and the endpoint set, which addresses the same objects. The Python
+//! delta-rs engine does the same rewrite (`_storage.azure_store_location`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,15 +89,87 @@ fn has_azure_endpoint(options: &HashMap<String, String>) -> bool {
     })
 }
 
+/// Host suffixes object_store's Azure URL parser recognises after
+/// `container@account.`.
+const PARSEABLE_AZURE_SUFFIXES: &[&str] = &[
+    "dfs.core.windows.net",
+    "blob.core.windows.net",
+    "dfs.fabric.microsoft.com",
+    "blob.fabric.microsoft.com",
+];
+
+fn has_option(options: &HashMap<String, String>, keys: &[&str]) -> bool {
+    options
+        .iter()
+        .any(|(k, v)| keys.iter().any(|key| k.eq_ignore_ascii_case(key)) && !v.trim().is_empty())
+}
+
+/// The URL and options object_store is given for an Azure `url`.
+///
+/// See the module docs: the endpoint comes from a fully qualified host, and a
+/// host object_store cannot parse is rewritten to `az://container/path`.
+fn azure_target(
+    url: &Url,
+    options: &HashMap<String, String>,
+) -> Result<(Url, HashMap<String, String>)> {
+    if matches!(url.scheme(), "wasb" | "wasbs") {
+        return Err(NativeError::Invalid(format!(
+            "{url} uses the legacy WASB driver scheme, which object_store does not \
+             support; address the same data as abfss://<container>@<account>.dfs.<suffix>/<path>"
+        )));
+    }
+    let mut out = options.clone();
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let qualified = matches!(url.scheme(), "abfs" | "abfss" | "az")
+        && !url.username().is_empty()
+        && host.contains('.');
+    if !qualified {
+        if !has_azure_endpoint(options) {
+            // Refusing here rather than letting a confusing 403 surface later.
+            return Err(NativeError::Invalid(format!(
+                "Azure URL {url} has no explicit endpoint: it names no account host, and \
+                 relying on account-name inference breaks Azurite, private-link DNS and \
+                 sovereign clouds; pass azure_endpoint, or use \
+                 abfss://<container>@<account>.dfs.<suffix>/<path>."
+            )));
+        }
+        return Ok((url.clone(), out));
+    }
+    let (account, rest) = host.split_once('.').unwrap_or((host.as_str(), ""));
+    let fabric = rest.ends_with("fabric.microsoft.com");
+    if !has_azure_endpoint(options) && !fabric {
+        // object_store speaks only the Blob API, so a dfs host maps to its
+        // blob sibling; the suffix is kept, which is what makes this right on
+        // sovereign clouds.
+        let service = rest
+            .strip_prefix("dfs.")
+            .map_or(rest.to_string(), |s| format!("blob.{s}"));
+        out.insert(
+            "azure_storage_endpoint".to_string(),
+            format!("https://{account}.{service}"),
+        );
+    }
+    if PARSEABLE_AZURE_SUFFIXES.iter().any(|s| host.ends_with(s)) {
+        return Ok((url.clone(), out));
+    }
+    if !has_option(options, &["azure_storage_account_name", "account_name"]) {
+        out.insert(
+            "azure_storage_account_name".to_string(),
+            account.to_string(),
+        );
+    }
+    let rewritten = Url::parse(&format!("az://{}{}", url.username(), url.path()))
+        .map_err(|e| NativeError::Invalid(format!("cannot address {url} as az://: {e}")))?;
+    Ok((rewritten, out))
+}
+
 /// Build an object store for `url`, honoring vended credentials.
 pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
-    if is_azure(url) && !has_azure_endpoint(options) {
-        // Refusing here rather than letting a confusing 403 surface later.
-        return Err(NativeError::Invalid(format!(
-            "Azure URL {url} has no explicit endpoint. Relying on account-name \
-             inference breaks Azurite, private-link DNS and sovereign clouds \
-             (.chinacloudapi.cn, .usgovcloudapi.net); pass azure_endpoint."
-        )));
+    if is_azure(url) {
+        let (target, options) = azure_target(url, options)?;
+        let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+        let (store, _path) = parse_url_opts(&target, pairs)?;
+        return Ok(Arc::from(store));
     }
 
     if is_gcs(url) {
@@ -99,6 +181,47 @@ pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<D
     let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     let (store, _path) = parse_url_opts(url, pairs)?;
     Ok(Arc::from(store))
+}
+
+/// Whether the store at `url` honours put-if-absent, found by trying it.
+///
+/// Two `PutMode::Create` puts of one sentinel under `_delta_log/`: a store
+/// that accepts the second ignores the condition every commit relies on
+/// (some S3-compatible stores drop `If-None-Match`). The sentinel is deleted
+/// afterwards; its name matches no log file, so a reader listing the log in
+/// between skips it.
+pub fn probe_put_if_absent(url: &Url, options: &HashMap<String, String>) -> Result<bool> {
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::{Error, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+
+    let store = build_store(url, options)?;
+    let root = Path::from_url_path(url.path()).map_err(Error::from)?;
+    let sentinel = root.join("_delta_log").join(format!(
+        ".deltaswamp-put-if-absent-probe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    crate::runtime::block_on(async {
+        let put = || {
+            store.put_opts(
+                &sentinel,
+                PutPayload::from_static(b"probe"),
+                PutOptions::from(PutMode::Create),
+            )
+        };
+        match put().await {
+            Ok(_) => {}
+            // aws_conditional_put=disabled: no put-if-absent at all.
+            Err(Error::NotImplemented { .. }) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let second = put().await;
+        let _ = store.delete(&sentinel).await;
+        match second {
+            Err(Error::AlreadyExists { .. }) | Err(Error::Precondition { .. }) => Ok(true),
+            Ok(_) | Err(Error::NotImplemented { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    })
 }
 
 /// Build a GCS store authenticated with a raw OAuth2 bearer token.
@@ -146,12 +269,89 @@ mod tests {
     }
 
     #[test]
-    fn azure_without_explicit_endpoint_is_refused() {
+    fn host_less_azure_without_explicit_endpoint_is_refused() {
         // The failure mode this prevents is a 403 several layers away, on
         // Azurite / private link / sovereign clouds.
-        let url = Url::parse("abfss://container@account.dfs.core.windows.net/t/").unwrap();
+        let url = Url::parse("az://container/t/").unwrap();
         let err = build_store(&url, &opts(&[("azure_storage_sas_key", "sig")])).unwrap_err();
         assert!(err.to_string().contains("no explicit endpoint"), "{err}");
+    }
+
+    #[test]
+    fn a_fully_qualified_azure_host_supplies_the_endpoint() {
+        // The host is in the URL, so nothing is inferred; the kernel refused
+        // this while delta-rs served it with the same options.
+        let url = Url::parse("abfss://container@account.dfs.core.windows.net/t/").unwrap();
+        let (target, o) = azure_target(&url, &opts(&[("azure_storage_sas_key", "sig")])).unwrap();
+        assert_eq!(target, url);
+        assert_eq!(
+            o["azure_storage_endpoint"],
+            "https://account.blob.core.windows.net"
+        );
+        assert!(build_store(&url, &opts(&[("azure_storage_sas_key", "sig=x")])).is_ok());
+    }
+
+    #[test]
+    fn sovereign_cloud_urls_are_rewritten_to_the_az_form() {
+        for (host, endpoint) in [
+            (
+                "acct.dfs.core.chinacloudapi.cn",
+                "https://acct.blob.core.chinacloudapi.cn",
+            ),
+            (
+                "acct.dfs.core.usgovcloudapi.net",
+                "https://acct.blob.core.usgovcloudapi.net",
+            ),
+            (
+                "acct.blob.core.cloudapi.de",
+                "https://acct.blob.core.cloudapi.de",
+            ),
+        ] {
+            let url = Url::parse(&format!("abfss://cont@{host}/a/b%20c/")).unwrap();
+            let (target, o) =
+                azure_target(&url, &opts(&[("azure_storage_sas_key", "sig")])).unwrap();
+            assert_eq!(target.as_str(), "az://cont/a/b%20c/", "{host}");
+            assert_eq!(o["azure_storage_account_name"], "acct");
+            assert_eq!(o["azure_storage_endpoint"], endpoint);
+            assert!(build_store(&url, &opts(&[("azure_storage_sas_key", "sig=x")])).is_ok());
+        }
+    }
+
+    #[test]
+    fn an_explicit_endpoint_and_account_win_over_the_host() {
+        let url = Url::parse("abfss://cont@acct.dfs.core.chinacloudapi.cn/t/").unwrap();
+        let given = opts(&[
+            (
+                "AZURE_STORAGE_ENDPOINT",
+                "http://127.0.0.1:10000/devstoreaccount1",
+            ),
+            ("account_name", "devstoreaccount1"),
+        ]);
+        let (_, o) = azure_target(&url, &given).unwrap();
+        assert!(!o.contains_key("azure_storage_endpoint"));
+        assert!(!o.contains_key("azure_storage_account_name"));
+    }
+
+    #[test]
+    fn wasb_urls_are_refused_with_the_abfss_form() {
+        let url = Url::parse("wasbs://cont@acct.blob.core.windows.net/t/").unwrap();
+        let err = build_store(&url, &opts(&[("azure_storage_use_emulator", "true")])).unwrap_err();
+        assert!(err.to_string().contains("abfss://"), "{err}");
+    }
+
+    #[test]
+    fn the_probe_sees_put_if_absent_on_a_local_store() {
+        let dir = std::env::temp_dir().join(format!("ds-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = Url::from_directory_path(&dir).unwrap();
+        assert!(probe_put_if_absent(&url, &HashMap::new()).unwrap());
+        let log = dir.join("_delta_log");
+        let left: Vec<_> = std::fs::read_dir(&log)
+            .map(|d| d.count())
+            .into_iter()
+            .collect();
+        assert_eq!(left, vec![0], "the sentinel was not removed");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
