@@ -22,6 +22,7 @@ use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::expressions::Predicate;
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::Engine;
 
@@ -40,9 +41,14 @@ pub fn list_files(
     engine: &dyn Engine,
     predicate: Option<Predicate>,
 ) -> Result<RecordBatch> {
+    // Struct stats are requested only so the kernel reads a checkpoint's
+    // `stats_parsed` and re-serializes it into `stats`. With the default
+    // (JSON only) a checkpoint written with writeStatsAsJson=false -- every
+    // Databricks managed table -- listed every file with no statistics.
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate.map(Arc::new))
+        .with_stats(StatsOptions::all())
         .without_row_transforms()
         .build()?;
 

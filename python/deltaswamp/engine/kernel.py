@@ -13,8 +13,10 @@ import importlib.util
 import inspect
 import json
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 from .. import predicate as sqlpred
 from .._sdk import PRODUCT, sdk_version
@@ -44,7 +46,12 @@ from ..errors import (
     TransientCommitError,
     UnreachableTableError,
 )
-from ..properties import effect_for
+from ..properties import (
+    CHECKPOINT_STATS_REMEDY,
+    KERNEL_CREATE_DEFERRED,
+    checkpoint_drops_stats,
+    effect_for,
+)
 from . import metadata as meta
 from .base import missing_method
 from .metadata import CLUSTERING_DOMAIN, TableState, arrow_to_delta_field, build_actions
@@ -295,6 +302,18 @@ class KernelEngine:
     #: and function calls go to an engine that evaluates SQL.
     supports_sql_expressions = False
 
+    #: Resolved snapshots kept per (location, version) for reuse.
+    snapshot_cache_size = 16
+    # Every metadata call and every routing decision resolved the log from
+    # scratch: 0.5 s each on a table 5000 commits past its last checkpoint,
+    # four of them for one UPDATE, and one per WritePlan.write(). A cached
+    # snapshot is brought up to date incrementally instead (one listing when
+    # nothing changed; nothing at all for a pinned version), so reads still
+    # see every commit, anyone's. Per process rather than per engine: a
+    # distributed write unpickles a fresh engine with every task.
+    _snapshots: ClassVar[OrderedDict[tuple[str, int | None], Any]] = OrderedDict()
+    _snapshots_lock: ClassVar[threading.Lock] = threading.Lock()
+
     def __init__(self, *, storage_options: dict[str, str] | None = None) -> None:
         self._base_options = dict(storage_options or {})
 
@@ -328,6 +347,14 @@ class KernelEngine:
                 operation,
                 ok=False,
                 reason=f"the kernel engine does not implement {operation.value} yet",
+            )
+
+        if operation is Operation.CHECKPOINT and checkpoint_drops_stats(table.properties):
+            return Capability(
+                operation,
+                ok=False,
+                reason=_DROPS_STATS_REASON,
+                remedy=CHECKPOINT_STATS_REMEDY,
             )
 
         if not table.is_delta:
@@ -546,6 +573,20 @@ class KernelEngine:
                         + ", ".join(sorted(unusable))
                     ),
                 )
+            deferred = sorted(set(shape.get("properties") or {}) & KERNEL_CREATE_DEFERRED)
+            if deferred and table.is_catalog_managed:
+                # create() commits these as version 1, a metadata commit that
+                # on a catalog-managed table would bypass the catalog.
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason=(
+                        "the kernel refuses these table properties at create, and the "
+                        "follow-up metadata commit that applies them would bypass the "
+                        "catalog: " + ", ".join(deferred)
+                    ),
+                    remedy="create the table, then set them through the catalog",
+                )
             declared = sorted(
                 (meta.create_schema_features(shape.get("schema")) or set()) & _CREATE_UNDECLARABLE
             )
@@ -616,16 +657,36 @@ class KernelEngine:
         ] or None
 
         location: str = table.location
+        # Only a path-based read by version (or latest) is cached: a
+        # catalog-managed table's latest version is the catalog's to say,
+        # which a log listing cannot see.
+        key = (location, version)
+        cacheable = log_tail is None and table.max_catalog_version is None and timestamp is None
 
         def resolve() -> Any:
-            return Snapshot.resolve(
+            options = self._options(table, write=write)
+            if cacheable:
+                with self._snapshots_lock:
+                    cached = self._snapshots.get(key)
+                if cached is not None and hasattr(cached, "refresh"):
+                    try:
+                        fresh = cached.refresh(options, latest=version is None)
+                    except Exception:
+                        fresh = None  # resolved afresh below, with its own errors
+                    if fresh is not None:
+                        self._remember(key, fresh)
+                        return fresh
+            snapshot = Snapshot.resolve(
                 location,
-                options=self._options(table, write=write),
+                options=options,
                 version=version,
                 log_tail=log_tail,
                 max_catalog_version=table.max_catalog_version,
                 timestamp_ms=timestamp_ms(timestamp) if timestamp is not None else None,
             )
+            if cacheable:
+                self._remember(key, snapshot)
+            return snapshot
 
         try:
             try:
@@ -683,6 +744,13 @@ class KernelEngine:
                     "time travel to a version at or after the table's oldest checkpoint",
                 ) from exc
             raise
+
+    def _remember(self, key: tuple[str, int | None], snapshot: Any) -> None:
+        with self._snapshots_lock:
+            self._snapshots[key] = snapshot
+            self._snapshots.move_to_end(key)
+            while len(self._snapshots) > self.snapshot_cache_size:
+                self._snapshots.popitem(last=False)
 
     def scan(
         self,
@@ -1179,6 +1247,17 @@ class KernelEngine:
                 "set the comment through the catalog after creating the table",
             )
 
+        # delta-kernel refuses these in CREATE TABLE although its metadata
+        # commit stores them; they land as version 1, before this returns.
+        deferred = {k: v for k, v in (properties or {}).items() if k in KERNEL_CREATE_DEFERRED}
+        if deferred and table.is_catalog_managed:
+            raise UnreachableTableError(
+                "create a catalog-managed table with " + ", ".join(sorted(deferred)),
+                "the kernel create refuses these properties, and a follow-up metadata commit "
+                "on a catalog-managed table would bypass the catalog",
+                "create the table, then set them through the catalog",
+            )
+        properties = {k: v for k, v in (properties or {}).items() if k not in deferred}
         version: int = create_table(
             table.location,
             schema,
@@ -1191,6 +1270,8 @@ class KernelEngine:
             uc=self._uc_commit_config(table),
             engine_info=engine_info or _engine_info(),
         )
+        if deferred:
+            version = self.set_properties(table, deferred)
         if description is not None:
             version = self.set_comment(table, description)
         return version
@@ -1230,6 +1311,8 @@ class KernelEngine:
             properties = None
         if version % self.checkpoint_interval(table, properties) != 0:
             return
+        if checkpoint_drops_stats({**table.properties, **(properties or {})}):
+            return  # it would erase every file's statistics; see supports()
         try:
             self.snapshot(table, version=version, write=True).checkpoint()
         except Exception:
@@ -2254,6 +2337,68 @@ class KernelEngine:
             columns = [columns]
         return self._commit_metadata(table, lambda s: meta.cluster_by(s, list(columns or [])))
 
+    def metadata_count(
+        self, table: ResolvedTable, *, predicate: str | None = None, version: int | None = None
+    ) -> int | None:
+        """The exact row count from the log alone, or None when it cannot be had.
+
+        Delta's `numRecords` is exact, and a deletion vector's cardinality is
+        exactly the rows it hides, so with both on every file no data file
+        need be opened -- how Databricks answers `count(*)`. None (so the
+        caller scans) when any file lacks `numRecords`, or the predicate
+        touches anything but partition columns of types whose string form
+        converts losslessly; a partition predicate is then applied exactly to
+        each file's partition values, with SQL's three-valued logic.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        snapshot = self.snapshot(table, version=version)
+        schema = _arrow_schema(snapshot)
+        node = sqlpred.parse(predicate) if predicate is not None else None
+        partitions: dict[str, Any] = {}
+        if node is not None:
+            by_lower = {name.lower(): name for name in snapshot.partition_columns}
+            for path in sqlpred.columns_of(node):
+                name = by_lower.get(path[0].lower()) if len(path) == 1 else None
+                if name is None:
+                    return None  # a data column: only a scan can decide it
+                field = schema.field(name)
+                t = field.type
+                if not (
+                    pa.types.is_string(t)
+                    or pa.types.is_integer(t)
+                    or pa.types.is_date(t)
+                    or pa.types.is_boolean(t)
+                ):
+                    return None
+                partitions[name] = field
+        skipping = sqlpred.to_kernel_json(node, schema) if node is not None else None
+        files = pa.table(snapshot.files(predicate=skipping))
+        records = files.column("num_records")
+        if records.null_count:
+            return None
+        live = pc.subtract(records, _dv_cardinalities(files.column("deletion_vector")))
+        if not partitions:
+            return int(pc.sum(live).as_py() or 0)
+        physical = {
+            fld.name: (fld.metadata or {}).get(b"delta.columnMapping.physicalName", b"").decode()
+            or fld.name
+            for fld in partitions.values()
+        }
+        values = files.column("partition_values").to_pylist()
+        columns = {}
+        for name, fld in partitions.items():
+            raw = [dict(v or ()).get(physical[name]) for v in values]
+            try:
+                columns[name] = pa.array(raw, pa.string()).cast(fld.type)
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                return None
+        columns["__live_rows"] = live
+        assert node is not None  # partitions are only collected from a predicate
+        kept = sqlpred.filter_table(pa.table(columns), node)
+        return int(pc.sum(kept.column("__live_rows")).as_py() or 0)
+
     def plan_scan(
         self,
         table: ResolvedTable,
@@ -2325,19 +2470,24 @@ class KernelEngine:
             )
         return splits
 
-    def write_files(self, table: ResolvedTable, data: Any) -> bytes:
+    def write_files(self, table: ResolvedTable, data: Any, *, version: int | None = None) -> bytes:
         """Write data files for `table` without committing them.
 
         Returns opaque fragment bytes describing what was written. The files
         exist and are durable once this returns; they belong to no version
         until `commit_files` accepts them, so a coordinator that abandons the
         write leaves them behind.
+
+        `version` writes with that snapshot's layout (the one the write was
+        planned at). A pinned snapshot is resolved once per process and then
+        reused, where the latest had to be listed again for every call; the
+        commit still refuses fragments whose layout the table has since left.
         """
         if not self.supports_distributed_write:
             raise NotImplementedError(
                 "the installed native extension cannot write files without committing"
             )
-        snapshot = self.snapshot(table, write=True)
+        snapshot = self.snapshot(table, version=version, write=True)
         result: bytes = snapshot.write_files(
             _as_record_batch_reader(data), uc=self._uc_commit_config(table, staging=True)
         )
@@ -2719,6 +2869,27 @@ def _read_plan(
                 read.append(path[0])
     read = _with_data_column(snapshot, read)
     return node, read, (wanted if read != wanted else None)
+
+
+_DROPS_STATS_REASON = (
+    "the table sets delta.checkpoint.writeStatsAsJson=false and leaves "
+    "writeStatsAsStruct unset: Spark reads that as struct stats on, this library's "
+    "checkpoint writers as off, so the checkpoint would keep no file statistics and "
+    "data skipping would stop working for every file it covers, on Databricks too"
+)
+
+
+def _dv_cardinalities(column: Any) -> Any:
+    """Rows each file's deletion vector (a descriptor JSON, or null) removes."""
+    import pyarrow as pa
+
+    return pa.array(
+        [
+            0 if dv is None else int(json.loads(dv).get("cardinality") or 0)
+            for dv in column.to_pylist()
+        ],
+        pa.int64(),
+    )
 
 
 def _arrow_schema(snapshot: Any) -> Any:

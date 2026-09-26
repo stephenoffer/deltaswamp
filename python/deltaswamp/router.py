@@ -419,7 +419,22 @@ def _preference(
 
     if operation in _DV_DML and EngineKind.KERNEL in engines and deletion_vectors_writable(table):
         return (EngineKind.KERNEL, *(k for k in engines if k is not EngineKind.KERNEL))
+    if operation in _STATS_WRITES and EngineKind.KERNEL in engines and _deltars_drops_stats(table):
+        # delta-rs matches delta.dataSkippingStatsColumns against top-level
+        # leaf names only: a nested field ("s.a") or a whole struct ("s") got
+        # no statistics, and on a column-mapped table no listed column did.
+        # The kernel honors every form. (The table's properties do not say
+        # which names are structs, so any list goes to the kernel.)
+        return (EngineKind.KERNEL, *(k for k in engines if k is not EngineKind.KERNEL))
     return engines
+
+
+_STATS_WRITES = frozenset({Operation.APPEND, Operation.OVERWRITE})
+
+
+def _deltars_drops_stats(table: ResolvedTable) -> bool:
+    """Whether delta-rs would write fewer statistics than the table asks for."""
+    return bool(table.properties.get("delta.dataSkippingStatsColumns"))
 
 
 @dataclass

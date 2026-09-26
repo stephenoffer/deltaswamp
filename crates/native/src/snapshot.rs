@@ -255,6 +255,73 @@ impl PySnapshot {
         Ok(Self { inner, engine })
     }
 
+    /// This snapshot brought up to date, reading only the log after it.
+    ///
+    /// Kernel's incremental update lists `_delta_log/` from this snapshot's
+    /// version and replays only newer commits, so on a table with nothing new
+    /// it costs one listing where `resolve` replays everything since the last
+    /// checkpoint. `options` builds a fresh store, so a re-vended credential
+    /// is used rather than the one this snapshot was read with.
+    ///
+    /// Path-based tables only: a catalog-managed table's latest version is
+    /// whatever the catalog ratified, which a listing cannot see.
+    #[pyo3(signature = (options = None, latest = true))]
+    fn refresh(
+        &self,
+        py: Python<'_>,
+        options: Option<HashMap<String, String>>,
+        latest: bool,
+    ) -> PyResult<Self> {
+        let url = self.inner.table_root().clone();
+        let options = options.unwrap_or_default();
+        let existing = self.inner.clone();
+        let (inner, engine) = py.detach(|| -> Result<(SnapshotRef, SharedEngine)> {
+            let object_store = store::build_store(&url, &options)?;
+            let engine = commit::new_engine(object_store);
+            if !latest {
+                // A pinned version never changes; only the store is renewed.
+                return Ok((existing, engine));
+            }
+            // The incremental update trusts that the log it read before is
+            // still there. A table deleted and re-created at the same path
+            // breaks that (it kept the old snapshot, or spliced the new
+            // table's commits onto the old one), so the commit file this
+            // snapshot ends at must still be the one it read.
+            let unchanged = existing
+                .log_segment()
+                .listed
+                .latest_commit_file
+                .as_ref()
+                .filter(|c| c.version == existing.version())
+                .is_some_and(|commit| {
+                    engine
+                        .storage_handler()
+                        .head(&commit.location.location)
+                        .is_ok_and(|now| {
+                            now.size == commit.location.size
+                                && now.last_modified == commit.location.last_modified
+                        })
+                });
+            let snapshot = if unchanged {
+                runtime::block_on(async {
+                    Snapshot::builder_from(existing).build(engine.as_ref() as &dyn Engine)
+                })
+            } else {
+                Err(delta_kernel::Error::generic(
+                    "the log changed under the snapshot",
+                ))
+            };
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                // Anything unexpected (the log shrank, the commit was
+                // replaced): read the table afresh, as `resolve` would.
+                Err(_) => Self::build(&engine, &url, None, None, None)?,
+            };
+            Ok((snapshot, engine))
+        })?;
+        Ok(Self { inner, engine })
+    }
+
     #[getter]
     fn version(&self) -> u64 {
         self.inner.version()

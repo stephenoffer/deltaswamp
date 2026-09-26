@@ -135,7 +135,7 @@ class Case:
         return frozenset({method, *extra} if method else extra)
 
 
-_READ_METHODS = ("scan", "execute_scan", "plan_scan")
+_READ_METHODS = ("scan", "execute_scan", "plan_scan", "metadata_count")
 _WRITE_PLAN = ("write_files", "commit_files", "append", "overwrite")
 
 
@@ -680,7 +680,7 @@ _KERNEL_WRITES = {"clustered", "defaults", "ict", "row_tracking", "type_widening
 _ALL = set(TABLES)
 
 try:
-    import pytz  # noqa: F401
+    import pytz  # type: ignore[import-untyped]  # noqa: F401
 
     _HAS_PYTZ = True
 except ImportError:

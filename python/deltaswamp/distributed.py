@@ -202,7 +202,11 @@ class WritePlan:
                 # The engines take the binary encoding; JSON text failed with a
                 # raw "Expected Struct, got Utf8".
                 data = binary_columns(pa, data, frozenset(self.variant_paths))
-        result: bytes = self.engine.write_files(self.table, data)
+
+        # At the planned version: resolved once per process and reused by
+        # every later write(), where the latest snapshot cost a log replay
+        # per call (0.6 s each, 5000 commits past a checkpoint).
+        result: bytes = self.engine.write_files(self.table, data, version=self.version)
         return result
 
     def commit(
@@ -691,13 +695,17 @@ def balance(splits: Iterable[Any], n: int) -> list[tuple[Any, ...]]:
     items = sorted(splits, key=lambda s: (-s.size, s.path))
     if not items:
         return []
+    import heapq
+
     count = max(1, min(n, len(items)))
     bins: list[list[Any]] = [[] for _ in range(count)]
-    loads = [0] * count
+    # (load, bin index): the lightest bin, lowest index on a tie -- the same
+    # choice as scanning for min(loads), in O(log n) rather than O(n) per split.
+    loads = [(0, i) for i in range(count)]
     for split in items:
-        target = loads.index(min(loads))
+        load, target = heapq.heappop(loads)
         bins[target].append(split)
-        loads[target] += split.size
+        heapq.heappush(loads, (load + split.size, target))
     return [tuple(b) for b in bins if b]
 
 

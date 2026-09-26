@@ -382,7 +382,6 @@ _FINDINGS: dict[str, tuple[str, ...]] = {
         "set_column_comment_missing",
     ),
     "E7: optimize(target_size=-1) escapes as a raw OverflowError": (
-        "optimize_target_size_negative",
     ),
     "E8: ScanPlan.read() with objects that are not splits escapes as a raw AttributeError": (
         "plan_scan_read_garbage",
