@@ -421,24 +421,25 @@ def _unescape(token: str) -> str:
     return "".join(out)
 
 
-_SPARK_TEXT = re.compile(r"""('(?:[^'\\]|\\.)*')|("(?:[^"\\]|\\.)*"|`(?:[^`]|``)*`)|'""", re.S)
+_SPARK_TEXT = re.compile(r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")|(`(?:[^`]|``)*`)|['"]""", re.S)
 
 
 def standard_string_literals(text: str) -> str:
     """SQL text with each Spark string literal respelled as ANSI SQL spells it.
 
-    Text the parser cannot represent (functions, arithmetic, MERGE clauses) is
-    handed to DataFusion or DuckDB as written, and they read string literals
-    the ANSI way: `''` is an escaped quote and a backslash is just a
-    backslash. Spark -- and so the warehouse -- reads `'it''s'` as two
-    adjacent literals (`its`) and `'a\\'b'` as `a'b`. Each run of adjacent
-    single-quoted literals is decoded as Spark decodes it and written back
-    as one `'...'` with doubled quotes, so every engine sees the value the
-    warehouse would. Double-quoted and backquoted text is left alone: those
-    engines read it as an identifier. An unterminated quote is left as is,
-    for the engine to reject.
+    DataFusion and DuckDB read string literals the ANSI way: `''` is an
+    escaped quote and a backslash is just a backslash. Spark -- and so the
+    warehouse -- reads `'it''s'` as two adjacent literals (`its`) and
+    `'a\\'b'` as `a'b`. Each run of adjacent literals is decoded as Spark
+    decodes it and written back as one `'...'` with doubled quotes, so every
+    engine sees the value the warehouse would. A double-quoted literal is a
+    string in Spark too (the warehouse reads `"ab"` as `ab`), where both
+    engines read a column named ab, so it is respelled the same way.
+    Backquoted text is an identifier and is left alone. An unterminated
+    quote is left as is, for the engine to reject. `engine.dialect` does
+    this and more for text the engines run.
     """
-    if not isinstance(text, str) or "'" not in text:
+    if not isinstance(text, str) or ("'" not in text and '"' not in text):
         return text
     out: list[str] = []
     pos = 0

@@ -1761,6 +1761,14 @@ class KernelEngine:
             assignments[column] = value
         if not assignments:
             raise UnreachableTableError("update", "no assignments given")
+        from .._variant import log_variant_columns, string_variant, variant_column
+
+        variants: frozenset[str] = frozenset()
+        if any(
+            isinstance(v.value if isinstance(v, sqlpred.Literal) else v, str)
+            for v in assignments.values()
+        ) and table.features & {"variantType", "variantType-preview"}:
+            variants = log_variant_columns(getattr(self.snapshot(table), "metadata_json", dict)())
 
         def column_index(schema: Any, name: str, what: str) -> int:
             # Delta column names are case-insensitive.
@@ -1788,6 +1796,16 @@ class KernelEngine:
                     # Stored as Spark stores it: 12.345 rounds into a
                     # DECIMAL(10,2), where Arrow's cast refused it.
                     raw = value.value if isinstance(value, sqlpred.Literal) else value
+                    if field.name.lower() in variants and isinstance(raw, str):
+                        # A new_values string is JSON text, as every write
+                        # takes a VARIANT; a SQL string literal is a variant
+                        # string, as Spark stores one.
+                        text = string_variant(raw) if isinstance(value, sqlpred.Literal) else raw
+                        encoded = variant_column(pa, pa.array([text] * out.num_rows, pa.string()))
+                        source = store_cast(encoded, field.type, field.name)
+                        new = pc.if_else(keep, out.column(index), source)
+                        out = out.set_column(index, field, new)
+                        continue
                     try:
                         literal = pa.array([raw] * out.num_rows)
                     except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:

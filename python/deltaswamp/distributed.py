@@ -41,6 +41,9 @@ class ScanPlan:
     #: Ship the catalog's own credential provider (and with it the catalog
     #: token) to workers, so they can re-vend. Off by default: see _for_workers.
     ship_catalog_auth: bool = False
+    #: Where the table's VARIANT columns are (paths of names), read as JSON
+    #: text as `Table` reads them; the engines give the binary encoding.
+    variant_paths: tuple[tuple[str, ...], ...] = ()
 
     @property
     def version(self) -> int | None:
@@ -95,6 +98,11 @@ class ScanPlan:
         )
         from .engine.base import translating_stream
 
+        if self.variant_paths:
+            from ._variant import json_text_stream
+
+            # to_arrow() gives VARIANT as JSON text; so does a planned read.
+            stream = json_text_stream(stream, frozenset(self.variant_paths))
         # A split whose file was vacuumed since planning failed as a bare
         # OSError; name the file instead.
         where = getattr(self.table, "location", None) or "the table"
@@ -138,6 +146,9 @@ class WritePlan:
     #: Ship the catalog's credential provider and the catalog itself (and with
     #: them the catalog token) to workers. Off by default: see _for_workers.
     ship_catalog_auth: bool = False
+    #: Where the table's VARIANT columns are: JSON text given for one is
+    #: encoded as `Table.append` encodes it.
+    variant_paths: tuple[tuple[str, ...], ...] = ()
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
@@ -180,6 +191,17 @@ class WritePlan:
                 data = pa.Table.from_pylist(data)
             elif all(isinstance(b, pa.RecordBatch) for b in data):
                 data = pa.Table.from_batches(data)
+        if self.variant_paths:
+            import pyarrow as pa
+
+            from ._variant import binary_columns
+
+            if isinstance(data, pa.RecordBatch):
+                data = pa.Table.from_batches([data])
+            if isinstance(data, pa.Table):
+                # The engines take the binary encoding; JSON text failed with a
+                # raw "Expected Struct, got Utf8".
+                data = binary_columns(pa, data, frozenset(self.variant_paths))
         result: bytes = self.engine.write_files(self.table, data)
         return result
 
@@ -756,6 +778,11 @@ def DeltaSwampDatasource(plan: ScanPlan) -> Any:
                         # A file vacuumed since planning: name it, not OSError.
                         where = getattr(plan.table, "location", None) or "the table"
                         reader = TranslatingStream(stream, f"{where} (a Ray read task)")
+                    paths = getattr(plan, "variant_paths", ())
+                    if paths:
+                        from deltaswamp._variant import json_text_stream
+
+                        reader = json_text_stream(reader, frozenset(paths))
                     produced = False
                     for batch in reader:
                         if batch.num_rows:

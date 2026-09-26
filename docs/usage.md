@@ -194,8 +194,13 @@ engines encode it), so a read written back stores the same values. Databricks
 turns `delta.enableVariantShredding` on for every new VARIANT table, and
 neither direct engine decodes a shredded file, so on such a table reads that
 touch a VARIANT column go to the warehouse or are refused; `count()` and reads
-of the other columns stay direct. VARIANTs nested inside a struct or array are
-not converted.
+of the other columns stay direct. Which columns are VARIANT is read from the
+log's schema, so a real `struct<metadata: binary, value: binary>` column stays
+a struct, and a VARIANT nested in a struct is converted too (one inside an
+array or a map is left in the engine's binary form). The text is Databricks':
+`1.0E20`, not `1e+20`; `00:00:00.5`, not `.500000`; object keys in Spark's
+order. `NaN` and `Infinity` are refused, as `parse_json` refuses them.
+`plan_scan()` and `plan_write()` read and take the same JSON text.
 
 Convenience wrappers sit on top:
 
@@ -299,6 +304,17 @@ t.update(new_values={"status": "archived"}, predicate="age > 365")  # plain valu
 )
 ```
 
+`DEFAULT` as a SET value (`{"city": "DEFAULT"}`, in `update` or a MERGE clause)
+is the column's DEFAULT, as in Spark: a literal DEFAULT is filled in on every
+engine, NULL where the column has none, and one that is an expression needs
+the warehouse. A column named `default` wins over the keyword, as on
+Databricks. A MERGE `when_not_matched_insert` that leaves a column out gives it
+its DEFAULT too.
+
+On a VARIANT column, `new_values` takes JSON text (`{"v": '{"q": 2}'}` stores
+the object), as every write does. In SQL `updates`, Spark's meaning holds: a
+string literal stores a variant *string*, and `parse_json('...')` an object.
+
 Through the warehouse, `update` sets a struct field by its dotted path
 (`{"s.a": 5}`) when no top-level column has that name, and `new_values` takes
 bytes, dicts (a struct) and lists (an array) as well as scalars.
@@ -329,11 +345,10 @@ as copy-on-write, or to the warehouse, and `t.can("update", updates=...,
 predicate=...)` says which.
 
 A MERGE evaluates its clauses with DuckDB (`pip install 'deltaswamp[duckdb]'`),
-after rewriting the Spark SQL spellings DuckDB reads differently: backslash
-escapes in string literals, `"text"` as a string, backtick identifiers, `<=>`,
-`nvl`, `nvl2`, `DIV`, `concat` (NULL when any argument is), numeric suffixes
-and LIKE's default `\` escape. Clause SQL DuckDB still cannot run moves the
-MERGE to delta-rs or the warehouse before anything is written. It skips target
+after translating them as described in [Spark SQL on the direct
+engines](#spark-sql-on-the-direct-engines). Clause SQL DuckDB still cannot run
+moves the MERGE to delta-rs or the warehouse before anything is written; so
+does a DEFAULT that is an expression. It skips target
 files using the source's join keys and refuses a target row that more than one
 source row would modify, as Spark does. Values are stored as Spark stores them:
 a fraction truncates into an integer column and rounds half-up into a narrower
@@ -357,6 +372,38 @@ DELETE, because UPDATE and MERGE need CDC files it cannot write. delta-rs
 `when_not_matched_insert` rejects on such a table, so that MERGE is refused
 there (and goes to the warehouse when the fallback is on); make the last NOT
 MATCHED clause unconditional, filtering the source first, to keep it local.
+
+### Spark SQL on the direct engines
+
+Predicates, SET values and MERGE clauses are Spark SQL, which the warehouse
+runs as written. SQL the predicate grammar covers is evaluated exactly on every
+engine; anything else (functions, arithmetic) is evaluated by DataFusion
+(delta-rs) or DuckDB (the kernel MERGE, the Delta Sharing filter), whose
+dialects read some Spark SQL differently or not at all. It is translated first
+(`deltaswamp.engine.dialect`), so each engine computes what the warehouse
+does:
+
+- `"ab"` is a string, adjacent literals concatenate (`'it''s'` is `its`), and
+  backslashes escape;
+- `5 / 2` is 2.5 (DataFusion divided integers into an integer), `7 DIV 2`
+  truncates, and dividing by zero is an error;
+- a fraction CAST to an integral type truncates (DuckDB rounded 1.9 to 2), and
+  `CAST('1.9' AS INT)` is an error;
+- `substring(s, 0, 2)` is `ab`, a negative position counts from the end, and
+  `left`/`right` of a non-positive length are empty;
+- `concat` is NULL when any argument is; `log(x)` is the natural log;
+  two-argument `trim`/`ltrim`/`rtrim` take the characters first;
+  `regexp_replace` replaces every match; `^` is XOR;
+- `RLIKE`/`REGEXP`, `<=>`, `nvl`, `nvl2`, `if`, `pmod`, `1.5D`, `7L`, `1.5BD`
+  and LIKE's default `\` escape work on both.
+
+SQL no rewrite makes agree is refused, and routes to the warehouse (the
+`spark_sql` need, which `can()` reports): an array subscript (0-based in Spark,
+1-based in both engines; `element_at` agrees everywhere), `split` (a regex in
+Spark), a Java date or format pattern (`date_format`, `to_date(s, fmt)`),
+`regexp_replace` with `$1` group references, and `hash`. SQL DataFusion
+cannot parse or plan raises `EngineLimitError` (a MERGE then moves to the next
+engine), not delta-rs's own `DeltaError`.
 
 ## Schema, properties and features
 
@@ -741,6 +788,13 @@ a `SqlFallbackWarning` names the warehouse whenever the fallback runs.
 [feature map](features.md) shows how each Databricks and open-source feature is
 reached.
 
+- Spark SQL that no direct engine can be made to evaluate as Spark does (an
+  array subscript, `split`, a Java date pattern, `hash`) needs the warehouse.
+  Differences that depend on the data's types stay: on delta-rs,
+  `CAST(ts AS STRING)` has a `T` between date and time, `0.1 + 0.2 = 0.3` is
+  false (short decimal literals are DOUBLEs), and a DOUBLE divided by zero is
+  infinity rather than an error; DuckDB upper-cases `ß` to `ẞ`; neither
+  raises on INT overflow where Spark's ANSI mode does.
 - DML on a kernel-only table without deletion vectors is a bounded whole-table
   rewrite, and MERGE there needs the warehouse. With deletion vectors enabled,
   UPDATE and MERGE on a change-data-feed table need the warehouse too.

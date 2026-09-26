@@ -10,6 +10,7 @@ everything afterward routes on the complete picture.
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 import warnings
 from collections.abc import Callable
@@ -224,35 +225,21 @@ def _default_column(pa: Any, field: Any, rows: int) -> Any:
 _VARIANT_FEATURES: frozenset[str] = frozenset({"variantType", "variantType-preview"})
 
 
-def _variant_text_stream(stream: Any) -> Any:
-    """A direct engine's stream with its VARIANT columns as JSON text."""
-    import pyarrow as pa
+def _log_schema(engine: Any, table: Any, version: int | None) -> Any:
+    """The table's schema as the log records it (`schemaString`, parsed), or None.
 
-    from ._variant import is_variant_struct, json_column
-
-    reader = (
-        stream.to_reader()
-        if isinstance(stream, pa.Table)
-        else stream
-        if isinstance(stream, pa.RecordBatchReader)
-        else pa.RecordBatchReader.from_stream(stream)
-    )
-    schema = reader.schema
-    indices = [i for i, f in enumerate(schema) if is_variant_struct(pa, f.type)]
-    if not indices:
-        return reader
-    target = schema
-    for i in indices:
-        target = target.set(i, pa.field(schema.field(i).name, pa.string()))
-
-    def batches() -> Any:
-        for batch in reader:
-            arrays = list(batch.columns)
-            for i in indices:
-                arrays[i] = json_column(pa, arrays[i])
-            yield pa.RecordBatch.from_arrays(arrays, schema=target)
-
-    return pa.RecordBatchReader.from_batches(target, batches())
+    Only the log says which columns are VARIANT: the direct engines read one
+    as a plain ``struct<metadata, value>``.
+    """
+    try:
+        if isinstance(engine, KernelEngine):
+            metadata = engine.snapshot(table, version=version).metadata_json()
+            return json.loads(json.loads(metadata)["schemaString"])
+        if isinstance(engine, DeltaRsEngine):
+            return json.loads(engine._open(table, version=version).schema().to_json())
+    except Exception:
+        return None
+    return None
 
 
 def _shredded_variant_error(exc: Exception) -> Exception | None:
@@ -849,6 +836,8 @@ class Table:
                 needs |= self._expression_needs(get("predicate"))
         elif op in (Operation.DELETE, Operation.UPDATE):
             needs |= self._expression_needs(get("predicate"), get("updates"))
+            if op is Operation.UPDATE:
+                needs |= self._update_defaults(get("updates"))[1]
         elif op in (Operation.SCAN, Operation.TIME_TRAVEL):
             if get("predicate") is not None:
                 needs |= self._predicate_needs(get("predicate"))
@@ -885,6 +874,10 @@ class Table:
         nested field lives on its parent and does not reach the Arrow schema.
         """
         needs = {"predicates"}
+        from .engine.dialect import warehouse_reason
+
+        if warehouse_reason(predicate) is not None:
+            needs.add("spark_sql")
         table = self._enrich()
         if not table.features & {"collations", "collations-preview"}:
             return needs
@@ -918,7 +911,7 @@ class Table:
         if not isinstance(columns, list | tuple) or not shreds_variants(self._enrich()):
             return set()
         try:
-            variants = {n.lower() for n in self._variant_names(self._raw_schema())}
+            variants = {p[0].lower() for p in self._variant_paths()}
             wanted = {str(c).lower() for c in columns}
             if predicate is not None:
                 from .predicate import columns_of, parse
@@ -946,18 +939,9 @@ class Table:
             return data
         if not isinstance(data, pa.Table):
             return data
-        from ._variant import variant_column
+        from ._variant import binary_columns
 
-        variants = {n.lower() for n in self._variant_names(self._raw_schema())}
-        for index, field in enumerate(data.schema):
-            if field.name.lower() in variants and (
-                pa.types.is_string(field.type)
-                or pa.types.is_large_string(field.type)
-                or pa.types.is_null(field.type)
-            ):
-                column = variant_column(pa, data.column(index).cast(pa.string()))
-                data = data.set_column(index, pa.field(field.name, column.type), column)
-        return data
+        return binary_columns(pa, data, self._variant_paths())
 
     def _engine(
         self,
@@ -1093,7 +1077,12 @@ class Table:
                 return stream
             if self._enrich().features & _VARIANT_FEATURES:
                 # The warehouse sends VARIANT as JSON text; so does this.
-                stream = _variant_text_stream(stream)
+                from ._variant import json_text_stream, variant_paths
+
+                log = _log_schema(
+                    engine, self._resolved, version if version is not None else self._version
+                )
+                stream = json_text_stream(stream, None if log is None else variant_paths(log))
             # A file VACUUM (or a manual delete) removed fails only once reading
             # reaches it, as a bare OSError/ArrowInvalid; name it instead.
             where = self._resolved.location or str(self._resolved.ref)
@@ -1434,6 +1423,7 @@ class Table:
         return WritePlan(
             engine=engine,
             table=self._enrich(),
+            variant_paths=tuple(sorted(self._variant_paths())),
             mode=mode,
             version=self.version,
             txn=txn,
@@ -1504,6 +1494,7 @@ class Table:
             predicate=predicate,
             snapshot_version=planned,
             ship_catalog_auth=bool(ship_catalog_auth),
+            variant_paths=tuple(sorted(self._variant_paths())),
         )
 
     def to_ray_dataset(self, *, override_num_blocks: int | None = None, **kwargs: Any) -> Any:
@@ -1841,38 +1832,51 @@ class Table:
         A VARIANT column is ``string``: reads return it as JSON text on every
         engine, and writes take JSON text (see `deltaswamp._variant`).
         """
-        schema = self._raw_schema()
-        variants = self._variant_names(schema)
-        if not variants:
+        schema, paths = self._schema_and_variants()
+        if not paths:
             return schema
         import pyarrow as pa
 
-        return pa.schema(
-            [f.with_type(pa.string()) if f.name in variants else f for f in schema],
-            metadata=schema.metadata,
-        )
+        from ._variant import text_schema
 
-    def _variant_names(self, schema: Any) -> frozenset[str]:
-        """The top-level VARIANT columns of an Arrow schema the log produced.
+        return text_schema(pa, schema, paths)
 
-        The kernel gives a VARIANT column as a bare ``struct<metadata, value>``
-        with no marker of its own, so a column of that shape on a table with
-        the variantType feature is taken as one.
-        """
+    def _variant_paths(self) -> frozenset[tuple[str, ...]]:
+        """The table's VARIANT columns (top level and nested in structs), as paths."""
         if not self._enrich().features & _VARIANT_FEATURES:
             return frozenset()
+        return self._schema_and_variants()[1]
+
+    def _schema_and_variants(self) -> tuple[Any, frozenset[tuple[str, ...]]]:
+        """The raw schema, and where its VARIANT columns are.
+
+        The kernel gives a VARIANT column as a bare ``struct<metadata, value>``
+        with no marker of its own, and a real struct of that shape looks the
+        same, so the log's schema -- where the type is ``variant`` -- decides.
+        Where the log cannot be read here, a top-level column of that shape
+        on a table with the variantType feature is taken as one.
+        """
+        schema, log = self._raw_schema(with_log=True)
+        if not self._enrich().features & _VARIANT_FEATURES:
+            return schema, frozenset()
         try:
             import pyarrow as pa
         except ImportError:
-            return frozenset()
-        from ._variant import is_variant_struct
+            return schema, frozenset()
+        from ._variant import is_variant_struct, variant_paths
 
+        if log is not None:
+            return schema, variant_paths(log)
         if not isinstance(schema, pa.Schema):
-            return frozenset()
-        return frozenset(f.name for f in schema if is_variant_struct(pa, f.type))
+            return schema, frozenset()
+        return schema, frozenset((f.name,) for f in schema if is_variant_struct(pa, f.type))
 
-    def _raw_schema(self) -> Any:
-        """The schema as the engines read and write it (VARIANT as its binary struct)."""
+    def _raw_schema(self, with_log: bool = False) -> Any:
+        """The schema as the engines read and write it (VARIANT as its binary struct).
+
+        With `with_log`, a pair: the schema and the log's own schema (parsed
+        `schemaString`), or None where the serving engine does not expose it.
+        """
         pinned = self._version is not None
         # Learning the schema reads the log, not a data file, so a table whose
         # VARIANT files are shredded still answers it directly.
@@ -1881,22 +1885,25 @@ class Table:
         )
         snapshot = getattr(engine, "snapshot", None)
         if snapshot is not None:
-            schema = snapshot(self._resolved, version=self._version).schema()
+            snap = snapshot(self._resolved, version=self._version)
+            schema = snap.schema()
         else:
             # Open the stream and take its schema; reading the whole table to
             # learn its columns cost a full scan on every count().
             schema = self.scan(limit=0)
+        log = _log_schema(engine, self._resolved, self._version) if with_log else None
         try:
             import pyarrow as pa
         except ImportError:
-            return schema
+            return (schema, log) if with_log else schema
         # The kernel hands back an arro3 Schema; every other engine a pyarrow
         # one. Return one type, whichever engine served it.
-        if isinstance(schema, pa.Schema):
-            return schema
-        if hasattr(schema, "__arrow_c_stream__"):
-            return pa.RecordBatchReader.from_stream(schema).schema
-        return pa.schema(schema)
+        if not isinstance(schema, pa.Schema):
+            if hasattr(schema, "__arrow_c_stream__"):
+                schema = pa.RecordBatchReader.from_stream(schema).schema
+            else:
+                schema = pa.schema(schema)
+        return (schema, log) if with_log else schema
 
     def _current(self) -> ResolvedTable:
         """Protocol state as the log has it now (as pinned, for a pinned handle).
@@ -2025,7 +2032,13 @@ class Table:
         that evaluates SQL instead of failing on the kernel mid-call.
         """
         from . import predicate as sqlpred
+        from .engine.dialect import warehouse_reason
 
+        texts = [predicate, *(updates.values() if isinstance(updates, dict) else ())]
+        if any(warehouse_reason(t) is not None for t in texts):
+            # Spark SQL neither direct engine can be made to compute as
+            # Databricks does (a 0-based array subscript, `split`).
+            return frozenset({"sql_expressions", "spark_sql"})
         try:
             if isinstance(predicate, str) and predicate.strip():
                 sqlpred.parse(predicate)
@@ -2441,8 +2454,17 @@ class Table:
         if not updates and not new_values:
             raise InvalidArgumentError("update needs at least one column to set")
         needs = self._update_needs(updates, False) | self._update_needs(new_values, True)
-        needs |= self._expression_needs(predicate, updates)
+        defaults, default_needs = self._update_defaults(updates)
+        needs |= default_needs
+        needs |= self._expression_needs(
+            predicate,
+            None if updates is None else {k: defaults.get(k, v) for k, v in updates.items()},
+        )
         engine = self._engine(Operation.UPDATE, needs)
+        if defaults and isinstance(engine, (KernelEngine, DeltaRsEngine)):
+            # The warehouse reads `DEFAULT` itself; a direct engine gets the
+            # column's literal DEFAULT (or NULL) spelled out.
+            updates = {k: defaults.get(k, v) for k, v in (updates or {}).items()}
         # delta-rs skips a SET target it cannot find -- an unknown name, a
         # different case, a nested field -- and still rewrites every matched
         # file, reporting the rows as updated while changing nothing.
@@ -2458,6 +2480,49 @@ class Table:
         )
         self._invalidate()
         return result
+
+    def _update_defaults(self, updates: Any) -> tuple[dict[str, str], frozenset[str]]:
+        """`SET c = DEFAULT`: each such column's DEFAULT as SQL, for a direct engine.
+
+        Spark sets the column to its DEFAULT (NULL for a column without one).
+        Read as SQL, `DEFAULT` was a column name, and the kernel refused "no
+        column 'DEFAULT'". A literal DEFAULT is spelled out, as `append` fills
+        one in; an expression (`current_timestamp()`) is Databricks' to
+        evaluate, so the UPDATE needs ``sql_column_defaults``.
+        """
+        if not isinstance(updates, dict):
+            return {}, frozenset()
+        keys = [
+            k
+            for k, v in updates.items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip().upper() == "DEFAULT"
+        ]
+        if not keys:
+            return {}, frozenset()
+        try:
+            import pyarrow as pa
+
+            fields = {f.name.lower(): f for f in self.schema()}
+        except (ImportError, DeltaSwampError):
+            return {}, frozenset()
+        if "default" in fields:
+            # A column named `default` wins over the keyword, as on Databricks.
+            return {}, frozenset()
+        out: dict[str, str] = {}
+        needs: set[str] = set()
+        for key in keys:
+            quoted = len(key) > 1 and key[0] == key[-1] == "`"
+            field = fields.get((key[1:-1].replace("``", "`") if quoted else key).lower())
+            if field is None:
+                continue  # _update_targets names the unknown column
+            text = _column_default(field)
+            if text is None:
+                out[key] = "NULL"
+            elif _default_column(pa, field, 1) is not None:
+                out[key] = text
+            else:
+                needs.add("sql_column_defaults")
+        return out, frozenset(needs)
 
     def _update_targets(self, targets: dict[str, Any], deltars: bool) -> dict[str, Any]:
         """Resolve UPDATE's SET targets against the table's columns.
