@@ -23,7 +23,20 @@ import struct
 import uuid
 from typing import Any
 
-__all__ = ["encode", "is_variant_struct", "json_column", "to_json", "variant_column"]
+__all__ = [
+    "binary_columns",
+    "datafusion_literal",
+    "encode",
+    "is_variant_struct",
+    "json_column",
+    "json_text_stream",
+    "log_variant_columns",
+    "string_variant",
+    "text_schema",
+    "to_json",
+    "variant_column",
+    "variant_paths",
+]
 
 _EPOCH = _dt.datetime(1970, 1, 1)
 _EPOCH_DATE = _dt.date(1970, 1, 1)
@@ -46,11 +59,13 @@ def _keys(metadata: bytes) -> list[str]:
 
 def _float32(value: float) -> str:
     """The shortest text that reads back as the same float32, as Spark prints it."""
+    if value != value or value in (float("inf"), float("-inf")):
+        return _number(value)
     packed = struct.pack("<f", value)
     for digits in range(1, 10):
         text = f"{value:.{digits}g}"
         if struct.pack("<f", float(text)) == packed:
-            return _number(float(text))
+            return _java_number(text)
     return _number(value)
 
 
@@ -58,7 +73,33 @@ def _number(value: float) -> str:
     if value != value or value in (float("inf"), float("-inf")):
         # Not JSON numbers; Spark writes them as strings.
         return json.dumps(str(value).replace("inf", "Infinity").replace("nan", "NaN"))
-    return repr(value)
+    return _java_number(repr(value))
+
+
+def _java_number(shortest: str) -> str:
+    """A float's shortest round-trip digits, laid out as Java's toString does.
+
+    Databricks' `to_json` prints a DOUBLE the Java way: plain notation with at
+    least one fractional digit from 10^-3 up to 10^7 (`1.5`, `100.0`), else
+    `1.0E20` / `1.0E-5`. Python's repr gave `1e+20` and `1e-05`, so the same
+    table read back different text through the kernel and the warehouse.
+    """
+    sign, digits, exponent = decimal.Decimal(shortest).as_tuple()
+    assert isinstance(exponent, int)
+    lead = "-" if sign else ""
+    text = "".join(map(str, digits)).lstrip("0")
+    if not text:
+        return lead + "0.0"
+    # The value is 0.<text> x 10^point.
+    point = len(text) + exponent
+    text = text.rstrip("0")
+    if -3 < point <= 7:
+        if point <= 0:
+            return f"{lead}0.{'0' * -point}{text}"
+        whole, frac = text[:point].ljust(point, "0"), text[point:]
+        return f"{lead}{whole}.{frac or '0'}"
+    mantissa = text[0] + "." + (text[1:] or "0")
+    return f"{lead}{mantissa}E{point - 1}"
 
 
 def _decimal(unscaled: int, scale: int) -> str:
@@ -73,6 +114,9 @@ def _micros(value: int, *, zone: bool) -> str:
     except OverflowError:
         return json.dumps(str(value))
     text = moment.isoformat(sep=" ")
+    if "." in text:
+        # Databricks prints the fraction without trailing zeros: .5, not .500000.
+        text = text.rstrip("0").rstrip(".")
     return json.dumps(text + "+00:00" if zone else text)
 
 
@@ -174,9 +218,12 @@ def _encode(item: Any, ids: dict[str, int]) -> bytes:
     if isinstance(item, _Float):
         exact = decimal.Decimal(item)
         _, digits, exponent = exact.as_tuple()
-        if "e" not in item.lower() and isinstance(exponent, int) and len(digits) <= 38:
-            scale = max(0, -exponent)
-            return _decimal_bytes(int(exact.scaleb(scale)), scale, max(len(digits), scale))
+        scale = max(0, -exponent) if isinstance(exponent, int) else 0
+        # DECIMAL(precision, scale) needs both within 38: `0.<37 zeros>12`
+        # has 2 digits but scale 39, which Databricks types as a DOUBLE.
+        precision = max(len(digits), scale)
+        if "e" not in item.lower() and isinstance(exponent, int) and precision <= 38:
+            return _decimal_bytes(int(exact.scaleb(scale)), scale, precision)
         return bytes([7 << 2]) + struct.pack("<d", float(item))
     if isinstance(item, int):
         for head, size in ((3, 1), (4, 2), (5, 4), (6, 8)):
@@ -194,7 +241,7 @@ def _encode(item: Any, ids: dict[str, int]) -> bytes:
         parts = [_encode(x, ids) for x in item]
         return _container(3, parts, None)
     if isinstance(item, dict):
-        names = sorted(item)
+        names = sorted(item, key=_java_order)
         parts = [_encode(item[n], ids) for n in names]
         return _container(2, parts, [ids[n] for n in names])
     raise ValueError(f"cannot encode {type(item).__name__} as a variant")
@@ -228,17 +275,33 @@ def _names(item: Any, into: set[str]) -> None:
             _names(v, into)
 
 
+def _java_order(key: str) -> bytes:
+    """Sort key giving Java's String order (by UTF-16 code unit), as Spark sorts.
+
+    Python orders by code point, which puts U+FF01 before U+1F600; in UTF-16
+    the emoji's surrogates come first. Spark looks object fields up by binary
+    search in its own order, so an object sorted the Python way could miss keys.
+    """
+    return key.encode("utf-16-be")
+
+
+def _no_constant(name: str) -> Any:
+    # Python's json reads NaN and Infinity; they are not JSON, and
+    # Databricks' parse_json refuses them (MALFORMED_RECORD_IN_PARSING).
+    raise ValueError(f"{name} is not a JSON value")
+
+
 def encode(text: str) -> tuple[bytes, bytes]:
     """JSON text as a variant's (metadata, value), typed the way ``parse_json`` does.
 
     Integers take the narrowest integer type, then DECIMAL(38); a number with a
-    fraction is an exact DECIMAL when it fits 38 digits, else a DOUBLE, as is
-    any number written with an exponent.
+    fraction is an exact DECIMAL when its precision and scale fit 38, else a
+    DOUBLE, as is any number written with an exponent.
     """
-    item = json.loads(text, parse_float=_Float, parse_constant=_Float)
+    item = json.loads(text, parse_float=_Float, parse_constant=_no_constant)
     keys: set[str] = set()
     _names(item, keys)
-    ordered = sorted(keys)
+    ordered = sorted(keys, key=_java_order)
     ids = {k: i for i, k in enumerate(ordered)}
     raw = [k.encode() for k in ordered]
     offsets = [0]
@@ -311,4 +374,198 @@ def variant_column(pa: Any, column: Any) -> Any:
         [pa.array(metadata, pa.binary()), pa.array(value, pa.binary())],
         fields=list(variant_type(pa)),
         mask=pa.array(mask, pa.bool_()),
+    )
+
+
+# ------------------------------------------------------------- by schema
+
+Paths = frozenset[tuple[str, ...]]
+
+
+def variant_paths(schema: Any) -> Paths:
+    """The VARIANT columns of a Delta schema (the log's `schemaString`, parsed).
+
+    Top-level columns and fields nested in structs, each as its path of names.
+    The Arrow schema cannot tell: the kernel reads a VARIANT as a bare
+    ``struct<metadata: binary, value: binary>``, and a real struct of that
+    shape looked the same -- and was then decoded as a variant, and failed.
+    A VARIANT inside an array or a map is not listed (it stays binary).
+    """
+    out: set[tuple[str, ...]] = set()
+
+    def walk(fields: Any, prefix: tuple[str, ...]) -> None:
+        for f in fields or []:
+            if not isinstance(f, dict):
+                continue
+            path = (*prefix, str(f.get("name")))
+            kind = f.get("type")
+            if kind == "variant":
+                out.add(path)
+            elif isinstance(kind, dict) and kind.get("type") == "struct":
+                walk(kind.get("fields"), path)
+
+    if isinstance(schema, dict):
+        walk(schema.get("fields"), ())
+    return frozenset(out)
+
+
+def _under(paths: Paths, name: str) -> Paths:
+    return frozenset(p[1:] for p in paths if p and p[0] == name and len(p) > 1)
+
+
+def _text_type(pa: Any, arrow_type: Any, paths: Paths, here: bool) -> Any:
+    if here and is_variant_struct(pa, arrow_type):
+        return pa.string()
+    if pa.types.is_struct(arrow_type) and paths:
+        return pa.struct(
+            [
+                f.with_type(_text_type(pa, f.type, _under(paths, f.name), (f.name,) in paths))
+                for f in (arrow_type.field(i) for i in range(arrow_type.num_fields))
+            ]
+        )
+    return arrow_type
+
+
+def text_schema(pa: Any, schema: Any, paths: Paths) -> Any:
+    """`schema` with each VARIANT (at `paths`) as a string, the type reads give it."""
+    return pa.schema(
+        [
+            f.with_type(_text_type(pa, f.type, _under(paths, f.name), (f.name,) in paths))
+            for f in schema
+        ],
+        metadata=schema.metadata,
+    )
+
+
+def _to_text(pa: Any, array: Any, paths: Paths, here: bool) -> Any:
+    if here and is_variant_struct(pa, array.type):
+        return json_column(pa, array)
+    if pa.types.is_struct(array.type) and paths:
+        if isinstance(array, pa.ChunkedArray):
+            chunks = [_to_text(pa, c, paths, False) for c in array.chunks]
+            return pa.chunked_array(chunks, type=_text_type(pa, array.type, paths, False))
+        fields = [array.type.field(i) for i in range(array.type.num_fields)]
+        children = [
+            _to_text(pa, array.field(i), _under(paths, f.name), (f.name,) in paths)
+            for i, f in enumerate(fields)
+        ]
+        return pa.StructArray.from_arrays(
+            children,
+            fields=[f.with_type(c.type) for f, c in zip(fields, children, strict=True)],
+            mask=array.is_null() if array.null_count else None,
+        )
+    return array
+
+
+def json_text_stream(stream: Any, paths: Paths | None) -> Any:
+    """A direct engine's stream with the VARIANT columns at `paths` as JSON text.
+
+    With `paths` None (the log's schema was not to hand), every top-level
+    column of the variant shape is taken as one.
+    """
+    import pyarrow as pa
+
+    reader = (
+        stream.to_reader()
+        if isinstance(stream, pa.Table)
+        else stream
+        if isinstance(stream, pa.RecordBatchReader)
+        else pa.RecordBatchReader.from_stream(stream)
+    )
+    schema = reader.schema
+    if paths is None:
+        paths = frozenset((f.name,) for f in schema if is_variant_struct(pa, f.type))
+    target = text_schema(pa, schema, paths)
+    if target == schema:
+        return reader
+
+    def batches() -> Any:
+        for batch in reader:
+            arrays = [
+                _to_text(pa, batch.column(i), _under(paths, f.name), (f.name,) in paths)
+                for i, f in enumerate(schema)
+            ]
+            yield pa.RecordBatch.from_arrays(arrays, schema=target)
+
+    return pa.RecordBatchReader.from_batches(target, batches())
+
+
+def _is_text(pa: Any, arrow_type: Any) -> bool:
+    t = pa.types
+    return bool(t.is_string(arrow_type) or t.is_large_string(arrow_type) or t.is_null(arrow_type))
+
+
+def _to_binary(pa: Any, array: Any, paths: Paths, here: bool) -> Any:
+    if here and _is_text(pa, array.type):
+        return variant_column(pa, array.cast(pa.string()))
+    if pa.types.is_struct(array.type) and paths:
+        if isinstance(array, pa.ChunkedArray):
+            chunks = [_to_binary(pa, c, paths, False) for c in array.chunks]
+            if not chunks:
+                return array
+            return pa.chunked_array(chunks, type=chunks[0].type)
+        fields = [array.type.field(i) for i in range(array.type.num_fields)]
+        children = [
+            _to_binary(pa, array.field(i), _under(paths, f.name), (f.name,) in paths)
+            for i, f in enumerate(fields)
+        ]
+        return pa.StructArray.from_arrays(
+            children,
+            fields=[f.with_type(c.type) for f, c in zip(fields, children, strict=True)],
+            mask=array.is_null() if array.null_count else None,
+        )
+    return array
+
+
+def binary_columns(pa: Any, data: Any, paths: Paths) -> Any:
+    """A pyarrow Table with JSON text at the VARIANT `paths` encoded for a direct engine.
+
+    Columns are matched case-insensitively, as a write matches them; data
+    already in the binary shape passes through.
+    """
+    if not paths:
+        return data
+    by_lower = {p[0].lower(): p[0] for p in paths}
+    for index, field in enumerate(data.schema):
+        name = by_lower.get(field.name.lower())
+        if name is None:
+            continue
+        column = _to_binary(pa, data.column(index), _under(paths, name), (name,) in paths)
+        if column is not data.column(index):
+            data = data.set_column(index, pa.field(field.name, column.type), column)
+    return data
+
+
+def log_variant_columns(metadata_json: Any) -> frozenset[str]:
+    """Lower-cased top-level VARIANT columns, from a snapshot's metaData JSON."""
+    try:
+        metadata = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+        schema = json.loads(metadata.get("schemaString") or "{}")
+    except (TypeError, ValueError, AttributeError):
+        return frozenset()
+    return frozenset(p[0].lower() for p in variant_paths(schema) if len(p) == 1)
+
+
+def string_variant(text: str) -> str:
+    """The JSON text of a VARIANT holding the string `text`.
+
+    Spark stores a STRING assigned to a VARIANT column as a variant string
+    (`SET v = '{"a":1}'` holds the text, not an object); `parse_json` is how
+    SQL makes an object.
+    """
+    return json.dumps(text, ensure_ascii=False)
+
+
+def datafusion_literal(column_sql: str, text: str) -> str:
+    """DataFusion SQL for a VARIANT value (JSON `text`), typed as `column_sql`'s column.
+
+    DataFusion builds a struct literal with nullable fields and cannot cast it
+    to the column's non-null ones ("Unsupported CAST"); a CASE with the column
+    itself in a branch that never applies gives the literal the column's type.
+    """
+    metadata, value = encode(text)
+    literal = f"named_struct('metadata', X'{metadata.hex()}', 'value', X'{value.hex()}')"
+    return (
+        f"CASE WHEN ({column_sql} IS NULL) AND ({column_sql} IS NOT NULL) THEN {column_sql} "
+        f"ELSE {literal} END"
     )

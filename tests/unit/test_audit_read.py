@@ -36,7 +36,7 @@ class TestAdjacentLiterals:
             ("s = 'it''s'", "s = 'its'"),
             (r"s = 'it\'s'", "s = 'it''s'"),
             (r"f(s) = 'a\\b' AND g = 'x' 'y'", "f(s) = 'a\\b' AND g = 'xy'"),
-            ("\"ident\" = 'v'", "\"ident\" = 'v'"),
+            ("\"text\" = 'v'", "'text' = 'v'"),
             ("`it's` = 'v'", "`it's` = 'v'"),
             ("s = 'unterminated", "s = 'unterminated"),
             ("no literals", "no literals"),

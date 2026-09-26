@@ -380,6 +380,9 @@ class SqlEngine:
     supports_predicates = True
     #: DML predicates and SET values are the warehouse's own Spark SQL.
     supports_sql_expressions = True
+    #: SQL no direct engine can be made to evaluate as Spark does (an array
+    #: subscript, `split`): see `dialect.warehouse_reason`.
+    supports_spark_sql = True
     supports_timestamp_travel = True
     #: `INSERT WITH SCHEMA EVOLUTION` / `MERGE WITH SCHEMA EVOLUTION`.
     supports_schema_merge = True
@@ -1218,9 +1221,21 @@ class SqlEngine:
         ]
         # None is written as the NULL literal: a STRING-typed NULL marker is
         # refused by ANSI store assignment into an INT/DATE/... column.
-        assignments += [
-            f"{target[k]} = {_value_sql(v, binder)}" for k, v in (new_values or {}).items()
-        ]
+        variants = (
+            self._variant_columns(table)
+            if any(isinstance(v, str) for v in (new_values or {}).values())
+            else frozenset()
+        )
+
+        def value(key: Any, v: Any) -> str:
+            text = _value_sql(v, binder)
+            if isinstance(v, str) and str(key).strip("`").lower() in variants:
+                # JSON text, as every write takes a VARIANT; bound bare, the
+                # warehouse stored the text as a variant string.
+                return f"parse_json({text})"
+            return text
+
+        assignments += [f"{target[k]} = {value(k, v)}" for k, v in (new_values or {}).items()]
         both = {str(k).lower() for k in (updates or {})} & {
             str(k).lower() for k in (new_values or {})
         }

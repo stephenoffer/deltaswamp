@@ -51,7 +51,7 @@ from ..catalog.sharing import (
     request_error_types,
     sharing_module,
 )
-from ..errors import UnreachableTableError
+from ..errors import EngineLimitError, UnreachableTableError
 from .base import missing_method
 
 __all__ = [
@@ -132,8 +132,8 @@ def filter_arrow_exact(table: Any, predicate: Any) -> Any:
     except sqlpred.PredicateError:
         if not isinstance(predicate, str) or _duckdb() is None:
             raise
-        # DuckDB reads string literals the ANSI way; respell Spark's.
-        predicate = sqlpred.standard_string_literals(predicate)
+        # DuckDB reads Spark SQL differently in places; respell it.
+        predicate = _duckdb_text(predicate)
         _screen_expression(predicate)
     return _sandboxed_filter(table, predicate)
 
@@ -145,6 +145,24 @@ class _SandboxedSql:
 
     def __init__(self, text: str) -> None:
         self.text = text
+
+
+def _duckdb_text(predicate: str) -> str:
+    """Spark SQL `predicate` as DuckDB must read it to mean the same.
+
+    `"ab"` is a string in Spark, a column in DuckDB; `substring`, CAST, `/`
+    and the rest differ too (see `engine.dialect`). SQL DuckDB cannot be
+    made to evaluate as Spark does is refused rather than filtered wrongly.
+    """
+    predicate_module = importlib.import_module("deltaswamp.predicate")
+    dialect = importlib.import_module("deltaswamp.engine.dialect")
+    try:
+        text: str = dialect.to_duckdb(predicate)
+    except EngineLimitError as exc:
+        raise predicate_module.PredicateError(
+            f"cannot filter a shared table by {predicate!r}: {exc.reason}"
+        ) from None
+    return text
 
 
 def _duckdb() -> Any:
@@ -195,6 +213,7 @@ def _sandboxed_filter(table: Any, text: str) -> Any:
         },
     )
     try:
+        importlib.import_module("deltaswamp.engine.dialect").install_duckdb_macros(con)
         # The relational API parses an expression list, never a statement.
         result = con.from_arrow(table).project(f"CAST(({text}) AS BOOLEAN) AS __deltaswamp_keep")
         result = result.arrow()
@@ -226,8 +245,8 @@ def _parse_predicate(predicate: str | None) -> Any:
     except predicate_module.PredicateError:
         if _duckdb() is None:
             raise
-        # DuckDB reads string literals the ANSI way; respell Spark's.
-        predicate = predicate_module.standard_string_literals(predicate)
+        # DuckDB reads Spark SQL differently in places; respell it.
+        predicate = _duckdb_text(predicate)
         _screen_expression(predicate)
         return _SandboxedSql(predicate)
 

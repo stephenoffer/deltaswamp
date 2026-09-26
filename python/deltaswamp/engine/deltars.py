@@ -1069,6 +1069,15 @@ class DeltaRsEngine:
             raise InvalidArgumentError("update needs at least one column to set")
         with _no_panics("update"):
             dt = self._open(table, write=True)
+            variants = _variant_columns(table, dt)
+            if variants and new_values is not None:
+                for column, value in new_values.items():
+                    name = column.strip("`").lower() if isinstance(column, str) else ""
+                    if name in variants and isinstance(value, str):
+                        # JSON text, as every write takes a VARIANT.
+                        updates[column] = _variant_sql(column, value)
+            elif variants:
+                updates = _variant_updates(dt, updates, variants)
             updates = _datafusion_updates(dt, updates, rendered=new_values is not None)
             if new_values is None:
                 names = _column_names(dt)
@@ -1112,13 +1121,23 @@ class DeltaRsEngine:
         )
         data = _respell_source(_plain_data(source), _column_names(dt))
         columns = _merge_columns(dt, data, kwargs)
+        kinds = _merge_kinds(dt, data)
+        refusal: EngineLimitError | None = None
         if isinstance(predicate, str):
-            predicate = _exact_decimals(_fold_case(_standard_string_literals(predicate), columns))
+            try:
+                predicate = _exact_decimals(
+                    _fold_case(_spark_to_datafusion(predicate, kinds), columns)
+                )
+            except EngineLimitError as exc:
+                # Raised at execute, so `Table` can hand the MERGE on.
+                refusal, predicate = exc, "FALSE"
         merger = dt.merge(data, predicate, **kwargs)
         return _CheckedMerger(
             merger,
             columns,
             _column_names(dt),
+            kinds=kinds,
+            refusal=refusal,
             generated=_generated_columns(dt),
             source_alias=kwargs.get("source_alias"),
             target_alias=kwargs.get("target_alias"),
@@ -1831,6 +1850,7 @@ def _datafusion_updates(dt: Any, updates: dict[str, str], *, rendered: bool) -> 
     pa = _require("pyarrow", "pyarrow", "an UPDATE through delta-rs")
 
     from .. import predicate as sqlpred
+    from .dialect import numeric_kinds
 
     keys = _canonical_columns(dt, list(updates)) or []
     try:
@@ -1842,8 +1862,8 @@ def _datafusion_updates(dt: Any, updates: dict[str, str], *, rendered: bool) -> 
         out[key] = expression
         if rendered:
             continue
-        # Spark SQL passed through: its string literals as DataFusion reads them.
-        out[key] = sqlpred.standard_string_literals(expression)
+        # Spark SQL passed through, as DataFusion must read it to agree.
+        out[key] = _spark_to_datafusion(expression, numeric_kinds(schema))
         # A name that is not a plain identifier arrives backticked.
         name = key[1:-1].replace("``", "`") if len(key) > 1 and key[0] == key[-1] == "`" else key
         if schema.get_field_index(name) < 0:
@@ -2028,6 +2048,7 @@ def _datafusion_predicate(
     pa = _require("pyarrow", "pyarrow", "a predicate on a delta-rs write")
 
     from .. import predicate as sqlpred
+    from .dialect import numeric_kinds
 
     try:
         schema = pa.schema(dt.schema().to_arrow())
@@ -2045,7 +2066,7 @@ def _datafusion_predicate(
         return _shield_stats(
             _exact_decimals(
                 _fold_case(
-                    _refuse_null_literals(sqlpred.standard_string_literals(predicate)),
+                    _refuse_null_literals(_spark_to_datafusion(predicate, numeric_kinds(schema))),
                     {None: list(schema.names)},
                 )
             ),
@@ -2068,7 +2089,7 @@ def _datafusion_predicate(
         return _shield_stats(
             _exact_decimals(
                 _fold_case(
-                    _refuse_null_literals(sqlpred.standard_string_literals(predicate)),
+                    _refuse_null_literals(_spark_to_datafusion(predicate, numeric_kinds(schema))),
                     {None: list(schema.names)},
                 )
             ),
@@ -2277,11 +2298,93 @@ _SQL_NUMBER = re.compile(
 )
 
 
-def _standard_string_literals(expr: str) -> str:
-    """Spark string literals in `expr` spelled as DataFusion reads them."""
-    from .. import predicate as sqlpred
+def _spark_to_datafusion(expr: str, kinds: Mapping[str, str] | None = None) -> str:
+    """Spark SQL text passed through to delta-rs, as DataFusion must read it.
 
-    return sqlpred.standard_string_literals(expr)
+    String literals (`"ab"` is one, as are adjacent ones), typed numeric
+    literals, `/`, `DIV`, `RLIKE`, `substring`, `concat` and the other places
+    the dialects differ (see `dialect`). `kinds` types the columns for `/`.
+    """
+    from .dialect import to_datafusion
+
+    return to_datafusion(expr, kinds)
+
+
+def _variant_columns(table: ResolvedTable, dt: Any) -> frozenset[str]:
+    """Lower-cased top-level VARIANT columns of `table`, from its log."""
+    if not table.features & {"variantType", "variantType-preview"}:
+        return frozenset()
+    try:
+        from .._variant import variant_paths
+
+        schema = json.loads(dt.schema().to_json())
+    except Exception:
+        return frozenset()
+    return frozenset(p[0].lower() for p in variant_paths(schema) if len(p) == 1)
+
+
+def _variant_sql(column: str, text: str) -> str:
+    from .._variant import datafusion_literal
+
+    bare = column[1:-1].replace("``", "`") if column[:1] == column[-1:] == "`" else column
+    try:
+        # Backquoted: this is Spark SQL still, translated with the rest.
+        return datafusion_literal("`" + bare.replace("`", "``") + "`", text)
+    except ValueError as exc:
+        raise InvalidArgumentError(
+            f"a VARIANT column takes JSON text, and {text[:80]!r} is not JSON ({exc})"
+        ) from None
+
+
+def _variant_updates(dt: Any, updates: dict[str, str], variants: frozenset[str]) -> dict[str, str]:
+    """SET values for VARIANT columns as DataFusion can store them.
+
+    `parse_json('<json>')` is the object; a string literal is a variant
+    string, as Spark stores it. delta-rs could do neither: "Unsupported CAST
+    from Utf8 to Struct".
+    """
+    from .. import predicate as sqlpred
+    from .._variant import string_variant
+    from .dialect import parse_json_literal
+
+    out = dict(updates)
+    for column, expression in updates.items():
+        if column.strip("`").lower() not in variants or not isinstance(expression, str):
+            continue
+        text = parse_json_literal(expression)
+        if text is None:
+            try:
+                value = sqlpred.parse_value(expression)
+            except sqlpred.PredicateError:
+                continue
+            if not (isinstance(value, sqlpred.Literal) and isinstance(value.value, str)):
+                continue
+            text = string_variant(value.value)
+        out[column] = _variant_sql(column, text)
+    return out
+
+
+def _is_default_keyword(value: Any) -> bool:
+    """`DEFAULT` as a SET/INSERT value. delta-rs serves no table with column
+    defaults (allowColumnDefaults), so it is NULL here, as Spark makes it for
+    a column without one."""
+    return isinstance(value, str) and value.strip().upper() == "DEFAULT"
+
+
+def _merge_kinds(dt: Any, source: Any) -> dict[str, str]:
+    """Numeric kinds of a MERGE's target and source columns, for `/`."""
+    from .dialect import numeric_kinds
+
+    try:
+        import pyarrow as pa
+
+        target = pa.schema(dt.schema().to_arrow())
+        schema = getattr(source, "schema", None)
+        if schema is not None and not isinstance(schema, pa.Schema):
+            schema = pa.schema(schema)
+        return numeric_kinds(target, schema)
+    except Exception:
+        return {}
 
 
 def _exact_decimals(expr: str) -> str:
@@ -2617,6 +2720,9 @@ def _no_panics(what: str) -> Iterator[None]:
             raise InvalidArgumentError(
                 f"the data violates the table's constraints, so nothing was written: {exc}"
             ) from exc
+        refused = _datafusion_sql_error(what, exc)
+        if refused is not None:
+            raise refused from exc
         raise
     except BaseException as exc:
         if type(exc).__name__ != "PanicException":
@@ -2639,6 +2745,41 @@ def _no_panics(what: str) -> Iterator[None]:
             "engine rather than in your input; deltaswamp validates properties up "
             "front to avoid the known cases."
         ) from exc
+
+
+#: DataFusion's words for SQL it could not parse, plan or type -- found before
+#: any row is read, so nothing has been written.
+_DATAFUSION_SQL_ERRORS = (
+    "SQL error: ParserError",
+    "Error during planning",
+    "This feature is not implemented",
+    "type_coercion",
+    "Invalid comparison operation",
+)
+
+
+def _datafusion_sql_error(what: str, exc: Exception) -> Exception | None:
+    """delta-rs's DeltaError for SQL DataFusion cannot evaluate, as this library's error.
+
+    Raw, it was not a DeltaSwampError, so `except DeltaSwampError` missed it
+    and a MERGE could not move on to an engine that evaluates Spark SQL.
+    """
+    if type(exc).__name__ != "DeltaError":
+        return None
+    message = str(exc)
+    first = message.strip().splitlines()[0][:300] if message.strip() else message
+    if "Schema error: No field named" in message:
+        return InvalidArgumentError(
+            f"cannot {what}: the SQL names a column that is not there: {first}"
+        )
+    if not any(marker in message for marker in _DATAFUSION_SQL_ERRORS):
+        return None
+    return EngineLimitError(
+        f"{what} with delta-rs",
+        f"DataFusion, which evaluates delta-rs's SQL, cannot run it ({first})",
+        "ds.connect(..., allow_sql_fallback=True) runs it on a SQL warehouse; or rewrite "
+        "the expression",
+    )
 
 
 #: commitInfo key marking a compaction this process ran, to find its commit.
@@ -2725,8 +2866,14 @@ class _CheckedMerger:
         target_alias: str | None = None,
         change_feed: bool = False,
         computed: set[str] | None = None,
+        kinds: Mapping[str, str] | None = None,
+        refusal: EngineLimitError | None = None,
     ) -> None:
         self._merger = merger
+        #: Numeric kinds of the columns, for translating `/`.
+        self._kinds = kinds
+        #: Clause SQL DataFusion cannot be made to evaluate as Spark does.
+        self._refusal = refusal
         #: alias -> column names, for respelling clause SQL case-insensitively.
         self._columns = columns or {}
         self._target = target or []
@@ -2747,6 +2894,8 @@ class _CheckedMerger:
             self._clauses.append(clause)
 
     def execute(self, *args: Any, **kwargs: Any) -> Any:
+        if self._refusal is not None:
+            raise self._refusal
         not_matched = [conditional for kind, conditional in self._clauses if kind == "not_matched"]
         if self._change_feed and not_matched and not_matched[-1]:
             # delta-rs 1.6.5 writes an all-NULL row into the table for every
@@ -2805,7 +2954,13 @@ class _CheckedMerger:
 
     def _fold(self, value: Any) -> Any:
         if isinstance(value, str):
-            return _exact_decimals(_fold_case(_standard_string_literals(value), self._columns))
+            try:
+                text = _spark_to_datafusion(value, self._kinds)
+            except EngineLimitError as exc:
+                # Raised at execute, before anything is written.
+                self._refusal = self._refusal or exc
+                return "FALSE"
+            return _exact_decimals(_fold_case(text, self._columns))
         if isinstance(value, dict):
             # SET/INSERT keys name target columns, unqualified.
             return {
@@ -2813,13 +2968,24 @@ class _CheckedMerger:
                     _fold_case(k, {None: self._target}).strip("`")
                     if isinstance(k, str) and "`" not in k
                     else k
-                ): self._fold(v)
+                ): "NULL"
+                if _is_default_keyword(v) and not self._default_column()
+                else self._fold(v)
                 for k, v in value.items()
             }
         return value
 
+    def _value(self, value: Any) -> Any:
+        if _is_default_keyword(value) and not self._default_column():
+            return "NULL"
+        return self._fold(value)
+
+    def _default_column(self) -> bool:
+        """Whether a column is named `default`, which wins over the keyword."""
+        return any(n.lower() == "default" for names in self._columns.values() for n in names)
+
     def __getattr__(self, name: str) -> Any:
-        if name.startswith("__") or name in ("_merger", "_columns", "_target"):
+        if name.startswith("__") or name in ("_merger", "_columns", "_target", "_refusal"):
             raise AttributeError(name)
         attr = getattr(self._merger, name)
         if not callable(attr):
