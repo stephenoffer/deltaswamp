@@ -308,7 +308,14 @@ works on row-tracked tables too: surviving rows keep their `baseRowId`, and
 rows an UPDATE or MERGE rewrites keep their row ids through the table's
 materialized row-id column. Only the files the predicate cannot skip are read,
 and the commit is staged against the snapshot that was read, so a concurrent
-writer makes it conflict rather than be lost. A data file whose add carries
+writer makes it conflict rather than be lost. As in Delta's default
+WriteSerializable isolation, a conflict with writers that only appended (and
+changed neither the schema nor the protocol, nor removed or re-vectored a file
+this commit touched) is re-committed on top of them, up to
+`KernelEngine.dml_commit_retries` (15) times: rows those appends added are
+not deleted or updated, since the statement never read them. Under
+`delta.isolationLevel=Serializable`, and on catalog-managed tables, every
+conflict is raised. A data file whose add carries
 no `numRecords` statistic (every file in a Databricks checkpoint, which keeps
 statistics only as `stats_parsed`) takes a vector too; its row count is read
 from the Parquet footer.

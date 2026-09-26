@@ -1668,18 +1668,33 @@ class KernelEngine:
         still takes a vector; the native commit reads the count from the
         file's Parquet footer.
         """
+        touched = set(deletions.column("path").to_pylist()) | set(whole_files or ())
+        attempt = 0
         try:
-            with _library_commit_errors():
-                version, _deleted, _dvs, _removed = snapshot.commit_dml(
-                    deletions.to_reader(),
-                    data=data.to_reader() if data is not None else None,
-                    whole_files=whole_files or None,
-                    uc=self._uc_commit_config(table),
-                    engine_info=engine_info or _engine_info(),
-                    operation=operation,
-                    txn=txn,
-                    commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-                )
+            while True:
+                try:
+                    with _library_commit_errors():
+                        version, _deleted, _dvs, _removed = snapshot.commit_dml(
+                            deletions.to_reader(),
+                            data=data.to_reader() if data is not None else None,
+                            whole_files=whole_files or None,
+                            uc=self._uc_commit_config(table),
+                            engine_info=engine_info or _engine_info(),
+                            operation=operation,
+                            txn=txn,
+                            commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
+                            or None,
+                        )
+                    break
+                except CommitConflictError:
+                    attempt += 1
+                    if attempt > self.dml_commit_retries:
+                        raise
+                    rebased = self._rebase_dv_commit(table, snapshot, touched, txn)
+                    if rebased is None:
+                        raise
+                    snapshot = rebased
+                    commit_backoff(attempt - 1)
         except ValueError as exc:
             # Refused before anything is written; the request's mistake, not
             # the engine's, so it is reported as one.
@@ -1691,6 +1706,62 @@ class KernelEngine:
         if int(version) != int(snapshot.version):
             self._maybe_checkpoint(table, version, snapshot)
         return int(version)
+
+    #: Re-commits of a deletion-vector DELETE/UPDATE that lost to writers
+    #: which left every file it touched alone (blind appends).
+    dml_commit_retries = 15
+
+    def _rebase_dv_commit(
+        self, table: ResolvedTable, read: Any, touched: set[str], txn: tuple[str, int] | None
+    ) -> Any:
+        """The latest snapshot, when the commits that won left this one valid; else None.
+
+        Delta's conflict check under WriteSerializable, its default: a DML
+        commit survives concurrent winners that changed neither the metadata
+        nor the protocol and neither removed nor re-vectored any file it
+        touched. Rows a concurrent blind append added are not deleted or
+        updated -- the transaction never read them, and WriteSerializable
+        orders it before the append. Under `delta.isolationLevel=Serializable`
+        such an append conflicts, as Spark decides it. Without this the
+        kernel path failed on any concurrent append, where delta-rs retried.
+        """
+        import pyarrow as pa
+
+        if table.is_catalog_managed:
+            # As for appends: a catalog commit is not re-staged here.
+            return None
+        if txn is not None and self._txn_won_race(read, table, txn):
+            return None
+        try:
+            fresh = self.snapshot(table, write=True)
+            if int(fresh.version) <= int(read.version):
+                return None
+            level = (fresh.table_properties() or {}).get("delta.isolationLevel", "")
+            if level.lower() == "serializable":
+                return None
+            if fresh.metadata_json() != read.metadata_json():
+                return None
+            if fresh.protocol_json() != read.protocol_json():
+                return None
+
+            def vectors(snapshot: Any) -> dict[str, Any]:
+                files = pa.table(snapshot.files()).select(["path", "deletion_vector"])
+                return {
+                    path: dv
+                    for path, dv in zip(
+                        files.column("path").to_pylist(),
+                        files.column("deletion_vector").to_pylist(),
+                        strict=True,
+                    )
+                    if path in touched
+                }
+
+            before = vectors(read)
+            if before != vectors(fresh) or set(before) != touched:
+                return None
+        except Exception:
+            return None  # cannot tell; surfacing the conflict is the safe answer
+        return fresh
 
     def merge(
         self,
@@ -2649,7 +2720,15 @@ def _library_commit_errors() -> Iterator[None]:
     except _native.BackfillRequiredError as exc:
         raise BackfillRequiredError(str(exc)) from exc
     except _native.CommitConflictError as exc:
-        raise CommitConflictError(_conflict_version(str(exc)), str(exc)) from exc
+        message = str(exc)
+        if "do not reuse the staged file" in message:
+            # Advice for a hand-staged catalog commit, which named a staged
+            # file and a txnId to a caller who had neither.
+            message = (
+                f"another writer committed version {_conflict_version(message)} first, and "
+                "nothing was committed. Re-read the table and retry the write."
+            )
+        raise CommitConflictError(_conflict_version(str(exc)), message) from exc
     except _native.RetryableError as exc:
         raise TransientCommitError(str(exc)) from exc
     except ValueError as exc:

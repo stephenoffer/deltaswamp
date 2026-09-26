@@ -117,3 +117,94 @@ class TestMiniblockErrorIsTyped:
         assert isinstance(error, EngineLimitError)
         assert isinstance(error, DeltaSwampError)
         assert "allow_sql_fallback" in str(error)
+
+
+def _dv_table(conn: Any, path: str, **properties: str) -> Any:
+    props = {"delta.enableDeletionVectors": "true", **properties}
+    t = conn.create_table(path, pa.schema([("id", pa.int64())]), properties=props)
+    t.append(pa.table({"id": [1, 2, 3]}))
+    return t
+
+
+def _race(monkeypatch: Any, concurrent: Any) -> None:
+    """Run `concurrent` once, just after the next DV DML has read its snapshot."""
+    from deltaswamp.engine.kernel import KernelEngine
+
+    real = KernelEngine._dv_dml
+    state = {"done": False}
+
+    def racing_snapshot(self: Any, table: Any, **kwargs: Any) -> Any:
+        snap = real_snapshot(self, table, **kwargs)
+        if kwargs.get("write") and not state["done"]:
+            state["done"] = True
+            concurrent()
+        return snap
+
+    real_snapshot = KernelEngine.snapshot
+
+    def dml(self: Any, *args: Any, **kwargs: Any) -> Any:
+        monkeypatch.setattr(KernelEngine, "snapshot", racing_snapshot)
+        try:
+            return real(self, *args, **kwargs)
+        finally:
+            monkeypatch.setattr(KernelEngine, "snapshot", real_snapshot)
+
+    monkeypatch.setattr(KernelEngine, "_dv_dml", dml)
+
+
+class TestDeletionVectorDmlSurvivesBlindAppends:
+    """A kernel DV DELETE/UPDATE failed CommitConflictError on any concurrent
+    append (23 of 24 deletes, with eight appenders); delta-rs retried."""
+
+    def test_delete_rebases_over_a_blind_append(
+        self, conn: Any, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        path = str(tmp_path / "t")
+        t = _dv_table(conn, path)
+        assert "kernel" in str(t.can("delete"))
+        other = ds.connect("file://")
+        _race(monkeypatch, lambda: other.open_table(path).append(pa.table({"id": [1, 9]})))
+        result = conn.open_table(path).delete("id = 1")
+        assert result["num_deleted_rows"] == 1
+        # WriteSerializable: the appended id 1 was never read, so it stays.
+        ids = sorted(conn.open_table(path).to_arrow().column("id").to_pylist())
+        assert ids == [1, 2, 3, 9]
+
+    def test_update_rebases_over_a_blind_append(
+        self, conn: Any, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        path = str(tmp_path / "t")
+        _dv_table(conn, path)
+        other = ds.connect("file://")
+        _race(monkeypatch, lambda: other.open_table(path).append(pa.table({"id": [7]})))
+        conn.open_table(path).update(new_values={"id": 20}, predicate="id = 2")
+        ids = sorted(conn.open_table(path).to_arrow().column("id").to_pylist())
+        assert ids == [1, 3, 7, 20]
+
+    def test_concurrent_delete_of_the_same_file_conflicts(
+        self, conn: Any, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        from deltaswamp.errors import CommitConflictError
+
+        path = str(tmp_path / "t")
+        _dv_table(conn, path)
+        other = ds.connect("file://")
+        _race(monkeypatch, lambda: other.open_table(path).delete("id = 3"))
+        with pytest.raises(CommitConflictError) as caught:
+            conn.open_table(path).delete("id = 1")
+        assert "staged file" not in str(caught.value)
+        assert "txnId" not in str(caught.value)
+        ids = sorted(conn.open_table(path).to_arrow().column("id").to_pylist())
+        assert ids == [1, 2]
+
+    def test_serializable_isolation_conflicts_on_an_append(
+        self, conn: Any, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        from deltaswamp.errors import CommitConflictError
+
+        path = str(tmp_path / "t")
+        _dv_table(conn, path).set_properties({"delta.isolationLevel": "Serializable"})
+        other = ds.connect("file://")
+        _race(monkeypatch, lambda: other.open_table(path).append(pa.table({"id": [1]})))
+        with pytest.raises(CommitConflictError):
+            conn.open_table(path).delete("id = 1")
