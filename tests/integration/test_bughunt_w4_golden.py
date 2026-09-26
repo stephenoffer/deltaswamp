@@ -491,7 +491,9 @@ def _vacuumed(tmp_path: Path) -> str:
     [
         lambda t: t.to_arrow(),
         lambda t: t.to_pandas(),
-        lambda t: t.count(),
+        # A predicate on a data column: a plain count() is answered from the
+        # log's numRecords without opening a data file.
+        lambda t: t.count(predicate="id >= 0"),
         lambda t: t.head(1),
         lambda t: list(t.scan()),
         lambda t: t.scan().read_all(),

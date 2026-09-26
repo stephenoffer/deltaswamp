@@ -202,7 +202,7 @@ Convenience wrappers sit on top:
 ```python
 t.to_arrow()  # pyarrow.Table
 t.to_pandas()
-t.to_polars()  # or to_polars(lazy=True)
+t.to_polars()  # or to_polars(lazy=True): reads on collect, filters pushed down
 t.to_pyarrow_dataset()
 t.head(10)
 t.count()  # exact; count(predicate="...") too

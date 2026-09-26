@@ -163,37 +163,55 @@ to the kernel automatically.
 | Property | delta-rs create | delta-rs set | kernel create |
 |---|---|---|---|
 | `delta.appendOnly` | honored | honored | honored |
-| `delta.autoOptimize.autoCompact` *(Databricks-only)* | stored, inert | stored, inert | n/a |
-| `delta.autoOptimize.optimizeWrite` *(Databricks-only)* | stored, inert | stored, inert | n/a |
+| `delta.autoOptimize.autoCompact` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
+| `delta.autoOptimize.optimizeWrite` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
 | `delta.checkpoint.writeStatsAsJson` | stored, inert | stored, inert | honored |
 | `delta.checkpoint.writeStatsAsStruct` | honored | honored | honored |
 | `delta.checkpointInterval` | honored | honored | honored |
 | `delta.checkpointPolicy` | stored, inert | stored, inert | honored |
-| `delta.checkpointRetentionDuration` *(Databricks-only)* | rejected | rejected | n/a |
+| `delta.checkpointRetentionDuration` *(Databricks-only)* | rejected | rejected | stored (as v1) |
 | `delta.columnMapping.mode` | honored | rejected | honored |
 | `delta.compatibility.symlinkFormatManifest.enabled` *(Databricks-only)* | rejected | rejected | n/a |
 | `delta.dataSkippingNumIndexedCols` | honored | honored | honored |
-| `delta.dataSkippingStatsColumns` | stored, inert | stored, inert | honored |
+| `delta.dataSkippingStatsColumns` | top-level names only | top-level names only | honored |
 | `delta.deletedFileRetentionDuration` | honored | honored | honored |
 | `delta.enableChangeDataFeed` | honored | honored | honored |
 | `delta.enableDeletionVectors` | rejected | rejected | honored |
-| `delta.enableExpiredLogCleanup` | stored, inert | stored, inert | honored |
+| `delta.enableExpiredLogCleanup` | honored | honored | honored |
 | `delta.enableIcebergCompatV2` | rejected | rejected | n/a |
 | `delta.enableIcebergCompatV3` | rejected | rejected | honored |
 | `delta.enableInCommitTimestamps` | rejected | rejected | honored |
 | `delta.enableRowTracking` | rejected | rejected | honored |
 | `delta.enableTypeWidening` | rejected | rejected | honored |
-| `delta.isolationLevel` | honored | honored | n/a |
+| `delta.isolationLevel` | honored | honored | stored (as v1) |
 | `delta.logRetentionDuration` | honored | honored | honored |
 | `delta.minReaderVersion` | **crashes** | rejected | n/a |
 | `delta.minWriterVersion` | honored | honored | n/a |
 | `delta.parquet.compression.codec` | rejected | rejected | n/a |
 | `delta.parquet.format.version` | rejected | rejected | honored |
-| `delta.randomizeFilePrefixes` *(Databricks-only)* | stored, inert | stored, inert | n/a |
+| `delta.randomizeFilePrefixes` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
 | `delta.setTransactionRetentionDuration` | stored, inert | stored, inert | honored |
-| `delta.targetFileSize` | honored | honored | n/a |
-| `delta.tuneFileSizesForRewrites` *(Databricks-only)* | stored, inert | stored, inert | n/a |
+| `delta.targetFileSize` | honored (byte strings such as `128mb` too) | honored | stored (as v1) |
+| `delta.tuneFileSizesForRewrites` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
 | `delta.universalFormat.enabledFormats` *(Databricks-only)* | rejected | rejected | n/a |
+
+"stored (as v1)": delta-kernel refuses these keys in CREATE TABLE, so a
+kernel create commits version 0 without them and applies them at once as
+version 1 (a metadata commit, like set_properties); a catalog-managed create
+refuses them instead. `delta.dataSkippingStatsColumns` on delta-rs covers
+top-level leaf columns only (no nested fields or structs, and nothing under
+column mapping), so appends and overwrites of a table that sets it go to the
+kernel; delta-rs UPDATE/MERGE/OPTIMIZE still write the narrower stats. A
+table setting `delta.checkpoint.writeStatsAsJson=false` gets
+`writeStatsAsStruct=true` recorded with it (Spark's default for the unset
+key, which this library's checkpoint writers read as false); a table that
+already has JSON stats off and struct stats unset refuses `checkpoint()` and
+skips automatic checkpoints, which would otherwise keep no statistics.
+`delta.dataSkippingNumIndexedCols` counts differently per writer: the kernel
+counts leaf fields as Spark does (`s struct<a,b,c>, x` with 2 indexes `s.a`,
+`s.b`), delta-rs counts top-level columns and indexes every leaf of the ones
+it takes. Extra statistics are harmless; the clustering-column check assumes
+Spark's leaf counting, the stricter of the two.
 
 On an existing table, set_properties checks values the same way whichever
 engine serves it: a delta-rs ALTER is first run through the kernel path's

@@ -25,6 +25,7 @@ from .errors import (
     UnreachableTableError,
 )
 from .identity import RefKind, TableRef, parse_ref
+from .properties import with_checkpoint_stats
 from .router import Router
 from .table import Table, _call, _check_version, _governed, _require, _write_data
 
@@ -567,6 +568,9 @@ class Connection:
                 "a table is either partitioned or liquid-clustered, not both"
             )
         _check_layout(schema, partition_by, cluster_by)
+        # JSON stats off with no word on struct stats: record Spark's default
+        # (struct on), or this library's checkpoints would keep no stats.
+        properties = with_checkpoint_stats(properties)
         clash = cdf_name_clash(_schema_names(schema) or (), properties)
         if clash:
             # The kernel's create refused this; delta-rs's created the table,
@@ -1169,10 +1173,12 @@ class Connection:
             raise InvalidArgumentError(
                 f"sql engine={engine!r}: the engines are 'duckdb', 'polars' and 'warehouse'"
             )
-        pa = _require("pyarrow", "pyarrow")
+        _require("pyarrow", "pyarrow")
         module = _require(engine, engine)
+        # Lazy datasets, not tables read in full: each engine pushes the
+        # query's projection and simple WHERE comparisons into the scan.
         frames = {
-            alias: pa.table((ref if isinstance(ref, Table) else self.table(ref)).scan())
+            alias: (ref if isinstance(ref, Table) else self.table(ref))._lazy_dataset()
             for alias, ref in (tables or {}).items()
         }
         if engine == "duckdb":
@@ -1187,7 +1193,9 @@ class Connection:
                 # An in-memory database per call; leaving it open leaked it
                 # and every registered frame until garbage collection.
                 con.close()
-        ctx = module.SQLContext({alias: module.from_arrow(f) for alias, f in frames.items()})
+        ctx = module.SQLContext(
+            {alias: module.scan_pyarrow_dataset(f) for alias, f in frames.items()}
+        )
         return ctx.execute(query, eager=True).to_arrow()
 
     # ------------------------------------------------------------- namespaces

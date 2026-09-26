@@ -109,6 +109,7 @@ class KernelMerger:
         self._passthrough = passthrough
         # (kind, condition, verb, argument)
         self._clauses: list[tuple[str, str | None, str, Any]] = []
+        self._by_source_conditions: list[str | None] = []
 
     # ---------------------------------------------------------------- clauses
 
@@ -122,6 +123,9 @@ class KernelMerger:
                 f"a {_KIND_NAMES[kind]} clause follows an unconditional one, which takes "
                 "every row; only the last clause of a kind may omit its condition"
             )
+        if kind == "not_matched_by_source":
+            # As written: the skipping predicate is built from it (`_skipping`).
+            self._by_source_conditions.append(predicate)
         if predicate is not None:
             predicate = _spark_sql(predicate)
         if verb in ("UPDATE", "INSERT"):
@@ -171,14 +175,13 @@ class KernelMerger:
         engine, table = self._engine, self._table
         snapshot = engine.snapshot(table, write=True)
         schema = pa.schema(snapshot.schema())
-        by_source = any(k == "not_matched_by_source" for k, *_ in self._clauses)
         row_ids = _row_tracking_enabled(table) and any(
             verb == "UPDATE" or verb == "UPDATE_ALL"
             for kind, _, verb, _ in self._clauses
             if kind != "not_matched"
         )
 
-        skipping = None if by_source else self._skipping(schema)
+        skipping = self._skipping(schema)
         extra = {"row_ids": True} if row_ids else {}
         target = pa.table(snapshot.scan(predicate=skipping, row_positions=True, **extra))
         source = self._source.append_column(
@@ -221,7 +224,61 @@ class KernelMerger:
         return {**metrics, "version": int(result_version)}
 
     def _skipping(self, schema: Any) -> str | None:
-        """A kernel skipping predicate the ON condition implies, or None."""
+        """A kernel skipping predicate the ON condition implies, or None.
+
+        Only target rows some source row can match are read: each
+        ``target.k = source.s`` conjunct bounds ``k`` to the source's values,
+        as an IN-list, or past `_SKIP_VALUES_LIMIT` distinct values as their
+        range (a 20,000-key source used to read -- and hold -- every row of
+        the table). A NOT MATCHED BY SOURCE clause acts on the other rows
+        too, so with one the rows its condition may select are read as well,
+        and with an unconditional one every row is.
+        """
+        from .. import predicate as sqlpred
+
+        bounds = self._key_bounds(schema)
+        if not self._by_source_conditions:
+            if not bounds:
+                return None
+            try:
+                return sqlpred.to_kernel_json(sqlpred.parse(" AND ".join(bounds)), schema)
+            except Exception:
+                return None
+        if not bounds or any(c is None for c in self._by_source_conditions):
+            return None
+        try:
+            alternatives = [sqlpred.parse(" AND ".join(bounds))]
+            for condition in self._by_source_conditions:
+                alternatives.append(self._unqualified(sqlpred.parse(str(condition)), schema))
+        except Exception:
+            return None
+        # An OR renders only when every alternative does, so an unreadable
+        # condition skips nothing rather than too much.
+        return sqlpred.to_kernel_json(sqlpred.Node("or", tuple(alternatives)), schema)
+
+    def _unqualified(self, node: Any, schema: Any) -> Any:
+        """`node` with ``target.col`` spelled ``col``; raises on any other column."""
+        from .. import predicate as sqlpred
+
+        names = {f.name.lower() for f in schema}
+        target = self._target_alias.lower()
+
+        def walk(value: Any) -> Any:
+            if isinstance(value, sqlpred.Column):
+                path = value.path
+                if len(path) >= 2 and path[0].lower() == target:
+                    path = path[1:]
+                elif path[0].lower() not in names or path[0].lower() == target:
+                    raise ValueError("not a target column")
+                return sqlpred.Column(tuple(path))
+            if isinstance(value, sqlpred.Node):
+                return sqlpred.Node(value.op, tuple(walk(a) for a in value.args), value.negated)
+            return value
+
+        return walk(node)
+
+    def _key_bounds(self, schema: Any) -> list[str]:
+        """``col IN (...)`` / ``col BETWEEN lo AND hi`` for each key the ON clause equates."""
         import pyarrow as pa
         import pyarrow.compute as pc
 
@@ -230,7 +287,7 @@ class KernelMerger:
         try:
             node = sqlpred.parse(self._predicate)
         except Exception:
-            return None
+            return []
         conjuncts = list(node.args) if node.op == "and" else [node]
         target, source = self._target_alias.lower(), self._source_alias.lower()
         targets = {f.name.lower(): f.name for f in schema}
@@ -249,27 +306,34 @@ class KernelMerger:
             if column is None or key is None:
                 continue
             values = pc.unique(self._source.column(key).drop_null())
-            if len(values) == 0 or len(values) > _SKIP_VALUES_LIMIT:
+            if len(values) == 0:
                 continue
             try:
                 values = values.cast(schema.field(column).type)
             except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
                 continue
-            literals = [_sql_literal(v) for v in values.to_pylist()]
-            if any(lit is None for lit in literals):
-                continue
-            text = f"{_quote_sql_ident(column)} IN ({', '.join(literals)})"  # type: ignore[arg-type]
+            if len(values) > _SKIP_VALUES_LIMIT:
+                if pa.types.is_floating(values.type):
+                    continue  # NaN sorts above every bound; leave it unbounded
+                try:
+                    low, high = (v.as_py() for v in pc.min_max(values).values())
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                    continue
+                ends = [_sql_literal(low), _sql_literal(high)]
+                if any(e is None for e in ends):
+                    continue
+                text = f"{_quote_sql_ident(column)} BETWEEN {ends[0]} AND {ends[1]}"
+            else:
+                literals = [_sql_literal(v) for v in values.to_pylist()]
+                if any(lit is None for lit in literals):
+                    continue
+                text = f"{_quote_sql_ident(column)} IN ({', '.join(literals)})"  # type: ignore[arg-type]
             try:
                 sqlpred.parse(text)
             except Exception:
                 continue
             parts.append(text)
-        if not parts:
-            return None
-        try:
-            return sqlpred.to_kernel_json(sqlpred.parse(" AND ".join(parts)), schema)
-        except Exception:
-            return None
+        return parts
 
     def _evaluate(
         self, con: Any, schema: Any, target: Any, row_ids: bool

@@ -808,14 +808,188 @@ def _stats_can_decide(node: Node, exact: bool, unsafe: dict[tuple[str, ...], str
     return False
 
 
+_FLIPPED = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
+#: Integers a double represents exactly, so `i < 3.0D` may become `i < 3`.
+_EXACT_DOUBLE_INT = 2**53
+
+
+def _skip_literal(lit: Literal, target: Any, op: str) -> Literal | None:
+    """`lit` as a literal of the `target` column's type for skipping; None if unchanged.
+
+    The kernel skips nothing when the literal's type differs from the
+    column's: `id < 1000.0` (a DECIMAL literal) read every file where
+    `id < 1000` read two. Each rewrite here is exactly the comparison the
+    row filter makes (`_coerce`), so it moves no boundary:
+
+    * DOUBLE column, DECIMAL literal: Arrow's decimal -> double cast, the
+      one the filter compares with (Spark compares them as DOUBLE too).
+    * integer column, DECIMAL or DOUBLE literal: integral values become
+      longs; a fraction becomes the nearest integer on the side the
+      comparison keeps (`i < 3.5` is `i <= 3`, `i > 3.5` is `i >= 4`).
+
+    Returns a Literal whose `type` is the op to use when it changed
+    (``Literal(value, "long:le")``); the caller splits it off.
+    """
+    import pyarrow as pa
+
+    value = lit.value
+    if isinstance(value, bool) or not isinstance(value, (float, decimal.Decimal)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if pa.types.is_float64(target) and isinstance(value, decimal.Decimal):
+        try:
+            as_double = pa.scalar(value).cast(pa.float64()).as_py()
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, OverflowError):
+            return None
+        return Literal(as_double, f"double:{op}")
+    if not pa.types.is_integer(target):
+        return None
+    number = decimal.Decimal(value) if isinstance(value, float) else value
+    if isinstance(value, float) and abs(value) > _EXACT_DOUBLE_INT:
+        # Past 2**53 the filter's double comparison rounds the column too.
+        return None
+    if number == number.to_integral_value():
+        new_op, whole = op, int(number)
+    elif op in ("lt", "le"):
+        new_op, whole = "le", int(number.to_integral_value(decimal.ROUND_FLOOR))
+    elif op in ("gt", "ge"):
+        new_op, whole = "ge", int(number.to_integral_value(decimal.ROUND_CEILING))
+    else:
+        return None  # `i = 2.5` holds for no integer; not worth a skipping form
+    if not _LONG_MIN <= whole <= _LONG_MAX:
+        return None
+    return Literal(whole, f"long:{new_op}")
+
+
+def _like_prefix(pattern: str) -> tuple[str, bool] | None:
+    """(literal prefix, whether the pattern is only that prefix) of a LIKE pattern.
+
+    The pattern is in the backslash-escaped form the parser stores. None when
+    it starts with a wildcard, so no range bounds it.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(pattern[i + 1])
+            i += 2
+            continue
+        if ch in "%_":
+            return ("".join(out), False) if out else None
+        out.append(ch)
+        i += 1
+    return "".join(out), True
+
+
+def _after_prefix(prefix: str) -> str | None:
+    """The smallest string greater than every string starting with `prefix`.
+
+    Statistics compare UTF-8 bytes, whose order is code point order, so
+    bumping the last code point that can be bumped bounds the range.
+    """
+    chars = list(prefix)
+    while chars:
+        code = ord(chars[-1]) + 1
+        if code == 0xD800:
+            code = 0xE000  # surrogates are not characters
+        if code <= 0x10FFFF:
+            chars[-1] = chr(code)
+            return "".join(chars)
+        chars.pop()
+    return None
+
+
+def _prepare_skipping(node: Node, schema: Any, exact: bool = False) -> Node:
+    """`node` with rewrites that let file statistics decide more, for skipping only.
+
+    Literal types are aligned with their columns (`_skip_literal`), and a
+    LIKE with a literal prefix on a STRING column becomes the range of
+    strings with that prefix. The range is weaker than the LIKE (it keeps
+    'abcx' for 'abc%x'), so it is used only where weakening is safe: not
+    beneath a NOT (`exact`).
+    """
+    op = node.op
+    if op in ("and", "or"):
+        return Node(op, tuple(_prepare_skipping(a, schema, exact) for a in node.args))
+    if op == "not":
+        return Node(op, (_prepare_skipping(node.args[0], schema, True),))
+
+    def column_type(value: Any) -> Any:
+        if not isinstance(value, Column):
+            return None
+        try:
+            return _schema_type(schema, value.path)
+        except PredicateError:
+            return None
+
+    if op in _FLIPPED and len(node.args) == 2:
+        left, right = node.args
+        flipped = isinstance(left, Literal) and isinstance(right, Column)
+        column, lit = (right, left) if flipped else (left, right)
+        target = column_type(column)
+        if target is not None and isinstance(lit, Literal):
+            wanted = _FLIPPED[op] if flipped else op
+            if (fixed := _skip_literal(lit, target, wanted)) is not None:
+                kind, new_op = fixed.type.split(":")
+                return Node(new_op, (column, Literal(fixed.value, kind)))
+        return node
+    if op in ("in", "between"):
+        target = column_type(node.args[0])
+        if target is None:
+            return node
+        items = list(node.args[1:])
+        wants = ["ge", "le"] if op == "between" else ["eq"] * len(items)
+        fixed_items = []
+        for item, want in zip(items, wants, strict=True):
+            fixed = _skip_literal(item, target, want) if isinstance(item, Literal) else None
+            if fixed is None:
+                fixed_items.append(item)
+                continue
+            kind, new_op = fixed.type.split(":")
+            if new_op != want and op == "in":
+                return node  # `i IN (2.5)`: that item can match nothing; leave it
+            fixed_items.append(Literal(fixed.value, kind))
+        return Node(op, (node.args[0], *fixed_items), node.negated)
+    if op == "like" and not node.negated and not exact:
+        target, pattern = node.args
+        text_type = column_type(target)
+        if text_type is None or not _is_text(_pa(), text_type):
+            return node  # LIKE casts a non-string column to text: its order differs
+        split = _like_prefix(pattern.value)
+        if split is None:
+            return node
+        prefix, whole = split
+        if whole:
+            return Node("eq", (target, Literal(prefix, "string")))
+        upper = _after_prefix(prefix)
+        low = Node("ge", (target, Literal(prefix, "string")))
+        if upper is None:
+            return low
+        return Node("and", (low, Node("lt", (target, Literal(upper, "string")))))
+    return node
+
+
+def _pa() -> Any:
+    import pyarrow as pa
+
+    return pa
+
+
 def to_kernel_json(node: Node, schema: Any = None) -> str | None:
     """The skipping predicate as the native extension's JSON, or None.
 
     With the table's Arrow `schema`, comparisons that file statistics cannot
     decide safely (NaN in floating columns, lossy wide-decimal stats) are
-    left out of skipping; the exact row filter still applies them.
+    left out of skipping; the exact row filter still applies them. The
+    schema also lets literals be aligned with their columns' types and a
+    prefix LIKE become a range (`_prepare_skipping`).
     """
-    unsafe = _unsafe_columns(schema) if schema is not None else None
+    unsafe = None
+    if schema is not None:
+        unsafe = _unsafe_columns(schema)
+        node = _prepare_skipping(node, schema)
     rendered = _skip(node, unsafe=unsafe)
     return None if rendered is None else json.dumps(rendered)
 

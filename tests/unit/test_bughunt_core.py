@@ -394,7 +394,10 @@ class TestPropertyValues:
 
     def test_kernel_remedy_does_not_blame_delta_rs(self) -> None:
         with pytest.raises(PropertyNotSupportedError) as info:
-            validate_properties({"delta.targetFileSize": "1"}, Engine.KERNEL, Operation.CREATE)
+            # (delta.targetFileSize, used here before, is now stored at create.)
+            validate_properties(
+                {"delta.parquet.compression.codec": "zstd"}, Engine.KERNEL, Operation.CREATE
+            )
         assert "delta-rs rejects" not in str(info.value)
 
 

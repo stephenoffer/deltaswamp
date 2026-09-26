@@ -37,6 +37,7 @@ from .errors import (
     UnreachableTableError,
 )
 from .identity import RefKind, parse_ref
+from .properties import with_checkpoint_stats
 
 if TYPE_CHECKING:
     from .connection import Connection
@@ -1340,24 +1341,43 @@ class Table:
         return self.to_arrow(**kwargs).to_pandas()
 
     def to_polars(self, *, lazy: bool = False, **kwargs: Any) -> Any:
-        """A Polars DataFrame, or a LazyFrame over it with ``lazy=True``.
+        """A Polars DataFrame, or with ``lazy=True`` a LazyFrame that reads on collect.
 
-        The lazy form still reads through this library, so it works on the
-        tables `polars.scan_delta` cannot open (catalog-managed, row-tracked,
-        vacuumProtocolCheck, ...).
+        The lazy form reads through this library, so it works on the tables
+        `polars.scan_delta` cannot open (catalog-managed, row-tracked,
+        vacuumProtocolCheck, ...). Its projection and the simple comparisons
+        of its filters are pushed into the scan (columns read, files
+        skipped); `columns=` and `predicate=` restrict it further.
         """
         pl = _require("polars", "polars")
+        if lazy and "limit" not in kwargs:
+            return pl.scan_pyarrow_dataset(self._lazy_dataset(**kwargs))
         frame = pl.DataFrame(self.to_arrow(**kwargs))
         return frame.lazy() if lazy else frame
+
+    def _lazy_dataset(self, **kwargs: Any) -> Any:
+        """A pyarrow Dataset that scans this table when (and as far as) it is read."""
+        _require("pyarrow", "pyarrow")
+        from ._lazy import TableDataset
+
+        columns = kwargs.pop("columns", None)
+        predicate = kwargs.pop("predicate", None)
+        # The stream's own schema, which is what every later scan yields.
+        schema = self.head(0, columns=columns, predicate=predicate, **kwargs).schema
+        return TableDataset(
+            self, schema, columns=_columns_arg(columns), predicate=predicate, scan_options=kwargs
+        )
 
     def to_duckdb(self, connection: Any = None, *, name: str | None = None, **kwargs: Any) -> Any:
         """A DuckDB relation over the table. With `name`, also a view of that name.
 
         DuckDB's own delta extension is C++ and knows nothing of Unity Catalog
-        credentials or catalog-managed commits; this hands it the rows instead.
+        credentials or catalog-managed commits, so the relation reads through
+        this library instead -- lazily, each time it runs, with DuckDB's
+        projection and simple filters pushed into the scan.
         """
         duckdb = _require("duckdb", "duckdb")
-        data = self.to_arrow(**kwargs)
+        data = self.to_arrow(**kwargs) if "limit" in kwargs else self._lazy_dataset(**kwargs)
         con = connection
         if con is None and name is not None:
             # The view has to live where it can be queried by name. On a
@@ -1540,13 +1560,18 @@ class Table:
         return ray_data.from_arrow(table)
 
     def to_daft(self, **kwargs: Any) -> Any:
-        """A Daft DataFrame."""
+        """A Daft DataFrame, read eagerly: pass `columns=` and `predicate=` to narrow it."""
         daft = _require("daft", "daft")
         return daft.from_arrow(self.to_arrow(**kwargs))
 
     def to_pyarrow_dataset(self, **kwargs: Any) -> Any:
-        dataset = _require("pyarrow.dataset", "pyarrow")
-        return dataset.dataset(self.to_arrow(**kwargs))
+        """A pyarrow Dataset that scans the table when read, pushing columns and filters down."""
+        _require("pyarrow.dataset", "pyarrow")
+        if "limit" in kwargs:
+            import pyarrow.dataset as dataset
+
+            return dataset.dataset(self.to_arrow(**kwargs))
+        return self._lazy_dataset(**kwargs)
 
     def head(self, n: int = 5, **kwargs: Any) -> Any:
         """The first `n` rows.
@@ -1590,11 +1615,19 @@ class Table:
     def count(self, *, predicate: str | None = None) -> int:
         """Exact row count.
 
-        Streams the narrowest column rather than materializing the table; the
-        engines' statistics-based counts are approximate by their own
+        On the kernel it comes from the log when it can: every file's
+        `numRecords` less its deletion vector's cardinality, with a predicate
+        on partition columns applied to each file's partition values. When a
+        file has no `numRecords`, or the predicate reads data columns, the
+        narrowest column is streamed instead of materializing the table. The
+        engines' own statistics-based counts are approximate by their own
         documentation (a file without stats counts as zero rows), so they are
-        not used here.
+        not used.
         """
+        _check_predicate(predicate, "count")
+        exact = self._count_from_log(predicate)
+        if exact is not None:
+            return exact
         pa = _require("pyarrow", "pyarrow")
         schema = self.schema()
         names = list(getattr(schema, "names", None) or [f.name for f in schema])
@@ -1606,6 +1639,29 @@ class Table:
         for batch in stream:
             total += batch.num_rows
         return total
+
+    def _count_from_log(self, predicate: str | None) -> int | None:
+        """`count()` from the log's numRecords, or None to count by scanning.
+
+        Anything unusual -- a table the kernel does not serve, VARIANT
+        columns, a log that cannot be read -- goes to the scan, whose own
+        routing and errors are the ones to report.
+        """
+        resolved = self._enrich()
+        if resolved.features & _VARIANT_FEATURES or resolved.open_error is not None:
+            return None
+        op = Operation.TIME_TRAVEL if self._version is not None else Operation.SCAN
+        needs = frozenset(self._predicate_needs(predicate) if predicate is not None else ())
+        try:
+            engine: Any = self._connection.router.engine_for(op, resolved, needs=needs)
+            if not isinstance(engine, KernelEngine):
+                return None
+            counted = engine.metadata_count(
+                self._resolved, predicate=predicate, version=self._version
+            )
+        except Exception:
+            return None
+        return None if counted is None else int(counted)
 
     def files(self) -> Any:
         """The table's live data files: path, size, partition values and statistics.
@@ -2555,6 +2611,7 @@ class Table:
         """
         self._check_writable("optimize")
         _check_options("optimize", kwargs, _OPTIMIZE_OPTIONS)
+        self._check_optimize_args(kwargs)
         if isinstance(zorder_by, str):
             zorder_by = [zorder_by]
         if zorder_by:
@@ -2574,6 +2631,7 @@ class Table:
     def z_order(self, columns: list[str] | str, **kwargs: Any) -> dict[str, Any]:
         self._check_writable("z-order")
         _check_options("z_order", kwargs, _OPTIMIZE_OPTIONS)
+        self._check_optimize_args(kwargs)
         columns = [columns] if isinstance(columns, str) else list(columns or [])
         if not columns:
             raise InvalidArgumentError("z_order needs at least one column")
@@ -2584,11 +2642,50 @@ class Table:
         self._invalidate()
         return result
 
+    def _check_optimize_args(self, kwargs: dict[str, Any]) -> None:
+        """Refuse OPTIMIZE tuning values delta-rs mishandles, before any work starts.
+
+        delta-rs waits forever for a task slot with max_concurrent_tasks=0,
+        raises a bare OverflowError for -1 and ValueError for target_size=0,
+        and treats a filter on a non-partition column as matching nothing:
+        a "successful" OPTIMIZE that compacted 0 of 0 files.
+        """
+        for name in ("max_concurrent_tasks", "target_size"):
+            value = kwargs.get(name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise InvalidArgumentError(f"{name} must be a positive integer, got {value!r}")
+        filters = kwargs.get("partition_filters")
+        if filters is None:
+            return
+        if not isinstance(filters, list) or not all(
+            isinstance(f, (list, tuple)) and len(f) == 3 and isinstance(f[0], str) for f in filters
+        ):
+            raise InvalidArgumentError(
+                "partition_filters is a list of (column, op, value) tuples, e.g. "
+                f"[('region', '=', 'eu')]; got {filters!r}"
+            )
+        partitions = list(self._enrich().partition_columns)
+        stray = sorted({f[0] for f in filters} - set(partitions))
+        if stray:
+            raise InvalidArgumentError(
+                f"partition_filters name {stray}, which are not partition columns "
+                f"(the table is partitioned by {partitions}); delta-rs matches no file "
+                "for them, so the OPTIMIZE would do nothing"
+            )
+
     def _check_zorder(self, columns: list[str]) -> None:
         """Z-order keys must be data columns: partition columns are constant per file."""
         names = list(self.schema().names)
         partitions = set(self._enrich().partition_columns)
         for column in columns:
+            if isinstance(column, str) and column not in names and "." in column:
+                # cluster_by takes nested fields; delta-rs's Z-ORDER does not.
+                raise InvalidArgumentError(
+                    f"cannot z-order by {column!r}: Z-ORDER takes top-level columns only, "
+                    "not nested fields (cluster_by= accepts nested fields)"
+                )
             if not isinstance(column, str) or column not in names:
                 raise InvalidArgumentError(
                     f"cannot z-order by {column!r}: the table has no such column; "
@@ -2815,6 +2912,7 @@ class Table:
         if not properties:
             # Nothing to set; every engine would still commit an empty change.
             return
+        properties = with_checkpoint_stats(properties, self.properties()) or properties
         self._engine(Operation.SET_PROPERTIES, properties=properties).set_properties(
             self._resolved, properties, **kwargs
         )
@@ -2947,7 +3045,10 @@ class Table:
         """Delete log files older than ``delta.logRetentionDuration``.
 
         This is what makes versions past log retention unreachable by time
-        travel, so it is never done implicitly.
+        travel. It runs regardless of ``delta.enableExpiredLogCleanup``. It
+        also happens implicitly, as in Spark: a delta-rs write that lands on
+        a checkpoint interval deletes expired log files unless the table sets
+        ``delta.enableExpiredLogCleanup=false`` (kernel writes never do).
         """
         self._engine(Operation.CLEANUP_METADATA).cleanup_metadata(self._resolved)
         self._invalidate()

@@ -17,7 +17,7 @@ import math
 import os
 import re
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from numbers import Integral
@@ -46,7 +46,13 @@ from ..errors import (
     InvalidArgumentError,
     UnreachableTableError,
 )
-from ..properties import effect_for, validate_properties
+from ..properties import (
+    CHECKPOINT_STATS_REMEDY,
+    checkpoint_drops_stats,
+    effect_for,
+    parse_byte_size,
+    validate_properties,
+)
 from . import metadata as meta
 from .base import merge_clause, missing_method
 from .calendar import has_datetime_columns
@@ -185,6 +191,13 @@ class DeltaRsEngine:
         gap = missing_method(self, operation)
         if gap is not None:
             return gap
+
+        if operation is Operation.CHECKPOINT and checkpoint_drops_stats(table.properties):
+            from .kernel import _DROPS_STATS_REASON
+
+            return Capability(
+                operation, ok=False, reason=_DROPS_STATS_REASON, remedy=CHECKPOINT_STATS_REMEDY
+            )
 
         routing = OPERATION_ENGINES.get(operation)
         if routing is None or self.kind not in routing.engines:
@@ -905,6 +918,7 @@ class DeltaRsEngine:
             "target_file_size": target_file_size,
             "writer_properties": _exact_stats(writer_properties, self._stats_schema(table, data)),
             "commit_properties": _commit_properties(commit_metadata, txn, max_commit_retries),
+            "post_commithook_properties": _hooks(table),
             "storage_options": _object_store_options(self._storage_options(table, write=True)),
         }
         extra: dict[str, Any] = {"predicate": predicate} if mode == "overwrite" else {}
@@ -1039,6 +1053,7 @@ class DeltaRsEngine:
                 _datafusion_predicate(dt, predicate, dml="delete"),
                 writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
                 commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
+                post_commithook_properties=_hooks(table),
             )
         if "num_deleted_rows" not in result:
             # A delete that only drops whole files (a partition predicate) on
@@ -1084,6 +1099,7 @@ class DeltaRsEngine:
                 writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
                 error_on_type_mismatch=error_on_type_mismatch,
                 commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
+                post_commithook_properties=_hooks(table),
             )
         return result
 
@@ -1112,12 +1128,15 @@ class DeltaRsEngine:
         kwargs["writer_properties"] = _exact_stats(
             kwargs.get("writer_properties"), _delta_schema(dt)
         )
+        kwargs["post_commithook_properties"] = _hooks(
+            table, kwargs.get("post_commithook_properties")
+        )
         data = _respell_source(_plain_data(source), _column_names(dt))
         columns = _merge_columns(dt, data, kwargs)
         if isinstance(predicate, str):
             predicate = _exact_decimals(_fold_case(_standard_string_literals(predicate), columns))
         merger = dt.merge(data, predicate, **kwargs)
-        return _CheckedMerger(
+        checked = _CheckedMerger(
             merger,
             columns,
             _column_names(dt),
@@ -1128,6 +1147,10 @@ class DeltaRsEngine:
             == "true",
             computed=_computed_columns(dt),
         )
+        bounded = _bounded_merge_predicate(predicate, data, kwargs, _column_names(dt))
+        if bounded is not None:
+            checked._bounded = lambda: dt.merge(data, bounded, **kwargs)
+        return checked
 
     # ------------------------------------------------------------ maintenance
 
@@ -1180,6 +1203,9 @@ class DeltaRsEngine:
         tag = uuid.uuid4().hex
         kwargs = dict(kwargs)
         kwargs["commit_properties"] = _tagged(kwargs.get("commit_properties"), tag)
+        kwargs["post_commithook_properties"] = _hooks(
+            table, kwargs.get("post_commithook_properties")
+        )
         with _rewrite_lock(table.location or ""):
             dt = self._open(table, write=True)
             before = int(dt.version())
@@ -1187,6 +1213,14 @@ class DeltaRsEngine:
             kwargs["writer_properties"] = _exact_stats(
                 kwargs.get("writer_properties"), _delta_schema(dt)
             )
+            if kwargs.get("target_size") is None:
+                # delta-rs parses delta.targetFileSize as a bare integer and
+                # quietly uses its own default for "128mb", a value Databricks
+                # (and the property validation here) accept.
+                raw = (dt.metadata().configuration or {}).get("delta.targetFileSize")
+                size = parse_byte_size(raw)
+                if size is not None and not str(raw).strip().isdigit():
+                    kwargs["target_size"] = size
             with _no_panics(what):
                 result: dict[str, Any] = run(dt, kwargs)
             self._check_rewrite(table, before, tag, result, what)
@@ -1537,10 +1571,22 @@ class DeltaRsEngine:
                 f"the oldest commit still there is {oldest}"
             )
         first = oldest if start is None else start
+        if start is None and log is not None:
+            # Commits a checkpoint already covers are never replayed, so a
+            # default range starts after the latest one.
+            with contextlib.suppress(Exception):
+                pointer = log.actions("_delta_log/_last_checkpoint")[0]
+                first = max(first, int(pointer["version"]) + 1)
         last = dt.version() if end is None else end
         if last <= first:
             return None
-        return dt.compact_logs(first, last)
+        dt.compact_logs(first, last)
+        # delta-rs returns nothing; say what was written.
+        return {
+            "start": first,
+            "end": last,
+            "path": f"_delta_log/{first:020d}.{last:020d}.compacted.json",
+        }
 
     def cleanup_metadata(self, table: ResolvedTable) -> None:
         """Delete log files older than `delta.logRetentionDuration`.
@@ -2546,6 +2592,20 @@ def _to_arrow_table(data: Any) -> Any:
     return pa.table(data)
 
 
+def _hooks(table: ResolvedTable, given: Any = None) -> Any:
+    """Post-commit hooks for a write: no automatic checkpoint where it would drop stats.
+
+    delta-rs checkpoints on its own at the interval; on a table that turns
+    JSON stats off without asking for struct stats, that checkpoint kept no
+    statistics for any file (see `checkpoint_drops_stats`).
+    """
+    if given is not None or not checkpoint_drops_stats(table.properties):
+        return given
+    from deltalake import PostCommitHookProperties
+
+    return PostCommitHookProperties(create_checkpoint=False)
+
+
 def _commit_kwargs(kwargs: dict[str, Any]) -> None:
     """Turn `commit_metadata=`/`max_commit_retries=` into delta-rs commit_properties.
 
@@ -2741,6 +2801,15 @@ class _CheckedMerger:
         self._computed = computed or set()
         #: (clause kind, whether it has a condition), in the order given.
         self._clauses: list[tuple[str, bool]] = []
+        #: Every builder call as made on the merger, to replay on a rebuilt one.
+        self._calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        #: Builds the same merger with the ON clause bounded to the source's
+        #: keys (`_bounded_merge_predicate`), when that is known to be safe.
+        self._bounded: Any = None
+
+    def _apply(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        self._calls.append((name, args, kwargs))
+        return getattr(self._merger, name)(*args, **kwargs)
 
     def _note(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         """Record a clause, for the checks `execute` makes."""
@@ -2771,9 +2840,20 @@ class _CheckedMerger:
             # Spark leaves it alone; a MATCHED clause that never applies makes
             # delta-rs do the same.
             with _no_panics("merge (when_matched_delete)"):
-                self._merger.when_matched_delete(predicate="false")
+                self._apply("when_matched_delete", predicate="false")
+        merger = self._merger
+        if self._bounded is not None and "not_matched_by_source" not in kinds:
+            # delta-rs derives no target-side file filter from the source: a
+            # 2-row source read all 20,000 files of a 10M-row table (2.5 GB).
+            # The ON clause is rebuilt with the bound its key equalities imply;
+            # it changes no match, and lets delta-rs skip files. Not with a
+            # NOT MATCHED BY SOURCE clause, which must see every target row.
+            with _no_panics("merge (execute)"):
+                merger = self._bounded()
+                for name, call_args, call_kwargs in self._calls:
+                    getattr(merger, name)(*call_args, **call_kwargs)
         with _no_panics("merge (execute)"):
-            return self._merger.execute(*args, **kwargs)
+            return merger.execute(*args, **kwargs)
 
     def _recompute(self, updates: dict[str, str]) -> dict[str, str]:
         """`updates` plus SETs recomputing the generated columns they feed.
@@ -2802,7 +2882,7 @@ class _CheckedMerger:
         if isinstance(folded, dict):
             folded = self._recompute(folded)
         with _no_panics("merge (when_matched_update)"):
-            self._merger.when_matched_update(folded, self._fold(predicate))
+            self._apply("when_matched_update", folded, self._fold(predicate))
         return self
 
     def _fold(self, value: Any) -> Any:
@@ -2821,7 +2901,13 @@ class _CheckedMerger:
         return value
 
     def __getattr__(self, name: str) -> Any:
-        if name.startswith("__") or name in ("_merger", "_columns", "_target"):
+        if name.startswith("__") or name in (
+            "_merger",
+            "_columns",
+            "_target",
+            "_calls",
+            "_bounded",
+        ):
             raise AttributeError(name)
         attr = getattr(self._merger, name)
         if not callable(attr):
@@ -2837,7 +2923,11 @@ class _CheckedMerger:
                 }
             # execute() commits: a lost race is a CommitConflictError here too.
             with _no_panics(f"merge ({name})"):
-                result = attr(*args, **kwargs)
+                result = (
+                    self._apply(name, *args, **kwargs)
+                    if name.startswith("when_")
+                    else attr(*args, **kwargs)
+                )
             return self if result is self._merger else result
 
         return call
@@ -2902,7 +2992,7 @@ class _CheckedMerger:
                         "merge(..., source_alias=..., target_alias=...) to recompute them"
                     )
                 return self.when_matched_update(sets, predicate)
-        self._merger.when_matched_update_all(self._fold(predicate), except_cols=excluded)
+        self._apply("when_matched_update_all", self._fold(predicate), except_cols=excluded)
         return self
 
     def when_not_matched_insert_all(
@@ -2911,8 +3001,87 @@ class _CheckedMerger:
         self._clauses.append(("not_matched", predicate is not None))
         excluded = self._except(except_cols)
         self._check_star(excluded, "INSERT *")
-        self._merger.when_not_matched_insert_all(self._fold(predicate), except_cols=excluded)
+        self._apply("when_not_matched_insert_all", self._fold(predicate), except_cols=excluded)
         return self
+
+
+#: Up to this many distinct source keys are listed with IN; past it, a range.
+_MERGE_IN_LIMIT = 1000
+
+
+def _bounded_merge_predicate(
+    predicate: Any, source: Any, kwargs: dict[str, Any], target_columns: list[str]
+) -> str | None:
+    """The MERGE ON clause with the target-side bound its key equalities imply.
+
+    For each top-level ``target.k = source.s`` conjunct, a target row can only
+    match when ``target.k`` is one of the source's non-null ``s`` values, so
+    ``AND target.k IN (...)`` (or ``BETWEEN min AND max`` for many keys) is
+    implied: adding it changes no match, but delta-rs can skip every file
+    whose statistics rule it out. None when nothing safe can be derived: a
+    source that is a stream (reading it for bounds would consume it), a
+    predicate the parser does not read, or keys of types whose SQL literals
+    are not exact here (floats, timestamps, decimals).
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    from .. import predicate as sqlpred
+
+    if not isinstance(predicate, str) or not isinstance(source, pa.Table):
+        return None
+    source_alias = str(kwargs.get("source_alias") or "").lower()
+    target_alias = str(kwargs.get("target_alias") or "").lower()
+    try:
+        node = sqlpred.parse(predicate)
+    except sqlpred.PredicateError:
+        return None
+    conjuncts = node.args if node.op == "and" else (node,)
+    targets = {c.lower(): c for c in target_columns}
+    sources = {c.lower(): c for c in source.column_names}
+    bounds: list[str] = []
+    for part in conjuncts:
+        if part.op != "eq" or not all(
+            isinstance(a, sqlpred.Column) and len(a.path) == 2 for a in part.args
+        ):
+            continue
+        sides = {a.path[0].lower(): a.path[1] for a in part.args}
+        if set(sides) != {source_alias, target_alias} or source_alias == target_alias:
+            continue
+        target_col = targets.get(sides[target_alias].lower())
+        source_col = sources.get(sides[source_alias].lower())
+        if target_col is None or source_col is None:
+            continue
+        if not _PLAIN_COLUMN.fullmatch(target_col):
+            continue
+        values = source.column(source_col)
+        kind = values.type
+        render: Callable[[Any], str]
+        if pa.types.is_integer(kind):
+            render = str
+        elif pa.types.is_string(kind) or pa.types.is_large_string(kind):
+            # DataFusion SQL: '' is an escaped quote, a backslash is itself.
+            render = lambda v: "'" + str(v).replace("'", "''") + "'"  # noqa: E731
+        elif pa.types.is_date32(kind):
+            render = lambda v: f"DATE '{v.isoformat()}'"  # noqa: E731
+        else:
+            continue
+        distinct = pc.unique(values.drop_null()) if values.null_count else pc.unique(values)
+        if len(distinct) == 0:
+            continue
+        column = f"{kwargs.get('target_alias')}.{target_col}"
+        if len(distinct) <= _MERGE_IN_LIMIT:
+            items = ", ".join(render(v) for v in distinct.to_pylist())
+            bounds.append(f"{column} IN ({items})")
+        else:
+            low, high = pc.min_max(distinct).values()
+            bounds.append(f"{column} BETWEEN {render(low.as_py())} AND {render(high.as_py())}")
+    if not bounds:
+        return None
+    return f"({predicate}) AND " + " AND ".join(bounds)
+
+
+_PLAIN_COLUMN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _create_refusal(shape: dict[str, Any]) -> tuple[str, str] | None:

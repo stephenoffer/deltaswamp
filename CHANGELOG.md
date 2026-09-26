@@ -45,6 +45,23 @@ First release.
 
 ### Known limits
 
+- A kernel create with `delta.targetFileSize`, `delta.isolationLevel`,
+  `delta.autoOptimize.*`, `delta.tuneFileSizesForRewrites`,
+  `delta.randomizeFilePrefixes` or `delta.checkpointRetentionDuration` writes
+  two versions: version 0 without them (delta-kernel refuses them in CREATE),
+  version 1 setting them. A catalog-managed create refuses them.
+- `to_duckdb()`, `to_polars(lazy=True)`, `to_pyarrow_dataset()` and
+  `Connection.sql` read lazily and push down the projection and simple
+  comparisons (`=`, `<`, `IN`, `IS NULL`, `AND`/`OR`/`NOT` of those); other
+  filters (functions, `LIKE` from Polars) read every row and filter afterward.
+  `to_daft()` still reads eagerly: pass `columns=`/`predicate=`.
+- `count()` answers from the log (numRecords less deletion-vector
+  cardinality) on the kernel when every file has numRecords and the predicate
+  reads only partition columns; otherwise it scans.
+- `delta.dataSkippingStatsColumns` naming nested fields is honored by kernel
+  writes only; delta-rs UPDATE, MERGE and OPTIMIZE (and every write to a
+  column-mapped table delta-rs created) still collect top-level stats only.
+
 - `convert_to_delta` refuses a hive-partitioned directory whose partition
   values are escaped (`region=a%20b`): delta-rs records those paths unencoded
   and the converted table cannot be read. Rewrite the data with `write_table`.

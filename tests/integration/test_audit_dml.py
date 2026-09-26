@@ -225,7 +225,8 @@ class TestCheckpointWithoutJsonStats:
         conn.open_table(path).checkpoint()
         kernel = conn.router.engines[Engine.KERNEL]
         files = pa.table(kernel.snapshot(conn.open_table(path).resolved).files())
-        assert files.column("num_records").to_pylist() == [None]  # stats_parsed only
+        # stats_parsed only in the checkpoint; the listing re-serializes it (OP-13).
+        assert files.column("num_records").to_pylist() == [4]
 
         t = conn.open_table(path)
         assert t.can(Operation.DELETE).engine is Engine.KERNEL

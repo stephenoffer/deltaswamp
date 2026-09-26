@@ -210,6 +210,13 @@ class Snapshot:
         oldest retained checkpoint).
         """
 
+    def refresh(self, options: dict[str, str] | None = None, latest: bool = True) -> Snapshot:
+        """This snapshot brought up to date by reading only the newer log.
+
+        With `latest=False` the same version, read through a store built from
+        `options`. Path-based tables only.
+        """
+
     @property
     def version(self) -> int: ...
     @property
