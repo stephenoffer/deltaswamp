@@ -125,6 +125,9 @@ table's vended credentials in this order:
    link. A region in a different AWS partition from the vended one (us-east-1
    against a cn-north-1 credential) is ignored.
 4. Other vended settings.
+5. The standard `AWS_*` environment variables (`AWS_ENDPOINT_URL`,
+   `AWS_REGION`, `AWS_ACCESS_KEY_ID`, ...) on `s3://`, as delta-rs reads them;
+   the credential ones only when nothing above gave a credential.
 
 S3 keys with a region and no endpoint get an explicit one,
 `https://s3.<region>.amazonaws.com` (`.amazonaws.com.cn` in China regions).
@@ -716,13 +719,17 @@ conn.sql("SELECT * FROM system.access.audit LIMIT 10", engine="warehouse")
 ```
 
 Each hand-off reads through this library, so it works on tables the target
-engine's own Delta reader cannot open. `to_polars(lazy=True)` reads nothing
-until the frame is collected, and then only the columns the query uses, up to
-its row limit; Polars applies its filters to the batches as they arrive, so
-pass `predicate=` (SQL) as well to have the engine skip files. `to_duckdb()`
-and `Connection.sql` hand DuckDB or Polars each table read in full, in
-memory: nothing in the query is pushed down, so select what you need with
-`t.to_arrow(columns=..., predicate=...)` first when a table is large.
+engine's own Delta reader cannot open. `to_polars(lazy=True)`, `to_duckdb()`,
+`to_pyarrow_dataset()` and `Connection.sql` read nothing until the query runs,
+and then only the columns it uses (and, for Polars, up to its row limit).
+Simple filters are also pushed into the scan to skip files: a column compared
+with a literal of its own kind on integer, string, boolean, date and decimal
+columns, `IN`, `IS NULL`, and `AND`/`OR` of those. Nothing whose meaning could
+differ is pushed -- `NOT`, float and double comparisons (Spark, pyarrow and
+Polars order NaN differently), binary values -- and the consumer applies its
+whole filter itself afterwards, Polars with Polars' semantics. Pass
+`predicate=` (SQL) as well when a filter the engine cannot push should still
+skip files.
 `Connection.sql` runs on DuckDB by default (or `engine="polars"`), and can join
 tables from different catalogs. `engine="warehouse"` sends the query to
 Databricks as it stands.

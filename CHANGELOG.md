@@ -72,9 +72,26 @@ First release.
   version 1 setting them. A catalog-managed create refuses them.
 - `to_duckdb()`, `to_polars(lazy=True)`, `to_pyarrow_dataset()` and
   `Connection.sql` read lazily and push down the projection and simple
-  comparisons (`=`, `<`, `IN`, `IS NULL`, `AND`/`OR`/`NOT` of those); other
-  filters (functions, `LIKE` from Polars) read every row and filter afterward.
+  comparisons of a column with a literal of its own kind -- integer, string,
+  boolean, date or decimal columns (`=`, `<`, `IN`, `IS NULL`, `AND`/`OR` of
+  those). `NOT`, float and double columns (NaN orders differently in Spark,
+  pyarrow and Polars), binary and timestamp columns, functions and `LIKE` are
+  not pushed: those read every row and the consumer filters afterward, with
+  its own semantics (Polars' filters run in Polars).
   `to_daft()` still reads eagerly: pass `columns=`/`predicate=`.
+- Snapshots are cached per process, keyed by location, version and a keyed
+  digest of the storage options (so one URL on two endpoints or accounts never
+  shares an entry). A reuse first re-reads the strong identity of the commit
+  file the snapshot ends at (ETag or object version on object stores; device,
+  inode, nanosecond mtime/ctime and size locally), so a table re-created at the
+  same path is read afresh; a store that reports no ETag is never cached.
+  Commits always read the log from storage, and a distributed write carries the
+  table's metaData id: `plan.write()`/`plan.commit()` against a table dropped
+  and re-created since planning raise `MetadataChangedError`.
+- The kernel's S3 store honours the standard `AWS_*` environment variables
+  (`AWS_ENDPOINT_URL`, keys, region, ...) as delta-rs does, below every option
+  passed or vended; environment credential keys are used only when neither
+  the caller nor the catalog gave one.
 - `count()` answers from the log (numRecords less deletion-vector
   cardinality) on the kernel when every file has numRecords and the predicate
   reads only partition columns; otherwise it scans.
