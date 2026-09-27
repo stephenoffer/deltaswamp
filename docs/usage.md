@@ -647,6 +647,17 @@ t.publish()  # staged catalog commits -> _delta_log
 conn.convert_to_delta("s3://bucket/parquet-dir")
 ```
 
+OPTIMIZE and Z-ORDER are committed by the kernel on the snapshot they were
+planned from, so concurrent runs never compact a file twice; delta-rs's own
+OPTIMIZE commit does, and is never used. They take delta-rs's options except
+`writer_properties`, `min_commit_interval` and app transactions, which are
+refused. Rows stream from the input files into the output files, one step
+(`KernelEngine.compaction_batch_bytes` of input, 1 GiB) per commit; memory is
+bounded by `KernelEngine.compaction_max_file_bytes` (512 MiB of decoded rows
+per output file or Z-order sort). `partition_filters` compare as the column's
+type, as delta-rs does: a NULL partition matches no comparison, `= ''` means
+NULL, and timestamps take ISO 8601 with or without the `T` and an offset.
+
 `vacuum` defaults to a dry run because the real thing deletes files. `lite=True`
 considers only files the log records as removed. On a table with deletion
 vectors, a full VACUUM through delta-rs keeps every `deletion_vector_*.bin`:

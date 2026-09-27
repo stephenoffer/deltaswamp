@@ -122,7 +122,7 @@ def _ts(conn: Any, path: str, column: str = "ts") -> list[int | None]:
 class TestRewritesKeepTheCalendar:
     """delta-rs rewrote legacy files from their raw Julian values: 0001-01-01 became 0000-12-30."""
 
-    @pytest.mark.parametrize("operation", ["update", "merge", "optimize", "zorder"])
+    @pytest.mark.parametrize("operation", ["update", "merge"])
     def test_delta_rs_is_refused_and_can_agrees(
         self, conn: Any, tmp_path: Any, operation: str
     ) -> None:
@@ -141,10 +141,6 @@ class TestRewritesKeepTheCalendar:
                 t.merge(source, "target.rid = source.rid").when_matched_update(
                     {"rid": "target.rid + 100"}
                 ).execute()
-            elif operation == "optimize":
-                t.optimize()
-            else:
-                t.z_order(["rid"])
         # Nothing was rewritten.
         assert [d for _, d in _rows(conn, path)] == EXPECTED_DATES
         assert _raw_days(path) == [-719164, -171489, 19723]  # the Julian day numbers
@@ -174,10 +170,32 @@ class TestRewritesKeepTheCalendar:
             (101, dt.date(1, 1, 1)),
         ]
 
-    def test_proleptic_files_still_go_to_delta_rs(self, conn: Any, tmp_path: Any) -> None:
+    @pytest.mark.parametrize("operation", ["optimize", "zorder"])
+    def test_the_kernel_compacts_legacy_files_keeping_the_values(
+        self, conn: Any, tmp_path: Any, operation: str
+    ) -> None:
+        import pyarrow.parquet as pq
+
+        path = _spark_table(tmp_path / "t")
+        t = conn.open_table(path)
+        assert t.can(operation).engine is ds.Engine.KERNEL
+        if operation == "optimize":
+            t.optimize()
+        else:
+            t.z_order(["rid"])
+        assert sorted(d for _, d in _rows(conn, path)) == sorted(EXPECTED_DATES)
+        # Written proleptic, and marked so Databricks does not rebase them.
+        assert sorted(_raw_days(path)) == sorted(_days(*EXPECTED_DATES))
+        for f in conn.open_table(path).files().column("path").to_pylist():
+            meta = pq.read_metadata(f"{path}/{f}").metadata or {}
+            assert meta.get(b"org.apache.spark.version", b"").startswith(b"3.")
+            assert b"org.apache.spark.legacyDateTime" not in meta
+
+    def test_proleptic_files_are_still_compacted(self, conn: Any, tmp_path: Any) -> None:
         path = _spark_table(tmp_path / "t", legacy=False)
         t = conn.open_table(path)
-        assert t.can("optimize").engine is ds.Engine.DELTARS
+        # By the kernel, which commits every compaction now.
+        assert t.can("optimize").engine is ds.Engine.KERNEL
         t.optimize()
         assert [d for _, d in _rows(conn, path)] == EXPECTED_DATES
 
@@ -219,15 +237,18 @@ class TestRewritesKeepTheCalendar:
             "\n".join(json.dumps(a) for a in actions) + "\n"
         )
         t = conn.open_table(str(root))
-        assert t.can("optimize").engine is ds.Engine.DELTARS
+        assert t.can("optimize").engine is ds.Engine.KERNEL
 
-    def test_old_int96_files_are_refused_too(self, conn: Any, tmp_path: Any) -> None:
-        # Not legacy at all, but delta-rs decodes INT96 as nanoseconds.
+    def test_old_int96_files_are_compacted_by_the_kernel(self, conn: Any, tmp_path: Any) -> None:
+        # Not legacy at all, but delta-rs decodes INT96 as nanoseconds; the
+        # kernel reads them at microseconds and rewrites them as INT64.
         meta = {"org.apache.spark.version": "3.5.0"}
         path = _ts_table(tmp_path / "t", [JULIAN_TS[min(JULIAN_TS)]], meta, int96=True)
-        verdict = conn.open_table(path).can(Operation.OPTIMIZE)
-        assert verdict.engine is not ds.Engine.DELTARS
-        assert "INT96" in verdict.reason
+        t = conn.open_table(path)
+        before = _ts(conn, path)
+        assert t.can(Operation.OPTIMIZE).engine is ds.Engine.KERNEL
+        t.optimize()
+        assert _ts(conn, path) == before
 
 
 class TestInt96:

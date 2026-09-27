@@ -182,7 +182,9 @@ class TestDeltaRsIsNotHandedEarlyValues:
         t = early_table()
         t.append(_rows(EARLY, base=100))
         props = deltalake.WriterProperties(compression="ZSTD")
-        with pytest.raises(UnreachableTableError, match="legacy calendar"):
+        # Refused on every table now: only delta-rs takes writer_properties,
+        # and its OPTIMIZE commit is never used (it duplicates rows).
+        with pytest.raises(UnreachableTableError, match="writer_properties"):
             t.optimize(writer_properties=props)
 
     def test_a_late_only_table_is_still_rewritten_by_delta_rs(

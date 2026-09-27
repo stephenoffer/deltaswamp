@@ -96,9 +96,9 @@ def test_optimize_on_a_column_mapped_table_is_refused_up_front(conn: Any, tmp_pa
 
 @needs_native
 def test_optimize_with_column_mapping_mode_none_still_routes(conn: Any, tmp_path: Path) -> None:
-    """The feature listed but mode none: delta-rs optimizes it fine."""
+    """The feature listed but mode none: the kernel compacts it."""
     path = _make(conn, tmp_path, {"delta.feature.columnMapping": "supported"})
-    assert conn.table(path).can("optimize").engine is Engine.DELTARS
+    assert conn.table(path).can("optimize").engine is Engine.KERNEL
     conn.table(path).optimize()
 
 
@@ -241,7 +241,9 @@ def test_history_exemptions_do_not_leak_into_writes() -> None:
     )
     assert router.capability(Operation.HISTORY, table).ok
     assert not router.capability(Operation.SCAN, table).ok
-    assert not router.capability(Operation.OPTIMIZE, table).ok
+    # A write delta-rs itself would commit (OPTIMIZE now hands its commit to
+    # the kernel, so it is not one).
+    assert not router.capability(Operation.DELETE, table).ok
 
 
 # ------------------------------------------------------------ kernel checkpoint

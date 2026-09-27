@@ -817,10 +817,17 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         # --- maintenance
         _op(
             Operation.OPTIMIZE,
-            (_D, _S),
-            "kernel has no OPTIMIZE; the warehouse runs it on managed and clustered tables",
+            (_K, _D, _S),
+            "the kernel commits a compaction on the snapshot it read, so a concurrent one "
+            "conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows "
+            "both compacted, so delta-rs hands it to the kernel. The warehouse runs it on "
+            "managed and clustered tables",
         ),
-        _op(Operation.ZORDER, (_D, _S), "kernel has no Z-ORDER"),
+        _op(
+            Operation.ZORDER,
+            (_K, _D, _S),
+            "as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one",
+        ),
         _op(Operation.VACUUM, (_D, _S), "kernel has no VACUUM"),
         _op(Operation.RESTORE, (_D, _S), "kernel has no RESTORE"),
         _op(Operation.REPAIR, (_D, _S), "kernel has no FSCK"),

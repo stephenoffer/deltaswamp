@@ -68,6 +68,13 @@ pub const FEATURES: &[&str] = &[
     "commit_log",
     // `commit_dml(data_change=False)`: compactions committed by the kernel.
     "compaction",
+    // `operation_parameters=` and `blind_append=` on every commit, written
+    // into its commitInfo.
+    "commit_info_patch",
+    // A compaction streams its rows (`commit_dml` pulls them as it writes),
+    // commits past the value-constraint features, and file-restricted scans
+    // read files in the order given.
+    "streaming_compaction",
 ];
 
 #[pyfunction]
