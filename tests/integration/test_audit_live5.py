@@ -274,7 +274,12 @@ class TestChangeFeedAcrossSchemaChanges:
 # ----------------------------------------------------------- #9 dropped
 
 
-def test_a_read_through_a_handle_whose_table_was_dropped_fails(conn: Any, tmp_path: Any) -> None:
+def test_a_read_through_a_handle_whose_table_was_dropped_fails(
+    conn: Any, tmp_path: Any, monkeypatch: Any
+) -> None:
+    import deltaswamp.table as table_module
+
+    monkeypatch.setattr(table_module, "_NAME_RECHECK_SECONDS", 0.0)
     path = str(tmp_path / "dropped")
     conn.create_table(path, pa.schema([("id", pa.int64())])).append(pa.table({"id": [1]}))
     t, catalog = _catalog_table(conn, path)
@@ -284,6 +289,26 @@ def test_a_read_through_a_handle_whose_table_was_dropped_fails(conn: Any, tmp_pa
         t.to_arrow()
     with pytest.raises(TableNotFoundError):
         t.count()
+
+
+def test_reads_recheck_the_name_at_most_once_a_window(
+    conn: Any, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Each read cost a catalog round trip; reads within a window share one."""
+    import deltaswamp.table as table_module
+
+    clock = [1000.0]
+    monkeypatch.setattr(table_module.time, "monotonic", lambda: clock[0])
+    path = str(tmp_path / "window")
+    conn.create_table(path, pa.schema([("id", pa.int64())])).append(pa.table({"id": [1]}))
+    t, catalog = _catalog_table(conn, path)
+    t.to_arrow()
+    catalog.gone = True
+    clock[0] += table_module._NAME_RECHECK_SECONDS / 2
+    assert pa.table(t.to_arrow()).num_rows == 1  # trusted within the window
+    clock[0] += table_module._NAME_RECHECK_SECONDS
+    with pytest.raises(TableNotFoundError):
+        t.to_arrow()
 
 
 # ------------------------------------------------------ #4 / #7 Iceberg

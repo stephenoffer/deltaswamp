@@ -14,6 +14,7 @@ import dataclasses
 import importlib
 import json
 import re
+import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -753,6 +754,11 @@ def _protocol_from_properties(resolved: ResolvedTable) -> dict[str, Any]:
     }
 
 
+#: How often a read through a catalog handle re-checks that its name still
+#: names the same table (seconds).
+_NAME_RECHECK_SECONDS = 1.0
+
+
 class Table:
     """One table: reads, writes, DDL and maintenance, routed per operation."""
 
@@ -864,7 +870,14 @@ class Table:
         """
         if self._version is not None or self._resolved.ref.kind is not RefKind.CATALOG:
             return
+        # One catalog round trip (~90 ms on Databricks) per read made a loop
+        # of small reads slow; a drop is noticed within this window instead.
+        # Writes check every time (_refresh_commit_tail(before_write=True)).
+        now = time.monotonic()
+        if now - getattr(self, "_named_checked_at", float("-inf")) < _NAME_RECHECK_SECONDS:
+            return
         self._refresh_commit_tail(before_write=True)
+        self._named_checked_at = now
 
     def _refresh_commit_tail(self, *, before_write: bool = False) -> None:
         """Re-read a catalog-managed table's ratified commits from the catalog.

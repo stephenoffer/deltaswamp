@@ -337,8 +337,14 @@ class ResolvedTable:
         """
         if self.is_iceberg:
             return True
-        writer_compat = str(self.properties.get("delta.enableIcebergWriterCompatV1", ""))
-        return self.is_catalog_managed and writer_compat.strip().lower() == "true"
+        # V3 (Iceberg v3 tables) is set in place of V1, not beside it.
+        return self.is_catalog_managed and any(
+            str(self.properties.get(key, "")).strip().lower() == "true"
+            for key in (
+                "delta.enableIcebergWriterCompatV1",
+                "delta.enableIcebergWriterCompatV3",
+            )
+        )
 
     @property
     def is_view_like(self) -> bool:

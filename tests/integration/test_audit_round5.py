@@ -79,3 +79,18 @@ def test_a_semicolon_in_a_predicate_is_refused(tmp_path: Any, op: str) -> None:
     assert sorted(t.to_arrow().column("id").to_pylist()) == [1, 2]
     # Inside a string literal a ';' is data.
     assert t.count(predicate="'a;b' = 'a;b'") == 2
+
+
+@pytest.mark.parametrize("version", ["V1", "V3"])
+def test_managed_iceberg_is_recognised_for_both_writer_compat_versions(version: str) -> None:
+    from deltaswamp.catalog.base import ResolvedTable
+    from deltaswamp.identity import parse_ref
+
+    table = ResolvedTable(
+        ref=parse_ref("main.s.t"),
+        location="s3://b/t",
+        reader_features=frozenset({"catalogManaged"}),
+        writer_features=frozenset({"catalogManaged"}),
+        properties={f"delta.enableIcebergWriterCompat{version}": "true"},
+    )
+    assert table.is_managed_iceberg
