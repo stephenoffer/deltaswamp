@@ -13,7 +13,7 @@ import threading
 import urllib.parse
 from typing import Any
 
-from ..errors import InvalidReferenceError, PreflightError
+from ..errors import InvalidReferenceError, PreflightError, TableNotFoundError
 from ..identity import RefKind, TableRef
 from .base import ResolvedTable, TableType
 
@@ -202,7 +202,10 @@ class GlueCatalog:
             name = type(exc).__name__
             if "EntityNotFoundException" in (code, name):
                 where = f" {kwargs['CatalogId']}" if kwargs.get("CatalogId") else ""
-                raise InvalidReferenceError(
+                missing = (
+                    TableNotFoundError if what.startswith("Glue table") else InvalidReferenceError
+                )
+                raise missing(
                     f"{what} does not exist in the Glue Data Catalog{where}: {exc}"
                 ) from exc
             if code in ("AccessDeniedException", "AccessDenied") or name == (

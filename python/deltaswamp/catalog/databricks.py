@@ -39,6 +39,7 @@ from ..errors import (
     InvalidArgumentError,
     InvalidReferenceError,
     PreflightError,
+    TableNotFoundError,
 )
 from ..governance import (
     ColumnLineage,
@@ -599,7 +600,7 @@ class DatabricksUnityCatalog:
         ):
             # Resolution is by name, so a stale table_id cannot be the cause;
             # the hint that said so appeared for tables that never existed.
-            return InvalidReferenceError(
+            return TableNotFoundError(
                 f"{ref.full_name} does not exist in Unity Catalog, or is not visible to "
                 f"this principal. Underlying error: {exc}"
             )

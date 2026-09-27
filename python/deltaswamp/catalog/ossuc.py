@@ -25,7 +25,7 @@ from typing import Any, NoReturn, TypeVar
 
 from ..credentials.base import DEFAULT_REFRESH_MARGIN_SECONDS, Cloud, Credentials, Operation
 from ..credentials.databricks import _expires_at_seconds, credentials_from_response
-from ..errors import CredentialError, InvalidReferenceError, PreflightError
+from ..errors import CredentialError, InvalidReferenceError, PreflightError, TableNotFoundError
 from ..governance import (
     ColumnLineage,
     FunctionSummary,
@@ -112,6 +112,9 @@ def _prop(value: Any) -> str:
 def _unsupported(method: str) -> NoReturn:
     raise NotImplementedError(f"{method}: {_UNSUPPORTED[method]}")
 
+
+#: Actions whose 404 means the table itself is missing.
+_TABLE_ACTIONS = frozenset({"resolve the table", "drop the table", "read table metadata"})
 
 #: A 404 from the permissions API that is about the principal, not the securable.
 _PRINCIPAL_MISSING = re.compile(
@@ -671,7 +674,8 @@ class OSSUnityCatalog:
             return fn()
         except UnityCatalogHTTPError as exc:
             if exc.status == 404:
-                raise InvalidReferenceError(
+                missing = TableNotFoundError if action in _TABLE_ACTIONS else InvalidReferenceError
+                raise missing(
                     f"cannot {action}: {name} does not exist in Unity Catalog. "
                     f"Underlying error: {exc}"
                 ) from exc

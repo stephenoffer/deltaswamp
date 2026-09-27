@@ -20,7 +20,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from ..errors import InvalidReferenceError, PreflightError
+from ..errors import InvalidReferenceError, PreflightError, TableNotFoundError
 from ..identity import RefKind, TableRef
 from .base import ResolvedTable, TableType
 from .glue import normalise_location
@@ -238,7 +238,7 @@ class HiveMetastoreCatalog:
             parsed = hms.get_table(schema, table)
         except Exception as exc:
             if type(exc).__name__ in ("NoSuchObjectException", "UnknownTableException"):
-                raise InvalidReferenceError(
+                raise TableNotFoundError(
                     f"{schema}.{table} does not exist in the Hive Metastore: "
                     f"{getattr(exc, 'message', None) or exc}"
                 ) from exc
@@ -386,7 +386,7 @@ class HiveMetastoreCatalog:
                 hms.client.drop_table(ref.schema, ref.table, False)
             except Exception as exc:
                 if type(exc).__name__ in ("NoSuchObjectException", "UnknownTableException"):
-                    raise InvalidReferenceError(
+                    raise TableNotFoundError(
                         f"{ref.schema}.{ref.table} does not exist in the Hive Metastore"
                     ) from exc
                 raise _thrift_error(f"drop {ref.schema}.{ref.table}", exc) from exc

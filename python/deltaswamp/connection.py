@@ -22,6 +22,7 @@ from .errors import (
     FallbackRequiredError,
     InvalidArgumentError,
     InvalidReferenceError,
+    TableNotFoundError,
     UnreachableTableError,
 )
 from .identity import RefKind, TableRef, parse_ref
@@ -1061,13 +1062,19 @@ class Connection:
             )
         return list(self._catalog_call("list_schemas", f"list schemas in {target}", target))
 
-    def drop_table(self, name: str) -> None:
+    def drop_table(self, name: str, *, if_exists: bool = False) -> None:
         """Remove a table from the catalog.
 
         For an EXTERNAL table the files remain; only the registration goes.
+        With `if_exists`, a table that is not there is not an error (DROP
+        TABLE IF EXISTS).
         """
         ref = self._catalog_ref(name, "drop")
-        self._catalog_call("drop_table", f"drop {ref}", ref, catalog=self._catalog_for(ref))
+        try:
+            self._catalog_call("drop_table", f"drop {ref}", ref, catalog=self._catalog_for(ref))
+        except TableNotFoundError:
+            if not if_exists:
+                raise
 
     def table_exists(self, name: str) -> bool:
         """Whether a table is already there.

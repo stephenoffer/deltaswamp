@@ -824,6 +824,7 @@ All inherit from `DeltaSwampError`.
 | Error | Means |
 |---|---|
 | `InvalidReferenceError` | the reference could not be parsed or resolved |
+| `TableNotFoundError` | an `InvalidReferenceError`: the catalog has no such table, or hides it from this principal; `conn.drop_table(name, if_exists=True)` ignores it |
 | `InvalidArgumentError` | a call's arguments are malformed or contradict each other (also a `ValueError`) |
 | `UnreachableTableError` | no available engine can serve the request |
 | `FallbackRequiredError` | only the SQL fallback could serve it, and it is off |

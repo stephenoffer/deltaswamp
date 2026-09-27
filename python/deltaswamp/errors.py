@@ -15,6 +15,14 @@ class InvalidReferenceError(DeltaSwampError):
     """A table reference could not be parsed or resolved."""
 
 
+class TableNotFoundError(InvalidReferenceError):
+    """The catalog has no table by that name, or does not let this principal see it.
+
+    A subclass of InvalidReferenceError, which it used to be raised as, so
+    existing handlers keep working.
+    """
+
+
 class InvalidArgumentError(DeltaSwampError, ValueError):
     """A call's arguments are malformed or contradict each other.
 

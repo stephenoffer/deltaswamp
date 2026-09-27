@@ -35,6 +35,7 @@ from .errors import (
     PropertyNotSupportedError,
     SqlFallbackWarning,
     StorageError,
+    TableNotFoundError,
     TransientCommitError,
     UnreachableTableError,
 )
@@ -111,6 +112,7 @@ __all__ = [
     "StorageError",
     "Table",
     "TableFeature",
+    "TableNotFoundError",
     "TableRef",
     "TransientCommitError",
     "UnreachableTableError",
