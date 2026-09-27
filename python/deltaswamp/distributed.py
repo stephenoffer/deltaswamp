@@ -74,6 +74,16 @@ class ScanPlan:
         """Read some (default: all) of the planned splits as an Arrow stream."""
         chosen = list(self.splits if splits is None else splits)
         if splits is not None:
+            from .engine.base import ScanSplit
+            from .errors import InvalidArgumentError
+
+            foreign = [s for s in chosen if not isinstance(s, ScanSplit)]
+            if foreign:
+                # A string raised a bare AttributeError ('str' has no 'path').
+                raise InvalidArgumentError(
+                    f"read() takes this plan's splits (ScanSplit objects), not "
+                    f"{type(foreign[0]).__name__} {foreign[0]!r:.80}"
+                )
             # A split names its file relative to its own table, so one from
             # another plan read *this* table's root: a missing file, or rows
             # from whatever file happened to share the name -- and an empty
@@ -186,6 +196,11 @@ class WritePlan:
 
         if data is None:
             raise InvalidArgumentError("plan.write() needs data; got None")
+        from ._util import not_table_data
+
+        refusal = not_table_data(data)
+        if refusal is not None:
+            raise InvalidArgumentError(refusal)
         if isinstance(data, list) and data:
             import pyarrow as pa
 

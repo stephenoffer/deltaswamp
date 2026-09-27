@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
+from collections.abc import Callable
 from typing import Any
 
-from .errors import UnreachableTableError
+from .errors import InvalidArgumentError
 
 
 def timestamp_ms(value: Any) -> int:
@@ -22,8 +24,10 @@ def timestamp_ms(value: Any) -> int:
         try:
             value = dt.datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
         except ValueError as exc:
-            raise UnreachableTableError(
-                f"time travel to {value!r}", "not an ISO-8601 timestamp or epoch milliseconds"
+            # The caller's mistake, not the table's: as UnreachableTableError
+            # it read as "no engine can serve this", and invited a fallback.
+            raise InvalidArgumentError(
+                f"cannot time travel to {value!r}: not an ISO-8601 timestamp or epoch milliseconds"
             ) from exc
     if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
         value = dt.datetime(value.year, value.month, value.day)
@@ -34,9 +38,44 @@ def timestamp_ms(value: Any) -> int:
         # toward zero, a millisecond late.
         epoch = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
         return int((value - epoch) // dt.timedelta(milliseconds=1))
-    raise UnreachableTableError(
-        f"time travel to {value!r}", "expected a datetime, an ISO-8601 string or epoch millis"
+    raise InvalidArgumentError(
+        f"cannot time travel to {value!r}: expected a datetime, an ISO-8601 string or epoch millis"
     )
+
+
+def check_keywords(what: str, target: Callable[..., Any], given: dict[str, Any]) -> None:
+    """Refuse keyword arguments `target` does not take, before calling it.
+
+    A method that passes its ``**kwargs`` on let a misspelt one through as
+    Python's TypeError naming the inner function (``Table.scan() got an
+    unexpected keyword argument``), which `except DeltaSwampError` missed.
+    """
+    try:
+        parameters = inspect.signature(target).parameters.values()
+    except (TypeError, ValueError):
+        return
+    if any(p.kind is p.VAR_KEYWORD for p in parameters):
+        return
+    known = {p.name for p in parameters if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+    unknown = sorted(set(given) - known)
+    if unknown:
+        raise InvalidArgumentError(
+            f"{what}() got unexpected keyword argument(s) {unknown}; it takes {sorted(known)}"
+        )
+
+
+def not_table_data(data: Any) -> str | None:
+    """Why `data` cannot be written as a table, or None if it may be.
+
+    Text and scalars reached the engines, which failed with a bare
+    AttributeError ('str' object has no attribute 'schema') or TypeError.
+    """
+    if isinstance(data, (str, bytes, bytearray, int, float, complex, bool)):
+        return (
+            f"data to write must be a table (Arrow, pandas, Polars, a dict of columns or a "
+            f"list of row dicts), not {type(data).__name__}"
+        )
+    return None
 
 
 def enum_value(value: Any) -> str | None:

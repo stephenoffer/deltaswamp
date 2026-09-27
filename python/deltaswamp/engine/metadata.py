@@ -40,7 +40,7 @@ from ..capability import (
     TableFeature,
     feature_from_wire,
 )
-from ..errors import DeltaSwampError, UnreachableTableError
+from ..errors import DeltaSwampError, InvalidArgumentError, UnreachableTableError
 
 __all__ = [
     "Change",
@@ -239,9 +239,11 @@ def _find(schema: dict[str, Any], path: list[str]) -> tuple[list[dict[str, Any]]
             (i for i, f in enumerate(container) if f["name"].lower() == name.lower()), None
         )
         if index is None:
-            raise _refuse(
-                f"find column {'.'.join(path)}",
-                f"the table has no column {'.'.join(path[: depth + 1])!r}",
+            # The caller's mistake, not a table no engine can serve: as
+            # UnreachableTableError it invited a fallback that cannot help.
+            raise InvalidArgumentError(
+                f"cannot find column {'.'.join(path)}: the table has no column "
+                f"{'.'.join(path[: depth + 1])!r}"
             )
         if depth == len(path) - 1:
             return container, index
@@ -1360,7 +1362,9 @@ def cluster_by(state: TableState, columns: list[str] | str | None) -> Change:
         for depth, part in enumerate(path):
             found = next((f for f in container if f["name"].lower() == part.lower()), None)
             if found is None:
-                raise _refuse(f"cluster by {column}", f"the table has no column {column!r}")
+                raise InvalidArgumentError(
+                    f"cannot cluster by {column}: the table has no column {column!r}"
+                )
             names.append(_physical_name(found))
             if depth < len(path) - 1:
                 if not (isinstance(found["type"], dict) and found["type"].get("type") == "struct"):
@@ -1761,7 +1765,9 @@ def unset_properties(state: TableState, keys: Iterable[str], *, if_exists: bool 
         if key not in configuration:
             if if_exists:
                 continue
-            raise _refuse(f"unset {key}", "the table has no such property")
+            raise InvalidArgumentError(
+                f"cannot unset {key}: the table has no such property (if_exists=True ignores it)"
+            )
         del configuration[key]
         removed.append(key)
     if not removed:

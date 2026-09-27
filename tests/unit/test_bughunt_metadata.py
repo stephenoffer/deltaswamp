@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from deltaswamp.engine import metadata as m
-from deltaswamp.errors import UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
 
 
 def _field(name: str, dtype: Any = "long", nullable: bool = True, /, **meta: Any) -> dict[str, Any]:
@@ -334,7 +334,7 @@ def test_isolation_level_canonical_spelling() -> None:
 
 
 def test_stats_columns_must_exist() -> None:
-    with pytest.raises(UnreachableTableError, match="no column 'nope'"):
+    with pytest.raises(InvalidArgumentError, match="no column 'nope'"):
         m.set_properties(state(), {"delta.dataSkippingStatsColumns": "id,nope"})
 
 

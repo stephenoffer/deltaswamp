@@ -350,7 +350,10 @@ class _StrictEngine:
 
     @property  # type: ignore[misc]
     def __class__(self) -> type:
-        return type(self._inner)
+        # The inner object's own answer, not type(): it may be the error
+        # boundary (engine/boundary.py), which reports the engine's class.
+        cls: type = self._inner.__class__
+        return cls
 
     def __reduce_ex__(self, protocol: Any) -> Any:
         return self._inner.__reduce_ex__(protocol)

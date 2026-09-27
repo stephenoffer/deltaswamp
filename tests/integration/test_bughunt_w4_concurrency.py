@@ -150,7 +150,7 @@ def test_deltars_lost_race_is_a_commit_conflict_error(path: str, monkeypatch: An
 
 
 def test_non_conflict_commit_failure_is_not_relabelled() -> None:
-    from deltaswamp.engine.deltars import _as_commit_conflict
+    from deltaswamp.engine.boundary import as_commit_conflict as _as_commit_conflict
 
     class CommitFailedError(Exception):
         pass
@@ -277,7 +277,10 @@ def test_forked_delta_rs_runtime_is_a_clear_error_and_rerouted(path: str, monkey
 
     monkeypatch.setattr(deltalake, "DeltaTable", forked)
     try:
-        engine = deltars.DeltaRsEngine()
+        from deltaswamp.capability import Engine as EngineKind
+        from deltaswamp.engine.boundary import guard
+
+        engine = guard(EngineKind.DELTARS, deltars.DeltaRsEngine())
         from deltaswamp.catalog.filesystem import FilesystemCatalog
         from deltaswamp.identity import parse_ref
 

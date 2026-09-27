@@ -8,15 +8,12 @@ features when reading, so it opens tables delta-rs refuses: every
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
-import inspect
 import json
 import os
 import re
 import threading
 from collections import OrderedDict
-from collections.abc import Iterator
 from typing import Any, ClassVar
 
 from .. import predicate as sqlpred
@@ -41,12 +38,9 @@ from ..catalog import ResolvedTable
 from ..credentials import Operation as CredentialOperation
 from ..errors import (
     SQL_FALLBACK_REMEDY,
-    BackfillRequiredError,
     CommitConflictError,
-    DeltaSwampError,
     EngineLimitError,
     InvalidArgumentError,
-    TransientCommitError,
     UnreachableTableError,
 )
 from ..properties import (
@@ -57,6 +51,7 @@ from ..properties import (
 )
 from . import metadata as meta
 from .base import missing_method
+from .boundary import conflict_version, engine_cause, translating
 from .metadata import CLUSTERING_DOMAIN, TableState, arrow_to_delta_field, build_actions
 
 __all__ = ["KernelEngine"]
@@ -1259,7 +1254,7 @@ class KernelEngine:
         replayable = hasattr(data, "to_reader") and not overwrite and not table.is_catalog_managed
         attempts = 1 + max(0, self.append_commit_retries if retries is None else int(retries))
         attempts = attempts if replayable else 1
-        with _library_commit_errors():
+        with translating(EngineKind.KERNEL, "commit"):
             for attempt in range(attempts):
                 snapshot = self.snapshot(table, write=True)
                 if txn is not None and hasattr(snapshot, "app_id_version"):
@@ -1723,7 +1718,7 @@ class KernelEngine:
         touched = int(pc.sum(matched).as_py() or 0)
         if touched == 0 and replacement.num_rows == current.num_rows:
             return {"version": int(snapshot.version), "num_affected_rows": 0}
-        with _library_commit_errors():
+        with translating(EngineKind.KERNEL, "commit"):
             version = snapshot.append(
                 replacement.to_reader(),
                 uc=self._uc_commit_config(table),
@@ -1906,7 +1901,7 @@ class KernelEngine:
         try:
             while True:
                 try:
-                    with _library_commit_errors():
+                    with translating(EngineKind.KERNEL, "commit"):
                         version, _deleted, _dvs, _removed = snapshot.commit_dml(
                             deletions.to_reader(),
                             data=data.to_reader() if data is not None else None,
@@ -1930,8 +1925,8 @@ class KernelEngine:
                     commit_backoff(attempt - 1)
         except ValueError as exc:
             # Refused before anything is written; the request's mistake, not
-            # the engine's, so it is reported as one.
-            if isinstance(exc, InvalidArgumentError) or "non-nullable" not in str(exc):
+            # the engine's, so it is reported as one, saying which.
+            if engine_cause(exc) is exc or "non-nullable" not in str(exc):
                 raise
             raise InvalidArgumentError(
                 f"{operation} would write NULL into a NOT NULL column: {exc}"
@@ -2077,7 +2072,7 @@ class KernelEngine:
             # Delta column names are case-insensitive.
             index = int(schema.get_field_index(_canonical_path(schema, (name,))[0]))
             if index < 0:
-                raise UnreachableTableError(what, f"the table has no column {name!r}")
+                raise InvalidArgumentError(f"cannot {what}: the table has no column {name!r}")
             return index
 
         def assign(current: Any, keep: Any) -> Any:
@@ -2139,7 +2134,7 @@ class KernelEngine:
     def publish(self, table: ResolvedTable) -> int:
         """Publish ratified-but-unpublished commits into the Delta log."""
         snapshot = self.snapshot(table, write=True)
-        with _library_commit_errors():
+        with translating(EngineKind.KERNEL, "commit"):
             version: int = snapshot.publish(uc=self._uc_commit_config(table))
         return version
 
@@ -2299,7 +2294,7 @@ class KernelEngine:
         # A lost race is a conflict, not an unreachable table: callers that
         # catch CommitConflictError to retry never saw this one.
         raise CommitConflictError(
-            _conflict_version(str(last_error)),
+            conflict_version(str(last_error)),
             f"cannot commit a metadata change: another writer committed first on each "
             f"of {self.metadata_commit_attempts} attempts ({last_error}); retry when the "
             "table is less busy",
@@ -2698,25 +2693,18 @@ class KernelEngine:
                     "committing these fragments would duplicate rows already in the table",
                     "drop the fragments; their files are unreferenced and VACUUM removes them",
                 )
-        try:
-            with _library_commit_errors():
-                committed: int = snapshot.commit_files(
-                    list(fragments),
-                    uc=self._uc_commit_config(table),
-                    engine_info=engine_info or _engine_info(),
-                    operation=operation,
-                    overwrite=overwrite,
-                    txn=txn,
-                    commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-                )
-        except ValueError as exc:
-            # A refused fragment is the caller's input, and reached callers as
-            # a bare ValueError that `except DeltaSwampError` did not catch.
-            from ..errors import DeltaSwampError, InvalidArgumentError
-
-            if isinstance(exc, DeltaSwampError) or "fragment" not in str(exc):
-                raise
-            raise InvalidArgumentError(str(exc)) from exc
+        # A refused fragment is the caller's input: the extension raises it as
+        # InvalidInputError, which the translation makes InvalidArgumentError.
+        with translating(EngineKind.KERNEL, "commit"):
+            committed: int = snapshot.commit_files(
+                list(fragments),
+                uc=self._uc_commit_config(table),
+                engine_info=engine_info or _engine_info(),
+                operation=operation,
+                overwrite=overwrite,
+                txn=txn,
+                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+            )
         self._maybe_checkpoint(table, committed, snapshot)
         return committed
 
@@ -2750,44 +2738,6 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
         return _planned_read(snapshot, columns, predicate, files=paths)
-
-
-def _library_input_errors(method: Any) -> Any:
-    """`method`, raising InvalidArgumentError where the extension refused its input.
-
-    The extension's `InvalidInputError` (a column that is not in the table, a
-    projection naming one twice, `set_not_null` on a missing column) is a
-    ValueError but not a DeltaSwampError. `Table` treats anything that is not
-    one of this library's errors as the engine breaking, so a typo in
-    `columns=` warned "kernel failed to serve scan", fell back to delta-rs,
-    and surfaced as delta-rs's own DeltaError. InvalidArgumentError is a
-    ValueError too, so `except ValueError` keeps working.
-    """
-    import functools
-
-    @functools.wraps(method)
-    def call(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return method(*args, **kwargs)
-        except ValueError as exc:
-            try:
-                from deltaswamp import _native
-            except ImportError:
-                raise exc from None
-            native = getattr(_native, "InvalidInputError", None)
-            if native is None or isinstance(exc, DeltaSwampError) or not isinstance(exc, native):
-                raise
-            from ..errors import InvalidArgumentError
-
-            raise InvalidArgumentError(str(exc)) from exc
-
-    return call
-
-
-for _name, _member in list(vars(KernelEngine).items()):
-    if not _name.startswith("_") and inspect.isfunction(_member):
-        setattr(KernelEngine, _name, _library_input_errors(_member))
-del _name, _member
 
 
 #: Fragment schema-metadata key: the table layout its files were written
@@ -3142,87 +3092,6 @@ def _planned_read(
     return stream if keep is None else _project(stream, keep)
 
 
-@contextlib.contextmanager
-def _library_commit_errors() -> Iterator[None]:
-    """Raise this library's error types instead of the extension's.
-
-    `errors.py` defines `CommitConflictError` and `BackfillRequiredError` so a
-    caller can catch `DeltaSwampError` and tell a lost race from backpressure.
-    The native ones are plain `RuntimeError`s, and they were reaching callers
-    untranslated -- so `except DeltaSwampError` around a commit caught nothing,
-    which is precisely the case it exists for.
-    """
-    from deltaswamp import _native
-
-    try:
-        yield
-    except _native.BackfillRequiredError as exc:
-        raise BackfillRequiredError(str(exc)) from exc
-    except _native.CommitConflictError as exc:
-        message = str(exc)
-        if "do not reuse the staged file" in message:
-            # Advice for a hand-staged catalog commit, which named a staged
-            # file and a txnId to a caller who had neither.
-            message = (
-                f"another writer committed version {_conflict_version(message)} first, and "
-                "nothing was committed. Re-read the table and retry the write."
-            )
-        raise CommitConflictError(_conflict_version(str(exc)), message) from exc
-    except _native.RetryableError as exc:
-        raise TransientCommitError(str(exc)) from exc
-    except ValueError as exc:
-        if isinstance(exc, DeltaSwampError):
-            raise
-        translated = _uc_commit_http_error(str(exc))
-        if translated is None and any(m in str(exc) for m in _BAD_DATA_MARKERS):
-            # The data does not fit the table: the caller's input, reported as
-            # a bare ValueError that `except DeltaSwampError` did not catch.
-            # InvalidArgumentError is still a ValueError.
-            from ..errors import InvalidArgumentError
-
-            translated = InvalidArgumentError(str(exc))
-        if translated is None and isinstance(exc, getattr(_native, "CatalogCommitError", ())):
-            from ..errors import CredentialError, InvalidReferenceError, PreflightError
-
-            # The extension types what the UC client words without a status
-            # (a 401 is "Authentication failed"); anything else -- a 400, say
-            # -- is still the catalog's refusal, with nothing committed.
-            if isinstance(exc, getattr(_native, "CatalogNotFoundError", ())):
-                translated = InvalidReferenceError(
-                    "the catalog no longer has this table: it was dropped (or renamed) "
-                    f"after it was opened, and the commit was refused. Re-resolve it. ({exc})"
-                )
-            elif isinstance(exc, getattr(_native, "CatalogPermissionError", ())):
-                if "authentication failed" in str(exc).lower() or "401" in str(exc):
-                    translated = CredentialError(
-                        "the catalog rejected the commit's credentials (expired or invalid "
-                        f"token); nothing was committed. ({exc})"
-                    )
-                else:
-                    translated = PreflightError(
-                        "the catalog refused the commit: the principal may not modify this "
-                        f"table; nothing was committed. ({exc})"
-                    )
-            else:
-                translated = UnreachableTableError(
-                    "commit to the catalog", f"the catalog refused the commit ({exc})"
-                )
-        if translated is None:
-            raise
-        raise translated from exc
-
-
-#: Messages the extension raises (as ValueError) for data that does not fit.
-_BAD_DATA_MARKERS = (
-    "that are not in the table schema",
-    "cannot be written as the table's type",
-    # A null in a NOT NULL column.
-    "Found unmasked nulls for non-nullable",
-    # Kernel writes binary partition values as text, so they must be UTF-8.
-    "binary partition value is not valid UTF-8",
-)
-
-
 _REJECTED_CREDENTIAL_MARKERS = (
     "expiredtoken",
     "token has expired",
@@ -3241,50 +3110,6 @@ def _rejected_credential(message: str) -> bool:
     """Whether a storage error reads as a credential the store refused."""
     lowered = message.lower()
     return any(marker in lowered for marker in _REJECTED_CREDENTIAL_MARKERS)
-
-
-def _uc_commit_http_error(message: str) -> Exception | None:
-    """A catalog refusal of a commit, as this library's error type.
-
-    The extension classifies only 409 and 429; any other status from the UC
-    commit API (the table dropped under the writer, an expired token, a lost
-    privilege) reached callers as a bare ValueError that `except
-    DeltaSwampError` did not catch, after the data files were written.
-    """
-    import re
-
-    from ..errors import CredentialError, InvalidReferenceError, PreflightError
-
-    if "UC update_table error" not in message:
-        return None
-    found = re.search(r"status\D{0,3}(\d{3})", message)
-    status = int(found.group(1)) if found else None
-    if status == 404:
-        return InvalidReferenceError(
-            "the catalog no longer has this table: it was dropped (or renamed) after it was "
-            f"opened, and the commit was refused. Re-resolve it. ({message})"
-        )
-    if status == 401:
-        return CredentialError(
-            "the catalog rejected the commit's credentials (expired or invalid token); "
-            f"nothing was committed. ({message})"
-        )
-    if status == 403:
-        return PreflightError(
-            "the catalog refused the commit: the principal may not modify this table "
-            f"(MODIFY, plus USE SCHEMA and USE CATALOG); nothing was committed. ({message})"
-        )
-    # A 5xx is left alone: the catalog may have ratified the commit before
-    # failing, so "unchanged, retry" (TransientCommitError) would be a guess.
-    return None
-
-
-def _conflict_version(message: str) -> int:
-    """The version someone else won, if the message names one; -1 otherwise."""
-    import re
-
-    found = re.search(r"version (\d+)", message)
-    return int(found.group(1)) if found else -1
 
 
 def _feature_usage(snapshot: Any) -> dict[str, bool]:
@@ -3380,10 +3205,9 @@ def _delta_fields(fields: Any) -> list[dict[str, Any]]:
         elif hasattr(item, "type") and hasattr(item, "nullable"):
             out.append(arrow_to_delta_field(item))
         else:
-            raise UnreachableTableError(
-                "add columns",
-                f"cannot interpret {type(item).__name__} as a column definition",
-                "pass pyarrow fields, deltalake Fields, or a {name: type} mapping",
+            raise InvalidArgumentError(
+                f"cannot add columns: cannot interpret {type(item).__name__} as a column "
+                "definition; pass pyarrow fields, deltalake Fields, or a {name: type} mapping"
             )
     return out
 
@@ -3399,11 +3223,10 @@ def _delta_type(name: str, dtype: Any) -> Any:
     try:
         return meta.sql_type_to_delta(dtype)
     except ValueError as exc:
-        raise UnreachableTableError(
-            f"add column {name}",
-            f"{dtype!r} is not a Delta type ({exc})",
-            "use a Delta or SQL type (long, bigint, string, decimal(p,s), array<int>, ...), "
-            "a pyarrow type, or a Delta JSON type",
+        raise InvalidArgumentError(
+            f"cannot add column {name}: {dtype!r} is not a Delta type ({exc}); use a Delta or "
+            "SQL type (long, bigint, string, decimal(p,s), array<int>, ...), a pyarrow type, "
+            "or a Delta JSON type"
         ) from exc
 
 

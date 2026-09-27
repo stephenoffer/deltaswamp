@@ -184,14 +184,6 @@ class KernelMerger:
     # -------------------------------------------------------------- execution
 
     def execute(self) -> dict[str, Any]:
-        from .kernel import _library_input_errors
-
-        # It runs after `KernelEngine.merge` returned, outside the wrapper that
-        # turns the extension's InvalidInputError into InvalidArgumentError.
-        result: dict[str, Any] = _library_input_errors(self._execute)()
-        return result
-
-    def _execute(self) -> dict[str, Any]:
         import duckdb
         import pyarrow as pa
 

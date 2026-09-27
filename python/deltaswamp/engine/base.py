@@ -246,20 +246,27 @@ class TranslatingStream:
     get its message, as the C stream interface carries no exception type.
     """
 
-    def __init__(self, source: Any, context: str, translate: Any = None) -> None:
+    def __init__(
+        self, source: Any, context: str, translate: Any = None, *, missing_files: bool = True
+    ) -> None:
         import pyarrow as pa
 
-        self._reader = (
+        # Another TranslatingStream is read as it is: through the C stream
+        # interface its errors would arrive untyped.
+        self._reader: Any = (
             source
-            if isinstance(source, pa.RecordBatchReader)
+            if isinstance(source, (pa.RecordBatchReader, TranslatingStream))
             else pa.RecordBatchReader.from_stream(source)
         )
         self._context = context
         #: A further `exc -> Exception | None` for failures particular to one
         #: kind of read, consulted when the failure is not a missing file.
         self._translate = translate
+        #: False for the engine boundary's stream: it keeps the message whole,
+        #: and the reader that knows the table's location names the file.
+        self._missing_files = missing_files
         self._batches = self._iterate()
-        self.schema = self._reader.schema
+        self.schema: Any = self._reader.schema
 
     def _iterate(self) -> Any:
         while True:
@@ -268,7 +275,7 @@ class TranslatingStream:
             except StopIteration:
                 return
             except Exception as exc:
-                translated = missing_file_error(exc, self._context)
+                translated = missing_file_error(exc, self._context) if self._missing_files else None
                 if translated is None and self._translate is not None:
                     translated = self._translate(exc)
                 if translated is None:
@@ -311,7 +318,9 @@ class TranslatingStream:
         return getattr(self._reader, name)
 
 
-def translating_stream(source: Any, context: str, translate: Any = None) -> Any:
+def translating_stream(
+    source: Any, context: str, translate: Any = None, *, missing_files: bool = True
+) -> Any:
     """`source` wrapped in a TranslatingStream, or as is without pyarrow."""
     if not hasattr(source, "__arrow_c_stream__"):
         return source
@@ -319,7 +328,7 @@ def translating_stream(source: Any, context: str, translate: Any = None) -> Any:
         import pyarrow  # noqa: F401
     except ImportError:
         return source
-    return TranslatingStream(source, context, translate)
+    return TranslatingStream(source, context, translate, missing_files=missing_files)
 
 
 # ---------------------------------------------------------------------------

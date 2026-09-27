@@ -412,7 +412,7 @@ class TestAddColumns:
 
     def test_unknown_type_is_refused_before_commit(self, plain: str) -> None:
         engine = KernelEngine()
-        with pytest.raises(UnreachableTableError, match="not a Delta type"):
+        with pytest.raises(InvalidArgumentError, match="not a Delta type"):
             engine.add_columns(resolved(plain), {"n": "nope"})
         assert engine.snapshot(resolved(plain)).version == 0
 

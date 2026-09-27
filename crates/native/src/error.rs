@@ -1,7 +1,8 @@
 //! Error translation from kernel errors into Python exceptions.
 
 use pyo3::exceptions::{PyFileNotFoundError, PyIOError, PyValueError};
-use pyo3::PyErr;
+use pyo3::types::PyAnyMethods;
+use pyo3::{PyErr, Python};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -95,33 +96,119 @@ pyo3::create_exception!(
     "The catalog no longer has this table (HTTP 404)."
 );
 
-impl From<NativeError> for PyErr {
-    fn from(err: NativeError) -> PyErr {
-        let message = err.to_string();
-        match err {
-            // A missing object (e.g. a data file removed by VACUUM) is an
-            // I/O failure, not bad input: callers retrying on OSError, or
-            // telling "not found" apart, need the right class.
-            NativeError::ObjectStore(delta_kernel::object_store::Error::NotFound { .. })
-            | NativeError::Kernel(delta_kernel::Error::FileNotFound(_)) => {
-                PyFileNotFoundError::new_err(message)
+impl NativeError {
+    /// A stable code for what failed, set on every exception the extension
+    /// raises as its `kind` attribute.
+    ///
+    /// Python classified these errors by searching their messages for phrases
+    /// ("that are not in the table schema", "Found unmasked nulls"), which
+    /// break whenever a message is reworded, here or in a dependency. The
+    /// codes are part of the extension's interface: add new ones, never
+    /// rename one.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            NativeError::ObjectStore(delta_kernel::object_store::Error::NotFound { .. }) => {
+                "not_found"
             }
-            NativeError::ObjectStore(_)
-            | NativeError::Kernel(
-                delta_kernel::Error::ObjectStore(_)
-                | delta_kernel::Error::IOError(_)
-                | delta_kernel::Error::Reqwest(_),
-            ) => PyIOError::new_err(message),
-            NativeError::CommitConflict(_) => CommitConflictError::new_err(message),
-            NativeError::BackfillRequired(_) => BackfillRequiredError::new_err(message),
-            NativeError::Retryable(_) => RetryableError::new_err(message),
-            NativeError::CatalogPermission(_) => CatalogPermissionError::new_err(message),
-            NativeError::CatalogNotFound(_) => CatalogNotFoundError::new_err(message),
-            NativeError::CatalogRejected(_) => CatalogCommitError::new_err(message),
-            NativeError::Invalid(_) => InvalidInputError::new_err(message),
-            _ => PyValueError::new_err(message),
+            NativeError::ObjectStore(_) => "storage",
+            NativeError::Kernel(err) => kernel_kind(err),
+            NativeError::Arrow(_) => "arrow",
+            NativeError::Url(_) | NativeError::Invalid(_) => "invalid_input",
+            NativeError::CommitConflict(_) => "commit_conflict",
+            NativeError::BackfillRequired(_) => "backfill_required",
+            NativeError::Retryable(_) => "retryable",
+            NativeError::CatalogPermission(_) => "catalog_permission",
+            NativeError::CatalogNotFound(_) => "catalog_not_found",
+            NativeError::CatalogRejected(_) => "catalog_rejected",
         }
     }
 }
 
+/// `NativeError::kind` for an error the kernel raised.
+fn kernel_kind(err: &delta_kernel::Error) -> &'static str {
+    use delta_kernel::Error as K;
+    match err {
+        K::Backtraced { source, .. } => kernel_kind(source),
+        K::FileNotFound(_) => "not_found",
+        K::ObjectStore(_) | K::IOError(_) | K::Reqwest(_) => "storage",
+        K::Arrow(_) => "arrow",
+        K::Unsupported(_)
+        | K::ChangeDataFeedUnsupported(_)
+        | K::RowTrackingChangeFeedUnsupported(_)
+        | K::ChecksumWriteUnsupported(_) => "unsupported",
+        _ => "kernel",
+    }
+}
+
+impl From<NativeError> for PyErr {
+    fn from(err: NativeError) -> PyErr {
+        let kind = err.kind();
+        let error = py_error(err);
+        // Best effort: an exception that cannot take an attribute is still
+        // raised, only without its code.
+        Python::attach(|py| {
+            let _ = error.value(py).setattr("kind", kind);
+        });
+        error
+    }
+}
+
+/// The Python exception class for `err`.
+fn py_error(err: NativeError) -> PyErr {
+    let message = err.to_string();
+    match err {
+        // A missing object (e.g. a data file removed by VACUUM) is an
+        // I/O failure, not bad input: callers retrying on OSError, or
+        // telling "not found" apart, need the right class.
+        NativeError::ObjectStore(delta_kernel::object_store::Error::NotFound { .. })
+        | NativeError::Kernel(delta_kernel::Error::FileNotFound(_)) => {
+            PyFileNotFoundError::new_err(message)
+        }
+        NativeError::ObjectStore(_)
+        | NativeError::Kernel(
+            delta_kernel::Error::ObjectStore(_)
+            | delta_kernel::Error::IOError(_)
+            | delta_kernel::Error::Reqwest(_),
+        ) => PyIOError::new_err(message),
+        NativeError::CommitConflict(_) => CommitConflictError::new_err(message),
+        NativeError::BackfillRequired(_) => BackfillRequiredError::new_err(message),
+        NativeError::Retryable(_) => RetryableError::new_err(message),
+        NativeError::CatalogPermission(_) => CatalogPermissionError::new_err(message),
+        NativeError::CatalogNotFound(_) => CatalogNotFoundError::new_err(message),
+        NativeError::CatalogRejected(_) => CatalogCommitError::new_err(message),
+        NativeError::Invalid(_) => InvalidInputError::new_err(message),
+        _ => PyValueError::new_err(message),
+    }
+}
+
 pub type Result<T> = std::result::Result<T, NativeError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kinds_are_stable_codes() {
+        assert_eq!(NativeError::Invalid("x".into()).kind(), "invalid_input");
+        assert_eq!(
+            NativeError::CommitConflict("x".into()).kind(),
+            "commit_conflict"
+        );
+        assert_eq!(
+            NativeError::Kernel(delta_kernel::Error::FileNotFound("f".into())).kind(),
+            "not_found"
+        );
+        assert_eq!(
+            NativeError::Kernel(delta_kernel::Error::Unsupported("u".into())).kind(),
+            "unsupported"
+        );
+        assert_eq!(
+            NativeError::Arrow(arrow::error::ArrowError::ComputeError("c".into())).kind(),
+            "arrow"
+        );
+        assert_eq!(
+            NativeError::Kernel(delta_kernel::Error::generic("g")).kind(),
+            "kernel"
+        );
+    }
+}

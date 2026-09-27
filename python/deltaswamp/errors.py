@@ -79,6 +79,84 @@ class EnginePanicError(DeltaSwampError):
     """
 
 
+class EngineError(DeltaSwampError):
+    """An engine failed in a way no more specific error of this library describes.
+
+    Every exception an engine raises is translated at one boundary (see
+    `deltaswamp.engine.boundary`); what matches no rule arrives as this rather
+    than as the engine's own type, so `except DeltaSwampError` catches every
+    failure. `engine` names the engine, `operation` the call it failed in,
+    and `original` is the engine's exception (also the `__cause__`).
+
+    An engine's builtin error stays an instance of its builtin class as well
+    (a raw `OSError` becomes an `EngineError` that is also an `OSError`), so
+    code catching the builtin keeps working.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        engine: str | None = None,
+        operation: str | None = None,
+        original: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.engine = engine
+        self.operation = operation
+        self.original = original
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # A class made by `engine_error` is not importable by name, and the
+        # original may not pickle at all (a Rust exception): rebuild from the
+        # builtin base's name and the message, as raised on a Ray worker.
+        builtin = next((c for c in type(self).__mro__ if c.__module__ == "builtins"), Exception)
+        return (
+            _rebuild_engine_error,
+            (builtin.__name__, self.args[0] if self.args else "", self.engine, self.operation),
+        )
+
+
+_ENGINE_ERROR_CLASSES: dict[type[BaseException], type[EngineError]] = {}
+
+
+def engine_error(
+    message: str, *, engine: str, operation: str, original: BaseException
+) -> EngineError:
+    """An EngineError that is also an instance of `original`'s nearest builtin class."""
+    builtin = next((c for c in type(original).__mro__ if c.__module__ == "builtins"), Exception)
+    if builtin in (Exception, BaseException) or not issubclass(builtin, Exception):
+        cls: type[EngineError] = EngineError
+    else:
+        cls = _ENGINE_ERROR_CLASSES.get(builtin) or _engine_error_class(builtin)
+    error = cls(message, engine=engine, operation=operation, original=original)
+    if isinstance(original, OSError) and isinstance(error, OSError):
+        error.errno = original.errno
+    return error
+
+
+def _engine_error_class(builtin: type[BaseException]) -> type[EngineError]:
+    try:
+        cls = type(f"EngineError[{builtin.__name__}]", (EngineError, builtin), {})
+    except TypeError:  # a builtin whose layout cannot be combined
+        cls = EngineError
+    cls.__module__ = __name__
+    _ENGINE_ERROR_CLASSES[builtin] = cls
+    return cls
+
+
+def _rebuild_engine_error(
+    builtin: str, message: str, engine: str | None, operation: str | None
+) -> EngineError:
+    import builtins
+
+    base = getattr(builtins, builtin, Exception)
+    if not (isinstance(base, type) and issubclass(base, Exception)) or base is Exception:
+        return EngineError(message, engine=engine, operation=operation)
+    cls = _ENGINE_ERROR_CLASSES.get(base) or _engine_error_class(base)
+    return cls(message, engine=engine, operation=operation)
+
+
 class DeltaSwampWarning(UserWarning):
     """Base class of every warning this library emits.
 

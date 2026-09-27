@@ -66,6 +66,16 @@ First release.
   `num_restored_files` for RESTORE), plus `.engine`. Code comparing a result
   for exact equality with a dict needs to compare the keys it cares about.
 
+- One error-translation boundary around every engine: nothing but a
+  `DeltaSwampError` reaches a caller, from a call or later from the stream or
+  MERGE builder it returned. What no rule recognises is the new `EngineError`
+  (`.engine`, `.operation`, `.original`), still an instance of the original's
+  builtin class. The extension's exceptions carry a stable `kind` code.
+  Malformed input (an unparseable timestamp, a missing column, an unknown
+  table feature, contradictory `partition_overwrite`/`predicate`, a misspelt
+  keyword, data that is not a table) is `InvalidArgumentError`, no longer an
+  `UnreachableTableError` that read as "no engine can serve this".
+
 ### Known limits
 
 - A kernel create with `delta.targetFileSize`, `delta.isolationLevel`,

@@ -68,7 +68,9 @@ def instrument(conn: Any) -> Served:
     served = Served()
     for engine in conn.router.engines.values():
         kind = str(getattr(engine, "kind", type(engine).__name__))
-        for name in dir(type(engine)):
+        # engine.__class__, not type(engine): the router hands engines out
+        # behind the error boundary, a wrapper that reports the engine's class.
+        for name in dir(engine.__class__):
             if name.startswith("_") or name in _PROBES:
                 continue
             method = getattr(engine, name, None)

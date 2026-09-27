@@ -346,67 +346,9 @@ VOLUME_CASES: list[Bad] = [
 ]
 
 #: case id -> finding. Strict xfails: each flips to XPASS (a failure) once fixed.
-_FINDINGS: dict[str, tuple[str, ...]] = {
-    "E1: an unknown keyword passed through **kwargs escapes as a raw TypeError": (
-        "to_arrow_unknown_kwarg",
-        "to_pandas_unknown_kwarg",
-        "to_polars_unknown_kwarg",
-        "write_table_unknown_kwarg",
-        "convert_unknown_kwarg",
-    ),
-    "E2: data that is not a table (str, dict of scalars) escapes as a raw Python error": (
-        "append_str",
-        "append_dict_of_scalars",
-        "merge_source_str",
-        "plan_write_write_str",
-        "write_table_str",
-    ),
-    "E3: data not matching the schema or partitioning escapes as a raw delta-rs error": (
-        "append_partition_by_mismatch",
-    ),
-    "E4: a malformed SQL predicate/expression on the delta-rs path escapes as a raw DeltaError": (
-        "overwrite_predicate_garbage",
-        "delete_predicate_garbage",
-        "update_bad_expression",
-        "update_predicate_garbage",
-        "add_constraint_garbage",
-    ),
-    "E5: a list/int where a dict/str is expected escapes as a raw Python error": (
-        "unset_properties_int",
-        "cluster_by_int",
-        "create_table_properties_list",
-    ),
-    "E6: a missing constraint or column on the delta-rs ALTER path escapes as a raw DeltaError": (
-        "drop_constraint_missing",
-        "set_column_comment_missing",
-    ),
-    "E7: optimize(target_size=-1) escapes as a raw OverflowError": (),
-    "E8: ScanPlan.read() with objects that are not splits escapes as a raw AttributeError": (
-        "plan_scan_read_garbage",
-    ),
-    "E9: convert_to_delta on an empty directory escapes as a raw DeltaError": (
-        "convert_missing_dir",
-    ),
-    "E10: Connection.sql() lets duckdb's raw exceptions escape": (
-        "sql_garbage",
-        "sql_missing_table",
-        "sql_int",
-    ),
-    "E11: malformed input is refused as UnreachableTableError, not InvalidArgumentError": (
-        "scan_timestamp_garbage",
-        "scan_timestamp_int",
-        "plan_scan_timestamp_garbage",
-        "overwrite_predicate_and_dynamic",
-        "add_column_str",
-        "add_column_bad_sql_type",
-        "unset_properties_missing_strict",
-        "add_feature_unknown",
-        "add_feature_int",
-        "set_not_null_missing",
-        "drop_not_null_missing",
-        "cluster_by_missing",
-    ),
-}
+#: Empty: E1-E11 were fixed by the engine error boundary (engine/boundary.py)
+#: and by checking arguments where the Table and the Connection take them.
+_FINDINGS: dict[str, tuple[str, ...]] = {}
 KNOWN: dict[str, str] = {c: reason for reason, ids in _FINDINGS.items() for c in ids}
 
 ALL_CASES = [("table", c) for c in TABLE_CASES] + [("connection", c) for c in CONNECTION_CASES]
