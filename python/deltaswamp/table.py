@@ -913,6 +913,11 @@ class Table:
         # Passing them through as a bare shape let `can("append",
         # schema_mode="merge")` answer for a plain APPEND (kernel: yes) while
         # the append itself routed as MERGE_SCHEMA and was refused.
+        if op is Operation.VACUUM:
+            # Judged as the call runs by default: t.vacuum() is a dry run,
+            # and can("vacuum") refused it by judging a real one.
+            shape.setdefault("dry_run", True)
+            shape.setdefault("lite", False)
         op, needs = self._call_route(op, shape)
         return self._connection.router.capability(op, self._enrich(), needs=needs, **shape)
 

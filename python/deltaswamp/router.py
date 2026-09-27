@@ -208,6 +208,17 @@ def _operation_blocker(
             f"{operation.value} without rewriting data needs column mapping, which the table "
             "does not have; set_properties({'delta.columnMapping.mode': 'name'}) first"
         )
+    if (
+        kind in _DIRECT_ENGINES
+        and operation is Operation.ALTER_COLUMN_TYPE
+        and str(table.properties.get("delta.enableTypeWidening", "")).strip().lower() != "true"
+    ):
+        # The call refused this ("needs the typeWidening feature enabled")
+        # while can() said ok on every table without it.
+        return (
+            "changing a type without rewriting data needs type widening, which the table "
+            "does not enable; set_properties({'delta.enableTypeWidening': 'true'}) first"
+        )
     blocking = OPERATION_FEATURE_BLOCKERS.get((kind, operation), frozenset())
     hit = sorted(f.value for f in blocking & _active_features(table))
     if hit:
