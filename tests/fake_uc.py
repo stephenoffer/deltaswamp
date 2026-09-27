@@ -244,7 +244,9 @@ class FakeUnityCatalog:
                 return self._send(200, {})
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self._thread.start()
         return self
 

@@ -189,7 +189,9 @@ class MiniServer:
                 return self._send(200, lines, self._version())
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        ).start()
         return self
 
     def stop(self) -> None:
