@@ -298,7 +298,7 @@ def test_reads_recheck_the_name_at_most_once_a_window(
     import deltaswamp.table as table_module
 
     clock = [1000.0]
-    monkeypatch.setattr(table_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr("deltaswamp.table.time.monotonic", lambda: clock[0])
     path = str(tmp_path / "window")
     conn.create_table(path, pa.schema([("id", pa.int64())])).append(pa.table({"id": [1]}))
     t, catalog = _catalog_table(conn, path)
