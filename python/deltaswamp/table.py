@@ -1481,7 +1481,11 @@ class Table:
         """
         pl = _require("polars", "polars")
         if lazy and "limit" not in kwargs:
-            return pl.scan_pyarrow_dataset(self._lazy_dataset(**kwargs))
+            from ._lazy import polars_frame
+
+            # Not scan_pyarrow_dataset: that let pyarrow apply the filter, with
+            # pyarrow's NaN semantics rather than Polars'.
+            return polars_frame(self._lazy_dataset(**kwargs))
         frame = pl.DataFrame(self.to_arrow(**kwargs))
         return frame.lazy() if lazy else frame
 
@@ -1581,10 +1585,18 @@ class Table:
                 "raise the txn version, or drop txn= to write unconditionally",
             )
         engine = self._engine(operation, frozenset(needs))
+        identity = None
+        if isinstance(engine, KernelEngine) and self.version is not None:
+            # Read from storage, not the cache: this is the identity every
+            # worker's write and the commit are checked against.
+            identity = str(
+                engine.snapshot(self._resolved, version=self.version, fresh=True).metadata_id
+            )
         return WritePlan(
             engine=engine,
             table=self._enrich(),
             variant_paths=tuple(sorted(self._variant_paths())),
+            table_identity=identity,
             mode=mode,
             version=self.version,
             txn=txn,

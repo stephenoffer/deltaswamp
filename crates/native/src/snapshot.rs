@@ -40,6 +40,67 @@ pub struct PySnapshot {
     /// The concrete engine, not `Arc<dyn Engine>`: the Parquet writer used on the
     /// commit path is a `DefaultEngine` method rather than part of the trait.
     engine: SharedEngine,
+    /// Identity of the commit file this snapshot ends at (see
+    /// [`commit_identity`]), recorded when it was read, so a reused snapshot
+    /// can prove the log it was built from is still the one in storage. None
+    /// when it was not asked for or storage gives no strong change token.
+    identity: Option<String>,
+}
+
+/// A strong identity for the commit file `snapshot` ends at, or None.
+///
+/// What a cached snapshot is revalidated against. Size and a whole-second
+/// Last-Modified are not enough: a table dropped and re-created at the same
+/// path rewrites `00000000000000000001.json` with the same size in the same
+/// second, and the old snapshot's schema was then applied to the new table's
+/// files. So: the ETag or object version on an object store, and device,
+/// inode, nanosecond mtime/ctime and size on a local filesystem. The file must
+/// also still match what the log listing reported (size and Last-Modified),
+/// so an identity is never paired with a file replaced after it was read.
+fn commit_identity(
+    store: &delta_kernel::object_store::DynObjectStore,
+    snapshot: &SnapshotRef,
+) -> Option<String> {
+    let commit = snapshot
+        .log_segment()
+        .listed
+        .latest_commit_file
+        .as_ref()
+        .filter(|c| c.version == snapshot.version())?;
+    let listed = &commit.location;
+    #[cfg(unix)]
+    if listed.location.scheme() == "file" {
+        use std::os::unix::fs::MetadataExt;
+        let path = listed.location.to_file_path().ok()?;
+        let m = std::fs::metadata(path).ok()?;
+        if m.size() != listed.size {
+            return None;
+        }
+        return Some(format!(
+            "file:{}:{}:{}.{}:{}.{}:{}",
+            m.dev(),
+            m.ino(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+            m.size()
+        ));
+    }
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStoreExt;
+    let path = Path::from_url_path(listed.location.path()).ok()?;
+    let meta = runtime::block_on(async { store.head(&path).await }).ok()?;
+    if meta.size != listed.size || meta.last_modified.timestamp_millis() != listed.last_modified {
+        return None;
+    }
+    if meta.e_tag.is_none() && meta.version.is_none() {
+        return None; // nothing strong to compare: never reused
+    }
+    Some(format!(
+        "object:{:?}:{:?}:{}",
+        meta.e_tag, meta.version, meta.size
+    ))
 }
 
 impl PySnapshot {
@@ -222,7 +283,9 @@ impl PySnapshot {
         log_tail = None,
         max_catalog_version = None,
         timestamp_ms = None,
+        identify = false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn resolve(
         py: Python<'_>,
         table_root: &str,
@@ -231,6 +294,7 @@ impl PySnapshot {
         log_tail: Option<Vec<LogTailEntry>>,
         max_catalog_version: Option<u64>,
         timestamp_ms: Option<i64>,
+        identify: bool,
     ) -> PyResult<Self> {
         if version.is_some() && timestamp_ms.is_some() {
             return Err(
@@ -241,27 +305,44 @@ impl PySnapshot {
         let options = options.unwrap_or_default();
 
         // Log resolution does real I/O, so release the GIL for it.
-        let (inner, engine) = py.detach(|| -> Result<(SnapshotRef, SharedEngine)> {
+        type Resolved = (SnapshotRef, SharedEngine, Option<String>);
+        let (inner, engine, identity) = py.detach(|| -> Result<Resolved> {
             let object_store = store::build_store(&url, &options)?;
-            let engine = commit::new_engine(object_store);
+            let engine = commit::new_engine(object_store.clone());
             let tail = log_tail.as_deref();
             let snapshot = match timestamp_ms {
                 Some(ts) => Self::resolve_as_of(&engine, &url, ts, tail, max_catalog_version)?,
                 None => Self::build(&engine, &url, version, tail, max_catalog_version)?,
             };
-            Ok((snapshot, engine))
+            let identity = if identify {
+                commit_identity(object_store.as_ref(), &snapshot)
+            } else {
+                None
+            };
+            Ok((snapshot, engine, identity))
         })?;
 
-        Ok(Self { inner, engine })
+        Ok(Self {
+            inner,
+            engine,
+            identity,
+        })
     }
 
-    /// This snapshot brought up to date, reading only the log after it.
+    /// This snapshot revalidated against storage, and brought up to date.
     ///
-    /// Kernel's incremental update lists `_delta_log/` from this snapshot's
-    /// version and replays only newer commits, so on a table with nothing new
-    /// it costs one listing where `resolve` replays everything since the last
-    /// checkpoint. `options` builds a fresh store, so a re-vended credential
-    /// is used rather than the one this snapshot was read with.
+    /// Only a snapshot resolved with `identify=True` can be refreshed. The
+    /// commit file it ends at is checked first, with a real read of its
+    /// strong identity through a store built from `options` (so a re-vended
+    /// credential is used, and a connection that cannot reach storage fails
+    /// here rather than being handed what another connection read). If it is
+    /// gone or replaced -- the table was deleted and re-created at the same
+    /// path -- the table is read afresh at the same version (or the latest).
+    /// Otherwise a pinned version (`latest=False`) is reused as it is, and the
+    /// latest is brought forward by kernel's incremental update, which lists
+    /// `_delta_log/` from this snapshot's version and replays only newer
+    /// commits: one listing when nothing changed, where `resolve` replays
+    /// everything since the last checkpoint.
     ///
     /// Path-based tables only: a catalog-managed table's latest version is
     /// whatever the catalog ratified, which a listing cannot see.
@@ -272,54 +353,61 @@ impl PySnapshot {
         options: Option<HashMap<String, String>>,
         latest: bool,
     ) -> PyResult<Self> {
+        let Some(recorded) = self.identity.clone() else {
+            return Err(NativeError::Invalid(
+                "this snapshot recorded no identity for its commit file, so it cannot be \
+                 revalidated; resolve the table afresh"
+                    .to_string(),
+            )
+            .into());
+        };
         let url = self.inner.table_root().clone();
         let options = options.unwrap_or_default();
         let existing = self.inner.clone();
-        let (inner, engine) = py.detach(|| -> Result<(SnapshotRef, SharedEngine)> {
+        type Refreshed = (SnapshotRef, SharedEngine, Option<String>);
+        let (inner, engine, identity) = py.detach(|| -> Result<Refreshed> {
             let object_store = store::build_store(&url, &options)?;
-            let engine = commit::new_engine(object_store);
-            if !latest {
-                // A pinned version never changes; only the store is renewed.
-                return Ok((existing, engine));
+            let engine = commit::new_engine(object_store.clone());
+            let pinned = (!latest).then(|| existing.version());
+            if commit_identity(object_store.as_ref(), &existing).as_deref()
+                != Some(recorded.as_str())
+            {
+                // Replaced, gone, or unreadable with these options: read the
+                // table afresh, as `resolve` would, with its own errors.
+                let snapshot = Self::build(&engine, &url, pinned, None, None)?;
+                let identity = commit_identity(object_store.as_ref(), &snapshot);
+                return Ok((snapshot, engine, identity));
             }
-            // The incremental update trusts that the log it read before is
-            // still there. A table deleted and re-created at the same path
-            // breaks that (it kept the old snapshot, or spliced the new
-            // table's commits onto the old one), so the commit file this
-            // snapshot ends at must still be the one it read.
-            let unchanged = existing
-                .log_segment()
-                .listed
-                .latest_commit_file
-                .as_ref()
-                .filter(|c| c.version == existing.version())
-                .is_some_and(|commit| {
-                    engine
-                        .storage_handler()
-                        .head(&commit.location.location)
-                        .is_ok_and(|now| {
-                            now.size == commit.location.size
-                                && now.last_modified == commit.location.last_modified
-                        })
-                });
-            let snapshot = if unchanged {
-                runtime::block_on(async {
-                    Snapshot::builder_from(existing).build(engine.as_ref() as &dyn Engine)
-                })
-            } else {
-                Err(delta_kernel::Error::generic(
-                    "the log changed under the snapshot",
-                ))
-            };
-            let snapshot = match snapshot {
+            if !latest {
+                return Ok((existing, engine, Some(recorded)));
+            }
+            let snapshot = match runtime::block_on(async {
+                Snapshot::builder_from(existing.clone()).build(engine.as_ref() as &dyn Engine)
+            }) {
                 Ok(snapshot) => snapshot,
-                // Anything unexpected (the log shrank, the commit was
-                // replaced): read the table afresh, as `resolve` would.
+                // Anything unexpected (the log shrank under it): read the
+                // table afresh.
                 Err(_) => Self::build(&engine, &url, None, None, None)?,
             };
-            Ok((snapshot, engine))
+            let identity = if snapshot.version() == existing.version() {
+                Some(recorded)
+            } else {
+                commit_identity(object_store.as_ref(), &snapshot)
+            };
+            Ok((snapshot, engine, identity))
         })?;
-        Ok(Self { inner, engine })
+        Ok(Self {
+            inner,
+            engine,
+            identity,
+        })
+    }
+
+    /// The identity recorded for the commit file this snapshot ends at, or
+    /// None: what `refresh` revalidates. Opaque; compare for equality only.
+    #[getter]
+    fn commit_identity(&self) -> Option<String> {
+        self.identity.clone()
     }
 
     #[getter]

@@ -347,6 +347,12 @@ class KernelMerger:
             values = pc.unique(self._source.column(key).drop_null())
             if len(values) == 0:
                 continue
+            if not _same_comparison_type(values.type, schema.field(column).type):
+                # The ON clause compares with type coercion ('01' = 1 is
+                # true), while a bound cast to the target's type is 1 -> '1':
+                # the file holding '01' was skipped, its row read as
+                # unmatched, and the source row inserted a second time.
+                continue
             try:
                 values = values.cast(schema.field(column).type)
             except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
@@ -649,6 +655,28 @@ def store_cast(column: Any, target: Any, name: str) -> Any:
             f"the value written to {name!r} is {column.type}, which cannot be stored in the "
             f"column's type {target}: {exc}"
         ) from exc
+
+
+def _same_comparison_type(source: Any, target: Any) -> bool:
+    """Whether a source key and a target column compare as one type, exactly.
+
+    Only then are bounds cast to the target's type the values the ON clause
+    compares: integers of any width (a lossless cast, checked), strings of
+    any encoding, or one identical type.
+    """
+    import pyarrow as pa
+
+    t = pa.types
+    if source.equals(target):
+        return True
+    if t.is_integer(source) and t.is_integer(target):
+        return True
+
+    def stringy(x: Any) -> bool:
+        view = getattr(t, "is_string_view", None)
+        return bool(t.is_string(x) or t.is_large_string(x) or (view is not None and view(x)))
+
+    return stringy(source) and stringy(target)
 
 
 def _quote_sql_ident(name: str) -> str:

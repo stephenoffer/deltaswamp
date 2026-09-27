@@ -1272,9 +1272,9 @@ class Connection:
                 # An in-memory database per call; leaving it open leaked it
                 # and every registered frame until garbage collection.
                 con.close()
-        ctx = module.SQLContext(
-            {alias: module.scan_pyarrow_dataset(f) for alias, f in frames.items()}
-        )
+        from ._lazy import polars_frame
+
+        ctx = module.SQLContext({alias: polars_frame(f) for alias, f in frames.items()})
         return ctx.execute(query, eager=True).to_arrow()
 
     # ------------------------------------------------------------- namespaces

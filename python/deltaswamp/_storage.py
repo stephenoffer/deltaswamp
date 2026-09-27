@@ -49,6 +49,7 @@ __all__ = [
     "cloud_of",
     "commit_refusal",
     "engine_options",
+    "environment_options",
     "iceberg_fileio_properties",
     "merge_options",
     "pin_s3_endpoint",
@@ -339,11 +340,47 @@ def pin_s3_endpoint(options: dict[str, str], location: str | None, *, vended: bo
     options["aws_endpoint"] = f"https://s3.{region}.{suffix}"
 
 
+def environment_options(location: str | None, present: dict[str, str]) -> dict[str, str]:
+    """The standard ``AWS_*`` environment settings `present` does not already make.
+
+    delta-rs builds its S3 store from the environment (object_store's
+    ``from_env``) and then applies the options; the kernel's store took the
+    options alone, so ``AWS_ENDPOINT_URL`` or keys exported in the shell
+    reached one engine and not the other -- the kernel then read real AWS, or
+    nothing. The weakest layer, below everything the caller or a catalog
+    passed, and credential keys only when neither passed a credential: a
+    session token from the environment paired with the caller's own key is
+    another principal's.
+    """
+    import os
+
+    if cloud_of(location) != "s3":
+        return {}
+    credential_keys = _CREDENTIAL_KEYS["s3"]
+    has_credential = any(k in credential_keys for k in present)
+    known = set(_S3_ALIASES) | _CLIENT_KEYS
+    out: dict[str, str] = {}
+    # Sorted so that two spellings of one setting resolve the same way in
+    # every process, as `canonical_options` insists for a caller's dict.
+    for name in sorted(os.environ):
+        value = os.environ[name]
+        if not name.upper().startswith("AWS_") or not value:
+            continue
+        key = canonical_key(name, "s3")
+        if key not in known or key in present or key in out:
+            continue
+        if has_credential and key in credential_keys:
+            continue
+        out[key] = value
+    return out
+
+
 def engine_options(
     base: dict[str, str] | None, vended: dict[str, str] | None, location: str | None
 ) -> dict[str, str]:
     """What an engine hands its object store for `location`."""
     options = merge_options(base, vended, location)
+    options.update(environment_options(location, options))
     pin_s3_endpoint(options, location, vended=bool(vended))
     return options
 

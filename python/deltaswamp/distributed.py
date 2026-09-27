@@ -149,6 +149,10 @@ class WritePlan:
     #: Where the table's VARIANT columns are: JSON text given for one is
     #: encoded as `Table.append` encodes it.
     variant_paths: tuple[tuple[str, ...], ...] = ()
+    #: The table's metaData id at the planned version. Workers reuse a cached
+    #: snapshot, and the commit reads a fresh one; both must be this table,
+    #: not one dropped and re-created at the same path since planning.
+    table_identity: str | None = None
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
@@ -206,7 +210,8 @@ class WritePlan:
         # At the planned version: resolved once per process and reused by
         # every later write(), where the latest snapshot cost a log replay
         # per call (0.6 s each, 5000 commits past a checkpoint).
-        result: bytes = self.engine.write_files(self.table, data, version=self.version)
+        identity = {"table_identity": self.table_identity} if self.table_identity else {}
+        result: bytes = self.engine.write_files(self.table, data, version=self.version, **identity)
         return result
 
     def commit(
@@ -341,6 +346,7 @@ class WritePlan:
                         txn=self.txn,
                         commit_metadata=self.commit_metadata,
                         **({"version": pinned} if pinned is not None else {}),
+                        **({"table_identity": self.table_identity} if self.table_identity else {}),
                     ),
                     table,
                 )

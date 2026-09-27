@@ -12,6 +12,7 @@ import contextlib
 import importlib.util
 import inspect
 import json
+import os
 import re
 import threading
 from collections import OrderedDict
@@ -211,6 +212,25 @@ _METADATA_BLOCKERS: frozenset[TableFeature] = frozenset(
 _RUNTIME_OWNER: list[int] = []
 
 
+#: Keys the store fingerprint with a secret of this process's own, so the
+#: cache holds no digest of a credential that could be checked offline.
+_FINGERPRINT_KEY = os.urandom(32)
+
+
+def _store_fingerprint(options: dict[str, str]) -> str:
+    """Which store `options` reach, as a keyed digest: the snapshot cache's key.
+
+    Every option counts -- endpoint, region, account, and the credential
+    itself -- because any of them can make one URL a different table (two
+    endpoints, two accounts) or an unreadable one (a principal without
+    access). Secrets go into a keyed hash, never into the key in the clear.
+    """
+    import hashlib
+
+    canonical = json.dumps(sorted((str(k).lower(), str(v)) for k, v in options.items()))
+    return hashlib.blake2b(canonical.encode(), key=_FINGERPRINT_KEY, digest_size=16).hexdigest()
+
+
 def _forked_on_macos() -> bool:
     """A macOS child forked from a process whose native runtime had started.
 
@@ -304,16 +324,21 @@ class KernelEngine:
     #: and function calls go to an engine that evaluates SQL.
     supports_sql_expressions = False
 
-    #: Resolved snapshots kept per (location, version) for reuse.
+    #: Resolved snapshots kept per (location, version, store) for reuse.
     snapshot_cache_size = 16
     # Every metadata call and every routing decision resolved the log from
     # scratch: 0.5 s each on a table 5000 commits past its last checkpoint,
     # four of them for one UPDATE, and one per WritePlan.write(). A cached
-    # snapshot is brought up to date incrementally instead (one listing when
-    # nothing changed; nothing at all for a pinned version), so reads still
-    # see every commit, anyone's. Per process rather than per engine: a
-    # distributed write unpickles a fresh engine with every task.
-    _snapshots: ClassVar[OrderedDict[tuple[str, int | None], Any]] = OrderedDict()
+    # snapshot is revalidated and brought up to date instead (see
+    # Snapshot.refresh: a real read of the strong identity of the commit file
+    # it ends at, then one listing for the latest), so reads still see every
+    # commit, anyone's. Per process rather than per engine: a distributed write
+    # unpickles a fresh engine with every task. Keyed by the store as well as
+    # the path: one s3:// URL on two endpoints or accounts is two tables, and
+    # sharing entries handed one connection's schema -- and its files -- to the
+    # other, or to a connection that could not reach storage at all. Commits
+    # never reuse an entry (see `snapshot(fresh=)`).
+    _snapshots: ClassVar[OrderedDict[tuple[Any, ...], Any]] = OrderedDict()
     _snapshots_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, *, storage_options: dict[str, str] | None = None) -> None:
@@ -637,8 +662,17 @@ class KernelEngine:
         version: int | None = None,
         timestamp: Any = None,
         write: bool = False,
+        fresh: bool | None = None,
     ) -> Any:
-        """Resolve a kernel snapshot, supplying the catalog tail when needed."""
+        """Resolve a kernel snapshot, supplying the catalog tail when needed.
+
+        `fresh` (default: `write`) resolves the log from storage rather than
+        reusing a cached snapshot. Every commit path passes write=True and so
+        builds on the table as it is now: a commit built on a revalidated but
+        cached snapshot trusts that revalidation with the table's contents,
+        and a stale one removed rows from a table re-created at the same path
+        and added files written for the old schema.
+        """
         from deltaswamp._native import Snapshot
 
         _enter_native("open the table with the kernel")
@@ -674,22 +708,23 @@ class KernelEngine:
         # Only a path-based read by version (or latest) is cached: a
         # catalog-managed table's latest version is the catalog's to say,
         # which a log listing cannot see.
-        key = (location, version)
         cacheable = log_tail is None and table.max_catalog_version is None and timestamp is None
+        reuse = cacheable and not (write if fresh is None else fresh)
 
         def resolve() -> Any:
             options = self._options(table, write=write)
-            if cacheable:
+            key = (location, version, _store_fingerprint(options), table.table_id)
+            if reuse:
                 with self._snapshots_lock:
                     cached = self._snapshots.get(key)
-                if cached is not None and hasattr(cached, "refresh"):
+                if cached is not None:
                     try:
-                        fresh = cached.refresh(options, latest=version is None)
+                        refreshed = cached.refresh(options, latest=version is None)
                     except Exception:
-                        fresh = None  # resolved afresh below, with its own errors
-                    if fresh is not None:
-                        self._remember(key, fresh)
-                        return fresh
+                        refreshed = None  # resolved afresh below, with its own errors
+                    if refreshed is not None:
+                        self._remember(key, refreshed)
+                        return refreshed
             snapshot = Snapshot.resolve(
                 location,
                 options=options,
@@ -697,6 +732,8 @@ class KernelEngine:
                 log_tail=log_tail,
                 max_catalog_version=table.max_catalog_version,
                 timestamp_ms=timestamp_ms(timestamp) if timestamp is not None else None,
+                # Records the identity a later reuse is revalidated against.
+                identify=cacheable,
             )
             if cacheable:
                 self._remember(key, snapshot)
@@ -759,7 +796,13 @@ class KernelEngine:
                 ) from exc
             raise
 
-    def _remember(self, key: tuple[str, int | None], snapshot: Any) -> None:
+    def _remember(self, key: tuple[Any, ...], snapshot: Any) -> None:
+        if getattr(snapshot, "commit_identity", None) is None:
+            # Nothing to revalidate it against (no commit file at its version,
+            # or a store without strong change tokens): never reused.
+            with self._snapshots_lock:
+                self._snapshots.pop(key, None)
+            return
         with self._snapshots_lock:
             self._snapshots[key] = snapshot
             self._snapshots.move_to_end(key)
@@ -2488,7 +2531,14 @@ class KernelEngine:
             )
         return splits
 
-    def write_files(self, table: ResolvedTable, data: Any, *, version: int | None = None) -> bytes:
+    def write_files(
+        self,
+        table: ResolvedTable,
+        data: Any,
+        *,
+        version: int | None = None,
+        table_identity: str | None = None,
+    ) -> bytes:
         """Write data files for `table` without committing them.
 
         Returns opaque fragment bytes describing what was written. The files
@@ -2498,14 +2548,21 @@ class KernelEngine:
 
         `version` writes with that snapshot's layout (the one the write was
         planned at). A pinned snapshot is resolved once per process and then
-        reused, where the latest had to be listed again for every call; the
-        commit still refuses fragments whose layout the table has since left.
+        reused (revalidated against storage each time), where the latest had
+        to be listed again for every call; the commit still refuses fragments
+        whose layout the table has since left. `table_identity` is the metaData
+        id the write was planned against: a table re-created at the same path
+        is refused here rather than written for.
         """
         if not self.supports_distributed_write:
             raise NotImplementedError(
                 "the installed native extension cannot write files without committing"
             )
-        snapshot = self.snapshot(table, version=version, write=True)
+        # The one write path that reuses a cached snapshot: it writes files and
+        # commits nothing, and the identity check below ties the reuse to the
+        # table the write was planned for.
+        snapshot = self.snapshot(table, version=version, write=True, fresh=False)
+        _refuse_other_table(snapshot, table_identity, "write files for this plan")
         result: bytes = snapshot.write_files(
             _as_record_batch_reader(data), uc=self._uc_commit_config(table, staging=True)
         )
@@ -2525,19 +2582,23 @@ class KernelEngine:
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, Any] | None = None,
         version: int | None = None,
+        table_identity: str | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
 
         Every fragment lands at a single version, so a distributed write is
         atomic: a reader sees all of it or none of it. With `version`, the
         commit is built on that snapshot, so it conflicts if the table has
-        moved past it -- what a guarded overwrite needs.
+        moved past it -- what a guarded overwrite needs. The snapshot is read
+        from storage, never reused from the cache, and must be the table
+        `table_identity` (the planned metaData id) names.
         """
         if not self.supports_distributed_write:
             raise NotImplementedError(
                 "the installed native extension cannot commit externally written files"
             )
         snapshot = self.snapshot(table, version=version, write=True)
+        _refuse_other_table(snapshot, table_identity, "commit these fragments", committing=True)
         # On the snapshot the commit is built on, like the txn check below: a
         # schema change that lands after it makes the commit conflict, and the
         # retry checks again.
@@ -2697,6 +2758,37 @@ def _write_layout(snapshot: Any) -> str | None:
         },
         sort_keys=True,
     )
+
+
+def _refuse_other_table(
+    snapshot: Any, identity: str | None, action: str, *, committing: bool = False
+) -> None:
+    """Refuse when `snapshot` is not the table `identity` (a metaData id) names.
+
+    Writing, MetadataChangedError: nothing was written, and the write must be
+    planned again. Committing, InvalidArgumentError, as the binding refuses a
+    fragment stamped with another table's id -- the same mistake, caught even
+    when no fragment carries a file (an empty overwrite would otherwise empty
+    the new table).
+    """
+    if identity is None:
+        return
+    now = getattr(snapshot, "metadata_id", None)
+    if now is None or str(now) == identity:
+        return
+    from ..errors import InvalidArgumentError, MetadataChangedError
+
+    reason = (
+        f"cannot {action}: "
+        + ("they were written for a different table -- " if committing else "")
+        + "the table at this location was dropped and re-created since the write was "
+        f"planned (its table id was {identity!r} and is {str(now)!r} now). Plan the write "
+        "again against the new table; files already written are unreferenced and VACUUM "
+        "removes them"
+    )
+    if committing:
+        raise InvalidArgumentError(reason)
+    raise MetadataChangedError(int(snapshot.version), reason)
 
 
 def _layout_still_fits(written: str, current: str) -> bool:

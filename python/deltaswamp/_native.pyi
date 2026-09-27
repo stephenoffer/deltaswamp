@@ -200,8 +200,12 @@ class Snapshot:
         log_tail: list[tuple[int, str, int, int]] | None = None,
         max_catalog_version: int | None = None,
         timestamp_ms: int | None = None,
+        identify: bool = False,
     ) -> Snapshot:
         """Resolve a snapshot.
+
+        `identify=True` records the strong identity of the commit file the
+        snapshot ends at (`commit_identity`), which `refresh` revalidates.
 
         `log_tail` entries are `(version, filename, last_modified_millis, size)`
         and `max_catalog_version` caps the version that may be trusted. Together
@@ -219,11 +223,17 @@ class Snapshot:
         """
 
     def refresh(self, options: dict[str, str] | None = None, latest: bool = True) -> Snapshot:
-        """This snapshot brought up to date by reading only the newer log.
+        """This snapshot revalidated against storage and brought up to date.
 
-        With `latest=False` the same version, read through a store built from
-        `options`. Path-based tables only.
+        The commit file it ends at must still have the recorded identity;
+        otherwise the table is read afresh (at the same version with
+        `latest=False`). Needs a snapshot resolved with `identify=True`.
+        Path-based tables only.
         """
+
+    @property
+    def commit_identity(self) -> str | None:
+        """Opaque identity of the commit file at `version`, or None."""
 
     @property
     def version(self) -> int: ...
