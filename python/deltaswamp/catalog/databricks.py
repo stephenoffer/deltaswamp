@@ -288,6 +288,9 @@ class DatabricksUnityCatalog:
     ref_schemes: frozenset[str] = frozenset({"uc"})
     #: Every governance method works here; see OSSUnityCatalog for the contrast.
     unsupported_operations: frozenset[str] = frozenset()
+    #: A SQL warehouse in this workspace can address this catalog's tables, so
+    #: the opt-in SQL fallback may serve them. Only this catalog says so.
+    sql_warehouse: bool = True
 
     @classmethod
     def from_uri(cls, uri: str | None, **kwargs: Any) -> DatabricksUnityCatalog:

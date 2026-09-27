@@ -49,6 +49,7 @@ from ..catalog.sharing import (
     load_profile,
     quote_name,
     request_error_types,
+    rest_client,
     sharing_module,
 )
 from ..errors import EngineLimitError, UnreachableTableError
@@ -80,6 +81,27 @@ CHANGE_TYPE, COMMIT_VERSION, COMMIT_TIMESTAMP = (
     "_commit_version",
     "_commit_timestamp",
 )
+
+
+def _delta_format_features(table: ResolvedTable) -> frozenset[str]:
+    """The features that make a parquet-format response unreadable as it stands.
+
+    Judged on what the table does, not only what its protocol lists. A
+    column-mapped table on the legacy protocol (reader 2, writer 5) lists no
+    reader features at all -- its mapping lives in ``delta.columnMapping.mode``
+    -- and its files hold physical names (``col-<uuid>``); read as parquet,
+    every column came back NULL.
+    """
+    found = set(_DELTA_FORMAT_FEATURES & table.effective_reader_features)
+    mode = str(table.properties.get("delta.columnMapping.mode", "")).strip().lower()
+    if mode in ("name", "id"):
+        found.add("columnMapping")
+    elif "columnMapping" not in table.reader_features:
+        # Reader version 2 implies column mapping is *supported*; with the
+        # mode off (or unset) the files carry logical names and parquet reads
+        # them, so the legacy version alone does not force the delta path.
+        found.discard("columnMapping")
+    return frozenset(found)
 
 
 def _pa() -> Any:
@@ -815,17 +837,56 @@ class SharingEngine:
                 operation,
                 ok=False,
                 reason="the table uses "
-                + ", ".join(sorted(_DELTA_FORMAT_FEATURES & table.reader_features))
+                + ", ".join(sorted(_delta_format_features(table)))
                 + ", which Delta Sharing serves only as Delta log actions, and the kernel "
                 "wrapper that replays them is not installed",
                 remedy="pip install delta-kernel-rust-sharing-wrapper",
             )
 
+        if (
+            operation is Operation.CDF
+            and table.table_id is not None
+            and str(table.properties.get("delta.enableChangeDataFeed", "")).strip().lower()
+            != "true"
+        ):
+            # The metadata the share served says so before any call: the
+            # server answered the query with an HTTP 400 while can() said ok.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the shared table does not have change data feed enabled "
+                "(delta.enableChangeDataFeed is not true in the metadata the share serves), "
+                "so the server has no changes to serve",
+                remedy="ask the provider to set delta.enableChangeDataFeed=true on the table "
+                "and share it WITH HISTORY; changes are recorded from then on",
+            )
+        if operation in (Operation.TIME_TRAVEL, Operation.CDF):
+            # Whether the table was shared WITH HISTORY is the provider's
+            # setting, and no endpoint reports it before the query; so is a
+            # server's own limit on protocols it can replay. ok, with the
+            # dependency said, rather than a promise the server may break.
+            return Capability(
+                operation,
+                ok=True,
+                engine=self.kind,
+                reason="depends on the provider: the server serves earlier versions and "
+                "changes only for a table shared WITH HISTORY, and refuses otherwise",
+            )
+        if self._needs_delta_format(table) and operation is not Operation.DETAIL:
+            return Capability(
+                operation,
+                ok=True,
+                engine=self.kind,
+                reason="depends on the server: the table uses "
+                + ", ".join(sorted(_delta_format_features(table)))
+                + ", which only a server that answers in delta format can serve (the "
+                "open-source reference server refuses such tables)",
+            )
         return Capability(operation, ok=True, engine=self.kind)
 
     @staticmethod
     def _needs_delta_format(table: ResolvedTable) -> bool:
-        return bool(_DELTA_FORMAT_FEATURES & table.reader_features)
+        return bool(_delta_format_features(table))
 
     # --------------------------------------------------------------- plumbing
 
@@ -834,10 +895,7 @@ class SharingEngine:
             raise UnreachableTableError(
                 "read the table through Delta Sharing", "it carries no sharing profile"
             )
-        rest = sharing_module("delta_sharing.rest_client")
-        return rest.DataSharingRestClient(
-            load_profile(table.sharing_profile), num_retries=self._num_retries
-        )
+        return rest_client(load_profile(table.sharing_profile), num_retries=self._num_retries)
 
     @staticmethod
     def _shared(table: ResolvedTable) -> Any:
@@ -885,7 +943,8 @@ class SharingEngine:
 
     @staticmethod
     def _check_url(url: str) -> None:
-        scheme = urlparse(url).scheme.lower()
+        parts = urlparse(url)
+        scheme = parts.scheme.lower()
         if scheme not in ("https", "http"):
             # A presigned URL is always HTTP(S); anything else (file://, ftp://)
             # from a server would make this process read local or foreign
@@ -895,6 +954,64 @@ class SharingEngine:
                 f"the sharing server issued a {scheme or 'relative'!s} URL, not an HTTP(S) "
                 "presigned URL",
             )
+        if not parts.hostname:
+            raise UnreachableTableError(
+                "read a shared data file",
+                "the sharing server issued an HTTP(S) URL with no host, not a presigned URL",
+            )
+
+    def _localize(self, actions: list[dict[str, Any]], root: Path, what: str) -> None:
+        """Download every file the actions name into `root`, and point them there.
+
+        The kernel wrapper resolves a delta response's paths itself, and it
+        takes an https URL without a signature-looking query for a path on
+        this machine: ``https://attacker.example/etc/secret.parquet`` read
+        the local /etc/secret.parquet. So it is never handed a server's URL.
+        Each is fetched here, over HTTP(S) only, and the log it replays names
+        the downloaded copies.
+        """
+        targets: list[tuple[dict[str, Any], str]] = []
+        for action in actions:
+            for kind in ("add", "remove", "cdc"):
+                body = action.get(kind)
+                if not isinstance(body, dict):
+                    continue
+                if body.get("path") is not None:
+                    targets.append((body, "path"))
+                dv = body.get("deletionVector")
+                if isinstance(dv, dict) and dv.get("storageType") == "p":
+                    targets.append((dv, "pathOrInlineDv"))
+        if not targets:
+            return
+        files = root / "files"
+        files.mkdir()
+        urls = sorted({str(holder[key]) for holder, key in targets})
+        for url in urls:
+            self._check_url(url)
+        local = {
+            url: files / f"{i:06d}{Path(urlparse(url).path).suffix[:16]}"
+            for i, url in enumerate(urls)
+        }
+
+        sizes: dict[str, int] = {}
+
+        def fetch(url: str) -> None:
+            payload = self._download(url)
+            local[url].write_bytes(payload)
+            sizes[url] = len(payload)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
+            for done in [pool.submit(fetch, url) for url in urls]:
+                done.result()
+        for holder, key in targets:
+            url = str(holder[key])
+            holder[key] = local[url].as_uri()
+            if key == "path" and "size" in holder:
+                # The kernel seeks the footer from the recorded size, so it
+                # must be the size of the copy it reads.
+                holder["size"] = sizes[url]
 
     @classmethod
     def _check_action_urls(cls, action: dict[str, Any]) -> None:
@@ -939,7 +1056,13 @@ class SharingEngine:
         *,
         key: Any = None,
         book: _UrlBook | None = None,
+        known: frozenset[str] | None = None,
     ) -> Any:
+        """One shared data file, conformed to `schema`.
+
+        `known` is every column of the table (lowercased), where `schema` is a
+        projection of it.
+        """
         parquet = importlib.import_module("pyarrow.parquet")
         pa = _pa()
         current = book.url(key, url) if book is not None else url
@@ -953,6 +1076,22 @@ class SharingEngine:
         source = pa.BufferReader(payload)
         file_names = parquet.ParquetFile(source).schema_arrow.names
         wanted = {f.name.lower() for f in schema}
+        stored = (known if known is not None else frozenset(wanted)) - {
+            str(k).lower() for k in (partition_values or {})
+        }
+        if file_names and stored and not any(name.lower() in stored for name in file_names):
+            # A column-mapped file names its columns physically (col-<uuid>).
+            # Conforming it to the logical schema null-filled every column, a
+            # wrong answer the caller could not tell from a table of NULLs.
+            raise UnreachableTableError(
+                "read a shared data file",
+                "the file holds none of the table's columns (it has "
+                f"{', '.join(file_names[:4])}{', ...' if len(file_names) > 4 else ''}): its "
+                "columns are physically named, as column mapping writes them, and a parquet "
+                "response cannot be mapped back to the logical names",
+                "the provider's server must answer in delta format for this table "
+                "(responseFormat=delta), which needs delta-kernel-rust-sharing-wrapper here",
+            )
         present = [name for name in file_names if name.lower() in wanted]
         source.seek(0)
         data = parquet.read_table(source, columns=present)
@@ -1049,6 +1188,7 @@ class SharingEngine:
         out = _project(full, columns)
         # The predicate may reference columns the caller did not ask for.
         read = full if predicate else out
+        known = frozenset(name.lower() for name in full.names)
         files = list(response.add_files)
         # Checked before streaming: an error raised inside the stream reaches
         # the caller only as pyarrow's ArrowInvalid.
@@ -1083,7 +1223,12 @@ class SharingEngine:
                 if remaining is not None and remaining <= 0:
                     return
                 rows = self._read_file(
-                    f.url, dict(f.partition_values or {}), read, key=f.id, book=book
+                    f.url,
+                    dict(f.partition_values or {}),
+                    read,
+                    key=f.id,
+                    book=book,
+                    known=known,
                 )
                 if node is not None:
                     rows = filter_arrow_exact(rows, node).select(out.names)
@@ -1133,6 +1278,8 @@ class SharingEngine:
         with tempfile.TemporaryDirectory(prefix="deltaswamp-sharing-") as root:
             log = Path(root) / "_delta_log"
             log.mkdir()
+            if check_urls:
+                self._localize(actions, Path(root), what)
             with (log / f"{0:020d}.json").open("w") as out:
                 out.write(json.dumps({"protocol": protocol}) + "\n")
                 out.write(json.dumps({"metaData": metadata}) + "\n")
@@ -1482,6 +1629,10 @@ class SharingEngine:
         with tempfile.TemporaryDirectory(prefix="deltaswamp-sharing-cdf-") as root:
             log = Path(root) / "_delta_log"
             log.mkdir()
+            if check_urls:
+                self._localize(
+                    [action for group in actions.values() for action in group], Path(root), what
+                )
             for version in range(first, last + 1):
                 path = log / f"{version:020d}.json"
                 with path.open("w") as out:

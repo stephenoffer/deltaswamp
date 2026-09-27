@@ -137,7 +137,7 @@ _AUTH_OPEN_ERRORS: tuple[str, ...] = (
 )
 
 
-def _open_error_remedy(table: ResolvedTable) -> str:
+def _open_error_remedy(table: ResolvedTable, *, warehouse: bool = True) -> str:
     """The remedy for a table whose Delta log could not be opened."""
     error = (table.open_error or "").lower()
     if any(marker in error for marker in _AUTH_OPEN_ERRORS):
@@ -153,7 +153,7 @@ def _open_error_remedy(table: ResolvedTable) -> str:
             f"check that {table.location or 'the table location'} holds a readable Delta "
             "log; the SQL warehouse reads the same storage and would fail the same way"
         )
-    if _warehouse_can_name(table):
+    if warehouse and _warehouse_can_name(table):
         return SQL_FALLBACK_REMEDY
     return ""
 
@@ -428,8 +428,48 @@ class Router:
 
     engines: dict[EngineKind, object] = field(default_factory=dict)
     allow_sql_fallback: bool = False
+    #: Whether this connection's catalog is the Databricks workspace a SQL
+    #: warehouse serves. An OSS Unity Catalog server names its tables the same
+    #: way (``uc`` references, three parts), and with the fallback on a read
+    #: or a write of ``r3.m.t`` went to the warehouse -- to whatever table of
+    #: that name the *Databricks* workspace held. False for every catalog but
+    #: Databricks, so the warehouse is never asked and never suggested.
+    warehouse_catalog: bool = True
+
+    def _warehouse_names(self, table: ResolvedTable) -> bool:
+        """Whether the warehouse this connection talks to can address `table`."""
+        return self.warehouse_catalog and _warehouse_can_name(table)
+
+    def _fallback_remedy(self, table: ResolvedTable) -> str:
+        """SQL_FALLBACK_REMEDY where following it can work, else nothing."""
+        return SQL_FALLBACK_REMEDY if self._warehouse_names(table) else ""
+
+    def _scrubbed(self, capability: Capability) -> Capability:
+        """`capability` without advice to enable a fallback this connection cannot have.
+
+        Engines phrase their own refusals and some name the warehouse as the
+        remedy; on a connection to another catalog there is none, and taking
+        the advice once sent the call to a same-named Databricks table.
+        """
+        if self.warehouse_catalog or "allow_sql_fallback" not in (capability.remedy or ""):
+            return capability
+        return dataclasses.replace(capability, remedy="")
 
     def capability(
+        self,
+        operation: Operation,
+        table: ResolvedTable,
+        *,
+        needs: frozenset[str] = frozenset(),
+        exclude: frozenset[EngineKind] = frozenset(),
+        **shape: object,
+    ) -> Capability:
+        """Decide how `operation` would be served, without performing it."""
+        return self._scrubbed(
+            self._capability(operation, table, needs=needs, exclude=exclude, **shape)
+        )
+
+    def _capability(
         self,
         operation: Operation,
         table: ResolvedTable,
@@ -488,6 +528,12 @@ class Router:
             # Checked before "not configured": connect() only builds the SQL
             # engine when the fallback is on, so with it off the reason was
             # always "sql: engine not configured", which names no remedy.
+            if kind is EngineKind.SQL and not self.warehouse_catalog:
+                reasons.append(
+                    "sql: a SQL warehouse serves only the Databricks workspace's own Unity "
+                    "Catalog, and this connection's catalog is not one"
+                )
+                continue
             if kind is EngineKind.SQL and not _warehouse_can_name(table):
                 # Enabling the fallback would not help: the warehouse takes a
                 # Unity Catalog name, and this table has none.
@@ -588,7 +634,9 @@ class Router:
 
         remedy = ""
         if EngineKind.SQL in routing.engines and not table.is_shared:
-            if not _warehouse_can_name(table):
+            if not self.warehouse_catalog and table.ref.kind is RefKind.CATALOG:
+                remedy = ""
+            elif not _warehouse_can_name(table):
                 remedy = _REGISTER_REMEDY
             elif not self.allow_sql_fallback:
                 remedy = (
@@ -753,7 +801,9 @@ class Router:
         # refusing on table_type first would contradict the manifest.
         manifest_says_readable = table.external_read_supported is True
         #: Whether a SQL warehouse is actually reachable for this connection.
-        sql_fallback = self.allow_sql_fallback and EngineKind.SQL in self.engines
+        sql_fallback = (
+            self.allow_sql_fallback and self.warehouse_catalog and EngineKind.SQL in self.engines
+        )
 
         # A shared table is served by the Delta Sharing engine or not at all:
         # its files are presigned URLs, so nothing else has a way in.
@@ -799,7 +849,7 @@ class Router:
                 reason=f"the table's format is {fmt}, not Delta, so it has no Delta log",
                 remedy=(
                     "ds.connect(..., allow_sql_fallback=True) can still query it"
-                    if _warehouse_can_name(table)
+                    if self._warehouse_names(table)
                     else ""
                 ),
             )
@@ -845,7 +895,7 @@ class Router:
                 reason=(
                     f"the table is a {kind}, which has no directly readable file surface. {detail}"
                 ),
-                remedy=SQL_FALLBACK_REMEDY,
+                remedy=self._fallback_remedy(table),
             )
 
         # Refusals no engine can get around, because the table itself forbids
@@ -880,7 +930,7 @@ class Router:
                 operation,
                 ok=False,
                 reason=warehouse_only,
-                remedy=SQL_FALLBACK_REMEDY,
+                remedy=self._fallback_remedy(table),
             )
 
         # Both manifest flags describe DIRECT EXTERNAL ENGINE access: vending a
@@ -902,7 +952,7 @@ class Router:
                 operation,
                 ok=False,
                 reason=reason,
-                remedy=SQL_FALLBACK_REMEDY,
+                remedy=self._fallback_remedy(table),
             )
 
         writing = operation not in READ_OPERATIONS
@@ -914,7 +964,7 @@ class Router:
                     "Unity Catalog reports no external-engine write support for this table "
                     "(HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT absent)"
                 ),
-                remedy=SQL_FALLBACK_REMEDY,
+                remedy=self._fallback_remedy(table),
             )
 
         # A table we could not open is not a table we can route. CREATE is
@@ -927,9 +977,23 @@ class Router:
                     "the table's Delta log could not be read, so no direct engine can "
                     f"serve this ({table.open_error})"
                 ),
-                remedy=_open_error_remedy(table),
+                remedy=_open_error_remedy(table, warehouse=self.warehouse_catalog),
             )
 
+        if (
+            operation in DATABRICKS_ONLY_OPERATIONS
+            and not self.warehouse_catalog
+            and table.ref.kind is RefKind.CATALOG
+        ):
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    f"{operation.value} has no open-source implementation in either delta-rs "
+                    "or delta-kernel; it exists only in Databricks, and this connection's "
+                    "catalog is not Databricks Unity Catalog"
+                ),
+            )
         if operation in DATABRICKS_ONLY_OPERATIONS and not _warehouse_can_name(table):
             return Capability(
                 operation,
@@ -949,7 +1013,7 @@ class Router:
                     f"{operation.value} has no open-source implementation in either delta-rs "
                     "or delta-kernel; it exists only in Databricks"
                 ),
-                remedy=SQL_FALLBACK_REMEDY,
+                remedy=self._fallback_remedy(table),
             )
 
         return None

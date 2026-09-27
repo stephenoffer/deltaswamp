@@ -101,9 +101,30 @@ def connect(
     if IcebergEngine.available():
         engines[EngineKind.ICEBERG] = IcebergEngine(token=token)
 
+    # The warehouse addresses tables by Unity Catalog name in its own
+    # workspace. Any other catalog -- an OSS Unity Catalog server above all,
+    # whose names look exactly the same -- has tables the warehouse cannot
+    # see, and a same-named Databricks table was read and written instead.
+    warehouse_catalog = bool(getattr(resolved_catalog, "sql_warehouse", False))
+    if allow_sql_fallback and not warehouse_catalog:
+        raise InvalidArgumentError(
+            "allow_sql_fallback=True routes operations to a Databricks SQL warehouse, which "
+            "serves only the tables of its own workspace's Unity Catalog; this connection's "
+            f"catalog is {getattr(resolved_catalog, 'name', type(resolved_catalog).__name__)!r}. "
+            "Leave the fallback off here, or open the table through ds.connect() to the "
+            "Databricks workspace that holds it"
+        )
     if allow_sql_fallback:
         from .engine.sql import SqlEngine
 
+        if catalog is not None and not any(v is not None for v in (profile, host, token, config)):
+            # A catalog passed in carries its own authentication; the engine
+            # built from none resolved the SDK defaults, which may be another
+            # workspace than the one whose tables it was sent.
+            profile = getattr(catalog, "_profile", None)
+            host = getattr(catalog, "_host", None)
+            token = getattr(catalog, "_token", None)
+            config = getattr(catalog, "_explicit_config", None)
         engines[EngineKind.SQL] = SqlEngine(
             profile=profile,
             host=host,
@@ -115,7 +136,11 @@ def connect(
 
     return Connection(
         catalog=resolved_catalog,
-        router=Router(engines=engines, allow_sql_fallback=allow_sql_fallback),
+        router=Router(
+            engines=engines,
+            allow_sql_fallback=allow_sql_fallback,
+            warehouse_catalog=warehouse_catalog,
+        ),
         default_catalog=default_catalog,
         default_schema=default_schema,
         storage_options=dict(storage_options or {}),
@@ -855,7 +880,11 @@ class Connection:
             # Nothing has been written yet, so the warehouse can take over
             # cleanly -- if the caller allowed it.
             sql: Any = self.router.engines.get(EngineKind.SQL)
-            if not self.router.allow_sql_fallback or sql is None:
+            if (
+                not self.router.allow_sql_fallback
+                or sql is None
+                or not self.router.warehouse_catalog
+            ):
                 raise
             # The staging flow makes a catalog-managed table, as documented;
             # a plain CREATE TABLE made an ordinary managed one, which Unity
@@ -962,7 +991,19 @@ class Connection:
             ),
         )
         kernel: Any = self.router.engines[EngineKind.KERNEL]
-        metadata = json.loads(kernel.snapshot(staged).metadata_json())
+        try:
+            metadata = json.loads(kernel.snapshot(staged).metadata_json())
+        except DeltaSwampError:
+            raise
+        except Exception as exc:
+            text = str(exc).lower()
+            if any(m in text for m in ("no files in log segment", "not found", "no such file")):
+                raise UnreachableTableError(
+                    f"register {ref}",
+                    f"there is no Delta log at {location} ({str(exc).splitlines()[0][:200]})",
+                    "check the location, or create the table with create_table(location=...)",
+                ) from exc
+            raise
         resolved = catalog.register_table(
             ref,
             location,
@@ -1209,6 +1250,13 @@ class Connection:
             )
         if engine == "warehouse":
             sql_engine: Any = self.router.engines.get(EngineKind.SQL)
+            if not self.router.warehouse_catalog:
+                raise UnreachableTableError(
+                    "run SQL on a warehouse",
+                    "a SQL warehouse serves only a Databricks workspace's own tables, and "
+                    "this connection's catalog is not Databricks Unity Catalog",
+                    "run it locally (engine='duckdb' or 'polars')",
+                )
             if sql_engine is None or not self.router.allow_sql_fallback:
                 raise UnreachableTableError(
                     "run SQL on a warehouse",
@@ -1402,6 +1450,12 @@ class Connection:
         """UNDROP TABLE: restore a recently dropped managed table (SQL fallback)."""
         ref = self._bound_ref(name, "undrop")
         sql_engine: Any = self.router.engines.get(EngineKind.SQL)
+        if not self.router.warehouse_catalog:
+            raise UnreachableTableError(
+                f"undrop {ref}",
+                "UNDROP is Databricks-only, and this connection's catalog is not "
+                "Databricks Unity Catalog",
+            )
         if sql_engine is None or not self.router.allow_sql_fallback:
             raise FallbackRequiredError(
                 f"undrop {ref}",

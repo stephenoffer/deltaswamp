@@ -3234,6 +3234,7 @@ class Table:
             )
         self._engine(Operation.ADD_COLUMN).add_columns(self._resolved, fields, **kwargs)
         self._invalidate()
+        self._sync_catalog()
 
     def drop_column(self, column: str | list[str]) -> dict[str, Any]:
         """Drop a column; a dotted name or a list is a field inside a struct."""
@@ -3252,6 +3253,7 @@ class Table:
             raise InvalidArgumentError(f"cannot drop {column!r}: it is the table's only column")
         result = self._engine(Operation.DROP_COLUMN).drop_column(self._resolved, column)
         self._invalidate()
+        self._sync_catalog()
         return _metrics(result)
 
     def rename_column(self, old: str | list[str], new: str) -> dict[str, Any]:
@@ -3265,6 +3267,7 @@ class Table:
             raise InvalidArgumentError(f"rename_column needs a new name, not {new!r}")
         result = self._engine(Operation.RENAME_COLUMN).rename_column(self._resolved, old, new)
         self._invalidate()
+        self._sync_catalog()
         return _metrics(result)
 
     def set_properties(self, properties: dict[str, str], **kwargs: Any) -> None:
@@ -3284,6 +3287,7 @@ class Table:
             self._resolved, properties, **kwargs
         )
         self._invalidate()
+        self._sync_catalog()
 
     def add_feature(self, feature: Any, **kwargs: Any) -> None:
         self._check_writable("add a feature")
@@ -3338,6 +3342,7 @@ class Table:
             self._resolved, names, if_exists=if_exists
         )
         self._invalidate()
+        self._sync_catalog(tuple(names))
 
     def set_comment(self, comment: str | None) -> None:
         """The table comment (the Metadata action's description)."""
@@ -3345,6 +3350,7 @@ class Table:
         _check_comment(comment)
         self._engine(Operation.SET_COMMENT).set_comment(self._resolved, comment)
         self._invalidate()
+        self._sync_catalog()
 
     def set_column_comment(self, column: str | list[str], comment: str | None) -> None:
         self._check_writable("set a column comment")
@@ -3354,6 +3360,7 @@ class Table:
             self._resolved, column, comment
         )
         self._invalidate()
+        self._sync_catalog()
 
     def alter_column_type(self, column: str | list[str], new_type: str) -> None:
         """Widen a column's type without rewriting data (type widening).
@@ -3368,6 +3375,7 @@ class Table:
             self._resolved, column, new_type
         )
         self._invalidate()
+        self._sync_catalog()
 
     def set_not_null(self, column: str | list[str]) -> None:
         """Add a NOT NULL constraint, after checking no existing row is null."""
@@ -3375,12 +3383,14 @@ class Table:
         column = _column_path(column, "set_not_null")
         self._engine(Operation.SET_NOT_NULL).set_not_null(self._resolved, column)
         self._invalidate()
+        self._sync_catalog()
 
     def drop_not_null(self, column: str | list[str]) -> None:
         self._check_writable("drop NOT NULL")
         column = _column_path(column, "drop_not_null")
         self._engine(Operation.DROP_NOT_NULL).drop_not_null(self._resolved, column)
         self._invalidate()
+        self._sync_catalog()
 
     def cluster_by(self, columns: list[str] | str | None) -> None:
         """Set the liquid-clustering keys (ALTER TABLE ... CLUSTER BY).
@@ -3591,6 +3601,12 @@ class Table:
 
     def _warehouse(self, what: str) -> Any:
         engine = self._connection.router.engines.get(EngineKind.SQL)
+        if not self._connection.router.warehouse_catalog:
+            raise UnreachableTableError(
+                what,
+                "row filters and column masks are defined in SQL and enforced by Databricks, "
+                "and this connection's catalog is not Databricks Unity Catalog",
+            )
         if engine is None or not self._connection.router.allow_sql_fallback:
             raise FallbackRequiredError(
                 what,
@@ -3598,6 +3614,50 @@ class Table:
                 SQL_FALLBACK_REMEDY,
             )
         return engine
+
+    def _sync_catalog(self, removed: tuple[str, ...] = ()) -> None:
+        """Tell a catalog that keeps its own copy of an external table's metadata.
+
+        Called after a schema, comment or property change committed to the log.
+        OSS Unity Catalog does not re-read the log, so its column list and
+        comment went stale. The change itself succeeded, so a failure here is a
+        warning, not an error.
+        """
+        resolved = self._resolved
+        if resolved.ref.kind is not RefKind.CATALOG or resolved.is_catalog_managed:
+            return
+        if resolved.table_type not in (TableType.EXTERNAL, None):
+            return
+        catalog = self._connection._catalog_for(resolved.ref)
+        sync = getattr(catalog, "sync_external_metadata", None)
+        if not callable(sync):
+            return
+        try:
+            import json
+
+            kernel: Any = self._connection.router.engines[EngineKind.KERNEL]
+            metadata = json.loads(kernel.snapshot(self._enrich()).metadata_json())
+            sync(
+                resolved.ref,
+                table_id=resolved.table_id,
+                schema_string=metadata["schemaString"],
+                description=metadata.get("description"),
+                configuration=dict(metadata.get("configuration") or {}),
+                removed=removed,
+            )
+            self._catalog_properties = {
+                **{k: v for k, v in self._catalog_properties.items() if k not in removed},
+                **dict(metadata.get("configuration") or {}),
+            }
+        except Exception as exc:
+            warnings.warn(
+                f"{resolved.ref} changed in its Delta log, but updating its entry in "
+                f"{getattr(catalog, 'name', 'the catalog')} failed ({type(exc).__name__}: "
+                f"{str(exc)[:200]}); the catalog's column list and comment may be stale "
+                "until the table is registered again",
+                UserWarning,
+                stacklevel=3,
+            )
 
     def _refresh_from_catalog(self) -> None:
         """Re-read the catalog's view of the table after a governance change.
