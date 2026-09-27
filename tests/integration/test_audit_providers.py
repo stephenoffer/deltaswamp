@@ -12,10 +12,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import deltaswamp as ds
 import pyarrow as pa
 import pytest
-
-import deltaswamp as ds
 
 SCHEMA = pa.schema([("id", pa.int64()), ("n32", pa.int32())])
 
@@ -95,8 +94,14 @@ def uc_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     )
     port = _free_port()
     process = subprocess.Popen(
-        [_JAVA, "-cp", _UC_JAR.read_text().strip(), "io.unitycatalog.server.UnityCatalogServer"]
-        + ["-p", str(port)],
+        [
+            _JAVA,
+            "-cp",
+            _UC_JAR.read_text().strip(),
+            "io.unitycatalog.server.UnityCatalogServer",
+            "-p",
+            str(port),
+        ],
         cwd=root,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
