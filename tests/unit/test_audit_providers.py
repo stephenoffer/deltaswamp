@@ -268,8 +268,8 @@ class TestOssUnityCatalog:
                     request.full_url,
                     status,
                     "err",
-                    {},
-                    io.BytesIO(text.encode()),  # type: ignore[arg-type]
+                    {},  # type: ignore[arg-type]
+                    io.BytesIO(text.encode()),
                 )
             return Response(text.encode())
 

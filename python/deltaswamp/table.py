@@ -3376,11 +3376,30 @@ class Table:
         """
         self._check_writable("change a column type")
         column = _column_path(column, "alter_column_type")
+        if self._has_type(column, new_type):
+            # Nothing to change, as Spark treats it. Checked here because the
+            # router refuses a type change on a table without type widening.
+            return
         self._engine(Operation.ALTER_COLUMN_TYPE).alter_column_type(
             self._resolved, column, new_type
         )
         self._invalidate()
         self._sync_catalog()
+
+    def _has_type(self, column: str, new_type: str) -> bool:
+        """Whether `column` already has `new_type` (``bigint`` for a long)."""
+        import json
+
+        from .engine.metadata import _find, _normalise_type, _split
+
+        try:
+            kernel: Any = self._connection.router.engines[EngineKind.KERNEL]
+            metadata = json.loads(kernel.snapshot(self._enrich()).metadata_json())
+            schema = json.loads(metadata["schemaString"])
+            container, index = _find(schema, _split(column))
+            return bool(container[index]["type"] == _normalise_type(new_type))
+        except Exception:
+            return False  # let the engine decide, and say why
 
     def set_not_null(self, column: str | list[str]) -> None:
         """Add a NOT NULL constraint, after checking no existing row is null."""
