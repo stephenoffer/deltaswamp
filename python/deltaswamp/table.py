@@ -2395,6 +2395,11 @@ class Table:
         from .engine.dialect import warehouse_reason
 
         texts = [predicate, *(updates.values() if isinstance(updates, dict) else ())]
+        for text in texts:
+            # Refused before any engine sees it: DataFusion reads up to a ';'
+            # and ignores the rest, so "id = 1; id = 2" deleted id = 1 and
+            # reported success.
+            sqlpred.refuse_statement_separator(text)
         if any(warehouse_reason(t) is not None for t in texts):
             # Spark SQL neither direct engine can be made to compute as
             # Databricks does (a 0-based array subscript, `split`).

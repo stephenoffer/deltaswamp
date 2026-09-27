@@ -42,3 +42,40 @@ def test_a_panic_mid_stream_is_an_engine_panic_error() -> None:
     stream._reader = Reader()  # read lazily, once iteration starts
     with pytest.raises(EnginePanicError, match="panicked"):
         stream.read_next_batch()
+
+
+def test_a_double_bound_at_two_to_the_53_skips_no_file(tmp_path: Any) -> None:
+    pa = pytest.importorskip("pyarrow")
+    import deltaswamp as ds
+
+    conn = ds.connect("file://")
+    path = str(tmp_path / "t")
+    t = conn.create_table(path, pa.schema([("id", pa.int64())]))
+    t.append(pa.table({"id": pa.array([2**53 + 1], pa.int64())}))
+    t.append(pa.table({"id": pa.array([1], pa.int64())}))
+    t = conn.open_table(path)
+    # The D suffix makes a DOUBLE literal; without it 9007199254740992.0 is a
+    # DECIMAL, compared exactly.
+    for predicate in (f"id = {2**53}D", f"id >= {2**53}D"):
+        rows = t.to_arrow(predicate=predicate).column("id").to_pylist()
+        # Spark compares as DOUBLE: 2**53 + 1 rounds to 2**53.0.
+        assert rows == [2**53 + 1], predicate
+
+
+@pytest.mark.parametrize("op", ["delete", "count", "to_arrow"])
+def test_a_semicolon_in_a_predicate_is_refused(tmp_path: Any, op: str) -> None:
+    pa = pytest.importorskip("pyarrow")
+    import deltaswamp as ds
+    from deltaswamp import PredicateError
+
+    conn = ds.connect("file://")
+    t = conn.create_table(str(tmp_path / "t"), pa.schema([("id", pa.int64())]))
+    t.append(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    with pytest.raises(PredicateError, match="';'"):
+        if op == "delete":
+            t.delete("id = 1; id = 2")
+        else:
+            getattr(t, op)(predicate="id = 1; id = 2")
+    assert sorted(t.to_arrow().column("id").to_pylist()) == [1, 2]
+    # Inside a string literal a ';' is data.
+    assert t.count(predicate="'a;b' = 'a;b'") == 2

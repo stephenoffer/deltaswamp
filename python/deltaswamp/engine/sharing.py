@@ -856,7 +856,14 @@ class SharingEngine:
         if (
             operation is Operation.CDF
             and table.table_id is not None
-            and str(table.properties.get("delta.enableChangeDataFeed", "")).strip().lower()
+            and str(
+                table.properties.get("delta.enableChangeDataFeed")
+                # Servers answering in parquet format drop the "delta."
+                # prefix; the official client accepts either key.
+                or table.properties.get("enableChangeDataFeed", "")
+            )
+            .strip()
+            .lower()
             != "true"
         ):
             # The metadata the share served says so before any call: the

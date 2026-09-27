@@ -116,12 +116,48 @@ class _Tok:
     text: str
 
 
+def refuse_statement_separator(text: Any) -> None:
+    """Refuse SQL text holding a ';' outside a string literal or quoted name.
+
+    A predicate or SET value is one expression. DataFusion stops reading at
+    the first ';', so the text after it was silently ignored.
+    """
+    if not isinstance(text, str) or ";" not in text:
+        return
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\" and quote != "`":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == ";":
+            raise PredicateError(
+                f"{text!r} contains ';' outside a string literal; a predicate or SET "
+                "value is a single SQL expression"
+            )
+        i += 1
+
+
 def _tokenize(text: str) -> list[_Tok]:
     tokens: list[_Tok] = []
     pos = 0
     stripped = text.rstrip()
     while pos < len(stripped):
         match = _TOKEN.match(stripped, pos)
+        if (match is None or match.end() == pos) and stripped[pos] == ";":
+            # Not SQL this or any engine should take further: DataFusion
+            # stops reading at the ';', so "id = 1; id = 2" deleted id = 1
+            # and reported success. A predicate is one expression.
+            raise PredicateError(
+                f"predicate {text!r} contains ';' outside a string literal; a predicate "
+                "is a single SQL expression"
+            )
         if match is None or match.end() == pos:
             raise PredicateError(
                 f"cannot parse predicate {text!r} at position {pos}: {stripped[pos : pos + 20]!r}",
@@ -866,8 +902,10 @@ def _skip_literal(lit: Literal, target: Any, op: str) -> Literal | None:
     if not pa.types.is_integer(target):
         return None
     number = decimal.Decimal(value) if isinstance(value, float) else value
-    if isinstance(value, float) and abs(value) > _EXACT_DOUBLE_INT:
-        # Past 2**53 the filter's double comparison rounds the column too.
+    if isinstance(value, float) and abs(value) >= _EXACT_DOUBLE_INT:
+        # From 2**53 the filter's double comparison rounds the column too:
+        # 2**53 + 1 compares equal to 2**53.0, so a bound at exactly 2**53
+        # skipped files holding matching rows.
         return None
     if number == number.to_integral_value():
         new_op, whole = op, int(number)
