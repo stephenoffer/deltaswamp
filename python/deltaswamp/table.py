@@ -18,6 +18,7 @@ import warnings
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
+from . import _results
 from ._util import timestamp_ms
 from .capability import FEATURE_SUPPORT, Capability, FeatureKind, Operation, feature_from_wire
 from .capability import READ_OPERATIONS as _READ_OPERATIONS
@@ -2816,16 +2817,16 @@ class Table:
         _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
         needs = self._expression_needs(predicate)
-        result: dict[str, Any] = _translated(
-            "delete",
-            lambda: self._backfilled(
-                lambda: self._engine(Operation.DELETE, needs).delete(
-                    self._resolved, predicate, **_given(kwargs)
-                )
-            ),
-        )
+        served: list[Any] = []
+
+        def run() -> Any:
+            engine = self._engine(Operation.DELETE, needs)
+            served.append(getattr(engine, "kind", None))
+            return engine.delete(self._resolved, predicate, **_given(kwargs))
+
+        result = _translated("delete", lambda: self._backfilled(run))
         self._invalidate()
-        return result
+        return _results.dml(result, served[-1] if served else None)
 
     def update(
         self,
@@ -2874,7 +2875,7 @@ class Table:
             ),
         )
         self._invalidate()
-        return result
+        return _results.dml(result, getattr(engine, "kind", None))
 
     def _update_defaults(self, updates: Any) -> tuple[dict[str, str], frozenset[str]]:
         """`SET c = DEFAULT`: each such column's DEFAULT as SQL, for a direct engine.
@@ -3061,11 +3062,12 @@ class Table:
             needs.add("optimize_full")
         if predicate is not None:
             needs.add("optimize_predicate")
-        result: dict[str, Any] = self._engine(op, frozenset(needs)).optimize(
+        engine = self._engine(op, frozenset(needs))
+        result = engine.optimize(
             self._resolved, zorder_by=zorder_by, full=full, predicate=predicate, **kwargs
         )
         self._invalidate()
-        return result
+        return _results.optimize(result, getattr(engine, "kind", None))
 
     def z_order(self, columns: list[str] | str, **kwargs: Any) -> dict[str, Any]:
         self._check_writable("z-order")
@@ -3075,11 +3077,10 @@ class Table:
         if not columns:
             raise InvalidArgumentError("z_order needs at least one column")
         self._check_zorder(columns)
-        result: dict[str, Any] = self._engine(Operation.ZORDER).zorder(
-            self._resolved, columns, **kwargs
-        )
+        engine = self._engine(Operation.ZORDER)
+        result = engine.zorder(self._resolved, columns, **kwargs)
         self._invalidate()
-        return result
+        return _results.optimize(result, getattr(engine, "kind", None))
 
     def _check_optimize_args(self, kwargs: dict[str, Any]) -> None:
         """Refuse OPTIMIZE tuning values delta-rs mishandles, before any work starts.
@@ -3204,10 +3205,12 @@ class Table:
                 # The table already is that version. delta-rs raised a raw
                 # "Version to restore 5 should be less then last available
                 # version 5"; restoring to where you are changes nothing.
-                return {"numRemovedFile": 0, "numRestoredFile": 0}
-        result: dict[str, Any] = engine.restore(self._resolved, target, **kwargs)
+                return _results.restore(
+                    {"numRemovedFile": 0, "numRestoredFile": 0}, getattr(engine, "kind", None)
+                )
+        result = engine.restore(self._resolved, target, **kwargs)
         self._invalidate()
-        return result
+        return _results.restore(result, getattr(engine, "kind", None))
 
     def _restore_version(self, timestamp: Any) -> Any:
         """The version a restore to `timestamp` means: the one a read at it sees.
@@ -4238,7 +4241,7 @@ class _InvalidatingMerger:
             if name == "execute":
                 result = self._execute(attr, args, kwargs)
                 self._invalidate()
-                return result
+                return _results.dml(result, self._kind)
             if name == "when_not_matched_insert" and "values" in kwargs:
                 # An INSERT sets values, and the name is what users reach for;
                 # the builders all call the parameter `updates` (delta-rs's

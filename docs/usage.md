@@ -399,6 +399,12 @@ Through the warehouse, `update` sets a struct field by its dotted path
 (`{"s.a": 5}`) when no top-level column has that name, and `new_values` takes
 bytes, dicts (a struct) and lists (an array) as well as scalars.
 
+`delete`, `update`, `merge(...).execute()`, `optimize`, `z_order` and
+`restore` return an `OperationResult`, a dict with the same keys on every
+engine (`num_deleted_rows`, `num_updated_rows`, `num_inserted_rows`,
+`num_affected_rows`, `num_files_added`, `num_files_removed`, `version` where
+known) next to the serving engine's own metrics; `.engine` names the engine.
+
 `merge` returns a builder with delta-rs's clause API, whichever engine serves
 it. When the warehouse serves it, the builder generates one `MERGE INTO`
 statement, with the source staged in a volume.

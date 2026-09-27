@@ -55,6 +55,14 @@ First release.
 - `connect(iceberg_properties=...)`; `storage_options` reach PyIceberg and
   Delta Sharing downloads.
 
+- DELETE, UPDATE, MERGE, OPTIMIZE, Z-ORDER and RESTORE return an
+  `OperationResult`: a dict that keeps the serving engine's own keys and adds
+  the same normalized keys on every engine (`num_deleted_rows`,
+  `num_updated_rows`, `num_inserted_rows`, `num_affected_rows`,
+  `num_files_added`, `num_files_removed`, `version`; `num_removed_files` and
+  `num_restored_files` for RESTORE), plus `.engine`. Code comparing a result
+  for exact equality with a dict needs to compare the keys it cares about.
+
 ### Known limits
 
 - A kernel create with `delta.targetFileSize`, `delta.isolationLevel`,

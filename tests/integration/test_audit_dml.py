@@ -236,10 +236,8 @@ class TestCheckpointWithoutJsonStats:
         # The count came from the Parquet footer; the new add records it.
         assert json.loads(adds[0]["stats"])["numRecords"] == 4
 
-        assert conn.open_table(path).update(new_values={"id": 30}, predicate="id = 3") == {
-            "num_updated_rows": 1,
-            "version": 3,
-        }
+        result = conn.open_table(path).update(new_values={"id": 30}, predicate="id = 3")
+        assert result.items() >= {"num_updated_rows": 1, "version": 3}.items()
         merged = (
             conn.open_table(path)
             .merge(

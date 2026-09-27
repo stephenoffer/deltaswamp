@@ -103,7 +103,7 @@ class TestRestoreByTimestamp:
         future = dt.datetime.now(dt.UTC) + dt.timedelta(days=1)
         with pytest.raises(InvalidArgumentError, match="after the latest commit"):
             t.restore(future)
-        assert t.restore(t.version) == {"numRemovedFile": 0, "numRestoredFile": 0}
+        assert t.restore(t.version).items() >= {"numRemovedFile": 0, "numRestoredFile": 0}.items()
         assert t.version == 3
 
     def test_restores_what_a_read_at_the_timestamp_sees(self, conn: Any, tmp_path: Any) -> None:

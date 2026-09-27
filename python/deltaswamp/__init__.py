@@ -8,6 +8,7 @@ that names the blocker and the remedy.
 
 from __future__ import annotations
 
+from ._results import OperationResult
 from .capability import Capability, Engine, Operation, TableFeature
 from .connection import Connection, connect
 from .credentials import Cloud, CredentialProvider, Credentials
@@ -101,6 +102,7 @@ __all__ = [
     "MetadataChangedError",
     "MissingDataFileError",
     "Operation",
+    "OperationResult",
     "PredicateError",
     "PreflightError",
     "PropertyNotSupportedError",
