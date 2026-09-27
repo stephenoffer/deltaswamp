@@ -127,7 +127,24 @@ First release.
 - DELETE/UPDATE/replaceWhere SQL beyond the kernel's predicate grammar
   (arithmetic, function calls) needs delta-rs or the warehouse, so on a
   catalog-managed table it needs the SQL fallback.
-- The change feed and history of a catalog-managed table need the warehouse.
+- The change feed and history of a catalog-managed table need the warehouse,
+  which only a Databricks connection has: `allow_sql_fallback=True` is refused
+  on OSS Unity Catalog, Hive Metastore, Glue, Delta Sharing and path
+  connections, where those operations are refused without that remedy.
+- Delta Sharing has no split planning: `plan_scan()` and `to_ray_dataset()`
+  are refused for shared tables (presigned URLs would expire in transit to
+  workers). Read with `to_arrow()` or `scan()`. Whether time travel and the
+  change feed work depends on the provider sharing the table WITH HISTORY;
+  `can()` says so, and refuses the change feed outright when the shared
+  metadata has it off. A column-mapped or deletion-vector table needs a server
+  that answers in delta format (the open-source reference server does not).
+- On a Databricks USING ICEBERG table, the SQL fallback refuses CHECK
+  constraints, deletion vectors, liquid clustering while deletion vectors or
+  row tracking are not explicitly off, and `delta.*` properties Databricks does
+  not keep; the change feed of any table with Iceberg metadata needs row
+  tracking.
+- Hive Metastore and Glue `drop_table` remove only the registration; the data
+  files, Delta log included, stay.
 - Databricks managed Iceberg (`USING ICEBERG`) takes appends through the
   Iceberg REST endpoint; overwrites need the warehouse, because the endpoint
   takes one snapshot per commit.

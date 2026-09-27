@@ -82,10 +82,63 @@ def _hms_class() -> Any:
     )
 
 
+def _invalid_method(exc: BaseException) -> bool:
+    """Whether `exc` is Thrift's "Invalid method name" (the server lacks the call)."""
+    return (
+        type(exc).__name__ == "TApplicationException" and "invalid method name" in str(exc).lower()
+    )
+
+
+def _raw_table(client: Any, schema: str, table: str) -> Any:
+    """The Thrift Table, from ``get_table_req`` or, on an old server, ``get_table``.
+
+    Hive 4 removed ``get_table``: every lookup failed with a raw
+    TApplicationException "Invalid method name: 'get_table'". Hive 3 has both,
+    Hive 2 only the old one.
+    """
+    request_type = None
+    try:
+        ttypes = importlib.import_module(type(client).__module__.rsplit(".", 1)[0] + ".ttypes")
+        request_type = getattr(ttypes, "GetTableRequest", None)
+    except ImportError:
+        pass
+    if request_type is not None and hasattr(client, "get_table_req"):
+        try:
+            return client.get_table_req(request_type(dbName=schema, tblName=table)).table
+        except Exception as exc:
+            if not _invalid_method(exc):
+                raise
+    return client.get_table(schema, table)
+
+
+def _thrift_error(what: str, exc: BaseException) -> PreflightError:
+    """A Thrift failure the metastore answered with, as a typed error."""
+    return PreflightError(
+        f"the Hive Metastore could not {what}: {type(exc).__name__}: "
+        f"{getattr(exc, 'message', None) or exc}"
+    )
+
+
+#: The catalog part a three-part name may give a metastore table. A metastore
+#: has two levels; any other first part was silently ignored, so
+#: ``prod.db.t`` read ``db.t`` from whatever metastore this was.
+_CATALOG_NAMES = frozenset({"hive_metastore", "hive", "hms", "spark_catalog"})
+
+
+def _check_catalog_part(ref: TableRef) -> None:
+    if ref.catalog and ref.catalog.lower() not in _CATALOG_NAMES:
+        raise InvalidReferenceError(
+            f"{ref.raw or ref} names the catalog {ref.catalog!r}, but a Hive Metastore has "
+            "only databases and tables. Name the table db.table (or hive_metastore.db.table)"
+        )
+
+
 class HiveMetastoreCatalog:
     """Resolves Delta tables registered in a Hive Metastore."""
 
     name = "hive"
+    #: What a two-part ``db.table`` name completes to on this connection.
+    default_catalog_name = "hive_metastore"
     #: The reference schemes this catalog serves; see `Connection._catalog_for`.
     ref_schemes: frozenset[str] = frozenset({"hms"})
 
@@ -172,7 +225,7 @@ class HiveMetastoreCatalog:
         try:
             client = getattr(hms, "client", None)
             if client is not None and hasattr(client, "get_table"):
-                raw = client.get_table(schema, table)
+                raw = _raw_table(client, schema, table)
                 sd = getattr(raw, "sd", None)
                 serde = getattr(sd, "serdeInfo", None)
                 return {
@@ -189,6 +242,8 @@ class HiveMetastoreCatalog:
                     f"{schema}.{table} does not exist in the Hive Metastore: "
                     f"{getattr(exc, 'message', None) or exc}"
                 ) from exc
+            if type(exc).__module__.startswith(("thrift", "pymetastore")):
+                raise _thrift_error(f"look up {schema}.{table}", exc) from exc
             raise
         storage = getattr(parsed, "storage", None)
         return {
@@ -204,6 +259,7 @@ class HiveMetastoreCatalog:
             raise InvalidReferenceError(f"{ref} does not name a database and table")
 
         self._check_endpoint(ref)
+        _check_catalog_part(ref)
         with self._connect() as hms:
             return self._resolved(ref, self._get_table(hms, ref.schema, ref.table))
 
@@ -272,6 +328,9 @@ class HiveMetastoreCatalog:
         return None
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
+        _check_catalog_part(
+            TableRef(kind=RefKind.CATALOG, catalog=catalog, schema=schema, table="_")
+        )
         out = []
         # One connection for the listing and every lookup, instead of one per table.
         with self._connect() as hms:
@@ -299,10 +358,57 @@ class HiveMetastoreCatalog:
         return out
 
     def list_catalogs(self) -> list[str]:
-        raise NotImplementedError("HiveMetastoreCatalog has no catalog namespace to enumerate")
+        """The one namespace a metastore has, as table names spell it."""
+        return ["hive_metastore"]
 
     def list_schemas(self, catalog: str) -> list[str]:
-        raise NotImplementedError("HiveMetastoreCatalog does not implement schema discovery")
+        """The metastore's databases."""
+        _check_catalog_part(TableRef(kind=RefKind.CATALOG, catalog=catalog, schema="_", table="_"))
+        with self._connect() as hms:
+            try:
+                return [str(name) for name in hms.client.get_all_databases()]
+            except Exception as exc:
+                raise _thrift_error("list its databases", exc) from exc
 
     def drop_table(self, ref: TableRef) -> None:
-        raise NotImplementedError("HiveMetastoreCatalog does not implement dropping tables")
+        """Remove the registration; the data files stay (deleteData=false).
+
+        For an EXTERNAL table that is what a drop means anyway. For a MANAGED
+        one the metastore would otherwise delete the table's directory, Delta
+        log included, which this library never does behind a drop.
+        """
+        if ref.kind is not RefKind.CATALOG or not ref.schema or not ref.table:
+            raise InvalidReferenceError(f"{ref} does not name a database and table")
+        self._check_endpoint(ref)
+        _check_catalog_part(ref)
+        with self._connect() as hms:
+            try:
+                hms.client.drop_table(ref.schema, ref.table, False)
+            except Exception as exc:
+                if type(exc).__name__ in ("NoSuchObjectException", "UnknownTableException"):
+                    raise InvalidReferenceError(
+                        f"{ref.schema}.{ref.table} does not exist in the Hive Metastore"
+                    ) from exc
+                raise _thrift_error(f"drop {ref.schema}.{ref.table}", exc) from exc
+
+    def preflight(self) -> list[str]:
+        """Connect and look a table up the way `resolve` does."""
+        try:
+            with self._connect() as hms:
+                client = getattr(hms, "client", None)
+                if client is None:
+                    return []
+                databases = list(client.get_all_databases())
+                try:
+                    _raw_table(
+                        client, databases[0] if databases else "default", "_deltaswamp_probe_"
+                    )
+                except Exception as exc:
+                    if type(exc).__name__ not in ("NoSuchObjectException", "UnknownTableException"):
+                        raise
+        except Exception as exc:
+            return [
+                f"the Hive Metastore at {self._host}:{self._port} cannot serve table lookups "
+                f"({type(exc).__name__}: {getattr(exc, 'message', None) or exc})"
+            ]
+        return []

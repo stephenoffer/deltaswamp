@@ -88,10 +88,30 @@ def _error_code(exc: BaseException) -> str:
     return ""
 
 
+def _check_catalog_part(ref: TableRef) -> None:
+    """Refuse a first name part that is neither ``glue`` nor an AWS account id.
+
+    Glue has databases and tables; ``prod.db.t`` used to read ``db.t`` from
+    this connection's catalog, the ``prod`` ignored.
+    """
+    part = ref.catalog or ""
+    if ref.endpoint or not part or part.lower() in ("glue", "awsdatacatalog"):
+        return
+    if part.isdigit() and len(part) == 12:
+        return
+    raise InvalidReferenceError(
+        f"{ref.raw or ref} names the catalog {part!r}, but Glue has only databases and "
+        "tables. Name the table database.table, glue.database.table, or "
+        "<account-id>.database.table"
+    )
+
+
 class GlueCatalog:
     """Resolves Delta tables registered in AWS Glue."""
 
     name = "glue"
+    #: What a two-part ``database.table`` name completes to on this connection.
+    default_catalog_name = "glue"
     #: The reference schemes this catalog serves; see `Connection._catalog_for`.
     ref_schemes: frozenset[str] = frozenset({"glue"})
 
@@ -199,6 +219,7 @@ class GlueCatalog:
         if ref.kind is not RefKind.CATALOG or not ref.schema or not ref.table:
             raise InvalidReferenceError(f"{ref} does not name a database and table")
 
+        _check_catalog_part(ref)
         kwargs: dict[str, Any] = {"DatabaseName": ref.schema, "Name": ref.table}
         catalog_id = self._catalog_id_for(ref)
         if catalog_id:
@@ -301,10 +322,27 @@ class GlueCatalog:
         return out
 
     def list_catalogs(self) -> list[str]:
-        raise NotImplementedError("GlueCatalog has no catalog namespace to enumerate")
+        """The Data Catalog this connection reads: its account id, or ``glue``."""
+        return [self._catalog_id or "glue"]
 
     def list_schemas(self, catalog: str) -> list[str]:
-        raise NotImplementedError("GlueCatalog does not implement schema discovery")
+        """The Glue databases."""
+        probe = TableRef(kind=RefKind.CATALOG, catalog=catalog, schema="_", table="_")
+        _check_catalog_part(probe)
+        paginator = self._glue().get_paginator("get_databases")
+        pages = self._call(
+            "the Glue databases",
+            lambda: list(paginator.paginate(**self._kwargs({}, self._catalog_id_for(probe)))),
+        )
+        return [str(db["Name"]) for page in pages for db in page.get("DatabaseList", [])]
 
     def drop_table(self, ref: TableRef) -> None:
-        raise NotImplementedError("GlueCatalog does not implement dropping tables")
+        """DeleteTable: the registration goes, the files stay (Glue never deletes data)."""
+        if ref.kind is not RefKind.CATALOG or not ref.schema or not ref.table:
+            raise InvalidReferenceError(f"{ref} does not name a database and table")
+        _check_catalog_part(ref)
+        kwargs: dict[str, Any] = {"DatabaseName": ref.schema, "Name": ref.table}
+        catalog_id = self._catalog_id_for(ref)
+        if catalog_id:
+            kwargs["CatalogId"] = catalog_id
+        self._call(f"Glue table {ref.schema}.{ref.table}", self._glue().delete_table, **kwargs)

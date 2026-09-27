@@ -55,8 +55,12 @@ class TestConnection:
         assert not conn.table_exists("main.sales.orders")
 
     def test_undrop_needs_the_warehouse(self, conn: Any) -> None:
-        with pytest.raises(ds.FallbackRequiredError, match="UNDROP"):
+        # OSS Unity Catalog has no warehouse: naming the fallback as the
+        # remedy sent the caller to a same-named Databricks table.
+        with pytest.raises(ds.UnreachableTableError, match="UNDROP") as info:
             conn.undrop_table("main.sales.orders")
+        assert not isinstance(info.value, ds.FallbackRequiredError)
+        assert "allow_sql_fallback" not in str(info.value)
 
 
 class TestTable:
@@ -78,8 +82,9 @@ class TestTable:
             table.lineage()
 
     def test_row_filters_need_the_warehouse(self, table: Any) -> None:
-        with pytest.raises(ds.FallbackRequiredError, match="allow_sql_fallback"):
+        with pytest.raises(ds.UnreachableTableError, match="Databricks") as info:
             table.set_row_filter("main.sales.only_eu", ["id"])
+        assert "allow_sql_fallback" not in str(info.value)
 
     def test_path_catalog_has_no_governance(self, tmp_path: Any) -> None:
         from deltalake import write_deltalake

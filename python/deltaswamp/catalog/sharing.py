@@ -36,7 +36,13 @@ from ..errors import InvalidReferenceError, UnreachableTableError
 from ..identity import RefKind, TableRef, _quote
 from .base import ResolvedTable
 
-__all__ = ["SHARING_SCHEMES", "SharingCatalog", "load_profile", "profile_document"]
+__all__ = [
+    "SHARING_SCHEMES",
+    "SharingCatalog",
+    "load_profile",
+    "profile_document",
+    "rest_client",
+]
 
 #: URI schemes this catalog answers to. `registry.scheme_to_catalog` maps each
 #: of them to ``"sharing"``.
@@ -226,6 +232,27 @@ def _read_profile_text(document: str) -> str:
         ) from exc
 
 
+def rest_client(profile: Any, **kwargs: Any) -> Any:
+    """A `DataSharingRestClient` for a parsed profile, refusing one it cannot authenticate.
+
+    The client raises a bare RuntimeError ("unsupported profile.type") for a
+    type and version pair it has no provider for.
+    """
+    rest = sharing_module("delta_sharing.rest_client")
+    try:
+        return rest.DataSharingRestClient(profile, **kwargs)
+    except RuntimeError as exc:
+        if "unsupported profile" not in str(exc).lower():
+            raise
+        raise InvalidReferenceError(
+            f"the Delta Sharing profile's credential type {getattr(profile, 'type', None)!r} "
+            f"(shareCredentialsVersion {getattr(profile, 'share_credentials_version', None)}) "
+            "is not one the delta-sharing client supports: version 1 takes a bearerToken; "
+            "version 2 takes oauth_client_credentials, oauth_jwt_bearer_private_key_jwt, "
+            "basic or bearer_token"
+        ) from exc
+
+
 def load_profile(profile: str | Path | dict[str, Any]) -> Any:
     """Parse a profile given as a path/URL, a JSON document, or a mapping.
 
@@ -240,7 +267,16 @@ def load_profile(profile: str | Path | dict[str, Any]) -> Any:
         parsed = json.loads(text)
         if not isinstance(parsed, dict):
             raise ValueError("the profile is not a JSON object")
-        return DeltaSharingProfile.from_json(parsed)
+        loaded = DeltaSharingProfile.from_json(parsed)
+        if loaded.share_credentials_version == 2 and loaded.type == "bearer_token":
+            # The protocol defines version-2 bearer-token profiles, but the
+            # client authenticates bearer tokens only under version 1 and
+            # raised a bare RuntimeError at the first request. The token is
+            # sent the same way either way.
+            import dataclasses
+
+            loaded = dataclasses.replace(loaded, share_credentials_version=1)
+        return loaded
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         where = "document" if inline else f"file {_display(document)}"
         # KeyError/ValueError text names a field or a version, never a value.
@@ -338,7 +374,7 @@ class SharingCatalog:
     # ---------------------------------------------------------------- client
 
     def _rest_client(self) -> Any:
-        return sharing_module("delta_sharing.rest_client").DataSharingRestClient(self._parsed)
+        return rest_client(self._parsed)
 
     def _failure(self, what: str, exc: BaseException) -> UnreachableTableError:
         return UnreachableTableError(

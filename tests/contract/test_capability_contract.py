@@ -694,10 +694,6 @@ KNOWN: dict[str, tuple[str, set[str]]] = {
         "C1: can(scan, predicate=<arithmetic>) says ok via kernel; scan raises PredicateError",
         _ALL,
     ),
-    "alter_column_type": (
-        "C2: can(alter_column_type) says ok on a table without typeWidening; the call refuses",
-        _ALL - {"type_widening", UC},
-    ),
     "plan_write": (
         "C3: plan_write routes on distributed_write, which can() cannot express: "
         "can(append) names delta-rs, the plan uses the kernel or refuses",

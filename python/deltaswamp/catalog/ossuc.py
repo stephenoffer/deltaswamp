@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NoReturn, TypeVar
 
@@ -77,6 +78,8 @@ _NEEDS = {
     "volume": "Creating a volume needs CREATE VOLUME, USE SCHEMA and USE CATALOG.",
     "register": "Registering a table needs CREATE TABLE and USE SCHEMA on the schema, "
     "USE CATALOG, and EXTERNAL USE SCHEMA where the server enforces it.",
+    "alter": "Updating a table's catalog metadata needs ownership or MODIFY on it, plus "
+    "USE SCHEMA and USE CATALOG.",
     "path": "Path credentials need access to an external location covering the path.",
     "staging": "Creating a managed table needs CREATE TABLE and USE SCHEMA on the schema "
     "and USE CATALOG; the server must be UC 0.5+ with managed tables enabled.",
@@ -108,6 +111,14 @@ def _prop(value: Any) -> str:
 
 def _unsupported(method: str) -> NoReturn:
     raise NotImplementedError(f"{method}: {_UNSUPPORTED[method]}")
+
+
+#: A 404 from the permissions API that is about the principal, not the securable.
+_PRINCIPAL_MISSING = re.compile(
+    r"(user|group|principal|service principal)\b[^.]*not found|"
+    r"not found[^.]*\b(user|group|principal)",
+    re.IGNORECASE,
+)
 
 
 class _Recreated(Exception):
@@ -155,9 +166,21 @@ def _request(
             text = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         try:
-            detail = exc.read().decode("utf-8", "replace")[:500]
+            raw = exc.read().decode("utf-8", "replace")
+            detail = raw[:500]
         except Exception:  # an HTTPError need not carry a readable body
-            detail = str(exc.reason)
+            raw, detail = "", str(exc.reason)
+        try:
+            parsed = json.loads(raw) if raw.strip().startswith("{") else None
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            parsed = parsed["error"]  # the Delta API's {"error": {"message": ...}}
+        if isinstance(parsed, dict) and parsed.get("message"):
+            # UC puts a long stack trace before the message; cut at 500
+            # characters, the message ("User not found: ...") was lost.
+            code = parsed.get("error_code")
+            detail = f"{code + ': ' if code else ''}{str(parsed['message'])[:400]}"
         raise UnityCatalogHTTPError(
             f"{method} {url} failed with HTTP {exc.code}: {detail}", exc.code
         ) from exc
@@ -172,6 +195,11 @@ def _request(
     try:
         return json.loads(text)
     except ValueError as exc:
+        if method == "DELETE":
+            # UC 0.6 answers a successful DELETE with text/plain "200 OK".
+            # Taking that as a failure told the caller a finished drop had
+            # failed, and a retry then found nothing to drop.
+            return {}
         # A proxy's HTML error page or a truncated body: say what came back
         # instead of raising a JSONDecodeError with no URL in it.
         raise PreflightError(
@@ -254,9 +282,28 @@ def _parse_vended(
             table_id=table_id,
             operation=operation,
         )
+    if url and _is_local(url) and not any(body.get(name) for name in _VENDED_BLOCKS):
+        # A server on local storage (the quickstart default) answers with
+        # every cloud block null and just the url: the files need no
+        # credential. Refusing it failed every external create and register.
+        return Credentials(
+            cloud=Cloud.LOCAL,
+            url=url,
+            expires_at=expires_at,
+            secrets={},
+            scope_prefix=url,
+            table_id=table_id,
+            operation=operation,
+        )
     raise CredentialError(
         f"OSS Unity Catalog returned no recognized credential block: {sorted(body)}"
     )
+
+
+def _is_local(url: str) -> bool:
+    """Whether `url` is on this machine's filesystem (``file:`` or a bare path)."""
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    return scheme == "file" or (scheme == "" and url.startswith("/"))
 
 
 class OSSUnityCredentialProvider:
@@ -583,9 +630,23 @@ class OSSUnityCatalog:
         except ValueError:
             return None
 
-    def preflight(self) -> list[str]:
+    def preflight(self, schema: str | None = None) -> list[str]:
+        path = f"{UC_DELTA_API}/config"
+        if schema:
+            # UC 0.6 requires the catalog the client will use.
+            path += "?" + urllib.parse.urlencode({"catalog": schema.split(".", 1)[0]})
         try:
-            _request(self._base_url, f"{UC_DELTA_API}/config", self._token)
+            _request(self._base_url, path, self._token)
+        except UnityCatalogHTTPError as exc:
+            if exc.status == 400:
+                # "Mandatory parameter is missing: catalog": the Delta API is
+                # there and answering. Reporting it unreachable was a false
+                # alarm on a working 0.6 server.
+                return []
+            return [
+                f"the UC Delta API is not reachable at {self._base_url}{UC_DELTA_API}/config "
+                f"({exc}). Catalog-managed tables need it; UC 0.5+ is required."
+            ]
         except PreflightError as exc:
             return [
                 f"the UC Delta API is not reachable at {self._base_url}{UC_DELTA_API}/config "
@@ -703,13 +764,40 @@ class OSSUnityCatalog:
             raise InvalidReferenceError("grant/revoke needs at least one privilege")
         name, path = self._permissions_path(target, securable_type)
         change = {"principal": principal, "add" if add else "remove": wire}
-        body = self._call(
-            "grant privileges" if add else "revoke privileges",
-            name,
-            "grant",
-            lambda: self._send("PATCH", path, {"changes": [change]}),
-        )
-        return self._from_wire(body)
+        action = "grant privileges" if add else "revoke privileges"
+
+        def send() -> Any:
+            try:
+                return self._send("PATCH", path, {"changes": [change]})
+            except UnityCatalogHTTPError as exc:
+                if exc.status == 404 and _PRINCIPAL_MISSING.search(str(exc)):
+                    # Mapped with every other 404, this said the *table* did
+                    # not exist.
+                    raise InvalidReferenceError(
+                        f"cannot {action} on {name}: Unity Catalog knows no principal "
+                        f"{principal!r}. Create the user or group first. "
+                        f"Underlying error: {exc}"
+                    ) from exc
+                raise
+
+        body = self._call(action, name, "grant", send)
+        granted = self._from_wire(body)
+        if (
+            add
+            and isinstance(body, Mapping)
+            and "privilege_assignments" in body
+            and not any(g.principal == principal for g in granted)
+        ):
+            # OSS UC with authorization off accepts the change and records
+            # nothing; a silent success left the caller believing it held.
+            warnings.warn(
+                f"Unity Catalog accepted the grant to {principal!r} on {name} but lists no "
+                "privileges for them afterwards; the server may run with authorization "
+                "disabled, where grants are not recorded",
+                UserWarning,
+                stacklevel=3,
+            )
+        return granted
 
     def grant(
         self,
@@ -1024,6 +1112,58 @@ class OSSUnityCatalog:
             lambda: self._send("POST", f"{UC_API}/tables", body),
         )
         return self._resolve_after(ref, "registered")
+
+    def sync_external_metadata(
+        self,
+        ref: TableRef,
+        *,
+        table_id: str | None,
+        schema_string: str,
+        description: str | None,
+        configuration: Mapping[str, str],
+        removed: Iterable[str] = (),
+    ) -> None:
+        """Bring an EXTERNAL table's catalog entry up to date with its log.
+
+        Databricks re-reads an external table's schema from the log; OSS Unity
+        Catalog keeps whatever it was told at registration. After a column was
+        added through the log, ``info().columns`` and every engine reading the
+        catalog's schema still saw the old one. The UC Delta API's update-table
+        call (0.6+) takes the log's schema, comment and properties.
+        """
+        name = _dotted(ref)
+        if not table_id:
+            raise PreflightError(f"cannot update {name} in Unity Catalog: it has no table id")
+        try:
+            columns = json.loads(schema_string)
+        except ValueError as exc:
+            raise PreflightError(f"the log's schema for {name} is not JSON ({exc})") from exc
+        props = {str(k): _prop(v) for k, v in dict(configuration).items()}
+        updates: list[dict[str, Any]] = [
+            {"action": "set-columns", "columns": columns},
+            # The server refuses a null comment ("set-table-comment requires a
+            # comment"), so a comment cleared in the log is sent as empty.
+            {"action": "set-table-comment", "comment": description or ""},
+        ]
+        if props:
+            updates.append({"action": "set-properties", "updates": props})
+        # Only keys the caller just unset: the entry may hold properties of
+        # the catalog's own that the log never had.
+        gone = sorted(set(removed) - set(props))
+        if gone:
+            updates.append({"action": "remove-properties", "removals": gone})
+        body = {
+            "requirements": [{"type": "assert-table-uuid", "uuid": table_id}],
+            "updates": updates,
+        }
+        self._call(
+            "update the table's catalog metadata",
+            name,
+            "alter",
+            lambda: self._send(
+                "POST", self._delta_tables_path(ref, f"tables/{_q(ref.table or '')}"), body
+            ),
+        )
 
     def path_credentials(self, url: str, operation: str = "PATH_READ") -> Credentials:
         op = path_operation(operation)

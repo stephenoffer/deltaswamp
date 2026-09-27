@@ -974,11 +974,13 @@ class TestDeltaFormat:
         # The query advertised delta responses with the reader features...
         capabilities = [h.get("delta-sharing-capabilities", "") for h in server.request_headers]
         assert any("responseformat=delta" in c and "columnmapping" in c for c in capabilities)
-        # ...and the log written for the kernel holds the delta actions verbatim.
+        # ...and the log written for the kernel holds the delta actions, each
+        # file downloaded here first: the kernel is never handed a server URL.
         protocol, metadata, add = fake_kernel.logs[-1]
         assert protocol["protocol"]["readerFeatures"] == ["columnMapping"]
         assert metadata["metaData"]["configuration"]["delta.columnMapping.mode"] == "name"
-        assert add["add"]["path"].endswith("/files/mapped-1")
+        assert add["add"]["path"].startswith("file://")
+        assert "deltaswamp-sharing-" in add["add"]["path"]
 
     def test_parquet_request_would_have_been_refused(self, renamed: ResolvedTable) -> None:
         # Guard for the fake itself: without the delta header the server refuses.
