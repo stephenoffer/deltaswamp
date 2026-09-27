@@ -1529,6 +1529,13 @@ class DeltaRsEngine:
         dt = self._open(table, write=True)
         # A dot means a nested path only when no top-level column has that
         # name; "a.b" is a legal column name and was refused outright.
+        if column.startswith("`") and column not in dt.schema().to_arrow().names:
+            # One backtick-quoted name (Table quotes a top-level column whose
+            # name holds a dot or a backtick), or a quoted nested path.
+            from ..identity import split_identifier
+
+            parts = split_identifier(column)
+            column = parts[0] if len(parts) == 1 else ".".join(parts)
         if "." in column and column not in dt.schema().to_arrow().names:
             raise UnreachableTableError(
                 f"comment on nested column {column!r} with delta-rs",

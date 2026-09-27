@@ -600,7 +600,8 @@ and writes are refused with that reason.
 
 Iceberg tables in Unity Catalog (managed or foreign) are served through the
 catalog's Iceberg REST endpoint with PyIceberg: reads, time travel by snapshot
-id or timestamp, history, appends, and overwrites by predicate. UniForm Delta
+id or timestamp, history, appends, and overwrites by predicate (for Databricks
+managed Iceberg, appends only; see below). UniForm Delta
 tables can also be read as Iceberg, but the Delta path remains the default for
 them. External writes to UniForm tables are refused, because they would leave
 the Iceberg metadata stale; `t.sync_iceberg()` regenerates it on Databricks.
@@ -610,8 +611,9 @@ case: Unity Catalog reports it as Delta, with a catalog-managed Delta log
 beside the Iceberg metadata. deltaswamp recognises it (the
 `delta.enableIcebergWriterCompatV1` property on a catalog-managed table), reads
 it through the Delta path, and appends through the Iceberg REST endpoint.
-Overwrites are refused there, because the endpoint takes one snapshot per commit
-and an Iceberg overwrite commits two; `history()` is refused too, because the
+Overwrites, deletes, updates and MERGE are refused there, because the endpoint
+takes one snapshot per commit and an Iceberg overwrite commits two (running them
+as two commits would not be atomic); `history()` is refused too, because the
 Iceberg snapshot log does not carry Delta versions. With
 `allow_sql_fallback=True` the warehouse serves both.
 

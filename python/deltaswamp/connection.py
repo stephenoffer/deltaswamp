@@ -1464,4 +1464,11 @@ class Connection:
                     "(append, overwrite, MERGE) to tables the direct engines cannot write; "
                     "pass ds.connect(..., staging_volume='catalog.schema.volume')"
                 )
+            else:
+                # A staging volume that does not exist (or cannot be read)
+                # passed preflight, and the first write then failed.
+                probe = getattr(sql_engine, "staging_volume_problem", None)
+                problem = probe() if callable(probe) else None
+                if problem is not None:
+                    problems.append(problem)
         return problems

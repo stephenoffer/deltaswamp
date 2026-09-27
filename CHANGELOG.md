@@ -65,7 +65,16 @@ First release.
   warehouse. An added column reads as null in older rows, and `changes()`
   yields each version under the schema it was written with. A range crossing
   a version with the feed off raises `UnreachableTableError` naming it
-  (`.version`); `changes()` yields the versions before it first.
+  (`.version`); `changes()` yields the versions before it first. A schema
+  change the range reverses (a RESTORE to an older schema) is found only
+  once the read reaches it, so a consumer of `__arrow_c_stream__`
+  (`pa.table(t.cdf(...))`, polars, DuckDB) gets that error's message as an
+  `ArrowInvalid`; iterate the stream, or call `read_all()`, for the typed
+  error.
+- Databricks managed Iceberg (`USING ICEBERG`) takes appends through the
+  Iceberg REST endpoint only; overwrite by predicate, DELETE, UPDATE and
+  MERGE need the SQL fallback (the endpoint takes one snapshot per commit,
+  and splitting them into two commits would not be atomic).
 - A MERGE with `merge_schema=True` that assigns a column only the target has
   is refused on delta-rs (1.6.5 fails it) and needs the SQL fallback.
 - On a legacy writer-3-to-6 table, enabling a feature delta-rs cannot write

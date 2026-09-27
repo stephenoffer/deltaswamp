@@ -195,6 +195,14 @@ def _operation_blocker(
         and "iceberg"
         in str(table.properties.get("delta.universalFormat.enabledFormats", "")).lower()
     ):
+        if table.is_managed_iceberg:
+            # Managed Iceberg (USING ICEBERG) carries the same property, but it
+            # is not UniForm: its Iceberg metadata is the table, and a Delta
+            # commit beside it would not reach it.
+            return (
+                "the table is managed Iceberg (USING ICEBERG): its Iceberg metadata is the "
+                "table of record, and a Delta commit would not reach it"
+            )
         return (
             "the table has UniForm Iceberg metadata enabled, and only Databricks regenerates "
             "it after a write, so the Iceberg view would silently go stale"
@@ -470,6 +478,7 @@ class Router:
             return verdict
 
         reasons: list[str] = []
+        sql_remedy = ""
         routing = OPERATION_ENGINES.get(operation)
         if routing is None:
             return Capability(operation, ok=False, reason=f"unknown operation {operation.value}")
@@ -518,10 +527,7 @@ class Router:
                 continue
 
             if kind in _DIRECT_ENGINES and not self._vendable(operation, table):
-                reasons.append(
-                    f"{kind.value}: Unity Catalog withdraws this table from credential "
-                    "vending, and a direct engine cannot reach the files without it"
-                )
+                reasons.append(f"{kind.value}: {self._unvendable_reason(operation, table)}")
                 continue
 
             missing = sorted(
@@ -585,8 +591,12 @@ class Router:
             if result.ok:
                 return result
             reasons.append(f"{kind.value}: {result.reason}")
+            if kind is EngineKind.SQL and result.remedy:
+                # The warehouse would serve it once configured (a staging
+                # volume, say): that is the one remedy that helps.
+                sql_remedy = result.remedy
 
-        remedy = ""
+        remedy = sql_remedy
         if EngineKind.SQL in routing.engines and not table.is_shared:
             if not _warehouse_can_name(table):
                 remedy = _REGISTER_REMEDY
@@ -702,6 +712,30 @@ class Router:
         if table.open_error is not None and operation is not Operation.CREATE:
             return f"the table's Delta log could not be read ({table.open_error})"
         return None
+
+    @staticmethod
+    def _unvendable_reason(operation: Operation, table: ResolvedTable) -> str:
+        """Why a direct engine cannot reach the table, as the catalog's manifest says.
+
+        Every such refusal used to say Unity Catalog "withdraws this table from
+        credential vending", which on a managed table that vends reads fine
+        pointed at the wrong cause; it is the missing external-write support.
+        """
+        if table.external_read_supported is False:
+            if table.access_policy:
+                return (
+                    f"the table has {table.access_policy}, and Unity Catalog vends no "
+                    "credentials for tables with row filters or column masks"
+                )
+            return (
+                "Unity Catalog reports no external-engine read support for this table "
+                "(HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT absent)"
+            )
+        return (
+            "Unity Catalog reports no external-engine write support for this table "
+            f"(HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT absent), so {operation.value} "
+            "cannot commit from outside Databricks"
+        )
 
     @staticmethod
     def _vendable(operation: Operation, table: ResolvedTable) -> bool:
