@@ -372,6 +372,106 @@ def _parquet_bytes(table: Any) -> bytes:
 # ------------------------------------------------------------------ engine
 
 
+_ICEBERG_COMPAT = frozenset({"icebergCompatV1", "icebergCompatV2", "icebergCompatV3"})
+_ICEBERG_WRITER_COMPAT = frozenset({"icebergWriterCompatV1", "icebergWriterCompatV3"})
+#: Features IcebergWriterCompat refuses (DELTA_ICEBERG_WRITER_COMPAT_VIOLATION).
+_ICEBERG_WRITER_INCOMPATIBLE = frozenset(
+    {"deletionVectors", "checkConstraints", "generatedColumns", "identityColumns"}
+)
+
+
+def _on(table: ResolvedTable, key: str) -> bool:
+    return str(table.properties.get(key, "")).strip().lower() == "true"
+
+
+def _off(table: ResolvedTable, name: str) -> bool:
+    """Whether ``delta.<name>`` is explicitly false.
+
+    Managed Iceberg records ``delta.enableRowTracking`` as ``iceberg.enableRowTracking``.
+    """
+    lowered = {str(k).lower(): str(v).strip().lower() for k, v in table.properties.items()}
+    key = name[0].lower() + name[1:]
+    return any(lowered.get(f"{p}.{key}".lower()) == "false" for p in ("delta", "iceberg"))
+
+
+def _iceberg_refusal(
+    operation: Operation, table: ResolvedTable, shape: dict[str, Any]
+) -> Capability | None:
+    """What Databricks refuses on a UniForm or managed Iceberg table, known up front.
+
+    Each of these was accepted by can() and then failed on the warehouse with a
+    raw SqlStatementError (verified on a live workspace).
+    """
+    features = table.features
+    if not features & (_ICEBERG_COMPAT | _ICEBERG_WRITER_COMPAT):
+        return None
+    if operation is Operation.CDF and not (
+        "rowTracking" in features and _on(table, "delta.enableRowTracking")
+    ):
+        return Capability(
+            operation,
+            ok=False,
+            reason="Databricks reads the change feed of a table with Iceberg metadata "
+            "(UniForm or managed Iceberg) only through row tracking, which this table does "
+            "not enable (DELTA_MISSING_ROW_TRACKING_FOR_CDC)",
+            remedy="t.set_properties({'delta.enableRowTracking': 'true'}); changes are "
+            "readable from then on",
+        )
+    if not features & _ICEBERG_WRITER_COMPAT:
+        return None
+    managed = "a managed Iceberg table (IcebergWriterCompat)"
+    if operation in (Operation.ADD_CONSTRAINT, Operation.DROP_CONSTRAINT):
+        return Capability(
+            operation,
+            ok=False,
+            reason=f"{managed} cannot have CHECK constraints: IcebergWriterCompat is "
+            "incompatible with checkConstraints, and Databricks refuses the change",
+        )
+    if operation is Operation.ADD_FEATURE:
+        asked = shape.get("features")
+        names = [asked] if isinstance(asked, str) else list(asked or ())
+        bad = sorted({str(getattr(n, "value", n)) for n in names} & _ICEBERG_WRITER_INCOMPATIBLE)
+        if bad:
+            return Capability(
+                operation,
+                ok=False,
+                reason=f"{managed} cannot take {', '.join(bad)}: IcebergWriterCompat is "
+                "incompatible with it",
+            )
+    if operation is Operation.SET_PROPERTIES:
+        props = shape.get("properties")
+        keys = [str(k) for k in props] if isinstance(props, dict) else []
+        # Databricks records delta.enable* switches on managed Iceberg as
+        # iceberg.enable*, but accepted delta.logRetentionDuration and kept it
+        # under no name at all.
+        dropped = sorted(
+            k
+            for k in keys
+            if k.lower().startswith("delta.")
+            and not k.lower().startswith(("delta.enable", "delta.feature."))
+        )
+        if dropped:
+            return Capability(
+                operation,
+                ok=False,
+                reason=f"{managed} does not keep {', '.join(dropped)}: Databricks accepts "
+                "the ALTER TABLE ... SET TBLPROPERTIES and records nothing",
+            )
+    if operation is Operation.CLUSTER_BY and not (
+        _off(table, "EnableDeletionVectors") and _off(table, "EnableRowTracking")
+    ):
+        return Capability(
+            operation,
+            ok=False,
+            reason=f"Databricks enables liquid clustering on {managed} only once deletion "
+            "vectors and row tracking are both explicitly disabled "
+            "(MANAGED_ICEBERG_ATTEMPTED_TO_ENABLE_CLUSTERING_WITHOUT_DISABLING_DVS_OR_ROW_TRACKING)",
+            remedy="t.set_properties({'delta.enableDeletionVectors': 'false', "
+            "'delta.enableRowTracking': 'false'}) first",
+        )
+    return None
+
+
 class SqlEngine:
     """Executes operations as SQL against a Databricks warehouse."""
 
@@ -503,6 +603,9 @@ class SqlEngine:
                 remedy="ds.connect(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
         refusal = self._table_type_refusal(operation, table)
+        if refusal is None:
+            # Not `or`: a refusal is a falsy Capability.
+            refusal = _iceberg_refusal(operation, table, shape)
         if refusal is not None:
             return refusal
         if self._backend is None and self._resolve_warehouse() is None:

@@ -422,3 +422,59 @@ class TestGlue:
         assert deleted == [{"DatabaseName": "db", "Name": "t"}]
         with pytest.raises(InvalidReferenceError, match="only databases and tables"):
             cat.resolve(parse_ref("prod.db.t"))
+
+
+# ------------------------------------------------------------------ PV-12
+
+
+class TestDatabricksIcebergRefusals:
+    """What the warehouse refused on USING ICEBERG and UniForm tables (verified live)."""
+
+    MANAGED = frozenset({"icebergCompatV2", "icebergWriterCompatV1", "columnMapping"})
+    UNIFORM = frozenset({"icebergCompatV2", "columnMapping"})
+
+    def _verdict(self, op: Operation, table_features: frozenset[str], **shape: Any) -> Any:
+        from deltaswamp.engine.sql import _iceberg_refusal
+
+        table = resolved_table("main.s.t", writer_features=table_features, properties={})
+        return _iceberg_refusal(op, table, shape)
+
+    def test_managed_iceberg(self) -> None:
+        for op in (Operation.ADD_CONSTRAINT, Operation.DROP_CONSTRAINT, Operation.CLUSTER_BY):
+            assert self._verdict(op, self.MANAGED) is not None, op
+        refused = self._verdict(Operation.ADD_FEATURE, self.MANAGED, features=["deletionVectors"])
+        assert refused is not None and not refused.ok
+        assert self._verdict(Operation.ADD_FEATURE, self.MANAGED, features=["v2Checkpoint"]) is None
+        assert self._verdict(Operation.CDF, self.MANAGED) is not None
+        props = {"delta.logRetentionDuration": "interval 40 days"}
+        assert self._verdict(Operation.SET_PROPERTIES, self.MANAGED, properties=props) is not None
+        ok = {"delta.enableRowTracking": "false", "custom.k": "v"}
+        assert self._verdict(Operation.SET_PROPERTIES, self.MANAGED, properties=ok) is None
+
+    def test_uniform(self) -> None:
+        assert self._verdict(Operation.CDF, self.UNIFORM) is not None
+        assert self._verdict(Operation.ADD_CONSTRAINT, self.UNIFORM) is None
+        assert self._verdict(Operation.CLUSTER_BY, self.UNIFORM) is None
+
+    def test_uniform_with_row_tracking_serves_cdf(self) -> None:
+        from deltaswamp.engine.sql import _iceberg_refusal
+
+        table = resolved_table(
+            "main.s.t",
+            writer_features=self.UNIFORM | {"rowTracking"},
+            properties={"delta.enableRowTracking": "true"},
+        )
+        assert _iceberg_refusal(Operation.CDF, table, {}) is None
+
+    def test_managed_iceberg_clustering_once_both_are_off(self) -> None:
+        from deltaswamp.engine.sql import _iceberg_refusal
+
+        table = resolved_table(
+            "main.s.t",
+            writer_features=self.MANAGED,
+            properties={
+                "iceberg.enableDeletionVectors": "false",
+                "iceberg.enableRowTracking": "false",
+            },
+        )
+        assert _iceberg_refusal(Operation.CLUSTER_BY, table, {}) is None
