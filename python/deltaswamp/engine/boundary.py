@@ -24,6 +24,7 @@ rules still read the message; each such rule names the text it matches.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import inspect
 import os
 import re
@@ -34,6 +35,8 @@ from ..capability import Engine as EngineKind
 from ..errors import (
     BackfillRequiredError,
     CommitConflictError,
+    CommitRefusedError,
+    CorruptTableError,
     CredentialError,
     DeltaSwampError,
     EngineLimitError,
@@ -42,8 +45,10 @@ from ..errors import (
     InvalidReferenceError,
     PreflightError,
     StorageError,
+    TableNotFoundError,
     TransientCommitError,
     UnreachableTableError,
+    combined,
     engine_error,
 )
 
@@ -116,6 +121,31 @@ def _panic(kind: EngineKind) -> Rule:
     return rule
 
 
+#: The Parquet readers' words for a data file whose bytes are not what the log
+#: says: cut short (a footer read past its end) or replaced by another file.
+_DAMAGED_FILE = re.compile(
+    r"Invalid Parquet file|Corrupt footer|Parquet magic bytes not found|"
+    r"Requested range was invalid|out of specified range"
+)
+
+
+def _damaged_file(exc: BaseException, what: str) -> BaseException | None:
+    """A truncated or replaced data file, as CorruptTableError.
+
+    It arrived as StorageError ("storage failed the request"), which blamed an
+    outage and qualified the read for a fallback that reads the same bytes.
+    """
+    if not isinstance(exc, Exception) or not _DAMAGED_FILE.search(str(exc)):
+        return None
+    # Still an instance of the reader's class (an OSError, an ArrowInvalid).
+    return combined(
+        CorruptTableError,
+        exc,
+        f"{what}: a data file of the table is damaged: it is shorter than the Delta log "
+        f"records, or another file replaced it ({_detail(exc)})",
+    )
+
+
 def _storage(exc: BaseException, what: str) -> BaseException | None:
     """A storage failure (unreachable, throttled, no such bucket) as StorageError.
 
@@ -125,8 +155,14 @@ def _storage(exc: BaseException, what: str) -> BaseException | None:
     """
     if not isinstance(exc, OSError) or isinstance(exc, (FileNotFoundError, PermissionError)):
         return None
-    error = StorageError(f"{what}: the table's storage failed the request ({_detail(exc)})")
+    # Still a TimeoutError or a ConnectionResetError: `except TimeoutError`,
+    # and retry policies keyed on ConnectionError, stopped matching.
+    error = combined(
+        StorageError, exc, f"{what}: the table's storage failed the request ({_detail(exc)})"
+    )
     error.errno = exc.errno
+    if exc.filename is not None:
+        error.filename = exc.filename
     return error
 
 
@@ -254,7 +290,7 @@ def _kernel_input(exc: BaseException, what: str) -> BaseException | None:
 #: delta-rs's wording for a commit that lost its race: a conflict found by its
 #: checker, a version someone else wrote, or retries used up (the bare number).
 _CONFLICT_MESSAGE = re.compile(
-    r"concurrent|changed since last commit|existing table version|"
+    r"concurrent|changed since last commit|existing table version|version \d+ already exists|"
     r"Failed to commit transaction: \d+\s*$",
     re.IGNORECASE,
 )
@@ -280,6 +316,61 @@ def as_commit_conflict(exc: BaseException) -> CommitConflictError | None:
 
 def _deltars_conflict(exc: BaseException, what: str) -> BaseException | None:
     return as_commit_conflict(exc)
+
+
+#: delta-rs's words for a table protocol it cannot read or write: a limit of
+#: delta-rs, which another engine may not share.
+_DELTARS_PROTOCOL = re.compile(
+    r"reader features|writer features|features? (?:is |are )?required|"
+    r"unsupported (?:reader|writer) ?(?:feature|version)|protocol",
+    re.IGNORECASE,
+)
+
+
+def _deltars_data(exc: BaseException, what: str) -> BaseException | None:
+    """Data delta-rs cannot take at all: not Arrow, pandas or anything exporting Arrow."""
+    if not isinstance(exc, ValueError) or "Expected object with __arrow_c_" not in str(exc):
+        return None
+    return InvalidArgumentError(
+        f"cannot {what}: the data is not a table delta-rs can read ({_first_line(exc)}). Pass "
+        "Arrow, pandas or Polars data; wrap an iterator of record batches as "
+        "pyarrow.RecordBatchReader.from_batches(schema, batches)"
+    )
+
+
+def _deltars_typed(exc: BaseException, what: str) -> BaseException | None:
+    """delta-rs's own exception types, as this library's.
+
+    They derive from Exception alone, so they arrived as a bare EngineError
+    that not even an `except` on their category caught.
+    """
+    name, first = type(exc).__name__, _first_line(exc)
+    if name == "TableNotFoundError":
+        return TableNotFoundError(f"cannot {what}: there is no Delta table there ({first})")
+    if name == "DeltaProtocolError":
+        if "Invariant violations" in str(exc):
+            return InvalidArgumentError(
+                f"the data violates the table's invariants, so nothing was written: {first}"
+            )
+        # A protocol or a log delta-rs cannot handle (features it does not
+        # implement, statistics it cannot parse): the kernel may read it, so a
+        # read moves on to the next engine.
+        return EngineLimitError(
+            f"{what} with delta-rs", f"delta-rs cannot handle the table's protocol or log ({first})"
+        )
+    if name == "CommitFailedError":
+        if _DELTARS_PROTOCOL.search(str(exc)):
+            return EngineLimitError(
+                f"{what} with delta-rs",
+                f"delta-rs cannot commit to this table's protocol ({first})",
+            )
+        return CommitRefusedError(
+            f"delta-rs refused the commit {_during(what)}: {first}",
+            engine=EngineKind.DELTARS.value,
+            operation=what,
+            original=exc,
+        )
+    return None
 
 
 def _deltars_fork(exc: BaseException, what: str) -> BaseException | None:
@@ -323,10 +414,47 @@ _DELTARS_BAD_INPUT = (
     re.compile(r"Unterminated string literal"),
     re.compile(r"Specified table partitioning does not match table partitioning"),
     re.compile(r"Constraint with name .* does not exist"),
-    re.compile(r"No field with the provided name in the schema"),
     re.compile(r"No parquet file is found in the given location"),
+)
+
+#: The same for names and types, which only a write or DML is sure to mean as
+#: the caller's mistake: on a read the table's own schema raises them where
+#: delta-rs cannot follow it, and the next engine may read it.
+_DELTARS_BAD_WRITE_INPUT = (
+    re.compile(r"No field with the provided name in the schema"),
     re.compile(r"Schema error: No field named"),
 )
+
+#: Leading words of the `what` of delta-rs's reads (method names, and the
+#: translating() sites that open the table or walk its log).
+_DELTARS_READS = frozenset(
+    {
+        "scan",
+        "history",
+        "detail",
+        "cdf",
+        "load",
+        "cleaned",
+        "files",
+        "plan_scan",
+        "execute_scan",
+        "open",
+        "actions",
+        "entry",
+        "walk",
+        "count",
+        "metadata_count",
+    }
+)
+
+
+def _is_read(what: str) -> bool:
+    return (what.split() or [""])[0] in _DELTARS_READS
+
+
+#: A type in the table's schema delta-rs does not implement: its limit, not the
+#: caller's input ("Unsupported Delta table type: 'interval'").
+_DELTARS_UNSUPPORTED_TYPE = re.compile(r"Unsupported (?:Delta )?(?:table |data )?type", re.I)
 
 #: DataFusion's words for SQL it could not parse, plan or type -- found before
 #: any row is read, so nothing has been written. Spark SQL it cannot run is a
@@ -346,8 +474,16 @@ def _deltars_sql(exc: BaseException, what: str) -> BaseException | None:
         return None
     message = str(exc)
     first = _first_line(exc)
-    if any(pattern.search(message) for pattern in _DELTARS_BAD_INPUT):
-        return InvalidArgumentError(f"cannot {what}: {first}")
+    if _DELTARS_UNSUPPORTED_TYPE.search(message):
+        return EngineLimitError(
+            f"{what} with delta-rs", f"delta-rs does not implement a type of the table ({first})"
+        )
+    bad_input = (
+        _DELTARS_BAD_INPUT if _is_read(what) else (*_DELTARS_BAD_INPUT, *_DELTARS_BAD_WRITE_INPUT)
+    )
+    if any(pattern.search(message) for pattern in bad_input):
+        # All of it: the first line dropped delta-rs's "Valid fields are ...".
+        return InvalidArgumentError(f"cannot {what}: {_detail(exc)}")
     if not any(marker in message for marker in _DATAFUSION_SQL_ERRORS):
         return None
     return EngineLimitError(
@@ -368,6 +504,10 @@ def _deltars_schema(exc: BaseException, what: str) -> BaseException | None:
         return InvalidArgumentError(
             f"{what}: the data does not fit the table's schema ({_detail(exc)})"
         )
+    if _is_read(what):
+        # A read has no data of the caller's to not fit: this is delta-rs
+        # failing on the table, which the next engine may read.
+        return None
     if name in ("DeltaError", "Exception") and re.search(
         r"No field named|Cast error|Schema error", str(exc)
     ):
@@ -405,20 +545,29 @@ _NATIVE: tuple[Rule, ...] = (_kernel_commit, _kernel_catalog, _kernel_input)
 
 #: Each engine's rules, tried in order; the first to answer wins.
 RULES: dict[EngineKind, tuple[Rule, ...]] = {
-    EngineKind.KERNEL: (*_NATIVE, _panic(EngineKind.KERNEL), _storage),
+    EngineKind.KERNEL: (*_NATIVE, _panic(EngineKind.KERNEL), _damaged_file, _storage),
     EngineKind.DELTARS: (
         _deltars_conflict,
         _deltars_fork,
         _panic(EngineKind.DELTARS),
         _deltars_constraint,
+        _damaged_file,
         _deltars_sql,
         _deltars_schema,
+        _deltars_typed,
+        _deltars_data,
         *_NATIVE,
         _storage,
     ),
-    EngineKind.ICEBERG: (_iceberg_schema, *_NATIVE, _panic(EngineKind.ICEBERG), _storage),
+    EngineKind.ICEBERG: (
+        _iceberg_schema,
+        *_NATIVE,
+        _panic(EngineKind.ICEBERG),
+        _damaged_file,
+        _storage,
+    ),
     EngineKind.SQL: (*_NATIVE, _panic(EngineKind.SQL), _storage),
-    EngineKind.SHARING: (*_NATIVE, _panic(EngineKind.SHARING), _storage),
+    EngineKind.SHARING: (*_NATIVE, _panic(EngineKind.SHARING), _damaged_file, _storage),
 }
 
 
@@ -461,6 +610,12 @@ def _passes(exc: BaseException) -> bool:
     return not isinstance(exc, Exception) and not _is_panic(exc)
 
 
+#: The caller's data sources of the boundary call in progress (see `_Sources`).
+_CALL_SOURCES: contextvars.ContextVar[_Sources | None] = contextvars.ContextVar(
+    "deltaswamp_call_sources", default=None
+)
+
+
 @contextlib.contextmanager
 def translating(kind: EngineKind, what: str) -> Iterator[None]:
     """Translate what the block raises, as the boundary would.
@@ -474,6 +629,12 @@ def translating(kind: EngineKind, what: str) -> Iterator[None]:
     except BaseException as exc:
         if _passes(exc):
             raise
+        sources = _CALL_SOURCES.get()
+        mine = sources.raised(exc) if sources is not None else None
+        if mine is exc:
+            raise
+        if mine is not None:
+            raise mine  # noqa: B904 - the engine's error stays as its context
         raise translate(kind, what, exc) from exc
 
 
@@ -491,14 +652,31 @@ class Boundary:
     stream, a generator or a MERGE builder comes back wrapped too, since they
     fail only once used; a method returning the object itself (a builder's
     chaining) returns the wrapper.
+
+    What the caller's own data raises is not the engine's failure, and passes
+    through as it was raised (see `_Sources`).
     """
 
-    __slots__ = ("_boundary_kind", "_boundary_prefix", "_boundary_target")
+    __slots__ = (
+        "_boundary_cache",
+        "_boundary_kind",
+        "_boundary_prefix",
+        "_boundary_sources",
+        "_boundary_target",
+    )
 
-    def __init__(self, target: Any, kind: EngineKind, prefix: str | None = None) -> None:
+    def __init__(
+        self,
+        target: Any,
+        kind: EngineKind,
+        prefix: str | None = None,
+        sources: _Sources | None = None,
+    ) -> None:
         object.__setattr__(self, "_boundary_target", target)
         object.__setattr__(self, "_boundary_kind", kind)
         object.__setattr__(self, "_boundary_prefix", prefix)
+        object.__setattr__(self, "_boundary_sources", sources)
+        object.__setattr__(self, "_boundary_cache", {})
 
     @property  # type: ignore[misc]
     def __class__(self) -> type:  # isinstance() sees the engine
@@ -513,10 +691,31 @@ class Boundary:
             or getattr(value, "_boundary_guarded", False)
         ):
             return value
-        return self._guarded(name, value)
+        # One wrapper per method, while the method stays the same: a fresh
+        # closure per access made `b.m is b.m` false, and a monkeypatch saved
+        # one and restored it as an instance attribute of the engine.
+        cached = self._boundary_cache.get(name)
+        if cached is not None and _same_method(cached.__wrapped__, value):
+            return cached
+        guarded = self._guarded(name, value)
+        self._boundary_cache[name] = guarded
+        return guarded
 
     def __setattr__(self, name: str, value: Any) -> None:
-        setattr(self._boundary_target, name, value)
+        target = self._boundary_target
+        if getattr(value, "_boundary_guarded", False):
+            # One of this wrapper's own methods written back (a monkeypatch
+            # undone): the engine gets the method, not the closure, which
+            # does not pickle -- and where it is the class's own method, no
+            # instance attribute at all.
+            value = value.__wrapped__
+            if getattr(value, "__self__", None) is target and _same_method(
+                getattr(type(target), name, None), getattr(value, "__func__", None)
+            ):
+                with contextlib.suppress(AttributeError):
+                    delattr(target, name)
+                return
+        setattr(target, name, value)
 
     def __delattr__(self, name: str) -> None:
         delattr(self._boundary_target, name)
@@ -535,17 +734,39 @@ class Boundary:
 
     def __reduce__(self) -> tuple[Any, ...]:
         # Plans carry their engine to Ray workers: the worker's calls are
-        # translated the same way.
-        return (Boundary, (self._boundary_target, self._boundary_kind, self._boundary_prefix))
+        # translated the same way. A method patched onto the engine instance
+        # (a test's monkeypatch) stays behind: a lambda or a closure does not
+        # pickle, and failed every plan of the connection.
+        return (
+            Boundary,
+            (_without_patches(self._boundary_target), self._boundary_kind, self._boundary_prefix),
+        )
 
     def _guarded(self, name: str, method: Any) -> Any:
         kind = self._boundary_kind
         what = f"{self._boundary_prefix} ({name})" if self._boundary_prefix else name
+        inherited = self._boundary_sources
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            with translating(kind, what):
+            sources = _Sources(inherited)
+            args, kwargs = sources.watch(args, kwargs)
+            # Seen by the engine's own `translating()` sites too, which
+            # translate before the call returns here.
+            token = _CALL_SOURCES.set(sources)
+            try:
                 result = method(*args, **kwargs)
-            return self._wrapped(result, what)
+            except BaseException as exc:
+                if _passes(exc):
+                    raise
+                mine = sources.raised(exc)
+                if mine is exc:
+                    raise
+                if mine is not None:
+                    raise mine  # noqa: B904 - the engine's error stays as its context
+                raise translate(kind, what, exc) from exc
+            finally:
+                _CALL_SOURCES.reset(token)
+            return self._wrapped(result, what, sources)
 
         call._boundary_guarded = True  # type: ignore[attr-defined]
         call.__name__ = getattr(method, "__name__", name)
@@ -553,7 +774,7 @@ class Boundary:
         call.__wrapped__ = method  # type: ignore[attr-defined]
         return call
 
-    def _wrapped(self, result: Any, what: str) -> Any:
+    def _wrapped(self, result: Any, what: str, sources: _Sources | None = None) -> Any:
         target = self._boundary_target
         if result is target:
             return self
@@ -572,8 +793,147 @@ class Boundary:
         if inspect.isgenerator(result):
             return _generator(result, kind, what)
         if callable(getattr(result, "execute", None)) and hasattr(result, "when_matched_update"):
-            return Boundary(result, kind, prefix=what)
+            # The builder reads the MERGE source only at execute(): what the
+            # source raises then is still the caller's.
+            return Boundary(result, kind, prefix=what, sources=sources)
         return result
+
+
+def _same_method(a: Any, b: Any) -> bool:
+    """Whether `a` and `b` are one method (bound methods are made anew per access)."""
+    if a is b:
+        return True
+    func = getattr(a, "__func__", None)
+    return (
+        func is not None
+        and func is getattr(b, "__func__", None)
+        and getattr(a, "__self__", None) is getattr(b, "__self__", None)
+    )
+
+
+def _without_patches(target: Any) -> Any:
+    """`target`, or a copy without the callables patched onto the instance."""
+    attrs = getattr(target, "__dict__", None)
+    if not attrs:
+        return target
+    patched = [
+        name
+        for name, value in attrs.items()
+        if callable(value) and not isinstance(value, type) and hasattr(type(target), name)
+    ]
+    if not patched:
+        return target
+    import copy
+
+    clone = copy.copy(target)
+    for name in patched:
+        with contextlib.suppress(AttributeError, KeyError):
+            del clone.__dict__[name]
+    return clone
+
+
+#: Top-level packages whose objects are not the caller's own data source.
+_LIBRARY_PACKAGES = frozenset({"deltaswamp", "deltalake", "pyarrow", "builtins", "_internal"})
+
+
+def _callers_own(cls: type) -> bool:
+    """Whether `cls` is the caller's own: not this library's, an installed package's or Python's."""
+    module = cls.__module__ or ""
+    if module.split(".")[0] in _LIBRARY_PACKAGES:
+        return False
+    if module == "__main__":
+        return True
+    import sys
+    import sysconfig
+
+    path = getattr(sys.modules.get(module), "__file__", None)
+    if not path:
+        return False
+    path = os.path.realpath(path)
+    installed = {
+        os.path.realpath(p)
+        for key in ("stdlib", "platstdlib", "purelib", "platlib")
+        if (p := sysconfig.get_paths().get(key))
+    }
+    return not any(path.startswith(root + os.sep) for root in installed)
+
+
+class _Sources:
+    """The caller's data sources handed to one engine call, and what they raised.
+
+    The caller's exception from their own source -- a `__arrow_c_stream__`
+    that raises, a reader over a generator that fails -- arrived as the
+    engine's failure ("delta-rs failed to append"), so `except MyError`
+    stopped matching and the engine was blamed. Two ways it is recognised:
+    a traceback frame running a method of an object the caller passed in, and
+    an Arrow reader passed in, which is read through a wrapper that keeps what
+    it raised (delta-rs and the kernel read a stream through Arrow's C
+    interface, which carries only the error's text).
+    """
+
+    __slots__ = ("errors", "objects", "parent")
+
+    def __init__(self, parent: _Sources | None = None) -> None:
+        self.parent = parent
+        self.objects: list[Any] = []
+        self.errors: list[BaseException] = []
+
+    def watch(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, Any]:
+        if not args and not kwargs:
+            return args, kwargs
+        new_args = tuple(self._watched(a) for a in args)
+        new_kwargs = {k: self._watched(v) for k, v in kwargs.items()} if kwargs else kwargs
+        return new_args, new_kwargs
+
+    def _watched(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, bytes, int, float, bool, dict, list, tuple)):
+            return value
+        cls = type(value)
+        if cls.__name__ == "RecordBatchReader" and cls.__module__ == "pyarrow.lib":
+            import pyarrow as pa
+
+            return pa.RecordBatchReader.from_batches(value.schema, self._read(value))
+        if _callers_own(cls):
+            self.objects.append(value)
+        return value
+
+    def _read(self, reader: Any) -> Iterator[Any]:
+        try:
+            yield from reader
+        except BaseException as exc:
+            self.errors.append(exc)
+            raise
+
+    def raised(self, exc: BaseException) -> BaseException | None:
+        """The caller's exception behind `exc`, if the caller's source raised it."""
+        for error in self._errors():
+            if (
+                isinstance(error, DeltaSwampError)
+                or _callers_own(type(error))
+                or (not isinstance(error, Exception) and not _is_panic(error))
+            ):
+                return error
+        objects = {id(o) for o in self._objects()}
+        if objects:
+            tb = exc.__traceback__
+            while tb is not None:
+                owner = tb.tb_frame.f_locals.get("self")
+                if owner is not None and id(owner) in objects:
+                    return exc
+                tb = tb.tb_next
+        return None
+
+    def _errors(self) -> Iterator[BaseException]:
+        node: _Sources | None = self
+        while node is not None:
+            yield from node.errors
+            node = node.parent
+
+    def _objects(self) -> Iterator[Any]:
+        node: _Sources | None = self
+        while node is not None:
+            yield from node.objects
+            node = node.parent
 
 
 def _generator(source: Any, kind: EngineKind, what: str) -> Iterator[Any]:
@@ -613,6 +973,25 @@ class GuardedEngines(dict):  # type: ignore[type-arg]
         if kind not in self:
             self[kind] = engine
         return self[kind]
+
+    # dict's own merge and copy build or fill a mapping without __setitem__:
+    # `router.engines |= {kind: raw}` put a raw engine past the boundary.
+    def __ior__(self, other: Any) -> GuardedEngines:
+        self.update(other)
+        return self
+
+    def __or__(self, other: Any) -> GuardedEngines:
+        merged = GuardedEngines(self)
+        merged.update(other)
+        return merged
+
+    def __ror__(self, other: Any) -> GuardedEngines:
+        merged = GuardedEngines(other)
+        merged.update(self)
+        return merged
+
+    def copy(self) -> GuardedEngines:
+        return GuardedEngines(self)
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (GuardedEngines, (dict(self),))

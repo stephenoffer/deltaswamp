@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import _results
-from ._request import METHOD_OPERATIONS, NO_DATA, Request, derive
+from ._request import METHOD_OPERATIONS, NO_DATA, Request, derive, refusal
 from ._request import strict_engine as _strict
 from ._util import check_keywords, not_table_data, timestamp_ms
 from .capability import FEATURE_SUPPORT, Capability, FeatureKind, Operation, feature_from_wire
@@ -938,6 +938,9 @@ class Table:
                 # literal DEFAULT is filled in, and needs no SQL engine.
                 data = self._align(data, shape.get("schema_mode"))
         request = self._request(op, shape, data)
+        refused = refusal(self, request)
+        if refused is not None:
+            return refused
         verdict = self._connection.router.capability(
             request.operation, self._enrich(), needs=request.needs, **request.shape
         )
@@ -1919,7 +1922,8 @@ class Table:
             return engine.cdf(self._resolved, **given)
 
         try:
-            stream = _cdf_types(self._read(Operation.CDF, call))
+            # Routed on the call's own options, as can("cdf", ...) routes them.
+            stream = _cdf_types(self._read(self._request(Operation.CDF, given), call))
         except Exception as exc:
             from .engine.base import missing_file_error
 
@@ -2404,8 +2408,14 @@ class Table:
                 sqlpred.parse(predicate)
             if isinstance(updates, dict):
                 for value in updates.values():
-                    if isinstance(value, str):
-                        sqlpred.parse_value(value)
+                    if not isinstance(value, str):
+                        continue
+                    parsed = sqlpred.parse_value(value)
+                    if isinstance(parsed, sqlpred.Column) and len(parsed.path) > 1:
+                        # The kernel's UPDATE reads a top-level column only:
+                        # SET v = st.x was refused mid-call after can() had
+                        # named the kernel. delta-rs evaluates it.
+                        return frozenset({"sql_expressions"})
         except sqlpred.PredicateError as exc:
             # Malformed in any SQL (`id ===`): no engine serves it, and the
             # kernel's parser names the mistake where delta-rs's raises a raw
@@ -2790,7 +2800,9 @@ class Table:
         # commit tail, which delta-rs cannot open at all, so txn_version()
         # there failed.
         reason = (
-            f"the {type(engine).__name__} engine cannot read transaction identifiers"
+            # engine.kind, not type(): that named the error boundary wrapping it.
+            f"the {getattr(getattr(engine, 'kind', None), 'value', 'routed')} engine cannot "
+            "read transaction identifiers"
             if engine is not None
             else "no engine here writes this table"
         )

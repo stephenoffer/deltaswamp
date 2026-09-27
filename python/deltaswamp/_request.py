@@ -20,7 +20,7 @@ import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from .capability import ENGINE_METHODS, Operation
+from .capability import ENGINE_METHODS, Capability, Operation
 from .errors import ChangeFeedSchemaChangeError, EngineLimitError, UnreachableTableError
 
 if TYPE_CHECKING:
@@ -70,6 +70,59 @@ def derive(table: Table, operation: Operation, args: Mapping[str, Any], data: An
     return Request(op, frozenset(needs), shape, operation)
 
 
+#: What the calls refuse on a handle opened at a past version (see
+#: `Table._check_writable`): every write, since every engine writes to the
+#: latest version.
+_PINNED_REFUSED: frozenset[Operation] = frozenset(
+    {
+        Operation.APPEND,
+        Operation.OVERWRITE,
+        Operation.REPLACE_WHERE,
+        Operation.MERGE_SCHEMA,
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.MERGE,
+        Operation.OPTIMIZE,
+        Operation.ZORDER,
+        Operation.RESTORE,
+        Operation.ADD_COLUMN,
+        Operation.DROP_COLUMN,
+        Operation.RENAME_COLUMN,
+        Operation.SET_PROPERTIES,
+        Operation.ADD_FEATURE,
+        Operation.DROP_FEATURE,
+        Operation.ADD_CONSTRAINT,
+        Operation.DROP_CONSTRAINT,
+        Operation.UNSET_PROPERTIES,
+        Operation.SET_COMMENT,
+        Operation.SET_COLUMN_COMMENT,
+        Operation.ALTER_COLUMN_TYPE,
+        Operation.SET_NOT_NULL,
+        Operation.DROP_NOT_NULL,
+        Operation.CLUSTER_BY,
+        Operation.REORG,
+    }
+)
+
+
+def refusal(table: Table, request: Request) -> Capability | None:
+    """The refusal the call makes of `request` before any engine is asked, if any.
+
+    A handle pinned to a version refuses every write in the method; can()
+    asked only the router, which judged the latest table and said yes.
+    """
+    version = table._version
+    if version is None or request.operation not in _PINNED_REFUSED:
+        return None
+    return Capability(
+        request.asked,
+        ok=False,
+        reason=f"this handle is pinned to version {version}, and every engine writes to the "
+        "latest version",
+        remedy="open the table without version= to write to it",
+    )
+
+
 # ------------------------------------------------------------------- reads
 
 
@@ -96,12 +149,30 @@ def _read(
     return op, needs
 
 
-def _incremental(
+def _feed(
     table: Table, op: Operation, shape: dict[str, Any], data: Any
 ) -> tuple[Operation, set[str]]:
-    # changes() is the incremental read, and it follows the change data feed:
-    # can(INCREMENTAL) refused on every table while changes() served it.
-    return Operation.CDF, set()
+    """cdf() and changes(), which read rows as a scan does and route the same way.
+
+    changes() is the incremental read, and it follows the change data feed:
+    can(INCREMENTAL) refused on every table while changes() served it. The
+    feed was routed with no needs at all, so can("cdf", predicate="id % 2 = 1")
+    named the kernel, whose grammar then refused the call that delta-rs serves.
+    """
+    get = shape.get
+    predicate = get("predicate")
+    needs: set[str] = set()
+    if predicate is not None:
+        needs |= table._predicate_needs(predicate)
+        needs |= table._expression_needs(predicate)
+    needs |= table._variant_needs(get("columns"), predicate)
+    if get("allow_out_of_range"):
+        # Only delta-rs reads past the table's last version; the kernel
+        # refused it at read time, so can() named it and delta-rs served.
+        needs.add("out_of_range_feed")
+    else:
+        shape.pop("allow_out_of_range", None)
+    return Operation.CDF, needs
 
 
 # ------------------------------------------------------------------ writes
@@ -187,7 +258,11 @@ def _merge(
         # can() said "via kernel" and the call then refused.
         needs.add("schema_merge")
     clauses = shape.get("clauses")
-    if isinstance(clauses, (list, tuple)) and any(
+    if isinstance(clauses, str):
+        # One clause named on its own; a set or a single string was ignored,
+        # and can() said yes on an append-only table the call then refused.
+        clauses = (clauses,)
+    if isinstance(clauses, (list, tuple, set, frozenset)) and any(
         str(c).startswith(_REMOVING_CLAUSES) for c in clauses
     ):
         needs.add("removes_rows")
@@ -257,8 +332,31 @@ def _set_properties(
 
     properties = shape.get("properties")
     if isinstance(properties, dict) and properties:
+        properties = _spelled(properties)
         shape["properties"] = with_checkpoint_stats(properties, table.properties()) or properties
     return Operation.SET_PROPERTIES, set()
+
+
+def _spelled(properties: dict[Any, Any]) -> dict[Any, Any]:
+    """Property values in the spelling every engine parses (True -> 'true', 10 -> '10').
+
+    The kernel's path normalised a value delta-rs's refused (a bool, ' true ',
+    '7 days'), so can() named delta-rs, which then refused the call. A value
+    neither reads is left as it is, for the engine to refuse.
+    """
+    from .engine.metadata import _canonical_key, _normalise_value
+
+    spelled = {}
+    for key, raw in properties.items():
+        canonical = _canonical_key(key) if isinstance(key, str) else key
+        if raw is None or canonical == "delta.dataSkippingStatsColumns":
+            spelled[key] = raw  # this one is checked against the schema
+            continue
+        try:
+            spelled[key] = _normalise_value(canonical, raw, None, "set properties")  # type: ignore[arg-type]
+        except Exception:
+            spelled[key] = raw
+    return spelled
 
 
 def _cluster_by(
@@ -274,7 +372,8 @@ _Rule = Callable[["Table", Operation, dict[str, Any], Any], tuple[Operation, set
 _RULES: dict[Operation, _Rule] = {
     Operation.SCAN: _read,
     Operation.TIME_TRAVEL: _read,
-    Operation.INCREMENTAL: _incremental,
+    Operation.CDF: _feed,
+    Operation.INCREMENTAL: _feed,
     Operation.APPEND: _write,
     Operation.MERGE_SCHEMA: _write,
     Operation.OVERWRITE: _write,

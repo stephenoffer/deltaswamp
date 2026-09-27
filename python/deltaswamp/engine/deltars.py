@@ -155,6 +155,9 @@ class DeltaRsEngine:
     #: delta-rs 1.x writes -1.5 as the partition value '-1.-50' and commits it,
     #: leaving the table unreadable, so such writes route elsewhere.
     supports_negative_decimal_partition_values = False
+    #: cdf(allow_out_of_range=True): a range past the last version reads what
+    #: there is. The kernel and the warehouse refuse the option.
+    supports_out_of_range_feed = True
 
     def __init__(self, *, storage_options: dict[str, str] | None = None) -> None:
         self._base_options = dict(storage_options or {})
