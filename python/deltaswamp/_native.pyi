@@ -14,7 +14,8 @@ FEATURES: list[str]
 One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
-"distributed_write", "deletion_vector_dml", "materialized_row_ids". Gate on this
+"distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
+"compaction". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
 
@@ -361,6 +362,13 @@ class Snapshot:
         `delta.setTransactionRetentionDuration` read as None.
         """
 
+    def commit_log(self, after: int) -> list[tuple[int, str]]:
+        """The raw commit files after version `after` up to this one, ascending.
+
+        `(version, text)`, each text the newline-delimited actions of that
+        commit. Published commits only.
+        """
+
     def timestamp(self) -> int:
         """This version's commit timestamp in epoch milliseconds.
 
@@ -448,8 +456,13 @@ class Snapshot:
         operation: str | None = None,
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, str] | None = None,
+        whole_files: list[str] | None = None,
+        data_change: bool = True,
     ) -> tuple[int, int, int, int]:
         """Commit row-level DML as deletion vectors, in one transaction.
+
+        `whole_files` are removed outright; `data_change=False` commits the
+        whole thing as a compaction (OPTIMIZE), the same rows in new files.
 
         `deletions` is an Arrow stream of `path` and `row_index` columns, as a
         positional scan reports them. Each touched file's new deletions are

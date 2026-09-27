@@ -117,6 +117,22 @@ First release.
 - `delta.dataSkippingStatsColumns` naming nested fields is honored by kernel
   writes only; delta-rs UPDATE, MERGE and OPTIMIZE (and every write to a
   column-mapped table delta-rs created) still collect top-level stats only.
+- Concurrent OPTIMIZE and Z-ORDER no longer duplicate rows. delta-rs's
+  conflict check ignores a concurrent compaction's `dataChange=false`
+  removes, and its OPTIMIZE takes neither `max_commit_retries` nor app
+  transactions, so two runs over the same files both committed (150 rows
+  became 450). The rewritten files are now committed by the kernel on the
+  snapshot they were planned from; a loser re-plans from the new snapshot.
+  delta-rs still commits where the kernel cannot write the table (row
+  tracking, CHECK constraints, generated or identity columns) or with
+  `writer_properties`/`min_commit_interval`, with the old after-the-fact
+  check.
+- A kernel MERGE, DELETE or UPDATE that lost a commit race rebases only over
+  blind appends and over commits that added nothing its read could match;
+  concurrent MERGE upserts of one new key each inserted it before. The
+  copy-on-write DELETE/UPDATE rebases over blind appends too (it conflicted on
+  every concurrent commit), and delta-rs's "Metadata changed since last
+  commit" is a `MetadataChangedError`, as the kernel's is.
 - Concurrent `create_table` on one path has exactly one winner; delta-rs used
   to retry the loser at version 1 and replace the winner's schema. The loser
   gets "a Delta table already exists there".

@@ -309,6 +309,10 @@ def _enter_native(what: str) -> None:
         )
 
 
+#: commitInfo operations that are appends when their commit removes nothing.
+_APPEND_OPERATIONS = frozenset({"WRITE", "STREAMING UPDATE", "APPEND"})
+
+
 def _native_has(*features: str) -> bool:
     """Whether the compiled extension advertises every one of `features`.
 
@@ -1718,28 +1722,51 @@ class KernelEngine:
             )
 
         snapshot = self.snapshot(table, write=True)
-        current = pa.table(snapshot.scan())
-        if predicate is None:
-            matched = pa.array([True] * current.num_rows, pa.bool_())
-        else:
-            node = _canonical_node(sqlpred.parse(predicate), current.schema)
-            expr = sqlpred.to_arrow(node, current.schema)
-            matched = pc.fill_null(_evaluate(current, expr), False)
-        keep = pc.invert(matched)
-        replacement = transform(current, keep)
-        touched = int(pc.sum(matched).as_py() or 0)
-        if touched == 0 and replacement.num_rows == current.num_rows:
-            return {"version": int(snapshot.version), "num_affected_rows": 0}
-        with translating(EngineKind.KERNEL, "commit"):
-            version = snapshot.append(
-                replacement.to_reader(),
-                uc=self._uc_commit_config(table),
-                engine_info=engine_info or _engine_info(),
-                operation=operation,
-                overwrite=True,
-                txn=txn,
-                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
-            )
+        attempt = 0
+        while True:
+            current = pa.table(snapshot.scan())
+            node = None
+            if predicate is None:
+                matched = pa.array([True] * current.num_rows, pa.bool_())
+            else:
+                node = _canonical_node(sqlpred.parse(predicate), current.schema)
+                expr = sqlpred.to_arrow(node, current.schema)
+                matched = pc.fill_null(_evaluate(current, expr), False)
+            keep = pc.invert(matched)
+            replacement = transform(current, keep)
+            touched = int(pc.sum(matched).as_py() or 0)
+            if touched == 0 and replacement.num_rows == current.num_rows:
+                return {"version": int(snapshot.version), "num_affected_rows": 0}
+            try:
+                with translating(EngineKind.KERNEL, "commit"):
+                    version = snapshot.append(
+                        replacement.to_reader(),
+                        uc=self._uc_commit_config(table),
+                        engine_info=engine_info or _engine_info(),
+                        operation=operation,
+                        overwrite=True,
+                        txn=txn,
+                        commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
+                        or None,
+                    )
+                break
+            except CommitConflictError:
+                # The overwrite removes every file of the snapshot it read, so
+                # it cannot be re-committed as staged; but when the winners
+                # were ones Delta lets it survive (blind appends, under
+                # WriteSerializable), running it again on the new snapshot is
+                # the same outcome, and without it a DELETE under steady
+                # appends never committed.
+                attempt += 1
+                if attempt > self.dml_commit_retries:
+                    raise
+                paths = set(pa.table(snapshot.files()).column("path").to_pylist())
+                reads = sqlpred.to_kernel_json(node, _arrow_schema(snapshot)) if node else None
+                rebased = self._rebase_dv_commit(table, snapshot, paths, txn, reads)
+                if rebased is None:
+                    raise
+                snapshot = rebased
+                commit_backoff(attempt - 1)
         self._maybe_checkpoint(table, version, snapshot)
         return {"version": int(version), "num_affected_rows": touched}
 
@@ -1842,6 +1869,7 @@ class KernelEngine:
             txn=txn,
             commit_metadata=commit_metadata,
             engine_info=engine_info,
+            read_predicate=skipping,
         )
         return {"version": version, "num_affected_rows": touched}
 
@@ -1900,13 +1928,16 @@ class KernelEngine:
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, Any] | None = None,
         engine_info: str | None = None,
+        read_predicate: str | None = None,
     ) -> int:
         """Commit `deletions` (path, row_index) as vectors plus `data`, in one transaction.
 
         A touched file whose add has no `numRecords` statistic (every add in a
         Databricks checkpoint: its tables write stats only as `stats_parsed`)
         still takes a vector; the native commit reads the count from the
-        file's Parquet footer.
+        file's Parquet footer. `read_predicate` is the kernel skipping
+        predicate the rows were read with (None: every file was read), which
+        decides which concurrently added files this commit must conflict with.
         """
         touched = set(deletions.column("path").to_pylist()) | set(whole_files or ())
         attempt = 0
@@ -1930,7 +1961,7 @@ class KernelEngine:
                     attempt += 1
                     if attempt > self.dml_commit_retries:
                         raise
-                    rebased = self._rebase_dv_commit(table, snapshot, touched, txn)
+                    rebased = self._rebase_dv_commit(table, snapshot, touched, txn, read_predicate)
                     if rebased is None:
                         raise
                     snapshot = rebased
@@ -1947,23 +1978,39 @@ class KernelEngine:
             self._maybe_checkpoint(table, version, snapshot)
         return int(version)
 
-    #: Re-commits of a deletion-vector DELETE/UPDATE that lost to writers
-    #: which left every file it touched alone (blind appends).
+    #: Re-commits of a DELETE/UPDATE/MERGE that lost to writers which left
+    #: every file it touched alone and added nothing it should have read.
     dml_commit_retries = 15
 
     def _rebase_dv_commit(
-        self, table: ResolvedTable, read: Any, touched: set[str], txn: tuple[str, int] | None
+        self,
+        table: ResolvedTable,
+        read: Any,
+        touched: set[str],
+        txn: tuple[str, int] | None,
+        read_predicate: str | None = None,
+        *,
+        compaction: bool = False,
     ) -> Any:
         """The latest snapshot, when the commits that won left this one valid; else None.
 
         Delta's conflict check under WriteSerializable, its default: a DML
         commit survives concurrent winners that changed neither the metadata
-        nor the protocol and neither removed nor re-vectored any file it
-        touched. Rows a concurrent blind append added are not deleted or
-        updated -- the transaction never read them, and WriteSerializable
-        orders it before the append. Under `delta.isolationLevel=Serializable`
-        such an append conflicts, as Spark decides it. Without this the
-        kernel path failed on any concurrent append, where delta-rs retried.
+        nor the protocol, neither removed nor re-vectored any file it
+        touched, and -- unless they were blind appends -- added no file its
+        read could have matched (Spark's checkForAddedFilesThatShouldHaveBeen-
+        ReadByCurrentTxn). Rows a concurrent blind append added are not
+        deleted or updated -- the transaction never read them, and
+        WriteSerializable orders it before the append. A MERGE, UPDATE or
+        DELETE that won is not blind: its new rows (an inserted key, an
+        updated value) are what this transaction's read would have seen, and
+        rebasing over them let four concurrent upserts of one key each insert
+        it. Under `delta.isolationLevel=Serializable` any concurrent append
+        conflicts, as Spark decides it. Without the rebase the kernel path
+        failed on any concurrent append, where delta-rs retried. A
+        `compaction` changes no rows, so what the winners added is no concern
+        of it (Spark checks it under snapshot isolation); only the files it
+        removes must be as it read them.
         """
         import pyarrow as pa
 
@@ -1977,7 +2024,7 @@ class KernelEngine:
             if int(fresh.version) <= int(read.version):
                 return None
             level = (fresh.table_properties() or {}).get("delta.isolationLevel", "")
-            if level.lower() == "serializable":
+            if level.lower() == "serializable" and not compaction:
                 return None
             if fresh.metadata_json() != read.metadata_json():
                 return None
@@ -1999,9 +2046,313 @@ class KernelEngine:
             before = vectors(read)
             if before != vectors(fresh) or set(before) != touched:
                 return None
+            added = not compaction and self._added_what_was_read(read, fresh, read_predicate)
         except Exception:
             return None  # cannot tell; surfacing the conflict is the safe answer
+        if added:
+            # Spark's ConcurrentAppendException, said plainly: the engine's
+            # own "committed first" reads as a race a retry wins as it stands.
+            raise CommitConflictError(
+                int(fresh.version),
+                "a concurrent commit (not a blind append) added rows this transaction's "
+                "read could have matched, so committing it as read would ignore them; "
+                "nothing was committed. Re-read the table and run it again",
+            )
         return fresh
+
+    def _added_what_was_read(self, read: Any, fresh: Any, read_predicate: str | None) -> bool:
+        """Whether a commit after `read` that was not a blind append added rows it could read.
+
+        Judged from the winners' own commit files: which were blind appends
+        (only adds; isBlindAppend, or a plain WRITE -- the kernel's appends
+        do not set the flag), and which data files the others added. An added
+        file the read predicate skips could not hold a row this transaction
+        would have matched; one already gone again (compacted since) cannot
+        be judged and counts as read.
+        """
+        import pyarrow as pa
+
+        if not _native_has("commit_log"):
+            return True
+        live_at_read = set(pa.table(read.files()).column("path").to_pylist())
+        added: set[str] = set()
+        for _version, text in fresh.commit_log(int(read.version)):
+            actions = [json.loads(line) for line in text.splitlines() if line.strip()]
+            info = next((a["commitInfo"] for a in actions if "commitInfo" in a), None) or {}
+            if not any(k in a for a in actions for k in ("remove", "metaData", "protocol")) and (
+                info.get("isBlindAppend") is True
+                or str(info.get("operation", "")).upper() in _APPEND_OPERATIONS
+            ):
+                continue
+            added.update(
+                a["add"]["path"]
+                for a in actions
+                if "add" in a
+                and a["add"].get("dataChange", True)
+                # A file re-added with a new vector holds no new rows.
+                and a["add"]["path"] not in live_at_read
+            )
+        if not added:
+            return False
+        if read_predicate is None:
+            return True
+        candidates = set(pa.table(fresh.files(predicate=read_predicate)).column("path").to_pylist())
+        live = set(pa.table(fresh.files()).column("path").to_pylist())
+        return bool(added & candidates) or not added <= live
+
+    # ------------------------------------------------------------ compaction
+
+    def compaction_refusal(self, table: ResolvedTable) -> str | None:
+        """Why the kernel cannot commit an OPTIMIZE of this table, or None.
+
+        delta-rs's own OPTIMIZE commit rebases over a concurrent compaction
+        of the same files (its conflict check ignores `dataChange=false`
+        removes) and duplicates every row both compacted; the kernel commits
+        on the snapshot it read, so the loser conflicts instead. DeltaRsEngine
+        uses this path wherever it is open.
+        """
+        if not self.available() or not _native_has("compaction", "commit_log"):
+            return "the native extension has no kernel compaction"
+        if _forked_on_macos():
+            return "the kernel cannot run in this forked process"
+        if table.location is None or table.is_catalog_managed or table.is_shallow_clone:
+            return "the kernel compacts path-based tables that own their files only"
+        if "rowTracking" in table.effective_writer_features:
+            return "rows moved to a new file would get new row ids"
+        cap = self.supports(Operation.APPEND, table)
+        if not cap.ok:
+            return cap.reason
+        return None
+
+    #: Commits of one OPTIMIZE's rewritten files that lost a race, re-made on
+    #: the new snapshot (or re-planned from it) before giving up.
+    compaction_commit_retries = 15
+
+    #: Rows read into memory before their compaction is committed, in bytes
+    #: of input files; a larger OPTIMIZE commits in several steps.
+    compaction_batch_bytes = 1 << 30
+
+    def compact(
+        self,
+        table: ResolvedTable,
+        *,
+        zorder_by: list[str] | None = None,
+        target_size: int | None = None,
+        partition_filters: list[Any] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+        max_commit_retries: int | None = None,
+    ) -> dict[str, Any]:
+        """OPTIMIZE (bin-packing, or Z-order with `zorder_by`), committed by the kernel.
+
+        Plans from one snapshot and commits the rewritten files against it,
+        `dataChange=false`. When a concurrent commit wins, the same files are
+        committed on the new snapshot if it left every file this one removes
+        as it was read (Delta's rule for compactions); otherwise the rest is
+        planned again from the new snapshot, so a file some other OPTIMIZE
+        compacted first is never compacted twice.
+        """
+        import pyarrow as pa
+
+        retries = (
+            self.compaction_commit_retries
+            if max_commit_retries is None
+            else int(max_commit_retries)
+        )
+        metrics: dict[str, Any] = {
+            "numFilesAdded": 0,
+            "numFilesRemoved": 0,
+            "partitionsOptimized": 0,
+            "numBatches": 0,
+            "totalConsideredFiles": 0,
+            "totalFilesSkipped": 0,
+            "preserveInsertionOrder": not zorder_by,
+        }
+        added_sizes: list[int] = []
+        removed_sizes: list[int] = []
+        done: set[str] = set()
+        partitions: set[Any] = set()
+        conflicts = 0
+        first_plan = True
+        while True:
+            snapshot = self.snapshot(table, write=True)
+            files = pa.table(snapshot.files())
+            bins, considered, skipped = self._plan_compaction(
+                snapshot, files, zorder_by, target_size, partition_filters, done
+            )
+            if first_plan:
+                metrics["totalConsideredFiles"] = considered
+                metrics["totalFilesSkipped"] = skipped
+                first_plan = False
+            if not bins:
+                break
+            step: list[tuple[Any, list[str], list[int]]] = []
+            budget = 0
+            for key, paths, sizes in bins:
+                step.append((key, paths, sizes))
+                budget += sum(sizes)
+                if budget >= self.compaction_batch_bytes:
+                    break
+            data, out_files = self._compacted_rows(snapshot, step, zorder_by, target_size)
+            removing = [p for _, paths, _ in step for p in paths]
+            while True:
+                try:
+                    version = self._commit_compaction(
+                        table, snapshot, removing, data, commit_metadata
+                    )
+                    break
+                except CommitConflictError:
+                    conflicts += 1
+                    if conflicts > retries:
+                        raise
+                    rebased = self._rebase_dv_commit(
+                        table, snapshot, set(removing), None, compaction=True
+                    )
+                    commit_backoff(conflicts - 1)
+                    if rebased is None:
+                        # Another writer changed a file this one would remove
+                        # (another OPTIMIZE compacted it, most likely): the
+                        # rows read are stale, so plan again from the table
+                        # as it is now.
+                        version = None
+                        break
+                    snapshot = rebased
+            if version is None:
+                continue
+            done.update(removing)
+            partitions.update(key for key, _, _ in step)
+            metrics["numBatches"] += len(step)
+            metrics["numFilesRemoved"] += len(removing)
+            metrics["numFilesAdded"] += out_files
+            removed_sizes.extend(size for _, _, sizes in step for size in sizes)
+            after = pa.table(self.snapshot(table, version=version).files())
+            before = set(pa.table(snapshot.files()).column("path").to_pylist())
+            for path, size in zip(
+                after.column("path").to_pylist(), after.column("size").to_pylist(), strict=True
+            ):
+                if path not in before:
+                    added_sizes.append(int(size))
+                    # Written by this OPTIMIZE: planning again (a Z-order
+                    # rewrites whole partitions) must not take it back up.
+                    done.add(path)
+        metrics["partitionsOptimized"] = len(partitions)
+        metrics["filesAdded"] = _size_stats(added_sizes)
+        metrics["filesRemoved"] = _size_stats(removed_sizes)
+        return metrics
+
+    def _plan_compaction(
+        self,
+        snapshot: Any,
+        files: Any,
+        zorder_by: list[str] | None,
+        target_size: int | None,
+        partition_filters: list[Any] | None,
+        exclude: set[str],
+    ) -> tuple[list[tuple[Any, list[str], list[int]]], int, int]:
+        """Bins of files to rewrite together: `(partition, paths, sizes)`, and the counts.
+
+        As delta-rs plans them: per partition, files below the target size
+        packed greedily up to it, a bin of one file left alone -- unless it
+        carries a deletion vector, whose deleted rows the rewrite drops. A
+        Z-order rewrites every file of each partition as one bin.
+        """
+        target = int(target_size or _DEFAULT_TARGET_SIZE)
+        physical = _physical_partition_names(snapshot)
+        keep = _partition_filter(snapshot, partition_filters, physical)
+        groups: dict[Any, list[tuple[str, int, bool]]] = {}
+        considered = skipped = 0
+        for path, size, values, dv in zip(
+            files.column("path").to_pylist(),
+            files.column("size").to_pylist(),
+            files.column("partition_values").to_pylist(),
+            files.column("deletion_vector").to_pylist(),
+            strict=True,
+        ):
+            values = dict(values or [])
+            if path in exclude or not keep(values):
+                continue
+            considered += 1
+            key = tuple(sorted(values.items()))
+            groups.setdefault(key, []).append((path, int(size), dv is not None))
+        bins: list[tuple[Any, list[str], list[int]]] = []
+        for key in sorted(groups, key=lambda k: [(n, v is None, v or "") for n, v in k]):
+            members = groups[key]
+            if zorder_by:
+                bins.append((key, [m[0] for m in members], [m[1] for m in members]))
+                continue
+            current: list[tuple[str, int, bool]] = []
+            total = 0
+            packed: list[list[tuple[str, int, bool]]] = []
+            for member in sorted(members, key=lambda m: m[1]):
+                if member[1] >= target and not member[2]:
+                    skipped += 1
+                    continue
+                if current and total + member[1] > target:
+                    packed.append(current)
+                    current, total = [], 0
+                current.append(member)
+                total += member[1]
+            if current:
+                packed.append(current)
+            for group in packed:
+                if len(group) == 1 and not group[0][2]:
+                    skipped += 1
+                    continue
+                bins.append((key, [m[0] for m in group], [m[1] for m in group]))
+        return bins, considered, skipped
+
+    def _compacted_rows(
+        self,
+        snapshot: Any,
+        step: list[tuple[Any, list[str], list[int]]],
+        zorder_by: list[str] | None,
+        target_size: int | None,
+    ) -> tuple[Any, int]:
+        """The rows of each bin, as one batch per output file, and the file count."""
+        import pyarrow as pa
+
+        target = int(target_size or _DEFAULT_TARGET_SIZE)
+        batches: list[Any] = []
+        schema = None
+        for _key, paths, sizes in step:
+            rows = pa.table(snapshot.scan(files=paths))
+            if rows.num_rows == 0:
+                continue
+            schema = rows.schema
+            if zorder_by:
+                rows = rows.take(_zorder_indices(rows, zorder_by))
+            # One batch is one file (the native writer writes each batch it
+            # is given as a file): sized from the input, compressed as it is.
+            per_file = max(1, int(rows.num_rows * target / max(1, sum(sizes))))
+            for start in range(0, rows.num_rows, per_file):
+                batches.extend(rows.slice(start, per_file).combine_chunks().to_batches())
+        if schema is None:
+            return None, 0
+        return pa.Table.from_batches(batches, schema=schema), len(batches)
+
+    def _commit_compaction(
+        self,
+        table: ResolvedTable,
+        snapshot: Any,
+        removing: list[str],
+        data: Any,
+        commit_metadata: dict[str, Any] | None,
+    ) -> int:
+        import pyarrow as pa
+
+        empty = pa.table({"path": pa.array([], pa.string()), "row_index": pa.array([], pa.int64())})
+        with translating(EngineKind.KERNEL, "commit"):
+            version, _deleted, _dvs, _removed = snapshot.commit_dml(
+                empty.to_reader(),
+                data=data.to_reader() if data is not None else None,
+                whole_files=removing,
+                engine_info=_engine_info(),
+                operation="OPTIMIZE",
+                commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+                data_change=False,
+            )
+        if int(version) != int(snapshot.version):
+            self._maybe_checkpoint(table, int(version), snapshot)
+        return int(version)
 
     def merge(
         self,
@@ -3044,6 +3395,134 @@ def _dv_cardinalities(column: Any) -> Any:
         ],
         pa.int64(),
     )
+
+
+#: delta-rs's OPTIMIZE target when neither the call nor delta.targetFileSize sets one.
+_DEFAULT_TARGET_SIZE = 104_857_600
+
+
+def _size_stats(sizes: list[int]) -> str:
+    """delta-rs's filesAdded/filesRemoved metric: size statistics as a JSON string."""
+    if not sizes:
+        return json.dumps({"avg": 0.0, "max": 0, "min": 0, "totalFiles": 0, "totalSize": 0})
+    return json.dumps(
+        {
+            "avg": sum(sizes) / len(sizes),
+            "max": max(sizes),
+            "min": min(sizes),
+            "totalFiles": len(sizes),
+            "totalSize": sum(sizes),
+        }
+    )
+
+
+def _physical_partition_names(snapshot: Any) -> dict[str, str]:
+    """Each partition column's logical name -> the key `files()` reports its value under."""
+    names = {c: c for c in snapshot.partition_columns}
+    try:
+        schema = json.loads(json.loads(snapshot.metadata_json())["schemaString"])
+    except Exception:
+        return names
+    for field in schema.get("fields", []):
+        name = field.get("name")
+        if name in names:
+            names[name] = (field.get("metadata") or {}).get(
+                "delta.columnMapping.physicalName", name
+            )
+    return names
+
+
+def _partition_filter(snapshot: Any, filters: list[Any] | None, physical: dict[str, str]) -> Any:
+    """A test of a file's partition values against delta-rs-style `(column, op, value)` filters.
+
+    Values compare as the column's type, as delta-rs compares them; a NULL
+    partition value matches no comparison (only `= None`/`!= None` test it).
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if not filters:
+        return lambda values: True
+    schema = _arrow_schema(snapshot)
+    by_lower = {n.lower(): n for n in physical}
+    tests = []
+    for column, op, value in filters:
+        name = by_lower.get(str(column).lower())
+        if name is None:
+            raise InvalidArgumentError(f"partition_filters name {column!r}, not a partition column")
+        kind = schema.field(name).type
+        op = str(op).strip().lower()
+
+        def typed(raw: Any, kind: Any = kind) -> Any:
+            if raw is None:
+                return None
+            try:
+                return pc.cast(pa.array([str(raw)]), kind)[0].as_py()
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                return str(raw)
+
+        in_list = op in ("in", "not in")
+        wanted = [typed(v) for v in (value or [])] if in_list else typed(value)
+        tests.append((physical[name], op, wanted, typed))
+
+    def keep(values: dict[str, Any]) -> bool:
+        for key, op, wanted, typed in tests:
+            have = typed(values.get(key))
+            if op in ("=", "=="):
+                ok = have == wanted
+            elif op in ("!=", "<>"):
+                ok = have != wanted
+            elif op == "in":
+                ok = have in wanted
+            elif op == "not in":
+                ok = have is not None and have not in wanted
+            elif have is None or wanted is None:
+                ok = False
+            elif op == "<":
+                ok = have < wanted
+            elif op == "<=":
+                ok = have <= wanted
+            elif op == ">":
+                ok = have > wanted
+            elif op == ">=":
+                ok = have >= wanted
+            else:
+                raise InvalidArgumentError(f"partition_filters: unknown operator {op!r}")
+            if not ok:
+                return False
+        return True
+
+    return keep
+
+
+def _zorder_indices(rows: Any, columns: list[str]) -> Any:
+    """The order that sorts `rows` along a Z-order curve over `columns`.
+
+    Each column's values become their dense rank (NULLs last), scaled into an
+    equal share of 64 bits, and the bits are interleaved; sorting by the
+    result clusters rows close in every column, which is what lets each
+    output file's min/max statistics skip well on any of them.
+    """
+    import numpy as np
+    import pyarrow.compute as pc
+
+    by_lower = {n.lower(): n for n in rows.column_names}
+    bits = max(1, 64 // len(columns))
+    keys = []
+    for column in columns:
+        name = by_lower.get(column.lower(), column)
+        # Ascending ranks put NULLs last by default.
+        ranks = pc.rank(rows.column(name), tiebreaker="dense")
+        r = np.asarray(ranks.to_numpy(zero_copy_only=False), dtype=np.uint64) - np.uint64(1)
+        distinct = int(r.max()) + 1 if len(r) else 1
+        if bits < 64 and distinct > (1 << bits):
+            r = (r.astype(np.float64) * float(1 << bits) / distinct).astype(np.uint64)
+        keys.append(r)
+    z = np.zeros(rows.num_rows, dtype=np.uint64)
+    for bit in range(bits - 1, -1, -1):
+        for r in keys:
+            z = (z << np.uint64(1)) | ((r >> np.uint64(bit)) & np.uint64(1))
+    return np.argsort(z, kind="stable")
 
 
 def _arrow_schema(snapshot: Any) -> Any:

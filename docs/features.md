@@ -129,8 +129,8 @@ variant; all three are writer-only, so both engines read and neither writes.
 
 | Feature | Where it exists | deltaswamp | Notes |
 |---|---|---|---|
-| OPTIMIZE (compaction) | all | delta-rs, warehouse | |
-| OPTIMIZE ZORDER BY | DBR, Spark, delta-rs | delta-rs, warehouse | |
+| OPTIMIZE (compaction) | all | delta-rs, warehouse | committed by the kernel on the snapshot it planned from, so concurrent runs never compact a file twice |
+| OPTIMIZE ZORDER BY | DBR, Spark, delta-rs | delta-rs, warehouse | as above |
 | OPTIMIZE on clustered / managed tables, OPTIMIZE FULL | DBR | warehouse | delta-rs cannot write clustered tables |
 | VACUUM (standard and LITE) | DBR, Spark, delta-rs | delta-rs, warehouse | dry run by default here |
 | VACUUM on managed tables | DBR | warehouse | Databricks forbids external VACUUM on managed tables |

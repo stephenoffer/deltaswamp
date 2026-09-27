@@ -43,6 +43,7 @@ from ..errors import (
     EnginePanicError,
     InvalidArgumentError,
     InvalidReferenceError,
+    MetadataChangedError,
     PreflightError,
     StorageError,
     TableNotFoundError,
@@ -308,7 +309,14 @@ def as_commit_conflict(exc: BaseException) -> CommitConflictError | None:
     if not _CONFLICT_MESSAGE.search(message):
         return None
     found = re.search(r"version:? (\d+)", message)
-    return CommitConflictError(
+    # The kernel's class for the same race: a caller catching
+    # MetadataChangedError to re-plan caught it on one engine only.
+    kind = (
+        MetadataChangedError
+        if re.search(r"metadata changed since last commit", message, re.IGNORECASE)
+        else CommitConflictError
+    )
+    return kind(
         int(found.group(1)) if found else -1,
         f"another writer committed first: {message}. Re-read the table and retry",
     )

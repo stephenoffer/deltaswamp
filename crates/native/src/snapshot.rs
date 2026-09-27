@@ -669,6 +669,45 @@ impl PySnapshot {
         Ok(version)
     }
 
+    /// The raw commit files `_delta_log/<v>.json` for `after < v <= self.version`,
+    /// as `(version, text)` pairs in ascending order.
+    ///
+    /// What a DML that lost a commit race needs to apply Delta's conflict
+    /// rules: whether each winning commit was a blind append, and which files
+    /// it added. Published commits only, so a catalog-managed table's
+    /// ratified tail is not covered; callers do not rebase those.
+    fn commit_log(&self, py: Python<'_>, after: u64) -> PyResult<Vec<(u64, String)>> {
+        let end = self.inner.version();
+        let root = self.inner.table_root().clone();
+        let texts = py.detach(|| -> Result<Vec<(u64, String)>> {
+            if after >= end {
+                return Ok(Vec::new());
+            }
+            let versions: Vec<u64> = ((after + 1)..=end).collect();
+            let urls = versions
+                .iter()
+                .map(|v| {
+                    root.join(&format!("_delta_log/{v:020}.json"))
+                        .map(|url| (url, None))
+                        .map_err(|e| NativeError::Invalid(format!("bad commit path: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let bytes = self.engine.storage_handler().read_files(urls)?;
+            versions
+                .into_iter()
+                .zip(bytes)
+                .map(|(v, data)| {
+                    let data = data?;
+                    let text = String::from_utf8(data.to_vec()).map_err(|e| {
+                        NativeError::Invalid(format!("commit {v} is not UTF-8: {e}"))
+                    })?;
+                    Ok((v, text))
+                })
+                .collect()
+        })?;
+        Ok(texts)
+    }
+
     /// This snapshot's commit timestamp in milliseconds: the in-commit
     /// timestamp when ICT is enabled, else the commit file's modification time.
     fn timestamp(&self, py: Python<'_>) -> PyResult<i64> {
@@ -837,7 +876,9 @@ impl PySnapshot {
     /// rows to delete, addressed as a positional scan (`row_positions=True`)
     /// reports them. `data`, if given, is appended in the same commit -- an
     /// UPDATE's rewritten rows. `whole_files` names files to delete entirely
-    /// (every live row) without listing rows. Returns `(version, deleted_rows,
+    /// (every live row) without listing rows. `data_change=False` commits
+    /// it as a compaction (OPTIMIZE): every add and remove says the rows did
+    /// not change, only the files holding them. Returns `(version, deleted_rows,
     /// deletion_vectors_added, files_removed)`; a DML that changes nothing
     /// commits nothing and returns this snapshot's version.
     #[allow(clippy::too_many_arguments)]
@@ -850,6 +891,7 @@ impl PySnapshot {
         operation = None,
         txn = None,
         commit_metadata = None,
+        data_change = true,
     ))]
     fn commit_dml(
         &self,
@@ -862,6 +904,7 @@ impl PySnapshot {
         operation: Option<String>,
         txn: Option<(String, i64)>,
         commit_metadata: Option<HashMap<String, String>>,
+        data_change: bool,
     ) -> PyResult<(u64, u64, usize, usize)> {
         let deletions = deletions.into_reader()?;
         let data = data.map(|d| d.into_reader()).transpose()?;
@@ -886,6 +929,7 @@ impl PySnapshot {
                 operation,
                 txn,
                 commit_metadata,
+                data_change,
             )
         })?;
         Ok((
