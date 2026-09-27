@@ -843,6 +843,11 @@ All inherit from `DeltaSwampError`.
 | `SqlStatementError` | the SQL warehouse rejected or failed a statement; the message carries its error |
 | `EnginePanicError` | an engine panicked across the FFI boundary |
 
+Warnings all derive from `DeltaSwampWarning` (`SqlFallbackWarning`,
+`EngineFallbackWarning`, `IgnoredPropertyWarning`, `CredentialExpiryWarning`),
+so one filter silences them:
+`warnings.filterwarnings("ignore", category=ds.DeltaSwampWarning)`.
+
 A conflict means re-read the snapshot, recompute, then stage again at the next
 version. A backfill demand is backpressure, not a rate limit: retrying it with
 exponential backoff and no publish will wedge the table.

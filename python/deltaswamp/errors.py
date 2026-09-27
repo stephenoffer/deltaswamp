@@ -71,7 +71,15 @@ class EnginePanicError(DeltaSwampError):
     """
 
 
-class CredentialExpiryWarning(UserWarning):
+class DeltaSwampWarning(UserWarning):
+    """Base class of every warning this library emits.
+
+    `warnings.filterwarnings("ignore", category=ds.DeltaSwampWarning)` silences
+    them all; each subclass can still be filtered on its own.
+    """
+
+
+class CredentialExpiryWarning(DeltaSwampWarning):
     """A read began with a vended credential that is close to expiring.
 
     Credentials are re-vended between operations, not during one, so a scan
@@ -79,15 +87,15 @@ class CredentialExpiryWarning(UserWarning):
     """
 
 
-class EngineFallbackWarning(UserWarning):
+class EngineFallbackWarning(DeltaSwampWarning):
     """An engine failed on a read it claimed, and the next engine is serving it."""
 
 
-class SqlFallbackWarning(UserWarning):
+class SqlFallbackWarning(DeltaSwampWarning):
     """An operation was served by a Databricks SQL warehouse rather than directly."""
 
 
-class IgnoredPropertyWarning(UserWarning):
+class IgnoredPropertyWarning(DeltaSwampWarning):
     """A property will be stored but nothing here acts on it."""
 
 
