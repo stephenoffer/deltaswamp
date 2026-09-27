@@ -426,9 +426,15 @@ WriteSerializable isolation, a conflict with writers that only appended (and
 changed neither the schema nor the protocol, nor removed or re-vectored a file
 this commit touched) is re-committed on top of them, up to
 `KernelEngine.dml_commit_retries` (15) times: rows those appends added are
-not deleted or updated, since the statement never read them. Under
+not deleted or updated, since the statement never read them. A winner that
+was not a blind append -- a MERGE, UPDATE or DELETE -- and added a file the
+statement's predicate (a MERGE: its join keys) could match makes it conflict
+instead, as Spark's ConcurrentAppendException does: two concurrent upserts of
+one new key used to insert it twice. Under
 `delta.isolationLevel=Serializable`, and on catalog-managed tables, every
-conflict is raised. A data file whose add carries
+conflict is raised. The copy-on-write DELETE and UPDATE (tables without
+deletion vectors) rebase over the same blind appends by running again on the
+new snapshot, so they also act on the appended rows. A data file whose add carries
 no `numRecords` statistic (every file in a Databricks checkpoint, which keeps
 statistics only as `stats_parsed`) takes a vector too; its row count is read
 from the Parquet footer.

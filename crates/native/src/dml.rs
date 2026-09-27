@@ -154,6 +154,7 @@ pub fn commit_dml(
     operation: Option<String>,
     txn: Option<(String, i64)>,
     commit_metadata: Option<HashMap<String, String>>,
+    data_change: bool,
 ) -> Result<DmlOutcome> {
     let deletions: HashMap<String, RoaringTreemap> = deletions
         .into_iter()
@@ -320,7 +321,17 @@ pub fn commit_dml(
         .to_vec();
     let table_schema = snapshot.schema();
     let materialized_row_ids = materialized_row_id_column(&snapshot, &batches)?;
-    let batches = prepare_with_row_ids(&snapshot, batches)?;
+    let batches = if data_change {
+        prepare_with_row_ids(&snapshot, batches)?
+    } else {
+        // A compaction sized each batch as one output file; coalescing them
+        // would ignore the table's target file size.
+        let mut prepared = Vec::with_capacity(batches.len());
+        for batch in batches {
+            prepared.extend(commit::prepare_batches(&snapshot, vec![batch])?);
+        }
+        prepared
+    };
 
     // Serialize every new vector into one file, in the protocol's format.
     let mut descriptors: HashMap<String, DeletionVectorDescriptor> = HashMap::new();
@@ -362,6 +373,11 @@ pub fn commit_dml(
         txn,
         commit_metadata,
     )?;
+    if !data_change {
+        // A compaction: the same rows, moved from the removed files into the
+        // new ones. Readers of the change feed and streams skip it.
+        transaction = transaction.with_data_change(false);
+    }
 
     // Split each scan-file batch into the rows whose vector changes and the
     // rows removed outright. Both halves share the same data.

@@ -1250,22 +1250,43 @@ class DeltaRsEngine:
         if zorder_by:
             order = list(zorder_by)
             return self._rewrite(
-                table, "optimize", lambda dt, kw: dt.optimize.z_order(order, **kw), kwargs
+                table,
+                "optimize",
+                lambda dt, kw: dt.optimize.z_order(order, **kw),
+                kwargs,
+                zorder=order,
             )
         return self._rewrite(table, "optimize", lambda dt, kw: dt.optimize.compact(**kw), kwargs)
 
     def _rewrite(
-        self, table: ResolvedTable, what: str, run: Any, kwargs: dict[str, Any]
+        self,
+        table: ResolvedTable,
+        what: str,
+        run: Any,
+        kwargs: dict[str, Any],
+        *,
+        zorder: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Run a delta-rs compaction, refusing to leave its data duplicated.
+        """Run a compaction, never leaving its data duplicated.
 
         delta-rs 1.6.5's conflict check ignores a concurrent commit's
         ``dataChange=false`` removes: two OPTIMIZE runs over the same files
         both commit, and every compacted row is then in the table twice
-        (verified: 5 rows became 10). In one process the runs are serialised
-        here; across processes the commit is found by a tag and checked, and
-        rolled back while it is still the latest one.
+        (three processes: 150 rows became 450). Its OPTIMIZE commit takes
+        neither ``max_commit_retries`` nor app transactions from the caller,
+        so it cannot be told to commit on the snapshot it planned from. The
+        kernel commits the rewritten files instead, on that snapshot, and a
+        loser conflicts and re-plans (`KernelEngine.compact`). Only where the
+        kernel cannot (options only delta-rs honors, tables it cannot write)
+        does delta-rs commit, serialised in this process and checked after.
         """
+        kernel = self._kernel_compactor(table, kwargs)
+        if kernel is not None:
+            with _rewrite_lock(table.location or ""):
+                done: dict[str, Any] = kernel.compact(
+                    table, zorder_by=zorder, **self._compaction_args(table, kwargs)
+                )
+                return done
         import uuid
 
         tag = uuid.uuid4().hex
@@ -1292,6 +1313,46 @@ class DeltaRsEngine:
             result: dict[str, Any] = run(dt, kwargs)
             self._check_rewrite(table, before, tag, result, what)
         return result
+
+    #: Options only delta-rs's own OPTIMIZE honors; with one, it runs it.
+    _DELTARS_ONLY_OPTIMIZE = frozenset(
+        {"writer_properties", "min_commit_interval", "post_commithook_properties"}
+    )
+
+    def _kernel_compactor(self, table: ResolvedTable, kwargs: dict[str, Any]) -> Any:
+        """The kernel engine, when it can commit this compaction; else None."""
+        from .kernel import KernelEngine
+
+        if any(kwargs.get(k) is not None for k in self._DELTARS_ONLY_OPTIMIZE):
+            return None
+        if getattr(kwargs.get("commit_properties"), "app_transactions", None):
+            return None
+        if not KernelEngine.available():
+            return None
+        kernel = guard(EngineKind.KERNEL, KernelEngine(storage_options=self._base_options))
+        try:
+            refusal = kernel.compaction_refusal(table)
+        except Exception:
+            return None
+        return None if refusal is not None else kernel
+
+    @staticmethod
+    def _compaction_args(table: ResolvedTable, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """This call's options as `KernelEngine.compact` takes them.
+
+        max_concurrent_tasks, max_spill_size and max_temp_directory_size tune
+        delta-rs's executor and have nothing to bound in the kernel's.
+        """
+        properties = kwargs.get("commit_properties")
+        target = kwargs.get("target_size")
+        if target is None:
+            target = parse_byte_size(table.properties.get("delta.targetFileSize"))
+        return {
+            "target_size": target,
+            "partition_filters": kwargs.get("partition_filters"),
+            "commit_metadata": dict(getattr(properties, "custom_metadata", None) or {}) or None,
+            "max_commit_retries": getattr(properties, "max_commit_retries", None),
+        }
 
     def _check_rewrite(
         self, table: ResolvedTable, before: int, tag: str, result: Any, what: str
@@ -1360,7 +1421,7 @@ class DeltaRsEngine:
         _commit_kwargs(kwargs)
         order = list(columns)
         return self._rewrite(
-            table, "z-order", lambda dt, kw: dt.optimize.z_order(order, **kw), kwargs
+            table, "z-order", lambda dt, kw: dt.optimize.z_order(order, **kw), kwargs, zorder=order
         )
 
     def vacuum(

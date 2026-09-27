@@ -210,6 +210,11 @@ def test_optimize_over_a_concurrent_optimize_does_not_duplicate_rows(
     stale = deltalake.DeltaTable(p)
     deltalake.DeltaTable(p).optimize.compact()  # the other process wins
     _stale_write_open(monkeypatch, stale)
+    # The fallback where delta-rs commits (the kernel commits otherwise; its
+    # races are in test_audit_conc.py).
+    from deltaswamp.engine.deltars import DeltaRsEngine
+
+    monkeypatch.setattr(DeltaRsEngine, "_kernel_compactor", lambda self, table, kwargs: None)
     with pytest.raises(CommitConflictError, match="rolled back"):
         t.optimize()
     monkeypatch.undo()

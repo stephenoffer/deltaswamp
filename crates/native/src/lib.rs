@@ -63,6 +63,10 @@ pub const FEATURES: &[&str] = &[
     "deletion_vector_dml",
     // UPDATE writes rewritten rows' ids to the materialized row-id column.
     "materialized_row_ids",
+    // Raw commit files, for applying Delta's conflict rules on a lost race.
+    "commit_log",
+    // `commit_dml(data_change=False)`: compactions committed by the kernel.
+    "compaction",
 ];
 
 #[pyfunction]
