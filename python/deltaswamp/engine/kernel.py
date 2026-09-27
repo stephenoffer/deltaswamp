@@ -925,18 +925,30 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version, timestamp=timestamp)
         return _planned_read(snapshot, columns, predicate)
 
-    def legacy_calendar_files(self, table: ResolvedTable) -> tuple[str, ...] | None:
+    def legacy_calendar_files(
+        self, table: ResolvedTable, *, version: int | None = None, timestamp: Any = None
+    ) -> tuple[str, ...] | None:
         """Live files a reader that does not rebase would misread; None if unknowable.
 
         Files Spark wrote in its legacy hybrid calendar with a value the rebase
-        moves, or with INT96 timestamps old enough to overflow as nanoseconds.
-        See `engine/calendar.py`.
+        moves, or with INT96 timestamps that overflow as nanoseconds (before
+        1677 or after 2262). See `engine/calendar.py`.
         """
         if not self.available() or not _native_has("legacy_calendar_files"):
             return None
         from .calendar import legacy_calendar_files
 
-        return legacy_calendar_files(self.snapshot(table))
+        return legacy_calendar_files(self.snapshot(table, version=version, timestamp=timestamp))
+
+    @property
+    def supports_read_sql_expressions(self) -> bool:
+        """A read can filter by SQL outside the grammar, evaluated by DuckDB.
+
+        Only the router asks, and only for a table delta-rs misreads (see
+        `Router._kernel_filters_sql`); elsewhere such a predicate goes to
+        delta-rs, which evaluates it itself.
+        """
+        return importlib.util.find_spec("duckdb") is not None
 
     def files(
         self,
@@ -3076,6 +3088,9 @@ def _planned_read(
     extra = {} if files is None else {"files": files}
     if predicate is not None:
         _require_pyarrow("filter rows with a predicate on the kernel path")
+        sql = _outside_grammar(predicate)
+        if sql is not None:
+            return _sql_filtered_read(snapshot, columns, sql, extra)
     elif columns is not None and not columns:
         _require_pyarrow("read an empty projection on the kernel path")
     if predicate is None and columns and all(isinstance(c, str) for c in columns):
@@ -3090,6 +3105,57 @@ def _planned_read(
     if node is not None:
         stream = sqlpred.filter_stream(stream, node)
     return stream if keep is None else _project(stream, keep)
+
+
+def _outside_grammar(predicate: str) -> str | None:
+    """`predicate` respelled for DuckDB when the kernel's grammar does not read it.
+
+    None when the grammar does (the usual path), or when DuckDB is not
+    installed (the grammar's own PredicateError then stands). The router sends
+    such a predicate here only for a table delta-rs misreads.
+    """
+    try:
+        sqlpred.parse(predicate)
+    except sqlpred.PredicateError as exc:
+        if not exc.beyond_grammar or importlib.util.find_spec("duckdb") is None:
+            raise
+    else:
+        return None
+    from . import sharing
+    from .dialect import to_duckdb
+
+    # Spark SQL DuckDB cannot be made to evaluate as Spark does is refused
+    # (EngineLimitError), rather than filtered by another meaning.
+    text = to_duckdb(predicate)
+    sharing._screen_expression(text)
+    return text
+
+
+def _sql_filtered_read(
+    snapshot: Any, columns: list[str] | None, text: str, extra: dict[str, Any]
+) -> Any:
+    """Every row of `snapshot` (no file skipping), kept where DuckDB finds `text` true.
+
+    The columns the expression reads are not known without a parse, so the
+    whole row is read and the projection applied after the filter.
+    """
+    import pyarrow as pa
+
+    reader = pa.RecordBatchReader.from_stream(snapshot.scan(**extra))
+    keep = None
+    if columns is not None:
+        keep = list(dict.fromkeys(_canonical_path(reader.schema, (c,))[0] for c in columns))
+        unknown = [c for c in keep if c not in reader.schema.names]
+        if unknown:
+            from ..errors import InvalidArgumentError
+
+            raise InvalidArgumentError(
+                f"column {unknown[0]!r} is not in the table schema; columns are "
+                f"{reader.schema.names}"
+            )
+    from .duckfilter import RowFilter
+
+    return RowFilter(text, reader.schema).filtered(reader, keep)
 
 
 _REJECTED_CREDENTIAL_MARKERS = (

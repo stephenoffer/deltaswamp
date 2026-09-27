@@ -212,9 +212,18 @@ First release.
   zone (Spark 2.x), are refused by the kernel and need the warehouse: Spark
   rebases them with per-zone tables this library does not carry. DELETE,
   UPDATE, MERGE, replaceWhere, OPTIMIZE and Z-ORDER never go to delta-rs on a
-  table holding such values (or pre-1900 INT96 timestamps), since it would
-  rewrite them shifted; they take the kernel's deletion-vector or whole-table
-  rewrite paths, or the warehouse, or are refused.
+  table holding such values (or INT96 timestamps before 1900 or after
+  2262-04-11, which delta-rs decodes as overflowing nanoseconds), since it
+  would rewrite them shifted; they take the kernel's deletion-vector or
+  whole-table rewrite paths, or the warehouse, or are refused. Reads of such a
+  table never go to delta-rs: the kernel reads, and a predicate outside its
+  grammar is evaluated by DuckDB afterwards (refused without DuckDB).
+- Lazy hand-offs (`to_duckdb`, `to_polars(lazy=True)`, `to_pyarrow_dataset`,
+  `Connection.sql`) read the version current when they were made;
+  `follow_latest=True` follows the latest and raises `MetadataChangedError`
+  if the schema changed. A pinned hand-off of a version whose files were
+  vacuumed fails in Polars as a `ComputeError` naming `MissingDataFileError`
+  (Polars wraps every error an IO source raises).
 - A time-travel timestamp after the latest commit reads the latest version on
   the direct engines; the warehouse refuses it. A RESTORE to one is refused
   everywhere, as Spark refuses it.

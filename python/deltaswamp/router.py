@@ -15,6 +15,7 @@ The router follows three rules:
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .capability import (
@@ -426,6 +427,11 @@ _FILE_REWRITES: frozenset[Operation] = frozenset(
 )
 
 
+#: Operations delta-rs must not serve on a table it misreads (see
+#: `Router._calendar_refusal`): the rewrites, and the reads that decode data.
+_CALENDAR_BOUND: frozenset[Operation] = _FILE_REWRITES | _DATA_READS
+
+
 #: DML that the kernel writes as deletion vectors when a table enables them.
 _DV_DML: frozenset[Operation] = frozenset(
     {Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE, Operation.MERGE}
@@ -638,6 +644,10 @@ class Router:
                 for need in needs - _ROUTER_HINTS
                 if not getattr(engine, f"supports_{need}", False)
             )
+            if missing == ["sql_expressions"] and self._kernel_filters_sql(
+                kind, operation, table, needs, engine, shape
+            ):
+                missing = []
             if missing:
                 reasons.append(f"{kind.value}: does not support {', '.join(missing)}")
                 continue
@@ -684,10 +694,10 @@ class Router:
 
             judged = _exempted(kind, operation, table, shape)
             result: Capability = engine.supports(operation, judged, **shape)  # type: ignore[attr-defined]
-            if result.ok and kind is EngineKind.DELTARS and operation in _FILE_REWRITES:
+            if result.ok and kind is EngineKind.DELTARS and operation in _CALENDAR_BOUND:
                 # Asked only once delta-rs would otherwise serve: the check
                 # lists the table's files, which is wasted on a refusal.
-                shifted = self._calendar_refusal(table)
+                shifted = self._calendar_refusal(table, operation, shape)
                 if shifted is not None:
                     reasons.append(f"{kind.value}: {shifted}")
                     continue
@@ -717,15 +727,21 @@ class Router:
             remedy=remedy,
         )
 
-    def _calendar_refusal(self, table: ResolvedTable) -> str | None:
-        """Why delta-rs must not rewrite this table's files, if it must not.
+    def _calendar_refusal(
+        self,
+        table: ResolvedTable,
+        operation: Operation,
+        shape: Mapping[str, object],
+    ) -> str | None:
+        """Why delta-rs must not read or rewrite this table's files, if it must not.
 
         delta-rs reads a file Spark wrote in its legacy hybrid calendar without
-        rebasing it, and INT96 timestamps as overflowing nanoseconds; its DML
-        and compaction then copy the rows they did not touch into new files,
-        shifted, without the footer that said so. The kernel's reads rebase
-        (and it finds the files), so its write paths and the warehouse serve
-        these tables instead.
+        rebasing it, and INT96 timestamps as overflowing nanoseconds
+        (``9999-12-31`` reads as ``1816-03-30``). A read through it returns
+        those values, and filters on them; its DML and compaction then copy the
+        rows they did not touch into new files, shifted, without the footer
+        that said so. The kernel's reads rebase (and it finds the files), so
+        its read and write paths and the warehouse serve these tables instead.
         """
         if not table.has_datetime_columns:
             return None
@@ -733,9 +749,20 @@ class Router:
         check = getattr(kernel, "legacy_calendar_files", None)
         if check is None:
             return None
+        reading = operation not in _FILE_REWRITES
+        at = {
+            k: v
+            for k, v in shape.items()
+            if k in ("version", "timestamp") and v is not None and reading
+        }
         try:
-            found = check(table)
+            found = check(table, **at) if at else check(table)
         except Exception as exc:
+            if reading:
+                # A read changes nothing, and a kernel that cannot open the
+                # snapshot to look cannot serve the read either: delta-rs is
+                # then the only way in, as it was before the check.
+                return None
             # Unknown is not "none": a wrong guess rewrites the table shifted.
             return (
                 "could not check whether its data files were written in Spark's legacy "
@@ -744,11 +771,42 @@ class Router:
             )
         if not found:
             return None
-        return (
+        held = (
             f"{len(found)} data file(s) (such as {found[0]}) hold dates before 1582-10-15 or "
-            "timestamps before 1900 that Spark wrote in its legacy hybrid calendar (or as "
-            "INT96), which delta-rs reads without rebasing; this operation would copy them "
-            "into new files shifted by days, corrupting the table"
+            "timestamps before 1900 that Spark wrote in its legacy hybrid calendar, or "
+            "INT96 timestamps (which delta-rs decodes as nanoseconds, overflowing before "
+            "1677-09-21 and after 2262-04-11), and delta-rs reads them without rebasing"
+        )
+        if reading:
+            return f"{held}; this read would return the shifted values and filter on them"
+        return (
+            f"{held}; this operation would copy them into new files shifted, corrupting the table"
+        )
+
+    def _kernel_filters_sql(
+        self,
+        kind: EngineKind,
+        operation: Operation,
+        table: ResolvedTable,
+        needs: frozenset[str],
+        engine: object,
+        shape: Mapping[str, object],
+    ) -> bool:
+        """Whether the kernel reads this table and filters by SQL outside its grammar.
+
+        A read predicate the kernel's grammar does not parse (`abs(id) > 0`,
+        `year(dt) = 1500`) goes to delta-rs, which evaluates SQL -- but not on a
+        table delta-rs misreads (see `_calendar_refusal`). There the kernel
+        reads, with the right values, and the predicate is evaluated exactly
+        afterwards by DuckDB in Spark's dialect, so the call keeps its
+        predicate rather than being refused.
+        """
+        return (
+            kind is EngineKind.KERNEL
+            and operation in (Operation.SCAN, Operation.TIME_TRAVEL)
+            and "distributed_scan" not in needs
+            and bool(getattr(engine, "supports_read_sql_expressions", False))
+            and self._calendar_refusal(table, operation, shape) is not None
         )
 
     def engine_for(

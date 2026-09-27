@@ -1450,14 +1450,16 @@ class Table:
         _require("pandas", "pandas")
         return self.to_arrow(**kwargs).to_pandas()
 
-    def to_polars(self, *, lazy: bool = False, **kwargs: Any) -> Any:
+    def to_polars(self, *, lazy: bool = False, follow_latest: bool = False, **kwargs: Any) -> Any:
         """A Polars DataFrame, or with ``lazy=True`` a LazyFrame that reads on collect.
 
         The lazy form reads through this library, so it works on the tables
         `polars.scan_delta` cannot open (catalog-managed, row-tracked,
         vacuumProtocolCheck, ...). Its projection and the simple comparisons
         of its filters are pushed into the scan (columns read, files
-        skipped); `columns=` and `predicate=` restrict it further.
+        skipped); `columns=` and `predicate=` restrict it further. It reads
+        the version current when it was made, at every collect; with
+        ``follow_latest=True``, the latest at each collect.
         """
         pl = _require("polars", "polars")
         check_keywords("to_polars", self.scan, kwargs)
@@ -1466,33 +1468,102 @@ class Table:
 
             # Not scan_pyarrow_dataset: that let pyarrow apply the filter, with
             # pyarrow's NaN semantics rather than Polars'.
-            return polars_frame(self._lazy_dataset(**kwargs))
+            return polars_frame(self._lazy_dataset(follow_latest=follow_latest, **kwargs))
         frame = pl.DataFrame(self.to_arrow(**kwargs))
         return frame.lazy() if lazy else frame
 
-    def _lazy_dataset(self, **kwargs: Any) -> Any:
-        """A pyarrow Dataset that scans this table when (and as far as) it is read."""
+    def _lazy_dataset(
+        self, *, follow_latest: bool = False, duckdb_filters: bool = False, **kwargs: Any
+    ) -> Any:
+        """A pyarrow Dataset that scans this table when (and as far as) it is read.
+
+        Every scan reads the version current when the dataset was made, as a
+        pinned handle does: one DuckDB statement scans a relation once per
+        reference (a self-join twice), and a LazyFrame once per collect, so
+        re-resolving the latest each time mixed two snapshots in one answer,
+        and a frame made before an overwrite yielded the new columns under the
+        old declared schema. ``follow_latest=True`` reads the latest version
+        at every scan instead; a scan whose schema is no longer the one the
+        dataset declared then raises MetadataChangedError.
+
+        ``duckdb_filters`` is for a dataset DuckDB scans: the filters it
+        pushes are evaluated with DuckDB's semantics (see `_lazy`).
+        """
         _require("pyarrow", "pyarrow")
         from ._lazy import TableDataset
 
+        if not isinstance(follow_latest, bool):
+            raise InvalidArgumentError(
+                f"follow_latest must be True or False, got {follow_latest!r}"
+            )
         columns = kwargs.pop("columns", None)
         predicate = kwargs.pop("predicate", None)
+        source = self
+        if (
+            not follow_latest
+            and self._version is None
+            and kwargs.get("version") is None
+            and kwargs.get("timestamp") is None
+        ):
+            pinned = self._current_version()
+            if pinned is not None:
+                # A handle, not a scan option: count_rows() still answers
+                # from the log, at that version.
+                source = Table(self._connection, self._resolved, version=pinned)
         # The stream's own schema, which is what every later scan yields.
-        schema = self.head(0, columns=columns, predicate=predicate, **kwargs).schema
+        schema = source.head(0, columns=columns, predicate=predicate, **kwargs).schema
+        # The hand-offs show a VARIANT as its JSON text, but the scan filters
+        # the binary value: a pushed `v = '"x"'` compared a struct with a
+        # string and failed. Nothing on such a column is pushed.
+        opaque = frozenset(p[0] for p in self._variant_paths() if len(p) == 1)
         return TableDataset(
-            self, schema, columns=_columns_arg(columns), predicate=predicate, scan_options=kwargs
+            source,
+            schema,
+            columns=_columns_arg(columns),
+            predicate=predicate,
+            scan_options=kwargs,
+            opaque=opaque,
+            duckdb_filters=duckdb_filters,
         )
 
-    def to_duckdb(self, connection: Any = None, *, name: str | None = None, **kwargs: Any) -> Any:
+    def _current_version(self) -> int | None:
+        """The latest version, to pin a lazy hand-off to; None where one cannot be read at it.
+
+        A table that cannot be read at a version (time travel refused, say, by
+        an access policy) is read at the latest by each scan, as before, with
+        the declared schema still checked.
+        """
+        try:
+            version = self.version
+        except DeltaSwampError:
+            return None
+        if version is None or not self.can(Operation.SCAN, version=version).ok:
+            return None
+        return version
+
+    def to_duckdb(
+        self,
+        connection: Any = None,
+        *,
+        name: str | None = None,
+        follow_latest: bool = False,
+        **kwargs: Any,
+    ) -> Any:
         """A DuckDB relation over the table. With `name`, also a view of that name.
 
         DuckDB's own delta extension is C++ and knows nothing of Unity Catalog
         credentials or catalog-managed commits, so the relation reads through
         this library instead -- lazily, each time it runs, with DuckDB's
-        projection and simple filters pushed into the scan.
+        projection and simple filters pushed into the scan. Every run reads
+        the version current when the relation was made (so one statement sees
+        one snapshot); ``follow_latest=True`` reads the latest at each scan.
         """
         duckdb = _require("duckdb", "duckdb")
-        data = self.to_arrow(**kwargs) if "limit" in kwargs else self._lazy_dataset(**kwargs)
+        data = (
+            self.to_arrow(**kwargs)
+            if "limit" in kwargs
+            else self._lazy_dataset(follow_latest=follow_latest, duckdb_filters=True, **kwargs)
+        )
         con = connection
         if con is None and name is not None:
             # The view has to live where it can be queried by name. On a
@@ -1691,14 +1762,18 @@ class Table:
         daft = _require("daft", "daft")
         return daft.from_arrow(self.to_arrow(**kwargs))
 
-    def to_pyarrow_dataset(self, **kwargs: Any) -> Any:
-        """A pyarrow Dataset that scans the table when read, pushing columns and filters down."""
+    def to_pyarrow_dataset(self, *, follow_latest: bool = False, **kwargs: Any) -> Any:
+        """A pyarrow Dataset that scans the table when read, pushing columns and filters down.
+
+        Every scan reads the version current when the dataset was made;
+        ``follow_latest=True`` reads the latest at each scan.
+        """
         _require("pyarrow.dataset", "pyarrow")
         if "limit" in kwargs:
             import pyarrow.dataset as dataset
 
             return dataset.dataset(self.to_arrow(**kwargs))
-        return self._lazy_dataset(**kwargs)
+        return self._lazy_dataset(follow_latest=follow_latest, **kwargs)
 
     def head(self, n: int = 5, **kwargs: Any) -> Any:
         """The first `n` rows.

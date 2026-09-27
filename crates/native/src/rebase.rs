@@ -525,11 +525,6 @@ fn footer(store: Arc<DynObjectStore>, file: &FileMeta) -> DeltaResult<Arc<Parque
     Ok(block(async move { reader.get_metadata(None).await })?)
 }
 
-/// Read the footer of one data file and decide how it must be read.
-fn file_spec(store: Arc<DynObjectStore>, file: &FileMeta) -> DeltaResult<RebaseSpec> {
-    RebaseSpec::from_footer(&*footer(store, file)?, file.location.as_str())
-}
-
 /// Which of `files` (`(path, size)`, the path relative to `table_root` as the
 /// log spells it) a reader that does not rebase would misread: files Spark
 /// wrote in its legacy hybrid calendar, and files storing INT96 timestamps,
@@ -575,16 +570,29 @@ impl ParquetHandler for RebasingParquet {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        if !needs_footer(&physical_schema) || files.is_empty() {
+        let rebase = needs_footer(&physical_schema);
+        let maps = has_map_of_structs(&physical_schema);
+        if !(rebase || maps) || files.is_empty() {
             return self
                 .inner
                 .read_parquet_files(files, physical_schema, predicate);
         }
-        let mut specs = Vec::with_capacity(files.len());
+        let mut plans = Vec::with_capacity(files.len());
         for file in files {
-            specs.push(file_spec(self.store.clone(), file)?);
+            let metadata = footer(self.store.clone(), file)?;
+            let spec = if rebase {
+                RebaseSpec::from_footer(&metadata, file.location.as_str())?
+            } else {
+                RebaseSpec::default()
+            };
+            let ordered = if maps {
+                file_ordered(&physical_schema, &metadata)?
+            } else {
+                None
+            };
+            plans.push((spec, ordered));
         }
-        if specs.iter().all(|s| !s.own_read()) {
+        if plans.iter().all(|(s, o)| !s.own_read() && o.is_none()) {
             return self
                 .inner
                 .read_parquet_files(files, physical_schema, predicate);
@@ -593,8 +601,8 @@ impl ParquetHandler for RebasingParquet {
         // spec. No row-group pushdown for a rebased file: its Parquet
         // statistics are in the Julian calendar too.
         let mut out: Vec<FileDataReadResultIterator> = Vec::with_capacity(files.len());
-        for (file, spec) in files.iter().zip(specs) {
-            if !spec.own_read() {
+        for (file, (spec, ordered)) in files.iter().zip(plans) {
+            if !spec.own_read() && ordered.is_none() {
                 out.push(self.inner.read_parquet_files(
                     std::slice::from_ref(file),
                     physical_schema.clone(),
@@ -603,31 +611,34 @@ impl ParquetHandler for RebasingParquet {
                 continue;
             }
             let location = file.location.to_string();
+            let read_schema = ordered.clone().unwrap_or_else(|| physical_schema.clone());
             let batches: Box<dyn Iterator<Item = DeltaResult<RecordBatch>> + Send> =
                 if spec.int96_micros {
                     Box::new(Int96MicrosRead::open(
                         self.store.clone(),
                         file,
-                        physical_schema.clone(),
+                        read_schema,
                     )?)
                 } else {
                     Box::new(
                         self.inner
                             .read_parquet_files(
                                 std::slice::from_ref(file),
-                                physical_schema.clone(),
-                                None,
+                                read_schema,
+                                if spec.any() { None } else { predicate.clone() },
                             )?
                             .map(|data| data?.try_into_record_batch()),
                     )
                 };
+            let requested = ordered.is_some().then(|| physical_schema.clone());
             out.push(Box::new(batches.map(move |batch| {
-                let batch = batch?;
-                let batch = if spec.any() {
-                    rebase_batch(batch, &spec, &location)?
-                } else {
-                    batch
-                };
+                let mut batch = batch?;
+                if let Some(requested) = &requested {
+                    batch = requested_order(batch, requested)?;
+                }
+                if spec.any() {
+                    batch = rebase_batch(batch, &spec, &location)?;
+                }
                 Ok(Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
             })));
         }
@@ -645,6 +656,233 @@ impl ParquetHandler for RebasingParquet {
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
+}
+
+// ------------------------------------------------------------------------
+// Maps of structs, read in the file's field order.
+//
+// The kernel's Parquet reader rebuilds a MAP column whose value struct it has
+// to reorder (`reorder_map` in delta_kernel's arrow_utils) with the map
+// *entries* field's nullability -- always false -- for the column itself, so
+// the first NULL map in a batch fails with "Found unmasked nulls for
+// non-nullable StructArray field". A VARIANT always needs that reorder when
+// Spark or Databricks wrote it: the file stores `value, metadata`, the kernel
+// asks for `metadata, value`. So a MAP<STRING, VARIANT> with a NULL row could
+// not be read at all. For such a file the structs under a map are requested
+// in the order the file stores them (a VARIANT as the plain struct it is on
+// disk), which leaves the kernel nothing to reorder there, and each batch is
+// put back into the requested order here.
+
+/// Whether `schema` has a MAP with a struct (or VARIANT) somewhere under it.
+fn has_map_of_structs(schema: &SchemaRef) -> bool {
+    fn under_map(t: &KernelType) -> bool {
+        match t {
+            KernelType::Struct(_) | KernelType::Variant(_) => true,
+            KernelType::Array(a) => under_map(a.element_type()),
+            KernelType::Map(m) => under_map(m.key_type()) || under_map(m.value_type()),
+            _ => false,
+        }
+    }
+    fn walk(t: &KernelType) -> bool {
+        match t {
+            KernelType::Struct(s) => s.fields().any(|f| walk(f.data_type())),
+            KernelType::Array(a) => walk(a.element_type()),
+            KernelType::Map(m) => under_map(m.key_type()) || under_map(m.value_type()),
+            _ => false,
+        }
+    }
+    schema.fields().any(|f| walk(f.data_type()))
+}
+
+/// `requested` with every struct under a map in `metadata`'s field order, or
+/// None when that is already its order (or the file does not say).
+fn file_ordered(
+    requested: &SchemaRef,
+    metadata: &ParquetMetaData,
+) -> DeltaResult<Option<SchemaRef>> {
+    let file = metadata.file_metadata();
+    let arrow = delta_kernel::parquet::arrow::parquet_to_arrow_schema(
+        file.schema_descr(),
+        file.key_value_metadata(),
+    )?;
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(requested.num_fields());
+    for field in requested.fields() {
+        let mut field = field.clone();
+        if let Ok(on_disk) = arrow.field_with_name(field.name()) {
+            if let Some(t) = order_type(&field.data_type, on_disk.data_type(), false)? {
+                field.data_type = t;
+                changed = true;
+            }
+        }
+        fields.push(field);
+    }
+    Ok(if changed {
+        Some(Arc::new(delta_kernel::schema::StructType::try_new(fields)?))
+    } else {
+        None
+    })
+}
+
+/// `want` in the order of `on_disk` where it is under a map; None if unchanged.
+fn order_type(
+    want: &KernelType,
+    on_disk: &DataType,
+    in_map: bool,
+) -> DeltaResult<Option<KernelType>> {
+    use delta_kernel::schema::{ArrayType, MapType, StructType};
+    Ok(match (want, on_disk) {
+        (KernelType::Map(m), DataType::Map(entries, _)) => {
+            let DataType::Struct(kv) = entries.data_type() else {
+                return Ok(None);
+            };
+            if kv.len() != 2 {
+                return Ok(None);
+            }
+            let key = order_type(m.key_type(), kv[0].data_type(), true)?;
+            let value = order_type(m.value_type(), kv[1].data_type(), true)?;
+            if key.is_none() && value.is_none() {
+                return Ok(None);
+            }
+            Some(KernelType::Map(Box::new(MapType::new(
+                key.unwrap_or_else(|| m.key_type().clone()),
+                value.unwrap_or_else(|| m.value_type().clone()),
+                m.value_contains_null(),
+            ))))
+        }
+        (KernelType::Array(a), DataType::List(f) | DataType::LargeList(f)) => {
+            order_type(a.element_type(), f.data_type(), in_map)?.map(|element| {
+                KernelType::Array(Box::new(ArrayType::new(element, a.contains_null())))
+            })
+        }
+        (KernelType::Variant(s), DataType::Struct(disk)) if in_map => {
+            // Only the unshredded form: anything else is left for the
+            // kernel's reader to refuse as shredded.
+            let names: Vec<&str> = disk.iter().map(|f| f.name().as_str()).collect();
+            if *want != KernelType::unshredded_variant() || names != ["value", "metadata"] {
+                return Ok(None);
+            }
+            let fields = ["value", "metadata"]
+                .iter()
+                .filter_map(|n| s.fields().find(|f| f.name() == n).cloned());
+            Some(KernelType::Struct(Box::new(StructType::try_new(fields)?)))
+        }
+        (KernelType::Struct(s), DataType::Struct(disk)) => {
+            let mut changed = false;
+            let mut fields = Vec::with_capacity(s.num_fields());
+            for field in s.fields() {
+                let mut field = field.clone();
+                if let Some(d) = disk.iter().find(|d| d.name() == field.name()) {
+                    if let Some(t) = order_type(&field.data_type, d.data_type(), in_map)? {
+                        field.data_type = t;
+                        changed = true;
+                    }
+                }
+                fields.push(field);
+            }
+            if in_map {
+                let position = |name: &str| disk.iter().position(|d| d.name() == name);
+                let before: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
+                // Fields the file lacks keep their place after those it has.
+                fields.sort_by_key(|f| position(f.name()).unwrap_or(usize::MAX));
+                changed |= fields.iter().map(|f| f.name()).ne(before.iter());
+            }
+            if !changed {
+                return Ok(None);
+            }
+            Some(KernelType::Struct(Box::new(StructType::try_new(fields)?)))
+        }
+        _ => None,
+    })
+}
+
+/// `batch`, read with [`file_ordered`]'s schema, with its structs back in the
+/// order of `requested`.
+fn requested_order(batch: RecordBatch, requested: &SchemaRef) -> DeltaResult<RecordBatch> {
+    let schema = batch.schema();
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let column = match requested.field(field.name()) {
+            Some(want) => reorder_array(column, want.data_type())?,
+            None => column.clone(),
+        };
+        fields.push(Arc::new(
+            Field::clone(field).with_data_type(column.data_type().clone()),
+        ));
+        columns.push(column);
+    }
+    let schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+    Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
+}
+
+fn reorder_array(array: &ArrayRef, want: &KernelType) -> DeltaResult<ArrayRef> {
+    let retyped = |f: &FieldRef, a: &ArrayRef| -> FieldRef {
+        Arc::new(Field::clone(f).with_data_type(a.data_type().clone()))
+    };
+    Ok(match (want, array.data_type()) {
+        (KernelType::Struct(s) | KernelType::Variant(s), DataType::Struct(have)) => {
+            let sa = array.as_struct();
+            let mut fields = Vec::with_capacity(s.num_fields());
+            let mut columns = Vec::with_capacity(s.num_fields());
+            for want_field in s.fields() {
+                let Some(i) = have.iter().position(|f| f.name() == want_field.name()) else {
+                    return Err(Error::generic(format!(
+                        "field {:?} is missing from a struct read in file order",
+                        want_field.name()
+                    )));
+                };
+                let column = reorder_array(sa.column(i), want_field.data_type())?;
+                fields.push(retyped(&have[i], &column));
+                columns.push(column);
+            }
+            Arc::new(StructArray::try_new(
+                fields.into(),
+                columns,
+                sa.nulls().cloned(),
+            )?)
+        }
+        (KernelType::Array(a), DataType::List(f)) => {
+            let l = array.as_list::<i32>();
+            let values = reorder_array(l.values(), a.element_type())?;
+            Arc::new(ListArray::try_new(
+                retyped(f, &values),
+                l.offsets().clone(),
+                values,
+                l.nulls().cloned(),
+            )?)
+        }
+        (KernelType::Array(a), DataType::LargeList(f)) => {
+            let l = array.as_list::<i64>();
+            let values = reorder_array(l.values(), a.element_type())?;
+            Arc::new(LargeListArray::try_new(
+                retyped(f, &values),
+                l.offsets().clone(),
+                values,
+                l.nulls().cloned(),
+            )?)
+        }
+        (KernelType::Map(m), DataType::Map(entries_field, ordered)) => {
+            let map = array.as_map();
+            let entries = map.entries();
+            let DataType::Struct(kv) = entries_field.data_type() else {
+                return Ok(array.clone());
+            };
+            let key = reorder_array(entries.column(0), m.key_type())?;
+            let value = reorder_array(entries.column(1), m.value_type())?;
+            let kv_fields = vec![retyped(&kv[0], &key), retyped(&kv[1], &value)];
+            let entries =
+                StructArray::try_new(kv_fields.into(), vec![key, value], entries.nulls().cloned())?;
+            Arc::new(MapArray::try_new(
+                Arc::new(Field::clone(entries_field).with_data_type(entries.data_type().clone())),
+                map.offsets().clone(),
+                entries,
+                map.nulls().cloned(),
+                *ordered,
+            )?)
+        }
+        _ => array.clone(),
+    })
 }
 
 /// The shared engine, reading Parquet through [`RebasingParquet`].
