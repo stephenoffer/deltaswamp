@@ -134,6 +134,10 @@ def connect(
             staging_volume=staging_volume,
         )
 
+    if default_catalog is None:
+        # A metastore has two levels: `db.table` on an hms:// or glue://
+        # connection was refused as "a two-part name ... no default catalog".
+        default_catalog = getattr(resolved_catalog, "default_catalog_name", None)
     return Connection(
         catalog=resolved_catalog,
         router=Router(

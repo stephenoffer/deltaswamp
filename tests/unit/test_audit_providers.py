@@ -297,3 +297,128 @@ class TestOssUnityCatalog:
         assert OSSUnityCatalog("http://h").preflight() == []
         self._serve(monkeypatch, 404, "nope")
         assert OSSUnityCatalog("http://h").preflight()
+
+
+# ------------------------------------------------------------ PV-4, PV-15
+
+
+class TApplicationException(Exception):
+    pass
+
+
+class NoSuchObjectException(Exception):
+    pass
+
+
+@pytest.fixture
+def hms4(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A Hive 4 metastore: get_table_req only, get_table is an invalid method."""
+    import sys
+    import types
+
+    state: dict[str, Any] = {"dropped": [], "tables": {}}
+
+    class GetTableRequest:
+        def __init__(self, dbName: str, tblName: str, **_: Any) -> None:
+            self.dbName, self.tblName = dbName, tblName
+
+    class Client:
+        def get_table(self, db: str, name: str) -> Any:
+            raise TApplicationException("Invalid method name: 'get_table'")
+
+        def get_table_req(self, req: Any) -> Any:
+            key = (req.dbName, req.tblName)
+            if key not in state["tables"]:
+                raise NoSuchObjectException(f"{key} table not found")
+            return types.SimpleNamespace(table=state["tables"][key])
+
+        def get_all_databases(self) -> list[str]:
+            return ["default", "db"]
+
+        def drop_table(self, db: str, name: str, delete_data: bool) -> None:
+            state["dropped"].append((db, name, delete_data))
+
+    Client.__module__ = "fakehms.ThriftHiveMetastore"
+    ttypes = types.ModuleType("fakehms.ttypes")
+    ttypes.GetTableRequest = GetTableRequest  # type: ignore[attr-defined]
+
+    class Connection:
+        def __enter__(self) -> Any:
+            return types.SimpleNamespace(client=Client())
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+    module = types.ModuleType("pymetastore.metastore")
+    module.HMS = types.SimpleNamespace(create=lambda host, port: Connection())  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pymetastore", types.ModuleType("pymetastore"))
+    monkeypatch.setitem(sys.modules, "pymetastore.metastore", module)
+    monkeypatch.setitem(sys.modules, "fakehms", types.ModuleType("fakehms"))
+    monkeypatch.setitem(sys.modules, "fakehms.ttypes", ttypes)
+    state["tables"][("db", "t")] = types.SimpleNamespace(
+        parameters={"spark.sql.sources.provider": "delta"},
+        tableType="EXTERNAL_TABLE",
+        viewOriginalText=None,
+        sd=types.SimpleNamespace(
+            location="s3://b/t", serdeInfo=types.SimpleNamespace(parameters=None)
+        ),
+    )
+    return state
+
+
+class TestHiveMetastore:
+    def test_hive_4_tables_resolve(self, hms4: dict[str, Any]) -> None:
+        from deltaswamp.catalog.hms import HiveMetastoreCatalog
+
+        cat = HiveMetastoreCatalog("hms://h:9083")
+        assert cat.resolve(parse_ref("hive_metastore.db.t")).location == "s3://b/t"
+        with pytest.raises(InvalidReferenceError, match="does not exist"):
+            cat.resolve(parse_ref("hive_metastore.db.nope"))
+        assert cat.preflight() == []
+
+    def test_two_part_names_and_foreign_catalog_parts(self, hms4: dict[str, Any]) -> None:
+        import deltaswamp as ds
+
+        conn = ds.connect("hms://h:9083")
+        assert conn.table("db.t").resolved.location == "s3://b/t"
+        with pytest.raises(InvalidReferenceError, match="only databases and tables"):
+            conn.table("prod.db.t")
+
+    def test_namespaces_and_drop(self, hms4: dict[str, Any]) -> None:
+        from deltaswamp.catalog.hms import HiveMetastoreCatalog
+
+        cat = HiveMetastoreCatalog("hms://h:9083")
+        assert cat.list_catalogs() == ["hive_metastore"]
+        assert cat.list_schemas("hive_metastore") == ["default", "db"]
+        cat.drop_table(parse_ref("hive_metastore.db.t"))
+        assert hms4["dropped"] == [("db", "t", False)]  # data kept
+
+
+class TestGlue:
+    def test_namespaces_drop_and_catalog_parts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+        import types
+
+        from deltaswamp.catalog.glue import GlueCatalog
+
+        deleted: list[dict[str, Any]] = []
+
+        class Paginator:
+            def paginate(self, **kwargs: Any) -> Any:
+                yield {"DatabaseList": [{"Name": "a"}]}
+                yield {"DatabaseList": [{"Name": "b"}]}
+
+        client = types.SimpleNamespace(
+            get_paginator=lambda name: Paginator(),
+            delete_table=lambda **kwargs: deleted.append(kwargs),
+        )
+        boto3 = types.ModuleType("boto3")
+        boto3.client = lambda service, region_name=None: client  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "boto3", boto3)
+        cat = GlueCatalog()
+        assert cat.list_catalogs() == ["glue"]
+        assert cat.list_schemas("glue") == ["a", "b"]
+        cat.drop_table(parse_ref("glue://db.t"))
+        assert deleted == [{"DatabaseName": "db", "Name": "t"}]
+        with pytest.raises(InvalidReferenceError, match="only databases and tables"):
+            cat.resolve(parse_ref("prod.db.t"))
