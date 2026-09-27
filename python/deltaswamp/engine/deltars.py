@@ -155,6 +155,9 @@ class DeltaRsEngine:
     #: delta-rs 1.x writes -1.5 as the partition value '-1.-50' and commits it,
     #: leaving the table unreadable, so such writes route elsewhere.
     supports_negative_decimal_partition_values = False
+    #: cdf(allow_out_of_range=True): a range past the last version reads what
+    #: there is. The kernel and the warehouse refuse the option.
+    supports_out_of_range_feed = True
 
     def __init__(self, *, storage_options: dict[str, str] | None = None) -> None:
         self._base_options = dict(storage_options or {})
@@ -166,6 +169,12 @@ class DeltaRsEngine:
         """Why a request need this engine has in general fails on `table`."""
         if needs & {"schema_merge", "schema_overwrite"} and _column_mapped(table):
             return _CM_SCHEMA_EVOLUTION
+        if "conditional_insert_with_feed" in needs:
+            # The MERGE builder's own refusal at execute(), stated up front.
+            return (
+                "the table has the change data feed enabled, and delta-rs 1.6.5 inserts an "
+                "all-NULL row for each source row a conditional WHEN NOT MATCHED clause rejects"
+            )
         return unpartitioned_dynamic_overwrite(needs, table)
 
     def supports(self, operation: Operation, table: ResolvedTable, **shape: Any) -> Capability:

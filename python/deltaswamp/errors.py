@@ -3,8 +3,13 @@ exists, the remedy."""
 
 from __future__ import annotations
 
+from typing import Any, TypeVar
+
 #: The remedy for anything only a Databricks SQL warehouse can serve.
 SQL_FALLBACK_REMEDY = "ds.connect(..., allow_sql_fallback=True)"
+
+
+_E = TypeVar("_E", bound=BaseException)
 
 
 class DeltaSwampError(Exception):
@@ -88,9 +93,10 @@ class EngineError(DeltaSwampError):
     failure. `engine` names the engine, `operation` the call it failed in,
     and `original` is the engine's exception (also the `__cause__`).
 
-    An engine's builtin error stays an instance of its builtin class as well
-    (a raw `OSError` becomes an `EngineError` that is also an `OSError`), so
-    code catching the builtin keeps working.
+    The error stays an instance of the original's class as well, so code
+    catching it keeps working: a raw `OSError` becomes an `EngineError` that
+    is also an `OSError`, a `pyarrow.ArrowInvalid` one that is also an
+    `ArrowInvalid` (see `combined` for which classes qualify).
     """
 
     def __init__(
@@ -107,63 +113,154 @@ class EngineError(DeltaSwampError):
         self.original = original
 
     def __reduce__(self) -> tuple[object, ...]:
-        # A class made by `engine_error` is not importable by name, and the
+        # A class made by `combined` is not importable by name, and the
         # original may not pickle at all (a Rust exception): rebuild from the
-        # builtin base's name and the message, as raised on a Ray worker.
-        builtin = next((c for c in type(self).__mro__ if c.__module__ == "builtins"), Exception)
-        return (
-            _rebuild_engine_error,
-            (builtin.__name__, self.args[0] if self.args else "", self.engine, self.operation),
+        # class it was combined with and the message, as raised on a Ray
+        # worker, with the rest of the state (errno, filename) kept.
+        return _reduced(
+            self, EngineError, {"engine": self.engine, "operation": self.operation}, ("original",)
         )
 
 
-_ENGINE_ERROR_CLASSES: dict[type[BaseException], type[EngineError]] = {}
+#: Modules whose exception classes are never combined with this library's:
+#: Rust extensions (delta-rs's `_internal`, this library's `_native`, pyo3's
+#: panics, Polars), whose types the translation exists to replace.
+_FOREIGN_MODULES = ("_internal", "deltalake", "deltaswamp", "pyo3_runtime", "polars", "daft")
+
+#: Py_TPFLAGS_BASETYPE: the class may be subclassed.
+_BASETYPE = 1 << 10
+
+_COMBINED: dict[tuple[type[BaseException], type[BaseException]], type[BaseException] | None] = {}
+
+
+def _combinable(cls: type) -> bool:
+    """Whether `cls` may be a base of a translated error, beside this library's class."""
+    if cls in (Exception, BaseException) or not issubclass(cls, Exception):
+        return False
+    if issubclass(cls, DeltaSwampError) or not cls.__flags__ & _BASETYPE:
+        return False
+    module = cls.__module__ or ""
+    return module.split(".")[0] not in _FOREIGN_MODULES
+
+
+def _combined_class(base: type[_E], other: type[BaseException]) -> type[_E] | None:
+    key = (base, other)
+    if key not in _COMBINED:
+        try:
+            # str() is the translated message: KeyError's own __str__ quoted it.
+            cls: type[BaseException] | None = type(
+                f"{base.__name__}[{other.__name__}]",
+                (base, other),
+                {"__str__": BaseException.__str__, "_combined_with": other},
+            )
+            cls.__module__ = __name__
+        except TypeError:  # bases whose layouts cannot be combined
+            cls = None
+        _COMBINED[key] = cls
+    return _COMBINED[key]  # type: ignore[return-value]
+
+
+def combined(
+    base: type[_E],
+    like: BaseException | type[BaseException] | None,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> _E:
+    """`base(*args, **kwargs)`, made an instance of `like`'s class too where it can be.
+
+    The rule: `like`'s own class if it qualifies, else the nearest
+    ancestor that does. A class qualifies when it is an Exception below
+    `Exception` itself, can be subclassed, is not a Rust extension's type (see
+    `_FOREIGN_MODULES`) nor this library's, and the combined class can be
+    built from the message alone -- UnicodeDecodeError or ExceptionGroup
+    cannot, and an ancestor (ValueError) is used instead. With none, the
+    error is a plain `base`.
+    """
+    cls = like if isinstance(like, type) else type(like)
+    if like is not None:
+        for candidate in cls.__mro__:
+            if issubclass(base, candidate):
+                break  # `base` is one already (StorageError is an OSError)
+            if not _combinable(candidate):
+                continue
+            made = _combined_class(base, candidate)
+            if made is None:
+                continue
+            try:
+                return made(*args, **kwargs)
+            except Exception:  # a constructor that needs more than a message
+                continue
+    return base(*args, **kwargs)
+
+
+def _reduced(
+    error: BaseException, base: type, kwargs: dict[str, Any], dropped: tuple[str, ...] = ()
+) -> tuple[object, ...]:
+    other = getattr(type(error), "_combined_with", None)
+    ref = (other.__module__, other.__qualname__) if other is not None else None
+    state = {k: v for k, v in vars(error).items() if k not in dropped}
+    if isinstance(error, OSError):
+        # Held in slots, not the instance dict: pickling lost them.
+        state.update(
+            (name, getattr(error, name))
+            for name in ("errno", "strerror", "filename")
+            if getattr(error, name) is not None
+        )
+    return (_rebuild_error, (base, ref, error.args[0] if error.args else "", kwargs), state)
+
+
+def _rebuild_error(
+    base: type[_E], ref: tuple[str, str] | None, message: str, kwargs: dict[str, Any]
+) -> _E:
+    other: Any = None
+    if ref is not None:
+        import importlib
+
+        try:
+            other = importlib.import_module(ref[0])
+            for part in ref[1].split("."):
+                other = getattr(other, part)
+        except Exception:  # not importable where it is unpickled
+            other = None
+    if not (isinstance(other, type) and issubclass(other, BaseException)):
+        other = None
+    return combined(base, other, message, **kwargs)
 
 
 def engine_error(
     message: str, *, engine: str, operation: str, original: BaseException
 ) -> EngineError:
-    """An EngineError that is also an instance of `original`'s nearest builtin class."""
-    builtin = next((c for c in type(original).__mro__ if c.__module__ == "builtins"), Exception)
-    if builtin in (Exception, BaseException) or not issubclass(builtin, Exception):
-        cls: type[EngineError] = EngineError
-    else:
-        cls = _ENGINE_ERROR_CLASSES.get(builtin) or _engine_error_class(builtin)
-    try:
-        error = cls(message, engine=engine, operation=operation, original=original)
-    except TypeError:
-        # A builtin whose constructor takes more than a message
-        # (UnicodeDecodeError, ExceptionGroup): the combined class cannot be
-        # built from one, and the TypeError escaped raw in place of the error.
-        error = EngineError(message, engine=engine, operation=operation, original=original)
+    """An EngineError that is also an instance of `original`'s class, where it can be."""
+    error = combined(
+        EngineError, original, message, engine=engine, operation=operation, original=original
+    )
     if isinstance(original, OSError) and isinstance(error, OSError):
         error.errno = original.errno
+        if original.filename is not None:
+            error.filename = original.filename
     return error
-
-
-def _engine_error_class(builtin: type[BaseException]) -> type[EngineError]:
-    try:
-        cls = type(f"EngineError[{builtin.__name__}]", (EngineError, builtin), {})
-    except TypeError:  # a builtin whose layout cannot be combined
-        cls = EngineError
-    cls.__module__ = __name__
-    _ENGINE_ERROR_CLASSES[builtin] = cls
-    return cls
 
 
 def _rebuild_engine_error(
     builtin: str, message: str, engine: str | None, operation: str | None
 ) -> EngineError:
+    # Pickles made before `_reduced`; kept so they still load.
     import builtins
 
-    base = getattr(builtins, builtin, Exception)
-    if not (isinstance(base, type) and issubclass(base, Exception)) or base is Exception:
-        return EngineError(message, engine=engine, operation=operation)
-    cls = _ENGINE_ERROR_CLASSES.get(base) or _engine_error_class(base)
-    try:
-        return cls(message, engine=engine, operation=operation)
-    except TypeError:  # see engine_error
-        return EngineError(message, engine=engine, operation=operation)
+    base = getattr(builtins, builtin, None)
+    other = base if isinstance(base, type) and issubclass(base, BaseException) else None
+    return combined(EngineError, other, message, engine=engine, operation=operation)
+
+
+class CommitRefusedError(EngineError):
+    """The engine refused a commit for a reason other than a lost race.
+
+    delta-rs's CommitFailedError that is not a conflict: a remove on an
+    append-only table, a protocol it will not write, a failure writing the
+    commit file. Retrying the same commit meets the same refusal. An
+    EngineError, which it used to arrive as.
+    """
 
 
 class DeltaSwampWarning(UserWarning):
@@ -251,9 +348,18 @@ class TransientCommitError(DeltaSwampError):
 class StorageError(DeltaSwampError, OSError):
     """The table's storage failed a request: unreachable, throttling, no such bucket.
 
-    An engine's raw OSError, which `except DeltaSwampError` did not catch. An
-    OSError too, so code that catches the builtin keeps working.
+    An engine's raw OSError, which `except DeltaSwampError` did not catch. It
+    stays an instance of that error's class (a `TimeoutError` or a
+    `ConnectionResetError` too, as `combined` builds it), so code catching the
+    builtin, and retry policies keyed on it, keep working.
     """
+
+    # The message, whatever errno or filename are set: OSError's own __str__
+    # printed "[Errno None] None: None" once filename was.
+    __str__ = BaseException.__str__
+
+    def __reduce__(self) -> tuple[object, ...]:
+        return _reduced(self, StorageError, {}, ("original",))
 
 
 class CorruptTableError(DeltaSwampError):

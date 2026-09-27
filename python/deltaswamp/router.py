@@ -318,6 +318,8 @@ def _strands_legacy_table(
     if operation not in METADATA_OPERATIONS:
         return None
     writer = table.min_writer_version or 0
+    if writer >= 7:
+        return _strands_feature_table(operation, table, shape)
     if not 3 <= writer <= 6:
         return None
     from .engine.metadata import _LEGACY_WRITER
@@ -340,6 +342,45 @@ def _strands_legacy_table(
         f"cannot write {', '.join(unwritable)}, so no local engine could write the table "
         "afterwards. Make this change from Databricks, which can go on writing it, or copy "
         "the data into a table created with table features"
+    )
+
+
+def _writes(features: set[str], engine: str) -> bool:
+    """Whether `engine` (``kernel`` or ``deltars``) writes a table listing `features`."""
+    for name in features:
+        feature = feature_from_wire(name)
+        if feature is None or getattr(FEATURE_SUPPORT[feature], f"{engine}_write") is Support.NO:
+            return False
+    return True
+
+
+def _strands_feature_table(
+    operation: Operation, table: ResolvedTable, shape: dict[str, object]
+) -> str | None:
+    """`_strands_legacy_table` for a table already on table features.
+
+    A legacy table moved to features by one change (a change feed, then
+    deletion vectors) keeps listing checkConstraints and generatedColumns,
+    which the kernel does not write; a second change adding a feature delta-rs
+    cannot write (typeWidening, clustering) then left no local engine able to
+    write it. Checked only where one could before the change.
+    """
+    current = set(table.effective_writer_features)
+    added = _features_added(operation, shape) - current
+    if not added:
+        return None
+    after = current | added
+    if not (_writes(current, "kernel") or _writes(current, "deltars")):
+        return None
+    if _writes(after, "kernel") or _writes(after, "deltars"):
+        return None
+    kernel_blocks = sorted(n for n in after if not _writes({n}, "kernel"))
+    deltars_blocks = sorted(n for n in after if not _writes({n}, "deltars"))
+    return (
+        f"turning on {', '.join(sorted(added))} would leave no local engine able to write the "
+        f"table: the kernel does not write {', '.join(kernel_blocks)}, and delta-rs does not "
+        f"write {', '.join(deltars_blocks)}. Make this change from Databricks, which can go on "
+        "writing it, or copy the data into a new table created with the features it needs"
     )
 
 
@@ -379,7 +420,9 @@ _COLLATIONS: frozenset[str] = frozenset({"collations", "collations-preview"})
 #: ``variant_free``: the read touches no VARIANT column. ``removes_rows``: the
 #: MERGE's clauses rewrite or delete target rows, which an append-only table
 #: forbids whichever engine runs it.
-_ROUTER_HINTS: frozenset[str] = frozenset({"collation_free", "variant_free", "removes_rows"})
+_ROUTER_HINTS: frozenset[str] = frozenset(
+    {"collation_free", "variant_free", "removes_rows", "conditional_insert_with_feed"}
+)
 #: Operations on a directory with no Delta log yet: can("convert") refused a
 #: Parquet directory because its (absent) log could not be read.
 _NO_LOG_YET: frozenset[Operation] = frozenset({Operation.CREATE, Operation.CONVERT})
@@ -493,6 +536,16 @@ class Router:
 
         if not isinstance(self.engines, GuardedEngines):
             self.engines = GuardedEngines(self.engines)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # `router.engines = {...}` after construction too: it replaced the
+        # guarded mapping with a plain one of raw engines.
+        if name == "engines":
+            from .engine.boundary import GuardedEngines
+
+            if not isinstance(value, GuardedEngines):
+                value = GuardedEngines(value)
+        object.__setattr__(self, name, value)
 
     def _warehouse_names(self, table: ResolvedTable) -> bool:
         """Whether the warehouse this connection talks to can address `table`."""

@@ -20,7 +20,7 @@ import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from .capability import ENGINE_METHODS, Operation
+from .capability import ENGINE_METHODS, READ_OPERATIONS, Capability, Operation
 from .errors import ChangeFeedSchemaChangeError, EngineLimitError, UnreachableTableError
 
 if TYPE_CHECKING:
@@ -70,6 +70,89 @@ def derive(table: Table, operation: Operation, args: Mapping[str, Any], data: An
     return Request(op, frozenset(needs), shape, operation)
 
 
+#: What the calls refuse on a handle opened at a past version (see
+#: `Table._check_writable`): every write, since every engine writes to the
+#: latest version.
+_PINNED_REFUSED: frozenset[Operation] = frozenset(
+    {
+        Operation.APPEND,
+        Operation.OVERWRITE,
+        Operation.REPLACE_WHERE,
+        Operation.MERGE_SCHEMA,
+        Operation.DELETE,
+        Operation.UPDATE,
+        Operation.MERGE,
+        Operation.OPTIMIZE,
+        Operation.ZORDER,
+        Operation.RESTORE,
+        Operation.ADD_COLUMN,
+        Operation.DROP_COLUMN,
+        Operation.RENAME_COLUMN,
+        Operation.SET_PROPERTIES,
+        Operation.ADD_FEATURE,
+        Operation.DROP_FEATURE,
+        Operation.ADD_CONSTRAINT,
+        Operation.DROP_CONSTRAINT,
+        Operation.UNSET_PROPERTIES,
+        Operation.SET_COMMENT,
+        Operation.SET_COLUMN_COMMENT,
+        Operation.ALTER_COLUMN_TYPE,
+        Operation.SET_NOT_NULL,
+        Operation.DROP_NOT_NULL,
+        Operation.CLUSTER_BY,
+        Operation.REORG,
+    }
+)
+
+
+def refusal(table: Table, request: Request) -> Capability | None:
+    """The refusal the call makes of `request` before any engine is asked, if any.
+
+    A handle pinned to a version refuses every write in the method; can()
+    asked only the router, which judged the latest table and said yes.
+    """
+    version = table._version
+    if request.operation is Operation.OVERWRITE and request.shape.get("schema_mode") == "overwrite":
+        kept = _replace_keeps(table)
+        if kept:
+            return Capability(
+                request.asked,
+                ok=False,
+                reason=f"replacing the schema would keep the table's {kept}: delta-rs carries "
+                "them over into the new table, where REPLACE TABLE drops them, and fails or "
+                "enforces them on data that may not have their columns",
+                remedy="drop the constraints first (drop_constraint()), or write the data as "
+                "a new table (write_table() at another location)",
+            )
+    if version is None or request.operation not in _PINNED_REFUSED:
+        return None
+    return Capability(
+        request.asked,
+        ok=False,
+        reason=f"this handle is pinned to version {version}, and every engine writes to the "
+        "latest version",
+        remedy="open the table without version= to write to it",
+    )
+
+
+def _replace_keeps(table: Table) -> str:
+    """What of the old table a schema-replacing overwrite would wrongly keep ("" if nothing)."""
+    from .errors import DeltaSwampError
+
+    kept = []
+    properties = table._enrich().properties
+    if any(str(k).lower().startswith("delta.constraints.") for k in properties):
+        kept.append("CHECK constraints")
+    try:
+        fields = list(table.schema())
+    except (DeltaSwampError, ImportError):
+        fields = []
+    computed = (b"delta.generationExpression", b"delta.identity.")
+    if any(f.metadata and any(k.startswith(computed) for k in f.metadata) for f in fields):
+        kept.append("generated or identity columns")
+    return " and ".join(kept)
+
+
 # ------------------------------------------------------------------- reads
 
 
@@ -96,12 +179,30 @@ def _read(
     return op, needs
 
 
-def _incremental(
+def _feed(
     table: Table, op: Operation, shape: dict[str, Any], data: Any
 ) -> tuple[Operation, set[str]]:
-    # changes() is the incremental read, and it follows the change data feed:
-    # can(INCREMENTAL) refused on every table while changes() served it.
-    return Operation.CDF, set()
+    """cdf() and changes(), which read rows as a scan does and route the same way.
+
+    changes() is the incremental read, and it follows the change data feed:
+    can(INCREMENTAL) refused on every table while changes() served it. The
+    feed was routed with no needs at all, so can("cdf", predicate="id % 2 = 1")
+    named the kernel, whose grammar then refused the call that delta-rs serves.
+    """
+    get = shape.get
+    predicate = get("predicate")
+    needs: set[str] = set()
+    if predicate is not None:
+        needs |= table._predicate_needs(predicate)
+        needs |= table._expression_needs(predicate)
+    needs |= table._variant_needs(get("columns"), predicate)
+    if get("allow_out_of_range"):
+        # Only delta-rs reads past the table's last version; the kernel
+        # refused it at read time, so can() named it and delta-rs served.
+        needs.add("out_of_range_feed")
+    else:
+        shape.pop("allow_out_of_range", None)
+    return Operation.CDF, needs
 
 
 # ------------------------------------------------------------------ writes
@@ -187,11 +288,38 @@ def _merge(
         # can() said "via kernel" and the call then refused.
         needs.add("schema_merge")
     clauses = shape.get("clauses")
-    if isinstance(clauses, (list, tuple)) and any(
-        str(c).startswith(_REMOVING_CLAUSES) for c in clauses
-    ):
+    if isinstance(clauses, str):
+        # One clause named on its own; a set or a single string was ignored,
+        # and can() said yes on an append-only table the call then refused.
+        clauses = (clauses,)
+    if not isinstance(clauses, (list, tuple, set, frozenset)):
+        return Operation.MERGE, needs
+    # Each clause is its method name, or (name, condition) for one with a
+    # condition, as the builder reports them at execute().
+    named = [
+        (str(c[0]), c[1] if len(c) > 1 else None)
+        if isinstance(c, (list, tuple)) and c
+        else (str(c), None)
+        for c in clauses
+    ]
+    if any(name.startswith(_REMOVING_CLAUSES) for name, _ in named):
         needs.add("removes_rows")
+    inserts = [
+        condition
+        for name, condition in named
+        if name.startswith("when_not_matched") and not name.startswith("when_not_matched_by")
+    ]
+    if inserts and inserts[-1] is not None and _change_feed_on(table):
+        # delta-rs inserts an all-NULL row for each source row the last
+        # NOT MATCHED condition rejects on a change-feed table, and refuses
+        # at execute(); can() named it all the same.
+        needs.add("conditional_insert_with_feed")
     return Operation.MERGE, needs
+
+
+def _change_feed_on(table: Table) -> bool:
+    properties = table._enrich().properties
+    return str(properties.get("delta.enableChangeDataFeed", "false")).lower() == "true"
 
 
 # ------------------------------------------------------------- maintenance
@@ -257,8 +385,31 @@ def _set_properties(
 
     properties = shape.get("properties")
     if isinstance(properties, dict) and properties:
+        properties = _spelled(properties)
         shape["properties"] = with_checkpoint_stats(properties, table.properties()) or properties
     return Operation.SET_PROPERTIES, set()
+
+
+def _spelled(properties: dict[Any, Any]) -> dict[Any, Any]:
+    """Property values in the spelling every engine parses (True -> 'true', 10 -> '10').
+
+    The kernel's path normalised a value delta-rs's refused (a bool, ' true ',
+    '7 days'), so can() named delta-rs, which then refused the call. A value
+    neither reads is left as it is, for the engine to refuse.
+    """
+    from .engine.metadata import _canonical_key, _normalise_value
+
+    spelled = {}
+    for key, raw in properties.items():
+        canonical = _canonical_key(key) if isinstance(key, str) else key
+        if raw is None or canonical == "delta.dataSkippingStatsColumns":
+            spelled[key] = raw  # this one is checked against the schema
+            continue
+        try:
+            spelled[key] = _normalise_value(canonical, raw, None, "set properties")  # type: ignore[arg-type]
+        except Exception:
+            spelled[key] = raw
+    return spelled
 
 
 def _cluster_by(
@@ -274,7 +425,8 @@ _Rule = Callable[["Table", Operation, dict[str, Any], Any], tuple[Operation, set
 _RULES: dict[Operation, _Rule] = {
     Operation.SCAN: _read,
     Operation.TIME_TRAVEL: _read,
-    Operation.INCREMENTAL: _incremental,
+    Operation.CDF: _feed,
+    Operation.INCREMENTAL: _feed,
     Operation.APPEND: _write,
     Operation.MERGE_SCHEMA: _write,
     Operation.OVERWRITE: _write,
@@ -320,16 +472,21 @@ class RoutingContractViolation(BaseException):
 
 
 def strict_engine(
-    engine: Any, operation: Operation, elsewhere: Callable[[Any], Any] | None = None
+    engine: Any,
+    operation: Operation,
+    elsewhere: Callable[[Any], Any] | None = None,
+    engines: Mapping[Any, Any] | None = None,
 ) -> Any:
     """`engine`, checked for refusals after routing when strict routing is on.
 
     `elsewhere(kind)` is the router's verdict on the same request with engine
-    `kind` excluded.
+    `kind` excluded. With `engines` (the router's), a read's refusal is put to
+    the engine named there as well: a read changes nothing, and one that both
+    refuse (a version the log does not hold) is about the request.
     """
     if os.environ.get(STRICT_ROUTING_ENV) != "1" or engine is None:
         return engine
-    return _StrictEngine(engine, operation, elsewhere)
+    return _StrictEngine(engine, operation, elsewhere, engines)
 
 
 class _StrictEngine:
@@ -339,14 +496,19 @@ class _StrictEngine:
     that routed it runs as it would without the check.
     """
 
-    __slots__ = ("_elsewhere", "_inner", "_operation")
+    __slots__ = ("_elsewhere", "_engines", "_inner", "_operation")
 
     def __init__(
-        self, inner: Any, operation: Operation, elsewhere: Callable[[Any], Any] | None
+        self,
+        inner: Any,
+        operation: Operation,
+        elsewhere: Callable[[Any], Any] | None,
+        engines: Mapping[Any, Any] | None = None,
     ) -> None:
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_operation", operation)
         object.__setattr__(self, "_elsewhere", elsewhere)
+        object.__setattr__(self, "_engines", engines)
 
     @property  # type: ignore[misc]
     def __class__(self) -> type:
@@ -373,6 +535,7 @@ class _StrictEngine:
             return attr
         kind = getattr(self._inner, "kind", None)
         elsewhere = self._elsewhere
+        engines = self._engines if operation in READ_OPERATIONS else None
 
         def call(*args: Any, **kwargs: Any) -> Any:
             try:
@@ -385,6 +548,10 @@ class _StrictEngine:
                 other = elsewhere(kind) if elsewhere is not None else None
                 if other is None or not getattr(other, "ok", False):
                     raise
+                if engines is not None and _refused_there_too(
+                    engines.get(other.engine), name, args, kwargs
+                ):
+                    raise
                 raise RoutingContractViolation(
                     f"strict routing: {operation.value} was routed to "
                     f"{getattr(kind, 'value', kind)}, whose {name}() then refused it, while "
@@ -392,3 +559,21 @@ class _StrictEngine:
                 ) from exc
 
         return call
+
+
+def _refused_there_too(engine: Any, name: str, args: Any, kwargs: Any) -> bool:
+    """Whether `engine` refuses the same read as a request error (not by a limit of its own)."""
+    from .errors import DeltaSwampError
+
+    if engine is None:
+        return False
+    try:
+        result = getattr(engine, name)(*args, **kwargs)
+    except EngineLimitError:
+        return False
+    except DeltaSwampError:
+        return True
+    close = getattr(result, "close", None)
+    if callable(close):
+        close()
+    return False

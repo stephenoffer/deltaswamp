@@ -854,7 +854,11 @@ Capability(ok=True, engine=Engine.KERNEL, ...)
 for that exact request. When it says ok, the engine it names is the one the
 call uses. When it refuses, the call refuses the same way before writing
 anything. A method name (`z_order`, `compact_logs`, `plan_write`,
-`plan_scan`) can stand in for the operation.
+`plan_scan`) can stand in for the operation. A MERGE clause with a condition
+is given as `(name, condition)`, e.g.
+`clauses=[("when_not_matched_insert_all", "s.v > 0")]`: on a change-feed table
+delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. On a handle
+opened with `version=`, every write is refused.
 
 `Capability` is truthy when `ok`. Every refusal carries a reason, and a remedy
 whenever one exists.
@@ -879,17 +883,18 @@ What no rule recognises arrives as `EngineError`.
 | `CredentialError` | vending or refresh failed |
 | `PreflightError` | a workspace prerequisite is not satisfied |
 | `CommitConflictError` | another writer took that version first |
+| `CommitRefusedError` | an `EngineError`: the engine refused a commit for a reason other than a lost race (a remove on an append-only table, a failure writing the commit file); retrying the same commit meets the same refusal |
 | `MetadataChangedError` | a `CommitConflictError`: a concurrent commit changed the schema, partitioning or column mapping, so the write must be planned again rather than retried |
 | `TransientCommitError` | a commit failed for a transient reason; the table is unchanged, so retry it as is |
 | `BackfillRequiredError` | the catalog wants staged commits published |
-| `StorageError` | the table's storage failed a request (unreachable, throttled, no such bucket); an `OSError` too |
-| `CorruptTableError` | on-disk state failed a correctness check |
+| `StorageError` | the table's storage failed a request (unreachable, throttled, no such bucket); an `OSError` too, and an instance of the storage error's own class (`TimeoutError`, `ConnectionResetError`), so retry policies keyed on those still match |
+| `CorruptTableError` | on-disk state failed a correctness check, or a data file is truncated or replaced (still an instance of the reader's error class, such as `OSError` or `pyarrow.ArrowInvalid`) |
 | `MissingDataFileError` | a `CorruptTableError`: a file the snapshot references was removed (VACUUM, manual delete); `.path` names it |
 | `ChangeFeedSchemaChangeError` | an `UnreachableTableError`: the change feed range crosses a schema change its rows cannot be read across; `.version` names the commit that changed it |
 | `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
 | `SqlStatementError` | the SQL warehouse rejected or failed a statement; the message carries its error |
 | `EnginePanicError` | an engine panicked across the FFI boundary |
-| `EngineError` | an engine failed in a way no error above describes; `.engine`, `.operation` and `.original` (the engine's exception, also the `__cause__`) say where. A builtin error stays an instance of its class too: an engine's `OSError` becomes an `EngineError` that is also an `OSError`. A read that fails this way moves on to the next capable engine, with an `EngineFallbackWarning` |
+| `EngineError` | an engine failed in a way no error above describes; `.engine`, `.operation` and `.original` (the engine's exception, also the `__cause__`) say where. The error stays an instance of the original's class too: an engine's `OSError` becomes an `EngineError` that is also an `OSError`, a `pyarrow.ArrowInvalid` one that is also an `ArrowInvalid`. The class combined is the original's own, or its nearest ancestor that can be: one below `Exception` that can be subclassed and built from a message, and is not a Rust extension's type (delta-rs's `DeltaError` family, this library's native errors, pyo3 panics, Polars'). delta-rs's own types map to this library's: `TableNotFoundError` to `TableNotFoundError`, `DeltaProtocolError` to `EngineLimitError` (or `InvalidArgumentError` for invariant violations), a non-conflict `CommitFailedError` to `CommitRefusedError`. An exception raised by your own data source -- a `__arrow_c_stream__` of yours, or the iterator behind a `RecordBatchReader` you pass -- reaches you as it was raised, not translated. A read that fails this way moves on to the next capable engine, with an `EngineFallbackWarning` |
 
 Warnings all derive from `DeltaSwampWarning` (`SqlFallbackWarning`,
 `EngineFallbackWarning`, `IgnoredPropertyWarning`, `CredentialExpiryWarning`),
