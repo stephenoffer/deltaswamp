@@ -129,7 +129,13 @@ def engine_error(
         cls: type[EngineError] = EngineError
     else:
         cls = _ENGINE_ERROR_CLASSES.get(builtin) or _engine_error_class(builtin)
-    error = cls(message, engine=engine, operation=operation, original=original)
+    try:
+        error = cls(message, engine=engine, operation=operation, original=original)
+    except TypeError:
+        # A builtin whose constructor takes more than a message
+        # (UnicodeDecodeError, ExceptionGroup): the combined class cannot be
+        # built from one, and the TypeError escaped raw in place of the error.
+        error = EngineError(message, engine=engine, operation=operation, original=original)
     if isinstance(original, OSError) and isinstance(error, OSError):
         error.errno = original.errno
     return error
@@ -154,7 +160,10 @@ def _rebuild_engine_error(
     if not (isinstance(base, type) and issubclass(base, Exception)) or base is Exception:
         return EngineError(message, engine=engine, operation=operation)
     cls = _ENGINE_ERROR_CLASSES.get(base) or _engine_error_class(base)
-    return cls(message, engine=engine, operation=operation)
+    try:
+        return cls(message, engine=engine, operation=operation)
+    except TypeError:  # see engine_error
+        return EngineError(message, engine=engine, operation=operation)
 
 
 class DeltaSwampWarning(UserWarning):

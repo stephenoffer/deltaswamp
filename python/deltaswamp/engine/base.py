@@ -281,6 +281,16 @@ class TranslatingStream:
                 if translated is None:
                     raise
                 raise translated from exc
+            except BaseException as exc:
+                # A Rust panic mid-stream is a BaseException that `except
+                # Exception` missed, so it escaped raw while the same panic in
+                # a direct call became EnginePanicError. Everything else that
+                # is not an Exception (KeyboardInterrupt, ...) passes through.
+                if type(exc).__name__ != "PanicException":
+                    raise
+                from ..errors import EnginePanicError
+
+                raise EnginePanicError(f"{self._context}: the engine panicked: {exc}") from exc
             yield batch
 
     def __iter__(self) -> Any:
