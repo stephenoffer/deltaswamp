@@ -213,3 +213,30 @@ class TestDuckDBFilterSemantics:
         assert got == expected
         result = conn.sql(f"SELECT id FROM t WHERE {where}", tables={"t": t})
         assert sorted(result.column("id").to_pylist()) == expected
+
+
+class TestCountThroughLazyHandOffs:
+    """r5lv #2: Polars asks for no columns for count(*), and got a frame of no rows."""
+
+    def test_count_star_counts_every_row(self, conn: Any, tmp_path: Any) -> None:
+        pl = pytest.importorskip("polars")
+        duckdb = pytest.importorskip("duckdb")
+        path = str(tmp_path / "t")
+        conn.write_table(
+            path, pa.table({"id": pa.array([1, 2, None], pa.int64()), "s": ["a", "b", "c"]})
+        )
+        t = conn.open_table(path)
+        for engine in ("polars", "duckdb"):
+            for query, want in (
+                ("SELECT count(*) AS n FROM m", 3),
+                ("SELECT count(1) AS n FROM m", 3),
+                ("SELECT count(id) AS n FROM m", 2),
+                ("SELECT count(*) AS n FROM m WHERE s = 'a'", 1),
+            ):
+                result = conn.sql(query, tables={"m": t}, engine=engine)
+                assert result.column("n").to_pylist() == [want], (engine, query)
+        lf = t.to_polars(lazy=True)
+        assert lf.select(pl.len()).collect().item() == 3
+        context = pl.SQLContext(m=lf)
+        assert context.execute("SELECT count(*) AS n FROM m").collect()["n"].to_list() == [3]
+        assert t.to_duckdb(duckdb.connect()).count("*").fetchone()[0] == 3

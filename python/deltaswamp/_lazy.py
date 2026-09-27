@@ -551,8 +551,13 @@ def polars_frame(dataset: TableDataset) -> Any:
             assert isinstance(frame, pl.DataFrame)
             if predicate is not None:
                 frame = frame.filter(predicate)
-            if with_columns is not None:
+            if with_columns:
                 frame = frame.select(with_columns)
+            elif with_columns is not None:
+                # No columns asked for (count(*)): a frame with none has no
+                # rows either in Polars, so count(*) came back 0. The one
+                # column read keeps the row count; Polars drops it.
+                frame = frame.select(frame.columns[:1])
             if remaining is not None:
                 frame = frame.head(remaining)
                 remaining -= frame.height
