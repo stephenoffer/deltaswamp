@@ -18,6 +18,7 @@ mod runtime;
 mod scan;
 mod snapshot;
 mod store;
+mod writer;
 
 pub use error::{NativeError, Result};
 

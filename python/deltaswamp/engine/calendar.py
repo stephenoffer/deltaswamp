@@ -19,6 +19,18 @@ per-zone rebase tables) and, stored as INT96, values past 2262-04-11, where
 nanoseconds overflow. So the check reads a file's footer only when its
 statistics cannot rule such a value out. Most tables never have one, and cost
 nothing beyond the file listing.
+
+The same values are what delta-rs must not *write*, whatever read them. Spark
+reads a Parquet file whose footer names no Spark version in the mode
+``spark.sql.parquet.datetimeRebaseModeInRead`` gives, and Databricks SQL
+warehouses read those LEGACY: a proleptic ``0001-01-01`` written by delta-rs
+(or pyarrow, or any arrow-rs writer) reads there as ``0001-01-03``, and
+``1500-06-15`` as ``1500-06-05``, while every other reader, deltaswamp's
+included, sees the value written. The kernel's writer names a Spark version
+(``crates/native/src/writer.rs``); delta-rs 1.6.5 has no way to put a key in
+the footer, so the router keeps such values -- in the rows being written
+(`holds_early_datetimes`) or in the files a rewrite copies
+(`early_datetime_files`) -- off it.
 """
 
 from __future__ import annotations
@@ -29,7 +41,12 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
-__all__ = ["has_datetime_columns", "legacy_calendar_files"]
+__all__ = [
+    "early_datetime_files",
+    "has_datetime_columns",
+    "holds_early_datetimes",
+    "legacy_calendar_files",
+]
 
 #: Dates before this are rebased by Spark's legacy calendar.
 _DATE_LIMIT = dt.date(1582, 10, 15)
@@ -42,6 +59,7 @@ _INT96_LIMIT = dt.datetime(2262, 4, 10, tzinfo=dt.UTC)
 
 #: Results per (table root, version); a version's files never change.
 _CACHE: OrderedDict[tuple[str, int], tuple[str, ...]] = OrderedDict()
+_EARLY_CACHE: OrderedDict[tuple[str, int], tuple[str, ...]] = OrderedDict()
 _CACHE_SIZE = 64
 _CACHE_LOCK = threading.Lock()
 
@@ -217,3 +235,141 @@ def legacy_calendar_files(snapshot: Any) -> tuple[str, ...]:
         while len(_CACHE) > _CACHE_SIZE:
             _CACHE.popitem(last=False)
     return found
+
+
+def _early(files: Any, leaves: list[tuple[tuple[str, ...], str]], unstatted: bool) -> list[str]:
+    """The files whose statistics do not rule out a value a legacy rebase moves."""
+    import pyarrow as pa
+
+    out: list[str] = []
+    for row in pa.table(files).select(["path", "stats"]).to_pylist():
+        path = row["path"]
+        try:
+            stats = json.loads(row.get("stats") or "null") if not unstatted else None
+        except ValueError:
+            stats = None
+        if not isinstance(stats, dict):
+            out.append(path)
+            continue
+        records = stats.get("numRecords")
+        for leaf, kind in leaves:
+            if records is not None and _get(stats.get("nullCount"), leaf) == records:
+                continue
+            if _before_limit(_get(stats.get("minValues"), leaf), kind):
+                out.append(path)
+                break
+    return out
+
+
+def early_datetime_files(snapshot: Any) -> tuple[str, ...]:
+    """Live files of `snapshot` that may hold a DATE or TIMESTAMP a legacy rebase moves.
+
+    Dates before 1582-10-15 and timestamps before 1900, whatever wrote them:
+    a rewrite through delta-rs copies them into files without Spark's
+    writer metadata, which Databricks then reads shifted (see the module
+    docstring). By statistics alone; a file they cannot clear counts.
+    Cached per table version.
+    """
+    key = (str(snapshot.table_root), int(snapshot.version))
+    with _CACHE_LOCK:
+        if key in _EARLY_CACHE:
+            _EARLY_CACHE.move_to_end(key)
+            return _EARLY_CACHE[key]
+
+    metadata = json.loads(snapshot.metadata_json())
+    schema = metadata.get("schemaString") or metadata.get("schema_string")
+    if isinstance(schema, str):
+        schema = json.loads(schema)
+    found: tuple[str, ...] = ()
+    if has_datetime_columns(schema):
+        configuration = metadata.get("configuration") or {}
+        mapped = str(configuration.get("delta.columnMapping.mode", "none")).lower() != "none"
+        partitions = {str(c) for c in metadata.get("partitionColumns") or ()}
+        # A partition value is in the log, not in the file, so its column
+        # never reaches a footer.
+        fields = [
+            f
+            for f in (schema or {}).get("fields") or ()
+            if isinstance(f, dict) and f.get("name") not in partitions
+        ]
+        leaves, unstatted = _leaves(fields, (), mapped)
+        if leaves or unstatted:
+            found = tuple(_early(snapshot.files(), leaves, unstatted))
+
+    with _CACHE_LOCK:
+        _EARLY_CACHE[key] = found
+        while len(_EARLY_CACHE) > _CACHE_SIZE:
+            _EARLY_CACHE.popitem(last=False)
+    return found
+
+
+#: Epoch offsets of the limits, per Arrow unit.
+_DATE_LIMIT_DAYS = -141427  # 1582-10-15
+_TIMESTAMP_LIMIT_SECONDS = -2_208_988_800  # 1900-01-01T00:00:00Z
+_PER_SECOND = {"s": 1, "ms": 1_000, "us": 1_000_000, "ns": 1_000_000_000}
+
+
+def _array_holds_early(array: Any) -> bool:
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    kind = array.type
+    if isinstance(array, pa.ChunkedArray):
+        return any(_array_holds_early(chunk) for chunk in array.chunks)
+    if pa.types.is_dictionary(kind):
+        return _array_holds_early(array.dictionary)
+    if pa.types.is_struct(kind):
+        return any(_array_holds_early(array.field(i)) for i in range(kind.num_fields))
+    if pa.types.is_map(kind):
+        return _array_holds_early(array.keys) or _array_holds_early(array.items)
+    if (
+        pa.types.is_list(kind)
+        or pa.types.is_large_list(kind)
+        or pa.types.is_fixed_size_list(kind)
+        or getattr(pa.types, "is_list_view", lambda _: False)(kind)
+        or getattr(pa.types, "is_large_list_view", lambda _: False)(kind)
+    ):
+        return _array_holds_early(array.flatten())
+    if pa.types.is_date32(kind):
+        limit = _DATE_LIMIT_DAYS
+        raw = array.cast(pa.int32())
+    elif pa.types.is_date64(kind):
+        limit = _DATE_LIMIT_DAYS * 86_400_000
+        raw = array.cast(pa.int64())
+    elif pa.types.is_timestamp(kind):
+        # Naive timestamps too: one written to a TIMESTAMP column is stored
+        # zoned. (A TIMESTAMP_NTZ one is not rebased, so this errs safe.)
+        limit = _TIMESTAMP_LIMIT_SECONDS * _PER_SECOND[kind.unit]
+        raw = array.cast(pa.int64())
+    else:
+        return False
+    if len(raw) == raw.null_count:
+        return False
+    low = pc.min(raw).as_py()
+    return low is not None and low < limit
+
+
+def holds_early_datetimes(data: Any) -> bool:
+    """Whether in-memory `data` holds a date before 1582-10-15 or a timestamp before 1900.
+
+    Those are the values Databricks reads shifted from a file whose footer
+    names no Spark version (see the module docstring). A pyarrow Table or
+    RecordBatch, or a pandas or polars DataFrame, is inspected; a stream
+    cannot be without consuming it, and is taken not to.
+    """
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return False
+    module = type(data).__module__ or ""
+    if module.startswith(("pandas", "polars")) and type(data).__name__ == "DataFrame":
+        try:
+            data = pa.table(data)
+        except Exception:
+            return False
+    if not isinstance(data, (pa.Table, pa.RecordBatch)):
+        return False
+    try:
+        return any(_array_holds_early(column) for column in data.columns)
+    except (pa.ArrowException, TypeError, ValueError):
+        return True  # could not tell: the safe side is the writer that says so

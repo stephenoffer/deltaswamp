@@ -240,7 +240,21 @@ def _write(
         if schema_mode != "overwrite":
             needs |= table._default_needs(data)
         needs |= table._identity_needs(data)
+        needs |= _calendar_needs(data)
     return op, needs
+
+
+def _calendar_needs(data: Any) -> set[str]:
+    """``early_datetimes`` when the rows hold values a legacy calendar read moves.
+
+    Databricks reads a date before 1582-10-15 (a timestamp before 1900 in a
+    zone other than UTC) shifted from a Parquet file whose footer names no
+    Spark version, and delta-rs cannot write one that does; see
+    `engine/calendar.py`.
+    """
+    from .engine.calendar import holds_early_datetimes
+
+    return {"early_datetimes"} if holds_early_datetimes(data) else set()
 
 
 def _commit_options(table: Table, shape: dict[str, Any]) -> set[str]:
@@ -285,6 +299,7 @@ def _merge(
     needs: set[str] = set()
     if data is not NO_DATA:
         needs |= table._data_needs(data)
+        needs |= _calendar_needs(data)
     if shape.get("merge_schema"):
         # The kernel MERGE cannot evolve the schema; routed without the need,
         # can() said "via kernel" and the call then refused.

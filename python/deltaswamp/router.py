@@ -429,7 +429,14 @@ _COLLATIONS: frozenset[str] = frozenset({"collations", "collations-preview"})
 #: MERGE's clauses rewrite or delete target rows, which an append-only table
 #: forbids whichever engine runs it.
 _ROUTER_HINTS: frozenset[str] = frozenset(
-    {"collation_free", "variant_free", "removes_rows", "conditional_insert_with_feed"}
+    {
+        "collation_free",
+        "variant_free",
+        "removes_rows",
+        "conditional_insert_with_feed",
+        # Only delta-rs cannot serve it (`DeltaRsEngine.need_refusal`).
+        "early_datetimes",
+    }
 )
 #: Operations on a directory with no Delta log yet: can("convert") refused a
 #: Parquet directory because its (absent) log could not be read.
@@ -781,6 +788,11 @@ class Router:
                 if shifted is not None:
                     reasons.append(f"{kind.value}: {shifted}")
                     continue
+            if result.ok and kind is EngineKind.DELTARS and operation in _FILE_REWRITES:
+                footerless = self._footerless_rewrite(table, operation, shape, engine)
+                if footerless is not None:
+                    reasons.append(f"{kind.value}: {footerless}")
+                    continue
             if result.ok:
                 return result
             reasons.append(f"{kind.value}: {result.reason}")
@@ -861,6 +873,47 @@ class Router:
             return f"{held}; this read would return the shifted values and filter on them"
         return (
             f"{held}; this operation would copy them into new files shifted, corrupting the table"
+        )
+
+    def _footerless_rewrite(
+        self,
+        table: ResolvedTable,
+        operation: Operation,
+        shape: Mapping[str, object],
+        engine: object,
+    ) -> str | None:
+        """Why delta-rs must not rewrite this table's files, if the footer is why.
+
+        A rewrite copies the rows it does not change into new files, and
+        delta-rs writes them without Spark's writer metadata. Databricks reads
+        a date before 1582-10-15 (or, outside UTC, a timestamp before 1900)
+        from such a file with its legacy calendar rebase: rows it read right
+        from a Spark or kernel-written file read two to ten days off after
+        delta-rs had copied them. By statistics, as `_calendar_refusal`; a
+        table whose files cannot be listed is left to that check.
+        """
+        if not table.has_datetime_columns:
+            return None
+        kernel = self.engines.get(EngineKind.KERNEL)
+        snapshot = getattr(kernel, "snapshot", None)
+        if snapshot is None:
+            return None
+        try:
+            from .engine.calendar import early_datetime_files
+
+            found = early_datetime_files(snapshot(table))
+        except Exception:
+            return None
+        if not found:
+            return None
+        writes_itself = getattr(engine, "writes_files_itself", None)
+        if writes_itself is not None and not writes_itself(operation, table, shape):
+            return None
+        return (
+            f"{len(found)} data file(s) (such as {found[0]}) may hold dates before "
+            "1582-10-15 or timestamps before 1900, and this operation would copy them into "
+            "files delta-rs writes without Spark's writer metadata, which Databricks reads "
+            "with its legacy calendar rebase (0001-01-01 reads there as 0001-01-03)"
         )
 
     def _kernel_filters_sql(

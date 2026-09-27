@@ -259,6 +259,40 @@ table never go to delta-rs either: a predicate outside the kernel's grammar
 by DuckDB in Spark's dialect (without DuckDB installed, the read is refused).
 The check reads a file's footer only when its statistics allow such a value.
 
+Writing, the same values need the right Parquet footer. Spark reads a file
+whose footer names no Spark version (`org.apache.spark.version`) in the mode
+`spark.sql.parquet.datetimeRebaseModeInRead` gives, and Databricks SQL
+warehouses read such files with the legacy rebase: a proleptic `0001-01-01`
+written by delta-rs, pyarrow or any other arrow-rs writer reads there as
+`0001-01-03`, `1500-06-15` as `1500-06-05`, and a TIMESTAMP the same (not a
+TIMESTAMP_NTZ, which Spark never rebases), while every other reader sees the
+value written. A file that names Spark 3.0 or later, without
+`org.apache.spark.legacyDateTime`, is read as written in any session time
+zone. Every data file the kernel writes -- appends, overwrites,
+replaceWhere, the rows a deletion-vector or copy-on-write DML rewrites,
+OPTIMIZE and Z-ORDER through the kernel, distributed workers -- names
+`org.apache.spark.version = 3.5.0` for that reason. delta-rs 1.6.5 has no way
+to add a footer key, so:
+
+- a write whose rows hold a date before 1582-10-15 or a timestamp before
+  1900 (APPEND, OVERWRITE, replaceWhere, a MERGE source) goes to the kernel
+  or the warehouse instead of delta-rs, or is refused when neither can serve
+  it (MERGE into a table without deletion vectors, schema merge). Only
+  in-memory data (a pyarrow Table or RecordBatch, a pandas or polars
+  DataFrame) is inspected; a stream is not, and is written as before;
+- DELETE, UPDATE, MERGE, replaceWhere, and an OPTIMIZE or Z-ORDER that only
+  delta-rs can run (`writer_properties=` and the other delta-rs-only
+  options), skip delta-rs on a table whose statistics allow such a value in
+  any file, since delta-rs would copy the rows it leaves alone into files
+  Databricks misreads. `t.set_properties({'delta.enableDeletionVectors':
+  'true'})` lets the kernel serve row-level DML there.
+
+A table delta-rs (or deltaswamp before this change) already wrote with such
+values reads shifted on Databricks until its files are rewritten;
+`t.optimize()` through the kernel rewrites small files with the footer. The
+warehouse-staging path reads its staged files with
+`datetimeRebaseMode => 'CORRECTED'`.
+
 A VARIANT column reads as JSON text (`string`), as Databricks' `to_json`
 renders it, whichever engine serves the read: the warehouse can send nothing
 else, so the direct engines decode the binary encoding to match. Writes take
@@ -1020,6 +1054,11 @@ reached.
 - delta-rs reads pre-1582 dates and timestamps from Spark's legacy-calendar
   files unrebased (2-10 days off); the kernel rebases them. Ancient timestamps
   in such files written in a non-UTC session zone need the warehouse.
+- delta-rs writes Parquet footers without `org.apache.spark.version`, which
+  Databricks reads with the legacy calendar rebase, so writes and rewrites of
+  dates before 1582-10-15 or timestamps before 1900 skip it (see above). A
+  streamed source is not inspected, and an UPDATE that sets such a value by a
+  literal on a table holding none is not caught; both still go to delta-rs.
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.
 - A MERGE with `merge_schema=True` whose SET or INSERT assigns a column the

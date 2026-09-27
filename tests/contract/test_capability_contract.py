@@ -141,6 +141,11 @@ _READ_METHODS = ("scan", "execute_scan", "plan_scan", "metadata_count")
 _WRITE_PLAN = ("write_files", "commit_files", "append", "overwrite")
 
 
+def _with_extra(cx: Ctx) -> Any:
+    """The table's rows, shifted, with a column the table does not have."""
+    return cx.shifted(100).append_column("extra", pa.array([1] * cx.before.num_rows, pa.int64()))
+
+
 def _same(cx: Ctx, before: list[int]) -> list[int]:
     return before
 
@@ -269,27 +274,28 @@ CASES: list[Case] = [
         P.APPEND,
         "append",
         lambda t, cx: t.append(cx.shifted(100)),
+        lambda cx: {"data": cx.shifted(100)},
         expect=lambda cx, b: sorted(b + [k + 100 for k in b]),
     ),
     Case(
         P.APPEND,
         "append_commit_metadata",
         lambda t, cx: t.append(cx.shifted(100), commit_metadata={"contract": "yes"}),
-        lambda cx: {"commit_metadata": {"contract": "yes"}},
+        lambda cx: {"data": cx.shifted(100), "commit_metadata": {"contract": "yes"}},
         expect=lambda cx, b: sorted(b + [k + 100 for k in b]),
     ),
     Case(
         P.APPEND,
         "append_txn",
         lambda t, cx: t.append(cx.shifted(100), txn=("contract", 1)),
-        lambda cx: {"txn": ("contract", 1)},
+        lambda cx: {"data": cx.shifted(100), "txn": ("contract", 1)},
         expect=lambda cx, b: sorted(b + [k + 100 for k in b]),
     ),
     Case(
         P.APPEND,
         "append_max_commit_retries",
         lambda t, cx: t.append(cx.shifted(100), max_commit_retries=2),
-        lambda cx: {"max_commit_retries": 2},
+        lambda cx: {"data": cx.shifted(100), "max_commit_retries": 2},
         expect=lambda cx, b: sorted(b + [k + 100 for k in b]),
     ),
     Case(
@@ -312,31 +318,29 @@ CASES: list[Case] = [
     Case(
         P.MERGE_SCHEMA,
         "append_schema_merge",
-        lambda t, cx: t.append(
-            cx.shifted(100).append_column("extra", pa.array([1] * cx.before.num_rows, pa.int64())),
-            schema_mode="merge",
-        ),
-        lambda cx: {"schema_mode": "merge"},
+        lambda t, cx: t.append(_with_extra(cx), schema_mode="merge"),
+        lambda cx: {"data": _with_extra(cx), "schema_mode": "merge"},
         expect=lambda cx, b: sorted(b + [k + 100 for k in b]),
     ),
     Case(
         P.OVERWRITE,
         "overwrite",
         lambda t, cx: t.overwrite(cx.shifted(100)),
+        lambda cx: {"data": cx.shifted(100)},
         expect=lambda cx, b: [k + 100 for k in b],
     ),
     Case(
         P.OVERWRITE,
         "overwrite_commit_metadata",
         lambda t, cx: t.overwrite(cx.shifted(100), commit_metadata={"contract": "yes"}),
-        lambda cx: {"commit_metadata": {"contract": "yes"}},
+        lambda cx: {"data": cx.shifted(100), "commit_metadata": {"contract": "yes"}},
         expect=lambda cx, b: [k + 100 for k in b],
     ),
     Case(
         P.OVERWRITE,
         "overwrite_txn",
         lambda t, cx: t.overwrite(cx.shifted(100), txn=("contract", 1)),
-        lambda cx: {"txn": ("contract", 1)},
+        lambda cx: {"data": cx.shifted(100), "txn": ("contract", 1)},
         expect=lambda cx, b: [k + 100 for k in b],
     ),
     Case(

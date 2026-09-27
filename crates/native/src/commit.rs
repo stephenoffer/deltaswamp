@@ -342,7 +342,7 @@ pub(crate) fn stage_batches(
         for batch in batches {
             let data = ArrowEngineData::new(batch);
             let metadata =
-                runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+                runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
             staged.push(metadata);
         }
     } else {
@@ -353,7 +353,7 @@ pub(crate) fn stage_batches(
                 let write_context = write_state.partitioned_write_context(group.values)?;
                 let data = ArrowEngineData::new(group.data);
                 let metadata =
-                    runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+                    runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
                 staged.push(metadata);
             }
         }
@@ -881,7 +881,7 @@ fn write_files_tracked(
         for batch in batches {
             let data = ArrowEngineData::new(batch);
             let metadata =
-                runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+                runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
             record(add_metadata_batch(metadata)?)?;
         }
     } else {
@@ -892,7 +892,7 @@ fn write_files_tracked(
                 let write_context = write_state.partitioned_write_context(group.values)?;
                 let data = ArrowEngineData::new(group.data);
                 let metadata =
-                    runtime::block_on(async { engine.write_parquet(&data, &write_context).await })?;
+                    runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
                 record(add_metadata_batch(metadata)?)?;
             }
         }

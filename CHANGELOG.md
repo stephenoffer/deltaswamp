@@ -268,6 +268,16 @@ First release.
   whole-table rewrite paths, or the warehouse, or are refused. Reads of such a
   table never go to delta-rs: the kernel reads, and a predicate outside its
   grammar is evaluated by DuckDB afterwards (refused without DuckDB).
+- Every data file the kernel writes names `org.apache.spark.version` in its
+  Parquet footer. Databricks SQL warehouses read a file without it with
+  Spark's legacy calendar rebase, so dates before 1582-10-15 (and
+  timestamps) that deltaswamp wrote read there 2-10 days off (`0001-01-01` as
+  `0001-01-03`), and OPTIMIZE turned Spark files Databricks read right into
+  files it misread. delta-rs cannot write the key: writes whose rows hold
+  such a value, and delta-rs rewrites of tables whose files may, go to the
+  kernel or the warehouse, or are refused (a MERGE into a table without
+  deletion vectors). Streamed sources are not inspected. Files delta-rs
+  already wrote stay misread by Databricks until rewritten (`optimize()`).
 - Lazy hand-offs (`to_duckdb`, `to_polars(lazy=True)`, `to_pyarrow_dataset`,
   `Connection.sql`) read the version current when they were made;
   `follow_latest=True` follows the latest and raises `MetadataChangedError`

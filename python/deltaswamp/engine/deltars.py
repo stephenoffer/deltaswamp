@@ -135,6 +135,15 @@ _READ_ONLY_OPS: frozenset[Operation] = frozenset(
 )
 
 
+#: Why delta-rs does not write dates before 1582-10-15 or timestamps before
+#: 1900 (see `engine/calendar.py`).
+_FOOTERLESS_EARLY_VALUES = (
+    "the rows hold dates before 1582-10-15 or timestamps before 1900, and delta-rs "
+    "writes Parquet files whose footer names no Spark version, which Databricks reads "
+    "with Spark's legacy calendar rebase (0001-01-01 reads there as 0001-01-03)"
+)
+
+
 class DeltaRsEngine:
     """Reads and writes Delta tables through the `deltalake` package."""
 
@@ -169,6 +178,8 @@ class DeltaRsEngine:
         """Why a request need this engine has in general fails on `table`."""
         if needs & {"schema_merge", "schema_overwrite"} and _column_mapped(table):
             return _CM_SCHEMA_EVOLUTION
+        if "early_datetimes" in needs:
+            return _FOOTERLESS_EARLY_VALUES
         if "conditional_insert_with_feed" in needs:
             # The MERGE builder's own refusal at execute(), stated up front.
             return (
@@ -1344,6 +1355,19 @@ class DeltaRsEngine:
         except Exception:
             return None
         return None if refusal is not None else kernel
+
+    def writes_files_itself(
+        self, operation: Operation, table: ResolvedTable, shape: Mapping[str, Any]
+    ) -> bool:
+        """Whether delta-rs's own Parquet writer would write this rewrite's files.
+
+        An OPTIMIZE or Z-ORDER the kernel can commit is written by the
+        kernel's writer too (`_rewrite`), with the footer Databricks needs to
+        read old dates right; everything else delta-rs rewrites, it writes.
+        """
+        if operation in (Operation.OPTIMIZE, Operation.ZORDER):
+            return self._kernel_compactor(table, dict(shape)) is None
+        return True
 
     @staticmethod
     def _compaction_args(table: ResolvedTable, kwargs: dict[str, Any]) -> dict[str, Any]:

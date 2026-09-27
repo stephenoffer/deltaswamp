@@ -563,8 +563,8 @@ fn with_column(
 
 /// `commit::stage_batches`, writing each batch's row ids to `column`.
 ///
-/// Mirrors `DefaultEngine::write_parquet` -- the logical-to-physical transform,
-/// then the Parquet write -- with the materialized row-id column appended to
+/// Mirrors `writer::write_parquet` -- the logical-to-physical transform, then
+/// the Parquet write -- with the materialized row-id column appended to
 /// the physical data in between. Batches without row ids are written normally.
 fn stage_with_row_ids(
     txn: &mut delta_kernel::transaction::Transaction,
@@ -605,9 +605,11 @@ fn stage_with_row_ids(
         };
         let Ok(index) = batch.schema().index_of(crate::scan::ROW_ID_COLUMN) else {
             let data = ArrowEngineData::new(batch);
-            staged.push(runtime::block_on(async {
-                engine.write_parquet(&data, &write_context).await
-            })?);
+            staged.push(runtime::block_on(crate::writer::write_parquet(
+                engine,
+                &data,
+                &write_context,
+            ))?);
             continue;
         };
         let row_ids = batch.column(index).clone();
@@ -623,11 +625,11 @@ fn stage_with_row_ids(
             .evaluate(&ArrowEngineData::new(logical))?
             .try_into_record_batch()?;
         let physical = with_column(&physical, column, row_ids)?;
-        let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::new(physical));
-        let handler = engine.default_parquet_handler();
-        staged.push(runtime::block_on(async {
-            handler.write_parquet_file(data, &write_context).await
-        })?);
+        staged.push(runtime::block_on(crate::writer::write_physical(
+            engine,
+            &physical,
+            &write_context,
+        ))?);
     }
     for metadata in staged {
         txn.add_files(metadata);
