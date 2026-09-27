@@ -15,7 +15,7 @@ import importlib
 import json
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from ._util import timestamp_ms
@@ -225,6 +225,16 @@ def _column_path(column: Any, what: str) -> str:
     raise InvalidArgumentError(
         f"{what} takes a column name or a nested path such as ['s', 'a'], not {column!r}"
     )
+
+
+def _top_level(column: Any, names: Sequence[str]) -> str | None:
+    """The top-level column a str names outright: exact spelling first, then any case."""
+    if not isinstance(column, str):
+        return None
+    if column in names:
+        return column
+    folded = [n for n in names if n.lower() == column.lower()]
+    return folded[0] if len(folded) == 1 else None
 
 
 def _column_default(field: Any) -> str | None:
@@ -913,8 +923,12 @@ class Table:
         # Passing them through as a bare shape let `can("append",
         # schema_mode="merge")` answer for a plain APPEND (kernel: yes) while
         # the append itself routed as MERGE_SCHEMA and was refused.
+        asked = op
         op, needs = self._call_route(op, shape)
-        return self._connection.router.capability(op, self._enrich(), needs=needs, **shape)
+        verdict = self._connection.router.capability(op, self._enrich(), needs=needs, **shape)
+        if asked is Operation.INCREMENTAL:
+            verdict = dataclasses.replace(verdict, operation=asked)
+        return verdict
 
     def _call_route(self, op: Operation, shape: dict[str, Any]) -> tuple[Operation, frozenset[str]]:
         """The operation and needs a call with these arguments routes on."""
@@ -967,6 +981,11 @@ class Table:
                 needs.add("optimize_full")
             if get("predicate") is not None:
                 needs.add("optimize_predicate")
+        elif op is Operation.INCREMENTAL:
+            # changes() is the incremental read, and it follows the change
+            # data feed: can(INCREMENTAL) refused on every table while
+            # changes() served it.
+            op = Operation.CDF
         elif op is Operation.CLUSTER_BY:
             columns = get("columns")
             if isinstance(columns, str) and columns.lower() == "auto":
@@ -1341,10 +1360,18 @@ class Table:
             ):
                 # delta-rs reads uint8 as byte before looking at the table,
                 # so 200 failed even against a short column. A safe cast to
-                # the table's type keeps every value or raises here.
-                data = data.set_column(
-                    index, by_name[name], data.column(index).cast(wanted, safe=True)
-                )
+                # the table's type keeps every value or raises here -- as a
+                # library error: a uint64 above the BIGINT range escaped as a
+                # bare ArrowInvalid.
+                try:
+                    cast = data.column(index).cast(wanted, safe=True)
+                except pa.ArrowInvalid as exc:
+                    raise InvalidArgumentError(
+                        f"column {name!r} holds a value outside the range of the table's "
+                        f"{wanted} ({exc}); widen the column (DECIMAL(20, 0) holds any uint64) "
+                        "or filter the value out"
+                    ) from exc
+                data = data.set_column(index, by_name[name], cast)
         # Generated and identity columns are the engine's to compute. On a
         # legacy protocol (writer 4-6) no feature list names them, only the
         # field metadata does, and filling one with nulls failed delta-rs's
@@ -1883,6 +1910,10 @@ class Table:
                 # Raised by the kernel mid-stream, after the rows before it,
                 # as a raw ArrowInvalid that `except DeltaSwampError` missed.
                 return _feed_gap_error(int(off.group(1)))
+            if "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE" in str(exc):
+                # The warehouse's own refusal of the same feed, which reached
+                # the caller as a raw SqlStatementError.
+                return _warehouse_feed_schema_error(exc)
             return self._feed_schema_change(exc, start, end)
 
         served: dict[str, Any] = {}
@@ -3152,6 +3183,9 @@ class Table:
             # Resolve it the way a read does, so restore(ts) restores exactly
             # the table that to_arrow(timestamp=ts) returns.
             target = self._restore_version(target)
+        # Routed before the no-op below: restore(current) returned success on
+        # a table no engine may restore, while can(RESTORE) said no.
+        engine = self._engine(Operation.RESTORE)
         if isinstance(target, (bool, int)):
             # -1 reached delta-rs as "either the version or datetime should
             # be provided"; True restored version 1.
@@ -3166,9 +3200,7 @@ class Table:
                 # "Version to restore 5 should be less then last available
                 # version 5"; restoring to where you are changes nothing.
                 return {"numRemovedFile": 0, "numRestoredFile": 0}
-        result: dict[str, Any] = self._engine(Operation.RESTORE).restore(
-            self._resolved, target, **kwargs
-        )
+        result: dict[str, Any] = engine.restore(self._resolved, target, **kwargs)
         self._invalidate()
         return result
 
@@ -3285,21 +3317,35 @@ class Table:
         self._engine(Operation.ADD_COLUMN).add_columns(self._resolved, fields, **kwargs)
         self._invalidate()
 
+    def _alter_path(self, column: Any, what: str, names: Sequence[str] | None = None) -> str:
+        """`_column_path`, with a str that is a top-level column's own name kept whole.
+
+        A str is otherwise read as a dotted path, so an ALTER of a column
+        named ``dot.name`` (or holding a backtick) went to a field ``name`` of
+        a struct ``dot`` -- or failed on an unbalanced quote. The name as the
+        table has it wins, then the dotted reading; a list is always a path.
+        """
+        path = _column_path(column, what)
+        if isinstance(column, str) and ("." in column or "`" in column):
+            top = _top_level(column, list(self.schema().names) if names is None else names)
+            if top is not None:
+                return "`" + top.replace("`", "``") + "`"
+        return path
+
     def drop_column(self, column: str | list[str]) -> dict[str, Any]:
         """Drop a column; a dotted name or a list is a field inside a struct."""
         self._check_writable("drop a column")
-        column = _column_path(column, "drop_column")
         names = list(self.schema().names)
+        top = _top_level(column, names)
+        column = self._alter_path(column, "drop_column", names)
         partitions = set(self._enrich().partition_columns)
-        rest = [name for name in names if name != column]
-        if column in names and rest and set(rest) <= partitions:
+        rest = [name for name in names if name != top]
+        if top is not None and rest and set(rest) <= partitions:
             # Delta needs a data column; the kernel panicked reading the
             # table this left behind.
-            raise InvalidArgumentError(
-                f"cannot drop {column!r}: it is the last non-partition column"
-            )
-        if column in names and not rest:
-            raise InvalidArgumentError(f"cannot drop {column!r}: it is the table's only column")
+            raise InvalidArgumentError(f"cannot drop {top!r}: it is the last non-partition column")
+        if top is not None and not rest:
+            raise InvalidArgumentError(f"cannot drop {top!r}: it is the table's only column")
         result = self._engine(Operation.DROP_COLUMN).drop_column(self._resolved, column)
         self._invalidate()
         return _metrics(result)
@@ -3310,7 +3356,7 @@ class Table:
         `new` is the new last part (it may repeat the struct path).
         """
         self._check_writable("rename a column")
-        old = _column_path(old, "rename_column")
+        old = self._alter_path(old, "rename_column")
         if not isinstance(new, str) or not new:
             raise InvalidArgumentError(f"rename_column needs a new name, not {new!r}")
         result = self._engine(Operation.RENAME_COLUMN).rename_column(self._resolved, old, new)
@@ -3351,7 +3397,7 @@ class Table:
         """Drop a table feature. Databricks-only, so it needs the SQL fallback."""
         self._check_writable("drop a feature")
         _check_options("drop_feature", kwargs, frozenset({"truncate_history"}))
-        result: dict[str, Any] = self._engine(Operation.DROP_FEATURE).drop_feature(
+        result: dict[str, Any] = self._engine(Operation.DROP_FEATURE, feature=feature).drop_feature(
             self._resolved, feature, **kwargs
         )
         self._invalidate()
@@ -3399,7 +3445,7 @@ class Table:
 
     def set_column_comment(self, column: str | list[str], comment: str | None) -> None:
         self._check_writable("set a column comment")
-        column = _column_path(column, "set_column_comment")
+        column = self._alter_path(column, "set_column_comment")
         _check_comment(comment)
         self._engine(Operation.SET_COLUMN_COMMENT).set_column_comment(
             self._resolved, column, comment
@@ -3414,7 +3460,7 @@ class Table:
         shrink. The table needs ``delta.enableTypeWidening = true``.
         """
         self._check_writable("change a column type")
-        column = _column_path(column, "alter_column_type")
+        column = self._alter_path(column, "alter_column_type")
         self._engine(Operation.ALTER_COLUMN_TYPE).alter_column_type(
             self._resolved, column, new_type
         )
@@ -3423,13 +3469,13 @@ class Table:
     def set_not_null(self, column: str | list[str]) -> None:
         """Add a NOT NULL constraint, after checking no existing row is null."""
         self._check_writable("set NOT NULL")
-        column = _column_path(column, "set_not_null")
+        column = self._alter_path(column, "set_not_null")
         self._engine(Operation.SET_NOT_NULL).set_not_null(self._resolved, column)
         self._invalidate()
 
     def drop_not_null(self, column: str | list[str]) -> None:
         self._check_writable("drop NOT NULL")
-        column = _column_path(column, "drop_not_null")
+        column = self._alter_path(column, "drop_not_null")
         self._engine(Operation.DROP_NOT_NULL).drop_not_null(self._resolved, column)
         self._invalidate()
 
@@ -3566,17 +3612,43 @@ class Table:
         cat = self._governance("revoke")
         return list(_call("revoke", cat.revoke, self._resolved.ref, principal, names))
 
+    def _tag_column(self, column: str | None, what: str) -> str | None:
+        """`column` as the table spells it: Unity Catalog resolves column names in any case.
+
+        The tag API takes the stored spelling only, so tags(column="EMAIL")
+        said column `EMAIL` does not exist, and set_tags on a missing column
+        failed as "cannot read tags".
+        """
+        if not isinstance(column, str):
+            return column
+        try:
+            names = list(self.schema().names)
+        except Exception:
+            return column  # no schema to hand (a view, say): let the catalog answer
+        if column in names:
+            return column
+        folded = [n for n in names if n.lower() == column.lower()]
+        if len(folded) == 1:
+            return str(folded[0])
+        raise InvalidReferenceError(
+            f"cannot {what}: {self._resolved.ref} has no column {column!r} "
+            f"(its columns are {', '.join(names)})"
+        )
+
     def tags(self, column: str | None = None) -> dict[str, str]:
         cat = self._governance("read tags")
+        column = self._tag_column(column, "read tags")
         return dict(_call("read tags", cat.tags, self._resolved.ref, column))
 
     def set_tags(self, tags: dict[str, str], *, column: str | None = None) -> None:
         cat = self._governance("set tags")
+        column = self._tag_column(column, "set tags")
         _call("set tags", cat.set_tags, self._resolved.ref, tags, column)
 
     def unset_tags(self, keys: list[str] | str, *, column: str | None = None) -> None:
         names = [keys] if isinstance(keys, str) else list(keys)
         cat = self._governance("unset tags")
+        column = self._tag_column(column, "unset tags")
         _call("unset tags", cat.unset_tags, self._resolved.ref, names, column)
 
     def set_owner(self, principal: str) -> None:
@@ -3898,6 +3970,27 @@ def _feed_gap_error(version: int) -> UnreachableTableError:
     return error
 
 
+def _warehouse_feed_schema_error(exc: BaseException) -> Exception:
+    """The warehouse's DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_* refusal, typed as the kernel's."""
+    from .errors import ChangeFeedSchemaChangeError
+
+    text = str(exc)
+    found = re.search(r"(?:at|in) version (\d+)", text)
+    changed = int(found.group(1)) if found is not None else None
+    first = (text.strip().splitlines() or [""])[0][:300]
+    error = ChangeFeedSchemaChangeError(
+        "read the change data feed",
+        "the table's schema changed"
+        + (f" at version {changed}" if changed is not None else "")
+        + f" in a way the rows written before it cannot be read under ({first})",
+        f"read the feed up to version {changed - 1}, or from version {changed} on"
+        if changed is not None
+        else "read a range that does not span the schema change",
+    )
+    error.version = changed
+    return error
+
+
 def _by_version(pa: Any, changes: Any, columns: list[str] | None) -> Any:
     """`(version, rows)` for each commit in a change-feed table, in order."""
     if not changes.num_rows:
@@ -4062,6 +4155,16 @@ class _InvalidatingMerger:
                 result = self._execute(attr, args, kwargs)
                 self._invalidate()
                 return result
+            if name == "when_not_matched_insert" and "values" in kwargs:
+                # An INSERT sets values, and the name is what users reach for;
+                # the builders all call the parameter `updates` (delta-rs's
+                # spelling), so values= was a bare TypeError.
+                if "updates" in kwargs or args:
+                    raise InvalidArgumentError(
+                        "when_not_matched_insert() takes the columns once: updates= or values="
+                    )
+                kwargs = dict(kwargs)
+                kwargs["updates"] = kwargs.pop("values")
             clause = merge_clause(name, args, kwargs)
             if clause is not None:
                 kind, conditional = clause

@@ -381,28 +381,40 @@ def variant_column(pa: Any, column: Any) -> Any:
 
 Paths = frozenset[tuple[str, ...]]
 
+#: Path steps into an array's elements and a map's values. A Delta field name
+#: cannot hold a NUL, so neither can be mistaken for a struct field.
+ELEMENT = "\x00element"
+VALUE = "\x00value"
+
 
 def variant_paths(schema: Any) -> Paths:
     """The VARIANT columns of a Delta schema (the log's `schemaString`, parsed).
 
-    Top-level columns and fields nested in structs, each as its path of names.
-    The Arrow schema cannot tell: the kernel reads a VARIANT as a bare
-    ``struct<metadata: binary, value: binary>``, and a real struct of that
-    shape looked the same -- and was then decoded as a variant, and failed.
-    A VARIANT inside an array or a map is not listed (it stays binary).
+    Top-level columns and VARIANTs nested in structs, arrays and maps, each
+    as its path: field names, with `ELEMENT` for an array's elements and
+    `VALUE` for a map's values. The Arrow schema cannot tell: the kernel
+    reads a VARIANT as a bare ``struct<metadata: binary, value: binary>``,
+    and a real struct of that shape looked the same -- and was then decoded
+    as a variant, and failed. A VARIANT in an array or a map was left binary
+    while the warehouse sent it as text, so its type depended on the engine.
     """
     out: set[tuple[str, ...]] = set()
 
+    def walk_type(kind: Any, path: tuple[str, ...]) -> None:
+        if kind == "variant":
+            out.add(path)
+        elif isinstance(kind, dict):
+            if kind.get("type") == "struct":
+                walk(kind.get("fields"), path)
+            elif kind.get("type") == "array":
+                walk_type(kind.get("elementType"), (*path, ELEMENT))
+            elif kind.get("type") == "map":
+                walk_type(kind.get("valueType"), (*path, VALUE))
+
     def walk(fields: Any, prefix: tuple[str, ...]) -> None:
         for f in fields or []:
-            if not isinstance(f, dict):
-                continue
-            path = (*prefix, str(f.get("name")))
-            kind = f.get("type")
-            if kind == "variant":
-                out.add(path)
-            elif isinstance(kind, dict) and kind.get("type") == "struct":
-                walk(kind.get("fields"), path)
+            if isinstance(f, dict):
+                walk_type(f.get("type"), (*prefix, str(f.get("name"))))
 
     if isinstance(schema, dict):
         walk(schema.get("fields"), ())
@@ -413,48 +425,113 @@ def _under(paths: Paths, name: str) -> Paths:
     return frozenset(p[1:] for p in paths if p and p[0] == name and len(p) > 1)
 
 
-def _text_type(pa: Any, arrow_type: Any, paths: Paths, here: bool) -> Any:
-    if here and is_variant_struct(pa, arrow_type):
-        return pa.string()
-    if pa.types.is_struct(arrow_type) and paths:
+def _is_list(pa: Any, arrow_type: Any) -> bool:
+    return bool(pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type))
+
+
+def _convert_type(pa: Any, arrow_type: Any, paths: Paths, here: bool, leaf: Any) -> Any:
+    """`arrow_type` with each VARIANT at `paths` (or here) given `leaf`'s type.
+
+    `leaf(type)` is the new type of a VARIANT position, or None to leave it.
+    """
+    if here:
+        new = leaf(arrow_type)
+        return arrow_type if new is None else new
+    if not paths:
+        return arrow_type
+    if pa.types.is_struct(arrow_type):
         return pa.struct(
             [
-                f.with_type(_text_type(pa, f.type, _under(paths, f.name), (f.name,) in paths))
+                f.with_type(
+                    _convert_type(pa, f.type, _under(paths, f.name), (f.name,) in paths, leaf)
+                )
                 for f in (arrow_type.field(i) for i in range(arrow_type.num_fields))
             ]
         )
+    if _is_list(pa, arrow_type):
+        field = arrow_type.value_field
+        inner = _convert_type(pa, field.type, _under(paths, ELEMENT), (ELEMENT,) in paths, leaf)
+        make = pa.large_list if pa.types.is_large_list(arrow_type) else pa.list_
+        return make(field.with_type(inner))
+    if pa.types.is_map(arrow_type):
+        field = arrow_type.item_field
+        inner = _convert_type(pa, field.type, _under(paths, VALUE), (VALUE,) in paths, leaf)
+        return pa.map_(arrow_type.key_field, field.with_type(inner), arrow_type.keys_sorted)
     return arrow_type
+
+
+def _convert(pa: Any, array: Any, paths: Paths, here: bool, leaf: Any, leaf_type: Any) -> Any:
+    """`array` with each VARIANT at `paths` (or here) rewritten by `leaf`.
+
+    `leaf(array)` returns the new array of a VARIANT position, or the array
+    itself to leave it; `leaf_type` is the matching type rule, for
+    `_convert_type`.
+    """
+    if here:
+        return leaf(array)
+    if not paths:
+        return array
+    kind = array.type
+    if not (pa.types.is_struct(kind) or _is_list(pa, kind) or pa.types.is_map(kind)):
+        return array
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [_convert(pa, c, paths, False, leaf, leaf_type) for c in array.chunks]
+        return pa.chunked_array(chunks, type=_convert_type(pa, kind, paths, False, leaf_type))
+    mask = array.is_null() if array.null_count else None
+    if pa.types.is_struct(kind):
+        fields = [kind.field(i) for i in range(kind.num_fields)]
+        # `flatten` carries the struct's own nulls into its children: under a
+        # null row a VARIANT child holds placeholder bytes (its children are
+        # non-nullable), which cannot be decoded.
+        flat = array.flatten() if mask is not None else [array.field(i) for i in range(len(fields))]
+        children = [
+            _convert(pa, flat[i], _under(paths, f.name), (f.name,) in paths, leaf, leaf_type)
+            for i, f in enumerate(fields)
+        ]
+        return pa.StructArray.from_arrays(
+            children,
+            fields=[f.with_type(c.type) for f, c in zip(fields, children, strict=True)],
+            mask=mask,
+        )
+    if _is_list(pa, kind):
+        values = _convert(
+            pa, array.values, _under(paths, ELEMENT), (ELEMENT,) in paths, leaf, leaf_type
+        )
+        if values is array.values:
+            return array
+        new_type = _convert_type(pa, kind, paths, False, leaf_type)
+        cls = pa.LargeListArray if pa.types.is_large_list(kind) else pa.ListArray
+        return cls.from_arrays(array.offsets, values, type=new_type, mask=mask)
+    items = _convert(pa, array.items, _under(paths, VALUE), (VALUE,) in paths, leaf, leaf_type)
+    if items is array.items:
+        return array
+    new_type = _convert_type(pa, kind, paths, False, leaf_type)
+    return pa.MapArray.from_arrays(array.offsets, array.keys, items, type=new_type, mask=mask)
+
+
+def _text_leaf_type(pa: Any) -> Any:
+    return lambda t: pa.string() if is_variant_struct(pa, t) else None
+
+
+def _text_leaf(pa: Any) -> Any:
+    return lambda a: json_column(pa, a) if is_variant_struct(pa, a.type) else a
 
 
 def text_schema(pa: Any, schema: Any, paths: Paths) -> Any:
     """`schema` with each VARIANT (at `paths`) as a string, the type reads give it."""
+    leaf = _text_leaf_type(pa)
     return pa.schema(
         [
-            f.with_type(_text_type(pa, f.type, _under(paths, f.name), (f.name,) in paths))
+            f.with_type(_convert_type(pa, f.type, _under(paths, f.name), (f.name,) in paths, leaf))
             for f in schema
         ],
         metadata=schema.metadata,
     )
 
 
-def _to_text(pa: Any, array: Any, paths: Paths, here: bool) -> Any:
-    if here and is_variant_struct(pa, array.type):
-        return json_column(pa, array)
-    if pa.types.is_struct(array.type) and paths:
-        if isinstance(array, pa.ChunkedArray):
-            chunks = [_to_text(pa, c, paths, False) for c in array.chunks]
-            return pa.chunked_array(chunks, type=_text_type(pa, array.type, paths, False))
-        fields = [array.type.field(i) for i in range(array.type.num_fields)]
-        children = [
-            _to_text(pa, array.field(i), _under(paths, f.name), (f.name,) in paths)
-            for i, f in enumerate(fields)
-        ]
-        return pa.StructArray.from_arrays(
-            children,
-            fields=[f.with_type(c.type) for f, c in zip(fields, children, strict=True)],
-            mask=array.is_null() if array.null_count else None,
-        )
-    return array
+def to_text(pa: Any, array: Any, paths: Paths, here: bool) -> Any:
+    """`array` with the VARIANT binary at `paths` (or here) decoded to JSON text."""
+    return _convert(pa, array, paths, here, _text_leaf(pa), _text_leaf_type(pa))
 
 
 def json_text_stream(stream: Any, paths: Paths | None) -> Any:
@@ -482,7 +559,7 @@ def json_text_stream(stream: Any, paths: Paths | None) -> Any:
     def batches() -> Any:
         for batch in reader:
             arrays = [
-                _to_text(pa, batch.column(i), _under(paths, f.name), (f.name,) in paths)
+                to_text(pa, batch.column(i), _under(paths, f.name), (f.name,) in paths)
                 for i, f in enumerate(schema)
             ]
             yield pa.RecordBatch.from_arrays(arrays, schema=target)
@@ -496,25 +573,13 @@ def _is_text(pa: Any, arrow_type: Any) -> bool:
 
 
 def _to_binary(pa: Any, array: Any, paths: Paths, here: bool) -> Any:
-    if here and _is_text(pa, array.type):
-        return variant_column(pa, array.cast(pa.string()))
-    if pa.types.is_struct(array.type) and paths:
-        if isinstance(array, pa.ChunkedArray):
-            chunks = [_to_binary(pa, c, paths, False) for c in array.chunks]
-            if not chunks:
-                return array
-            return pa.chunked_array(chunks, type=chunks[0].type)
-        fields = [array.type.field(i) for i in range(array.type.num_fields)]
-        children = [
-            _to_binary(pa, array.field(i), _under(paths, f.name), (f.name,) in paths)
-            for i, f in enumerate(fields)
-        ]
-        return pa.StructArray.from_arrays(
-            children,
-            fields=[f.with_type(c.type) for f, c in zip(fields, children, strict=True)],
-            mask=array.is_null() if array.null_count else None,
-        )
-    return array
+    def leaf(a: Any) -> Any:
+        return variant_column(pa, a.cast(pa.string())) if _is_text(pa, a.type) else a
+
+    def leaf_type(t: Any) -> Any:
+        return variant_type(pa) if _is_text(pa, t) else None
+
+    return _convert(pa, array, paths, here, leaf, leaf_type)
 
 
 def binary_columns(pa: Any, data: Any, paths: Paths) -> Any:

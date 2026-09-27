@@ -309,31 +309,261 @@ def _stageable(table: Any) -> Any:
     return table if schema.equals(table.schema) else table.cast(schema)
 
 
-def _variant_text(table: Any, variants: frozenset[str]) -> Any:
-    """Columns bound for VARIANT targets, as JSON text `parse_json` can read.
+#: A column type as far as its VARIANTs go: "variant", ("struct", {lower-cased
+#: field name: tree}), ("array", tree) or ("map", tree) for the value -- each
+#: pruned to the parts that hold a VARIANT -- or None for a type without one.
+VariantTree = Any
 
-    The binary ``struct<metadata, value>`` a direct engine reads is decoded;
-    a column of nulls becomes a null string. The binary form cannot be staged
-    as it is: Parquet refuses its non-nullable children under a null row, and
-    Databricks would not cast the struct to VARIANT anyway.
+
+def _variant_tree(type_text: str) -> VariantTree:
+    """Where the VARIANTs are in a DESCRIBE type string (``struct<v:variant,n:int>``).
+
+    DESCRIBE is the one place the warehouse tells a VARIANT from its JSON text,
+    and it spells a nested one inside the column's type string.
+    """
+    text = type_text.strip()
+    pos = 0
+
+    def skip_ws() -> None:
+        nonlocal pos
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+
+    def ident() -> str:
+        nonlocal pos
+        skip_ws()
+        if pos < len(text) and text[pos] == "`":
+            out = []
+            pos += 1
+            while pos < len(text):
+                if text[pos] == "`":
+                    if text[pos + 1 : pos + 2] == "`":
+                        out.append("`")
+                        pos += 2
+                        continue
+                    pos += 1
+                    break
+                out.append(text[pos])
+                pos += 1
+            return "".join(out)
+        start = pos
+        while pos < len(text) and text[pos] not in ":<>,( \t\n":
+            pos += 1
+        return text[start:pos]
+
+    def skip_to_end_of_field() -> None:
+        # NOT NULL, COMMENT '...', COLLATE x after a struct field's type.
+        nonlocal pos
+        while pos < len(text) and text[pos] not in ",>":
+            if text[pos] in "'\"":
+                quote_char = text[pos]
+                pos += 1
+                while pos < len(text) and text[pos] != quote_char:
+                    pos += 2 if text[pos] == "\\" else 1
+            pos += 1
+
+    def parse() -> VariantTree:
+        nonlocal pos
+        word = ident().lower()
+        skip_ws()
+        if pos < len(text) and text[pos] == "(":  # decimal(10,2), varchar(5)
+            pos = text.index(")", pos) + 1
+        if word == "variant":
+            return "variant"
+        if word not in ("struct", "array", "map") or pos >= len(text) or text[pos] != "<":
+            return None
+        pos += 1
+        if word == "array":
+            inner = parse()
+            skip_to_end_of_field()
+            pos += 1
+            return None if inner is None else ("array", inner)
+        if word == "map":
+            parse()  # the key: Databricks refuses a VARIANT map key
+            skip_ws()
+            pos += 1  # ,
+            inner = parse()
+            skip_to_end_of_field()
+            pos += 1
+            return None if inner is None else ("map", inner)
+        fields = {}
+        skip_ws()
+        if pos < len(text) and text[pos] == ">":
+            pos += 1
+            return None
+        while pos < len(text):
+            name = ident()
+            skip_ws()
+            pos += 1  # :
+            inner = parse()
+            skip_to_end_of_field()
+            if inner is not None:
+                fields[name.lower()] = inner
+            closing = pos < len(text) and text[pos] == ">"
+            pos += 1
+            if closing:
+                break
+        return ("struct", fields) if fields else None
+
+    try:
+        return parse()
+    except (ValueError, IndexError):
+        return None
+
+
+def _variant_arrow_paths(pa: Any, arrow_type: Any, tree: VariantTree) -> Any:
+    """`tree`, as `deltaswamp._variant` paths under a staged column of `arrow_type`."""
+    from .._variant import ELEMENT, VALUE
+
+    if tree == "variant":
+        return {()}
+    out: set[tuple[str, ...]] = set()
+    if tree is None:
+        return out
+    kind, inner = tree
+    if kind == "struct" and pa.types.is_struct(arrow_type):
+        for i in range(arrow_type.num_fields):
+            field = arrow_type.field(i)
+            sub = inner.get(field.name.lower())
+            if sub is not None:
+                out |= {(field.name, *p) for p in _variant_arrow_paths(pa, field.type, sub)}
+    elif kind == "array" and (pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type)):
+        out |= {(ELEMENT, *p) for p in _variant_arrow_paths(pa, arrow_type.value_type, inner)}
+    elif kind == "map" and pa.types.is_map(arrow_type):
+        out |= {(VALUE, *p) for p in _variant_arrow_paths(pa, arrow_type.item_type, inner)}
+    return out
+
+
+def _variant_text(table: Any, variants: Mapping[str, VariantTree]) -> Any:
+    """Values bound for VARIANT targets, as JSON text `parse_json` can read.
+
+    `variants` maps the target's lower-cased columns to where their VARIANTs
+    are, top level or nested in a struct, array or map. The binary
+    ``struct<metadata, value>`` a direct engine reads is decoded; nulls
+    become null strings. The binary form cannot be staged as it is: Parquet
+    refuses its non-nullable children under a null row, and Databricks would
+    not cast the struct to VARIANT anyway.
     """
     if not variants:
         return table
     import pyarrow as pa
 
-    from .._variant import is_variant_struct, json_column
+    from .._variant import _convert, is_variant_struct, json_column
+
+    def leaf(a: Any) -> Any:
+        if is_variant_struct(pa, a.type):
+            return json_column(pa, a)
+        return a.cast(pa.string()) if pa.types.is_null(a.type) else a
+
+    def leaf_type(t: Any) -> Any:
+        return pa.string() if is_variant_struct(pa, t) or pa.types.is_null(t) else None
 
     for index, field in enumerate(table.schema):
-        if field.name.lower() not in variants:
+        tree = variants.get(field.name.lower())
+        if tree is None:
             continue
-        if is_variant_struct(pa, field.type):
-            column = json_column(pa, table.column(index))
-        elif pa.types.is_null(field.type):
-            column = table.column(index).cast(pa.string())
-        else:
+        paths = frozenset(_variant_arrow_paths(pa, field.type, tree))
+        if not paths:
             continue
-        table = table.set_column(index, pa.field(field.name, pa.string()), column)
+        column = _convert(
+            pa,
+            table.column(index),
+            frozenset(p for p in paths if p),
+            () in paths,
+            leaf,
+            leaf_type,
+        )
+        if column is not table.column(index):
+            table = table.set_column(index, pa.field(field.name, column.type), column)
     return table
+
+
+def _variant_sql(pa: Any, expr: str, arrow_type: Any, tree: VariantTree, depth: int = 0) -> str:
+    """`expr` (a staged value of `arrow_type`) with its JSON text parsed where `tree` says.
+
+    Nested VARIANTs are reached through `named_struct` and the higher-order
+    `transform` / `transform_values`, so a VARIANT inside a struct, an array
+    or a map is parsed too; staged as text and inserted as it was, each
+    became a string scalar (``schema_of_variant`` STRING).
+    """
+    if tree is None:
+        return expr
+    if tree == "variant":
+        if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+            return f"parse_json({expr})"
+        return expr
+    kind, inner = tree
+    if kind == "struct" and pa.types.is_struct(arrow_type):
+        parts, changed = [], False
+        for i in range(arrow_type.num_fields):
+            field = arrow_type.field(i)
+            child = f"{expr}.{sq.quote(field.name)}"
+            sub = _variant_sql(pa, child, field.type, inner.get(field.name.lower()), depth)
+            changed |= sub != child
+            parts.append(f"{sq.literal(field.name)}, {sub}")
+        if not changed:
+            return expr
+        return f"CASE WHEN {expr} IS NULL THEN NULL ELSE named_struct({', '.join(parts)}) END"
+    if kind == "array" and (pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type)):
+        var = f"__e{depth}"
+        sub = _variant_sql(pa, var, arrow_type.value_type, inner, depth + 1)
+        return expr if sub == var else f"transform({expr}, {var} -> {sub})"
+    if kind == "map" and pa.types.is_map(arrow_type):
+        key, var = f"__k{depth}", f"__v{depth}"
+        sub = _variant_sql(pa, var, arrow_type.item_type, inner, depth + 1)
+        return expr if sub == var else f"transform_values({expr}, ({key}, {var}) -> {sub})"
+    return expr
+
+
+#: Features Databricks will not drop (DELTA_FEATURE_DROP_NONREMOVABLE_FEATURE,
+#: each checked against a warehouse).
+_NONREMOVABLE_FEATURES = frozenset(
+    {
+        "appendonly",
+        "invariants",
+        "changedatafeed",
+        "generatedcolumns",
+        "identitycolumns",
+        "timestampntz",
+        "allowcolumndefaults",
+    }
+)
+
+
+def _drop_feature_refusal(table: ResolvedTable, feature: Any) -> Capability | None:
+    """Why Databricks would refuse to drop `feature` from `table`, if it would.
+
+    can(DROP_FEATURE) answered for the operation alone, so it said yes for a
+    feature Databricks never drops, or one the table does not have, and the
+    call then failed on the warehouse.
+    """
+    name = sq.feature_name(feature)
+    if name.lower() in _NONREMOVABLE_FEATURES:
+        return Capability(
+            Operation.DROP_FEATURE,
+            ok=False,
+            reason=f"Databricks cannot drop the {name} feature from a table "
+            "(DELTA_FEATURE_DROP_NONREMOVABLE_FEATURE)",
+            remedy="recreate the table without it (CREATE TABLE ... AS SELECT)",
+        )
+
+    def base(wire: str) -> str:
+        # typeWidening drops typeWidening-preview too.
+        return wire.lower().removesuffix("-preview")
+
+    features = {base(f) for f in table.features} | {
+        base(key[len("delta.feature.") :])
+        for key in table.properties
+        if key.startswith("delta.feature.")
+    }
+    if features and base(name) not in features:
+        return Capability(
+            Operation.DROP_FEATURE,
+            ok=False,
+            reason=f"the table does not have the {name} feature, so there is nothing to drop "
+            "(DELTA_FEATURE_DROP_FEATURE_NOT_PRESENT)",
+        )
+    return None
 
 
 def _parquet_bytes(table: Any) -> bytes:
@@ -503,6 +733,8 @@ class SqlEngine:
                 remedy="ds.connect(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
         refusal = self._table_type_refusal(operation, table)
+        if refusal is None and operation is Operation.DROP_FEATURE and "feature" in shape:
+            refusal = _drop_feature_refusal(table, shape["feature"])
         if refusal is not None:
             return refusal
         if self._backend is None and self._resolve_warehouse() is None:
@@ -592,6 +824,36 @@ class SqlEngine:
                 remedy="t.optimize() clusters by the table's clustering keys; "
                 "t.cluster_by([...]) changes them",
             )
+        if operation is Operation.CLUSTER_BY and table.partition_columns:
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is partitioned, and Databricks refuses CLUSTER BY on it "
+                    "(DELTA_ALTER_TABLE_CLUSTER_BY_ON_PARTITIONED_TABLE_NOT_ALLOWED)"
+                ),
+                remedy="recreate the table with CLUSTER BY (CREATE TABLE ... CLUSTER BY ... "
+                "AS SELECT * FROM the old one)",
+            )
+        if operation is Operation.CDF and (features or table.properties):
+
+            def on(key: str) -> bool:
+                return str(table.properties.get(key, "")).lower() == "true"
+
+            if not on("delta.enableChangeDataFeed") and not on("delta.enableRowTracking"):
+                # The warehouse serves table_changes from the change feed, or
+                # from row tracking without one; with neither it answers
+                # DELTA_MISSING_ROW_TRACKING_FOR_CDC after can() said yes.
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason=(
+                        "delta.enableChangeDataFeed is not enabled on this table, nor is row "
+                        "tracking, so there is no change feed to read. Enabling either is not "
+                        "retroactive: only changes after enablement are recorded"
+                    ),
+                    remedy="t.set_properties({'delta.enableChangeDataFeed': 'true'})",
+                )
         if kind in _NOT_WRITABLE_TYPES and operation not in READ_OPERATIONS:
             return Capability(
                 operation,
@@ -901,14 +1163,14 @@ class SqlEngine:
 
     @contextlib.contextmanager
     def _staged(
-        self, data: Any, variants: frozenset[str] = frozenset()
+        self, data: Any, variants: Mapping[str, VariantTree] | None = None
     ) -> Iterator[tuple[str, Any]]:
         """Upload `data` as Parquet to the staging volume; always delete it after.
 
         Yields the `read_files(...)` relation and the Arrow table uploaded.
-        `variants` names the target's VARIANT columns (lower-cased): one given
-        in the variant binary encoding is staged as JSON text, which is what
-        `_staged_select` parses back.
+        `variants` (from `_variant_columns`) says where the target's VARIANTs
+        are: one given in the variant binary encoding is staged as JSON text,
+        which is what `_staged_select` parses back.
         """
         if self._staging_volume is None:
             raise UnreachableTableError(
@@ -916,7 +1178,7 @@ class SqlEngine:
                 "no staging volume is configured",
                 "ds.connect(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
-        arrow = _variant_text(_stageable(_to_arrow(data)), variants)
+        arrow = _variant_text(_stageable(_to_arrow(data)), variants or {})
         payload = _parquet_bytes(arrow)
         catalog, schema, volume = self._staging_volume
         path = f"/Volumes/{catalog}/{schema}/{volume}/{_STAGING_DIR}/{uuid.uuid4().hex}.parquet"
@@ -952,6 +1214,22 @@ class SqlEngine:
                     stacklevel=3,
                 )
 
+    def staging_volume_problem(self) -> str | None:
+        """Why the configured staging volume cannot take a write, or None if it can."""
+        if self._staging_volume is None:
+            return None
+        name = ".".join(self._staging_volume)
+        try:
+            self._workspace().volumes.read(name)
+        except Exception as exc:
+            reason = sdk_error(exc, f"the staging volume {name}")
+            return (
+                f"the staging volume {name} cannot be used, so writes through the SQL "
+                f"fallback would fail: {getattr(reason, 'reason', None) or reason}. Create it "
+                f"(CREATE VOLUME {name}) or pass another staging_volume"
+            )
+        return None
+
     @staticmethod
     def _staged_columns(arrow: Any) -> str:
         """The staged file's own columns, spelled out.
@@ -964,12 +1242,13 @@ class SqlEngine:
         return sq.columns(list(arrow.column_names))
 
     @staticmethod
-    def _staged_select(arrow: Any, variants: frozenset[str], columns: Any = None) -> str:
+    def _staged_select(arrow: Any, variants: Mapping[str, VariantTree], columns: Any = None) -> str:
         """The staged columns as a SELECT list, JSON text parsed for VARIANT targets.
 
         Spark casts a STRING into a VARIANT column as a string scalar, so the
         JSON text a read returns for a VARIANT came back as ``"{\"a\":1}"``,
-        its objects gone. `parse_json` stores the value the text describes.
+        its objects gone. `parse_json` stores the value the text describes,
+        at the top level and inside structs, arrays and maps alike.
         """
         import pyarrow as pa
 
@@ -977,19 +1256,18 @@ class SqlEngine:
         out = []
         for name in names:
             field = arrow.schema.field(name)
-            if name.lower() in variants and (
-                pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
-            ):
-                out.append(f"parse_json({sq.quote(name)}) AS {sq.quote(name)}")
-            else:
-                out.append(sq.quote(name))
+            quoted = sq.quote(name)
+            expr = _variant_sql(pa, quoted, field.type, variants.get(name.lower()))
+            out.append(quoted if expr == quoted else f"{expr} AS {quoted}")
         return ", ".join(out)
 
-    def _variant_columns(self, table: ResolvedTable) -> frozenset[str]:
-        """The table's top-level VARIANT columns, lower-cased; asked only of a VARIANT table.
+    def _variant_columns(self, table: ResolvedTable) -> dict[str, VariantTree]:
+        """The columns holding a VARIANT, lower-cased, each with where its VARIANTs are.
 
         The warehouse's own result schema gives VARIANT as text, so DESCRIBE
-        is the one place that tells the two apart.
+        is the one place that tells the two apart; it spells a VARIANT nested
+        in a struct, array or map inside the column's type string. Asked only
+        of a table with the variantType feature.
         """
         features = set(table.features) | {
             key[len("delta.feature.") :]
@@ -997,16 +1275,17 @@ class SqlEngine:
             if key.startswith("delta.feature.")
         }
         if not features & {"variantType", "variantType-preview"}:
-            return frozenset()
+            return {}
         result = self._query(Operation.DETAIL, f"DESCRIBE TABLE {sq.name(table)}")
-        found = set()
+        found: dict[str, VariantTree] = {}
         for row in result.to_pylist():
             name = str(row.get("col_name") or "")
             if not name or name.startswith("#"):
                 break  # partition and clustering sections repeat the columns
-            if str(row.get("data_type") or "").strip().lower() == "variant":
-                found.add(name.lower())
-        return frozenset(found)
+            tree = _variant_tree(str(row.get("data_type") or ""))
+            if tree is not None:
+                found[name.lower()] = tree
+        return found
 
     def _table_schema(self, table: ResolvedTable) -> Any:
         return self._query(Operation.SCAN, f"SELECT * FROM {sq.name(table)} LIMIT 0").schema
@@ -1078,7 +1357,7 @@ class SqlEngine:
                 return
             binder = ParameterBinder()
             if predicate is None:
-                predicate = self._dynamic_predicate(table, arrow, binder)
+                predicate = self._dynamic_predicate(table, arrow, binder, source)
             # Column names resolve case-insensitively on Databricks, so match
             # them that way, projecting the data's own spelling.
             target = self._table_columns(table)
@@ -1118,7 +1397,9 @@ class SqlEngine:
                 binder,
             )
 
-    def _dynamic_predicate(self, table: ResolvedTable, arrow: Any, binder: ParameterBinder) -> str:
+    def _dynamic_predicate(
+        self, table: ResolvedTable, arrow: Any, binder: ParameterBinder, source: str | None = None
+    ) -> str:
         partitions = list(table.partition_columns)
         if not partitions:
             raise UnreachableTableError(
@@ -1128,23 +1409,48 @@ class SqlEngine:
             )
         by_lower = {c.lower(): c for c in arrow.column_names}
         missing = [c for c in partitions if c.lower() not in by_lower]
-        if missing:
+        generated = self._generation_expressions(table) if missing and source else {}
+        if [c for c in missing if c.lower() not in generated]:
             raise UnreachableTableError(
                 "overwrite dynamically",
                 f"the data has no {', '.join(missing)} column, so the partitions it would "
                 "replace cannot be determined",
+                "include the partition column(s) in the data",
             )
-        # The catalog may spell a partition column differently from the data
-        # ("Region" vs "region"); Databricks resolves names case-insensitively.
-        source_cols = [by_lower[c.lower()] for c in partitions]
-        # Databricks stores an empty-string partition value as the null
-        # partition, as Spark does, so a row with region '' lands where
-        # `region IS NULL`; `region = ''` would match nothing it wrote and the
-        # REPLACE WHERE check would refuse the row.
-        tuples = {
-            tuple(None if r[c] == "" else r[c] for c in source_cols)
-            for r in arrow.select(source_cols).to_pylist()
-        }
+        if missing:
+            # A generated partition column (day = CAST(ts AS DATE)) the data
+            # leaves out, as Databricks lets it: the warehouse computes each
+            # row's value from the staged rows, as the insert will.
+            select = ", ".join(
+                f"({generated[c.lower()]}) AS {sq.quote(c)}"
+                if c.lower() in generated and c.lower() not in by_lower
+                else sq.quote(by_lower[c.lower()])
+                for c in partitions
+            )
+            try:
+                rows = self._query(
+                    Operation.REPLACE_WHERE, f"SELECT DISTINCT {select} FROM {source}"
+                ).to_pylist()
+            except SqlStatementError as exc:
+                raise UnreachableTableError(
+                    "overwrite dynamically",
+                    f"the generated partition column(s) {', '.join(missing)} could not be "
+                    f"computed from the data ({str(exc).splitlines()[0][:200]})",
+                    "include the partition column(s) in the data",
+                ) from exc
+            tuples = {tuple(None if r[c] == "" else r[c] for c in partitions) for r in rows}
+        else:
+            # The catalog may spell a partition column differently from the data
+            # ("Region" vs "region"); Databricks resolves names case-insensitively.
+            source_cols = [by_lower[c.lower()] for c in partitions]
+            # Databricks stores an empty-string partition value as the null
+            # partition, as Spark does, so a row with region '' lands where
+            # `region IS NULL`; `region = ''` would match nothing it wrote and the
+            # REPLACE WHERE check would refuse the row.
+            tuples = {
+                tuple(None if r[c] == "" else r[c] for c in source_cols)
+                for r in arrow.select(source_cols).to_pylist()
+            }
         if not tuples:
             raise UnreachableTableError(
                 "overwrite dynamically", "the data is empty, so no partitions are implied"
@@ -1164,6 +1470,35 @@ class SqlEngine:
             ]
             clauses.append("(" + " AND ".join(terms) + ")")
         return " OR ".join(clauses)
+
+    def _generation_expressions(self, table: ResolvedTable) -> dict[str, str]:
+        """The table's generated columns, lower-cased, with their SQL expressions.
+
+        Read from Unity Catalog's column `type_json` (the Delta StructField,
+        metadata included): information_schema and DESCRIBE leave the
+        expression out.
+        """
+        import json
+
+        # Asked only when the data leaves a partition column out, so not gated
+        # on has_generated_columns, which a Unity Catalog listing leaves unset.
+        ref = table.ref
+        if ref.kind is not RefKind.CATALOG:
+            return {}
+        try:
+            info = self._workspace().tables.get(f"{ref.catalog}.{ref.schema}.{ref.table}")
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for column in info.columns or []:
+            try:
+                metadata = json.loads(column.type_json or "{}").get("metadata") or {}
+            except (TypeError, ValueError, AttributeError):
+                continue
+            expression = metadata.get("delta.generationExpression")
+            if column.name and expression:
+                out[str(column.name).lower()] = str(expression)
+        return out
 
     @staticmethod
     def _check_write_args(what: str, schema_mode: str | None, kwargs: Mapping[str, Any]) -> None:
@@ -1224,12 +1559,12 @@ class SqlEngine:
         variants = (
             self._variant_columns(table)
             if any(isinstance(v, str) for v in (new_values or {}).values())
-            else frozenset()
+            else {}
         )
 
         def value(key: Any, v: Any) -> str:
             text = _value_sql(v, binder)
-            if isinstance(v, str) and str(key).strip("`").lower() in variants:
+            if isinstance(v, str) and variants.get(str(key).strip("`").lower()) == "variant":
                 # JSON text, as every write takes a VARIANT; bound bare, the
                 # warehouse stored the text as a variant string.
                 return f"parse_json({text})"
@@ -1936,6 +2271,9 @@ class SqlMerger:
         self._target_alias = target_alias
         self._merge_schema = merge_schema
         self._arrow: Any = None
+        # The target's columns, lower-cased, looked up at execute() for a
+        # *_ALL clause; None leaves the spelled-out list unfiltered.
+        self._target_columns: set[str] | None = None
         # (kind, predicate, action), resolved against the source columns at execute().
         self._clauses: list[tuple[str, str | None, Any]] = []
 
@@ -2010,6 +2348,13 @@ class SqlMerger:
         # Names resolve case-insensitively, so except_cols=["ID"] excludes "id".
         excluded = {str(c).lower() for c in arg}
         cols = [c for c in source_columns if c.lower() not in excluded]
+        if self._target_columns is not None and not self._merge_schema:
+            # `UPDATE SET *` / `INSERT *` ignore a source column the target
+            # lacks, as delta-rs does; spelled out, it failed the MERGE with
+            # "cannot resolve target.extra". With no column in common the
+            # list is left whole, for the warehouse to name the mismatch.
+            shared = [c for c in cols if c.lower() in self._target_columns]
+            cols = shared or cols
         if not cols:
             raise InvalidArgumentError("except_cols excludes every source column")
         # `*` only under schema evolution, which needs it to add columns.
@@ -2054,6 +2399,10 @@ class SqlMerger:
         if not self._clauses:
             raise InvalidArgumentError("a MERGE needs at least one WHEN clause")
         variants = self._engine._variant_columns(self._table)
+        if not self._merge_schema and any(
+            action[0] in ("UPDATE_ALL", "INSERT_ALL") for _, _, action in self._clauses
+        ):
+            self._target_columns = {c.lower() for c in self._engine._table_columns(self._table)}
         with self._engine._staged(self._source, variants) as (relation, arrow):
             select = self._engine._staged_select(arrow, variants)
             sql = self.statement(relation, list(arrow.column_names), select)
