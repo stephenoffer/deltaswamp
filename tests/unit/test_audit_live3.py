@@ -206,7 +206,9 @@ def test_generated_partition_values_come_from_the_warehouse() -> None:
         SimpleNamespace(name="ts", type_json="{}"),
         SimpleNamespace(name="day", type_json=json.dumps(field)),
     ]
-    client.tables = SimpleNamespace(get=lambda name: SimpleNamespace(columns=columns))
+    client.tables = SimpleNamespace(  # type: ignore[attr-defined]
+        get=lambda name: SimpleNamespace(columns=columns)
+    )
     t = table(partition_columns=("day",))
     data = pa.table({"ts": pa.array([0], pa.timestamp("us", tz="UTC"))})
     eng.overwrite(t, data, partition_overwrite="dynamic")
