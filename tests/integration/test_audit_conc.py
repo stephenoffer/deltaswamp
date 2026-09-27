@@ -224,8 +224,8 @@ def _two_columns(tmp_path: Any, properties: dict[str, str]) -> str:
 
 
 def _append_row(path: str, key: int) -> Any:
-    return (
-        lambda: _kernel_only()
+    return lambda: (
+        _kernel_only()
         .open_table(path)
         .append(pa.table({"id": pa.array([key], pa.int64()), "v": pa.array([0], pa.int64())}))
     )

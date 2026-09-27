@@ -3503,7 +3503,9 @@ def _zorder_indices(rows: Any, columns: list[str]) -> Any:
     result clusters rows close in every column, which is what lets each
     output file's min/max statistics skip well on any of them.
     """
-    import numpy as np
+    from ..table import _require
+
+    np = _require("numpy", "pyarrow", "Z-ORDER")
     import pyarrow.compute as pc
 
     by_lower = {n.lower(): n for n in rows.column_names}
