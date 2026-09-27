@@ -424,7 +424,7 @@ def polars_frame(dataset: TableDataset) -> Any:
     from polars.io.plugins import register_io_source
 
     arrow_schema = dataset.schema
-    polars_schema = pl.from_arrow(arrow_schema.empty_table()).schema  # type: ignore[union-attr]
+    polars_schema = pl.from_arrow(arrow_schema.empty_table()).schema  # type: ignore[union-attr, unused-ignore]
     names = list(arrow_schema.names)
 
     def source(

@@ -151,15 +151,19 @@ TABLE_CASES: list[Bad] = [
     ),
     Bad(
         "merge_bad_predicate_execute",
-        lambda e: e.table.merge(_data(), "t.nope = s.id", source_alias="s", target_alias="t")
-        .when_matched_update_all()
-        .execute(),
+        lambda e: (
+            e.table.merge(_data(), "t.nope = s.id", source_alias="s", target_alias="t")
+            .when_matched_update_all()
+            .execute()
+        ),
     ),
     Bad(
         "merge_bad_clause_expression",
-        lambda e: e.table.merge(_data(), "t.id = s.id", source_alias="s", target_alias="t")
-        .when_matched_update({"v": "s.nope"})
-        .execute(),
+        lambda e: (
+            e.table.merge(_data(), "t.id = s.id", source_alias="s", target_alias="t")
+            .when_matched_update({"v": "s.nope"})
+            .execute()
+        ),
     ),
     # --- ddl
     Bad("add_column_empty", lambda e: e.table.add_column([])),

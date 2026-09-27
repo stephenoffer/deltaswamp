@@ -141,9 +141,9 @@ def test_deltars_lost_race_is_a_commit_conflict_error(path: str, monkeypatch: An
     monkeypatch.setattr(
         DeltaRsEngine,
         "_open",
-        lambda self, table, *, version=None, write=False: stale
-        if write
-        else real(self, table, version=version, write=write),
+        lambda self, table, *, version=None, write=False: (
+            stale if write else real(self, table, version=version, write=write)
+        ),
     )
     with pytest.raises(CommitConflictError):
         t.delete("id = 2")

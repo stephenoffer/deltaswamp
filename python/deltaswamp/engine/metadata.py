@@ -540,7 +540,7 @@ def _structs_in(datatype: Any) -> Iterable[dict[str, Any]]:
 def _max_column_id(state: TableState) -> int:
     """The highest column-mapping id in use: the recorded maximum or any field's."""
     recorded = state.configuration.get(_CM_MAX)
-    highest = int(recorded) if recorded not in (None, "") else 0
+    highest = int(recorded) if recorded else 0
     for f in _walk(state.schema):
         value = (f.get("metadata") or {}).get(_CM_ID)
         if value is not None:

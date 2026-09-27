@@ -446,10 +446,12 @@ CASES: list[Case] = [
     Case(
         P.MERGE,
         "merge_commit_metadata",
-        lambda t, cx: t.merge(**_merge_args(cx), commit_metadata={"contract": "yes"})
-        .when_matched_update_all()
-        .when_not_matched_insert_all()
-        .execute(),
+        lambda t, cx: (
+            t.merge(**_merge_args(cx), commit_metadata={"contract": "yes"})
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute()
+        ),
         lambda cx: {
             **_merge_args(cx),
             "commit_metadata": {"contract": "yes"},

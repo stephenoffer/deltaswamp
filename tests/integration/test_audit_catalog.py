@@ -260,7 +260,7 @@ class TestPickledProviderBuildsAClient:
     def test_unpickled_provider_builds_the_client(self, offline_sdk: None) -> None:
         from deltaswamp.credentials.databricks import DatabricksCredentialProvider
 
-        provider = DatabricksCredentialProvider("tid-1", config=_FakeConfig())  # type: ignore[arg-type]
+        provider = DatabricksCredentialProvider("tid-1", config=_FakeConfig())  # type: ignore[arg-type, unused-ignore]
         clone = pickle.loads(pickle.dumps(provider))
         client = clone._workspace()  # TypeError: multiple values for 'host'
         assert client.config.host == _FakeConfig.host
@@ -269,7 +269,7 @@ class TestPickledProviderBuildsAClient:
     def test_unpickled_catalog_builds_the_client(self, offline_sdk: None) -> None:
         from deltaswamp.catalog.databricks import DatabricksUnityCatalog
 
-        catalog = DatabricksUnityCatalog(config=_FakeConfig())  # type: ignore[arg-type]
+        catalog = DatabricksUnityCatalog(config=_FakeConfig())  # type: ignore[arg-type, unused-ignore]
         clone = pickle.loads(pickle.dumps(catalog))
         assert clone.workspace.config.host == _FakeConfig.host
 
