@@ -622,7 +622,10 @@ class Connection:
         _check_version(version)
         ref = parse_ref(path)
         if ref.kind is not RefKind.PATH:
-            raise InvalidReferenceError(f"{path!r} is a catalog name; use .table() instead")
+            raise InvalidReferenceError(
+                f"{path!r} is a catalog table name (catalog.schema.table), not a storage "
+                "path; open it with .table() instead"
+            )
         return Table(self, FilesystemCatalog().resolve(ref), version=version)
 
     def _catalog_ref(self, name: str, what: str) -> Any:

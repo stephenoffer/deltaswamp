@@ -44,6 +44,9 @@ class ScanPlan:
     #: Where the table's VARIANT columns are (paths of names), read as JSON
     #: text as `Table` reads them; the engines give the binary encoding.
     variant_paths: tuple[tuple[str, ...], ...] = ()
+    #: Where its interval columns are, by kind (`engine.intervals`): read as
+    #: `Table` reads them, a duration or text, where the engines give integers.
+    interval_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = ()
 
     @property
     def version(self) -> int | None:
@@ -113,6 +116,10 @@ class ScanPlan:
 
             # to_arrow() gives VARIANT as JSON text; so does a planned read.
             stream = json_text_stream(stream, frozenset(self.variant_paths))
+        if self.interval_paths:
+            from .engine.intervals import interval_stream
+
+            stream = interval_stream(stream, {g: frozenset(p) for g, p in self.interval_paths})
         # A split whose file was vacuumed since planning failed as a bare
         # OSError; name the file instead.
         where = getattr(self.table, "location", None) or "the table"
@@ -159,6 +166,9 @@ class WritePlan:
     #: Where the table's VARIANT columns are: JSON text given for one is
     #: encoded as `Table.append` encodes it.
     variant_paths: tuple[tuple[str, ...], ...] = ()
+    #: Where its interval columns are (see `ScanPlan`): a duration or text
+    #: given for one is written as the integers Delta stores.
+    interval_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = ()
     #: The table's metaData id at the planned version. Workers reuse a cached
     #: snapshot, and the commit reads a fresh one; both must be this table,
     #: not one dropped and re-created at the same path since planning.
@@ -221,6 +231,15 @@ class WritePlan:
                 # The engines take the binary encoding; JSON text failed with a
                 # raw "Expected Struct, got Utf8".
                 data = binary_columns(pa, data, frozenset(self.variant_paths))
+        if self.interval_paths:
+            import pyarrow as pa
+
+            from .engine.intervals import storage_columns
+
+            if isinstance(data, pa.RecordBatch):
+                data = pa.Table.from_batches([data])
+            if isinstance(data, pa.Table):
+                data = storage_columns(pa, data, {g: frozenset(p) for g, p in self.interval_paths})
 
         # At the planned version: resolved once per process and reused by
         # every later write(), where the latest snapshot cost a log replay
@@ -812,6 +831,11 @@ def DeltaSwampDatasource(plan: ScanPlan) -> Any:
                         from deltaswamp._variant import json_text_stream
 
                         reader = json_text_stream(reader, frozenset(paths))
+                    intervals = getattr(plan, "interval_paths", ())
+                    if intervals:
+                        from deltaswamp.engine.intervals import interval_stream
+
+                        reader = interval_stream(reader, {g: frozenset(p) for g, p in intervals})
                     produced = False
                     for batch in reader:
                         if batch.num_rows:

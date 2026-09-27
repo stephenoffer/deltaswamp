@@ -38,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import io
 import numbers
+import re
 import uuid
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
@@ -64,6 +65,7 @@ from .sql_backend import (
     _check_timeout,
     _check_wait_timeout,
     parameters_from_mapping,
+    permission_error,
     sdk_error,
 )
 
@@ -239,6 +241,42 @@ def _unstageable(arrow_type: Any) -> bool:
     if t.is_struct(arrow_type):
         return any(_unstageable(arrow_type.field(i).type) for i in range(arrow_type.num_fields))
     return False
+
+
+#: Field metadata marking a staged column that was a duration: staged as its
+#: microseconds and turned back into an interval by `_staged_select`.
+_DURATION_US = b"deltaswamp.duration_us"
+
+
+def _staged_durations(table: Any) -> Any:
+    """Top-level durations as INT64 microseconds, marked for `_staged_select`.
+
+    Databricks reads no Parquet duration, and a BIGINT cast to a day-time
+    interval counts *seconds*: an INTERVAL DAY TO SECOND that a direct read
+    returned as bare microseconds went back in as that integer, a million
+    times too large. Reads now give a duration (`engine.intervals`), staged
+    here as microseconds; times ``INTERVAL '0.000001' SECOND`` it is exact
+    over the whole interval range.
+    """
+    import pyarrow as pa
+
+    for index, field in enumerate(table.schema):
+        if not pa.types.is_duration(field.type):
+            continue
+        column = table.column(index)
+        if field.type.unit != "us":
+            try:
+                column = column.cast(pa.duration("us"), safe=True)
+            except pa.ArrowInvalid as exc:
+                raise InvalidArgumentError(
+                    f"column {field.name!r} holds a sub-microsecond duration, which a "
+                    f"Databricks interval (microseconds) cannot hold ({exc})"
+                ) from exc
+        staged = pa.field(
+            field.name, pa.int64(), field.nullable, {**(field.metadata or {}), _DURATION_US: b"1"}
+        )
+        table = table.set_column(index, staged, column.cast(pa.int64()))
+    return table
 
 
 def _stageable_type(arrow_type: Any) -> Any:
@@ -478,6 +516,33 @@ def _variant_text(table: Any, variants: Mapping[str, VariantTree]) -> Any:
     return table
 
 
+#: A DESCRIBE type string of a geospatial column: ``geometry(4326)``.
+_GEO_TYPE = re.compile(r"(geometry|geography)\(([A-Za-z0-9:_]+)\)", re.IGNORECASE)
+
+
+def _geo_sql(pa: Any, expr: str, arrow_type: Any, kind: str, srid: str) -> str:
+    """A staged value bound for a GEOMETRY / GEOGRAPHY column, as that type.
+
+    Reads give such a column as EWKT (``SRID=4326;POINT(1 2)``), and the
+    warehouse casts neither text nor ``st_geomfromewkt``'s GEOMETRY(ANY) to
+    a column's own SRID -- even a NULL, so an append that left the column
+    out failed too. WKT with the column's SRID is: an EWKT prefix naming it
+    is dropped, and one naming another SRID fails to parse, rather than
+    being relabelled. Binary is taken as WKB.
+    """
+    make = "st_geomfromtext" if kind == "geometry" else "st_geogfromtext"
+    tail = f", {srid}" if kind == "geometry" and srid.isdigit() else ""
+    if pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
+        wkb = "st_geomfromwkb" if kind == "geometry" else "st_geogfromwkb"
+        return f"{wkb}({expr}{tail})"
+    number = srid.rsplit(":", 1)[-1] if kind == "geometry" else "4326"
+    prefix = sq.literal(f"^SRID={number};") if number.isdigit() else None
+    text = f"CAST({expr} AS STRING)"
+    if prefix is not None:
+        text = f"regexp_replace({text}, {prefix}, '')"
+    return f"{make}({text}{tail})"
+
+
 def _variant_sql(pa: Any, expr: str, arrow_type: Any, tree: VariantTree, depth: int = 0) -> str:
     """`expr` (a staged value of `arrow_type`) with its JSON text parsed where `tree` says.
 
@@ -563,7 +628,48 @@ def _drop_feature_refusal(table: ResolvedTable, feature: Any) -> Capability | No
             reason=f"the table does not have the {name} feature, so there is nothing to drop "
             "(DELTA_FEATURE_DROP_FEATURE_NOT_PRESENT)",
         )
+    constraints = sorted(
+        key[len("delta.constraints.") :]
+        for key in table.properties
+        if key.lower().startswith("delta.constraints.")
+    )
+    if base(name) == "checkconstraints" and constraints:
+        return Capability(
+            Operation.DROP_FEATURE,
+            ok=False,
+            reason="Databricks drops the checkConstraints feature only once the table has no "
+            f"CHECK constraint, and it has {', '.join(constraints)} "
+            "(DELTA_CANNOT_DROP_CHECK_CONSTRAINT_FEATURE)",
+            remedy="t.drop_constraint(name) for each first",
+        )
     return None
+
+
+#: What Delta refuses in a column name without column mapping.
+_INVALID_NAME_CHARACTERS = frozenset(" ,;{}()\n\t=")
+
+
+def _column_name_refusal(table: ResolvedTable, fields: Any) -> Capability | None:
+    """ADD COLUMNS of a name Databricks refuses on a table without column mapping."""
+    mode = str(table.properties.get("delta.columnMapping.mode", "none")).strip().lower()
+    if mode in ("name", "id"):
+        return None
+    if isinstance(fields, Mapping):
+        names = [str(n) for n in fields]
+    else:
+        items = fields if isinstance(fields, (list, tuple)) else [fields]
+        names = [n for n in (getattr(f, "name", None) for f in items) if isinstance(n, str)]
+    bad = [n for n in names if set(n) & _INVALID_NAME_CHARACTERS]
+    if not bad:
+        return None
+    return Capability(
+        Operation.ADD_COLUMN,
+        ok=False,
+        reason=f"column name(s) {', '.join(map(repr, bad))} hold a character Delta allows only "
+        "with column mapping (one of ' ,;{}()\\n\\t=') "
+        "(DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES)",
+        remedy="t.set_properties({'delta.columnMapping.mode': 'name'}) first, or rename the column",
+    )
 
 
 def _parquet_bytes(table: Any) -> bytes:
@@ -576,9 +682,11 @@ def _parquet_bytes(table: Any) -> bytes:
     if bad:
         raise UnreachableTableError(
             "write via a SQL warehouse",
-            f"column(s) {', '.join(bad)} have a time-of-day, duration or interval type, "
-            "which Databricks SQL cannot store",
-            "cast them to STRING, BIGINT or TIMESTAMP first",
+            f"column(s) {', '.join(bad)} have a time-of-day type, or a duration or "
+            "interval nested in a struct, list or map, which cannot be staged for "
+            "Databricks SQL",
+            "cast them to STRING, BIGINT or TIMESTAMP first (a top-level duration is "
+            "written to an INTERVAL column as it is)",
         )
 
     import pyarrow as pa
@@ -650,6 +758,14 @@ def _iceberg_refusal(
     if not features & _ICEBERG_WRITER_COMPAT:
         return None
     managed = "a managed Iceberg table (IcebergWriterCompat)"
+    if operation is Operation.CLONE and shape.get("shallow", True) is not False:
+        return Capability(
+            operation,
+            ok=False,
+            reason=f"Databricks cannot SHALLOW CLONE {managed} "
+            "(MANAGED_ICEBERG_OPERATION_NOT_SUPPORTED)",
+            remedy="t.clone(target, shallow=False) makes a deep clone, which it does take",
+        )
     if operation in (Operation.ADD_CONSTRAINT, Operation.DROP_CONSTRAINT):
         return Capability(
             operation,
@@ -713,6 +829,8 @@ class SqlEngine:
     #: SQL no direct engine can be made to evaluate as Spark does (an array
     #: subscript, `split`): see `dialect.warehouse_reason`.
     supports_spark_sql = True
+    #: Spark's CHAR(n) comparisons, which pad with spaces (`Table._char_needs`).
+    supports_char_padding = True
     supports_timestamp_travel = True
     #: `INSERT WITH SCHEMA EVOLUTION` / `MERGE WITH SCHEMA EVOLUTION`.
     supports_schema_merge = True
@@ -840,6 +958,8 @@ class SqlEngine:
         refusal = self._table_type_refusal(operation, table)
         if refusal is None and operation is Operation.DROP_FEATURE and "feature" in shape:
             refusal = _drop_feature_refusal(table, shape["feature"])
+        if refusal is None and operation is Operation.ADD_COLUMN and "fields" in shape:
+            refusal = _column_name_refusal(table, shape["fields"])
         if refusal is None:
             # Not `or`: a refusal is a falsy Capability.
             refusal = _iceberg_refusal(operation, table, shape)
@@ -1050,6 +1170,18 @@ class SqlEngine:
                     f"the SQL warehouse {warehouse_id!r} does not exist in this workspace ({exc})"
                 )
                 return None
+            # A malformed id ('bogus') is not a 404 but an InvalidParameterValue
+            # ("bogus is not a valid endpoint id"), which let it through to a
+            # raw SqlStatementError on the first statement.
+            code = str(getattr(exc, "error_code", "") or "").upper()
+            names = {c.__name__ for c in type(exc).__mro__}
+            if code == "INVALID_PARAMETER_VALUE" or "InvalidParameterValue" in names:
+                self._selection_error = (
+                    f"{warehouse_id!r} is not a SQL warehouse id in this workspace ({exc}); "
+                    "a warehouse id is the 16-character hex id on the warehouse's "
+                    "Connection details tab"
+                )
+                return None
         self._warehouse_checked = True
         return warehouse_id
 
@@ -1105,7 +1237,13 @@ class SqlEngine:
             params: Sequence[SqlParameter] = parameters_from_mapping(parameters)
         else:
             params = list(parameters or ())
-        return backend.execute(statement, params, fetch=fetch)
+        try:
+            return backend.execute(statement, params, fetch=fetch)
+        except SqlStatementError as exc:
+            denied = permission_error(exc)
+            if denied is None:
+                raise
+            raise denied from exc
 
     def _run(
         self, operation: Operation, statement: str, binder: ParameterBinder | None = None
@@ -1286,7 +1424,7 @@ class SqlEngine:
                 "no staging volume is configured",
                 "ds.connect(..., staging_volume='<catalog>.<schema>.<volume>')",
             )
-        arrow = _variant_text(_stageable(_to_arrow(data)), variants or {})
+        arrow = _staged_durations(_variant_text(_stageable(_to_arrow(data)), variants or {}))
         payload = _parquet_bytes(arrow)
         catalog, schema, volume = self._staging_volume
         path = f"/Volumes/{catalog}/{schema}/{volume}/{_STAGING_DIR}/{uuid.uuid4().hex}.parquet"
@@ -1365,6 +1503,15 @@ class SqlEngine:
         for name in names:
             field = arrow.schema.field(name)
             quoted = sq.quote(name)
+            tree = variants.get(name.lower())
+            if isinstance(tree, tuple) and tree[0] == "geo":
+                out.append(f"{_geo_sql(pa, quoted, field.type, *tree[1])} AS {quoted}")
+                continue
+            if field.metadata and _DURATION_US in field.metadata:
+                # Staged as microseconds (`_staged_durations`); a bare BIGINT
+                # would be cast to the interval as seconds.
+                out.append(f"{quoted} * INTERVAL '0.000001' SECOND AS {quoted}")
+                continue
             expr = _variant_sql(pa, quoted, field.type, variants.get(name.lower()))
             out.append(quoted if expr == quoted else f"{expr} AS {quoted}")
         return ", ".join(out)
@@ -1376,13 +1523,17 @@ class SqlEngine:
         is the one place that tells the two apart; it spells a VARIANT nested
         in a struct, array or map inside the column's type string. Asked only
         of a table with the variantType feature.
+
+        A top-level GEOMETRY / GEOGRAPHY column is listed too, as
+        ``("geo", (kind, srid))``: reads give it as EWKT text, which the
+        warehouse will not cast back (`_geo_sql`).
         """
         features = set(table.features) | {
             key[len("delta.feature.") :]
             for key in table.properties
             if key.startswith("delta.feature.")
         }
-        if not features & {"variantType", "variantType-preview"}:
+        if not features & {"variantType", "variantType-preview", "geospatial"}:
             return {}
         result = self._query(Operation.DETAIL, f"DESCRIBE TABLE {sq.name(table)}")
         found: dict[str, VariantTree] = {}
@@ -1390,6 +1541,10 @@ class SqlEngine:
             name = str(row.get("col_name") or "")
             if not name or name.startswith("#"):
                 break  # partition and clustering sections repeat the columns
+            geo = _GEO_TYPE.fullmatch(str(row.get("data_type") or "").strip())
+            if geo is not None:
+                found[name.lower()] = ("geo", (geo.group(1).lower(), geo.group(2)))
+                continue
             tree = _variant_tree(str(row.get("data_type") or ""))
             if tree is not None:
                 found[name.lower()] = tree

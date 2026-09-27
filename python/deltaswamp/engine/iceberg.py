@@ -365,6 +365,26 @@ def _as_json(model: Any) -> Any:
     return json.loads(model.model_dump_json())
 
 
+_VARIANT_FEATURES = frozenset({"variantType", "variantType-preview", "variantShredding"})
+
+
+def _has_variant(table: ResolvedTable) -> bool:
+    """Whether the table's protocol (or its properties) says it holds a VARIANT."""
+    features = set(table.features) | {
+        key[len("delta.feature.") :] for key in table.properties if key.startswith("delta.feature.")
+    }
+    return bool(features & _VARIANT_FEATURES)
+
+
+def _pyiceberg_reads_variant() -> bool:
+    """Whether PyIceberg knows the Iceberg v3 ``variant`` type (0.12 does not)."""
+    try:
+        types = importlib.import_module("pyiceberg.types")
+    except ImportError:
+        return False
+    return hasattr(types, "VariantType")
+
+
 class IcebergEngine:
     """Reads and writes Iceberg tables through a catalog's Iceberg REST endpoint."""
 
@@ -469,6 +489,19 @@ class IcebergEngine:
                 reason="the catalog reports no external-engine read support for this table "
                 "(usually a row filter or column mask)",
                 remedy=SQL_FALLBACK_REMEDY,
+            )
+
+        if _has_variant(table) and not _pyiceberg_reads_variant():
+            # An Iceberg v3 schema (UniForm icebergCompatV3, or USING ICEBERG
+            # with format-version 3) carries the VARIANT as `variant`, which
+            # PyIceberg cannot parse: loading the table failed with a pydantic
+            # "Unsupported field type: 'variant'" after can() said yes.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table has a VARIANT column, which the installed PyIceberg cannot "
+                "read from Iceberg v3 metadata",
+                remedy="the Delta engines, or ds.connect(..., allow_sql_fallback=True), read it",
             )
 
         if operation is Operation.HISTORY and not table.is_iceberg:

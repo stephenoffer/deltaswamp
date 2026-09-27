@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .._util import enum_value
-from ..errors import DeltaSwampError
+from ..errors import DeltaSwampError, PreflightError
 
 __all__ = [
     "ParameterBinder",
@@ -73,6 +73,55 @@ class SqlStatementError(DeltaSwampError):
             if v
         )
         super().__init__(f"{message} ({detail})" if detail else message)
+
+
+class SqlPermissionError(SqlStatementError, PreflightError):
+    """The warehouse refused a statement for a privilege the caller lacks.
+
+    Still a `SqlStatementError` (its codes and statement id are the
+    server's), and a `PreflightError`: a grant is missing, which no retry or
+    other engine fixes. `privilege` and `securable` name it where the
+    server's message does; `remedy` says what to ask for.
+    """
+
+    privilege: str | None = None
+    securable: str | None = None
+    remedy: str | None = None
+
+
+_PRIVILEGE = re.compile(
+    r"does not have ([A-Z][A-Z _]*?) (?:privilege )?on (\w+) "
+    r"(?:'([^']+)'|`([^`]+)`|(\S+?))(?:[.\s]|$)",
+    re.IGNORECASE,
+)
+
+
+def permission_error(exc: SqlStatementError) -> SqlPermissionError | None:
+    """`exc` as a SqlPermissionError when the server refused it for a privilege."""
+    code = str(exc.error_code or "").upper()
+    if (
+        exc.sql_state != "42501"
+        and "PERMISSION_DENIED" not in code
+        and "PERMISSION_DENIED" not in str(exc)
+    ):
+        return None
+    match = _PRIVILEGE.search(str(exc))
+    if match is not None:
+        privilege, kind = match.group(1).upper(), match.group(2).upper()
+        name = match.group(3) or match.group(4) or match.group(5)
+        remedy = f"ask an owner of {name} to GRANT {privilege} ON {kind} {name} TO you"
+    else:
+        privilege = kind = name = None
+        remedy = "ask the object's owner for the privilege the message names"
+    error = SqlPermissionError(
+        f"the warehouse refused the statement for a missing privilege: {exc}; {remedy}",
+        statement_id=exc.statement_id,
+        error_code=exc.error_code,
+        sql_state=exc.sql_state,
+        state=exc.state,
+    )
+    error.privilege, error.securable, error.remedy = privilege, name, remedy
+    return error
 
 
 def sdk_error(exc: Exception, where: str) -> DeltaSwampError:
@@ -458,7 +507,10 @@ class SdkStatementBackend:
 
         if schema is None:
             schema = _schema_from_manifest(manifest)
-        table = pa.Table.from_batches(batches, schema=schema)
+        if any(str(f.type) == "month_interval" for f in schema):
+            table = _year_month_text(schema, batches, manifest)
+        else:
+            table = pa.Table.from_batches(batches, schema=schema)
         expected = getattr(manifest, "total_row_count", None)
         if isinstance(expected, int) and table.num_rows != expected:
             raise SqlStatementError(
@@ -693,7 +745,7 @@ class _TypeParser:
                 units.append(self.take().upper())
             if units and all(u in _DAY_TIME_UNITS or u == "TO" for u in units):
                 return pa.duration("us")
-            return pa.string()  # YEAR-MONTH: no pyarrow factory; the warehouse sends text
+            return pa.string()  # YEAR-MONTH: read as text (`intervals.month_interval_text`)
         factory = _TYPE_NAMES.get(word)
         if factory is not None:
             return getattr(pa, factory)()
@@ -707,6 +759,26 @@ class _TypeParser:
                 if depth == 0:
                     break
         return pa.string()
+
+
+def _year_month_text(schema: Any, batches: list[Any], manifest: Any) -> Any:
+    """A result's year-month intervals as the text a direct read gives.
+
+    The warehouse sends them as Arrow's ``month_interval``, which pyarrow
+    cannot convert to Python, pandas, polars or Parquet (a bare KeyError).
+    The manifest's ``type_text`` names each column's qualifier.
+    """
+    import pyarrow as pa
+
+    from .intervals import month_interval_text
+
+    qualifiers = {}
+    columns = getattr(getattr(manifest, "schema", None), "columns", None) or []
+    for column in columns:
+        text = " ".join(str(getattr(column, "type_text", None) or "").upper().split())
+        if text.startswith("INTERVAL "):
+            qualifiers[str(column.name)] = text[len("INTERVAL ") :]
+    return month_interval_text(pa, schema, batches, qualifiers)
 
 
 def _schema_from_manifest(manifest: Any) -> Any:

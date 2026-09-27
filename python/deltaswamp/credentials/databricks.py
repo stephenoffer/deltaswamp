@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from datetime import UTC
@@ -226,6 +227,17 @@ _TRANSIENT_ERRORS = frozenset(
 _TRANSIENT_CODES = frozenset(
     {"RESOURCE_EXHAUSTED", "REQUEST_LIMIT_EXCEEDED", "TEMPORARILY_UNAVAILABLE", "TOO_MANY_REQUESTS"}
 )
+
+
+def sdk_message(exc: BaseException) -> str:
+    """An SDK error's message without the client configuration it appends.
+
+    databricks-sdk ends an authentication failure with ``Config: host=...,
+    account_id=..., workspace_id=..., discovery_url=..., token=***, ...``
+    and ``Env: ...``: the token is masked, but the rest is noise in an
+    error that already names the host to check.
+    """
+    return re.split(r"\.?\s+Config: ", str(exc), maxsplit=1)[0]
 
 
 def _error_kind(exc: BaseException) -> str | None:
@@ -546,7 +558,7 @@ class DatabricksCredentialProvider:
                     f"credential vending failed for table_id={self._table_id} "
                     f"({operation.value}): the Databricks credentials were rejected "
                     "(expired or invalid token, or wrong workspace host). "
-                    f"Underlying error: {exc}"
+                    f"Underlying error: {sdk_message(exc)}"
                 ) from exc
             raise CredentialError(
                 f"credential vending failed for table_id={self._table_id} ({operation.value}). "

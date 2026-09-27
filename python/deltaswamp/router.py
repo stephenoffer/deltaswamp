@@ -15,6 +15,7 @@ The router follows three rules:
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass, field
 
 from .capability import (
@@ -135,6 +136,13 @@ _AUTH_OPEN_ERRORS: tuple[str, ...] = (
     "the databricks credentials were rejected",
     "cannot reach the databricks host",
 )
+
+
+def _geospatial(table: ResolvedTable) -> bool:
+    """Whether the table uses the geospatial feature (a GEOMETRY / GEOGRAPHY column)."""
+    if "geospatial" in table.features or "delta.feature.geospatial" in table.properties:
+        return True
+    return bool(re.search(r"type: '(geometry|geography)\(", table.open_error or ""))
 
 
 def _open_error_remedy(table: ResolvedTable, *, warehouse: bool = True) -> str:
@@ -539,6 +547,25 @@ class Router:
         blocked = self._catalog_level_block(operation, table)
         if blocked is not None:
             return blocked
+        if "identity_insert" in needs:
+            return Capability(
+                operation,
+                ok=False,
+                reason="the data gives values for a GENERATED ALWAYS AS IDENTITY column, "
+                "which Delta generates itself and refuses to take "
+                "(DELTA_IDENTITY_COLUMNS_EXPLICIT_INSERT_NOT_SUPPORTED)",
+                remedy="leave the identity column out of the data",
+            )
+        if "identity_update" in needs:
+            return Capability(
+                operation,
+                ok=False,
+                reason="when_matched_update_all() would assign the identity column the source "
+                "carries, and Delta refuses to update an identity column "
+                "(DELTA_IDENTITY_COLUMNS_UPDATE_NOT_SUPPORTED)",
+                remedy="drop the identity column from the source, or name the columns to set "
+                "with when_matched_update(...)",
+            )
         if "removes_rows" in needs and _append_only(table):
             # A MERGE with an UPDATE or DELETE clause: delta-rs accepted it and
             # failed at commit with a raw CommitFailedError.
@@ -1061,13 +1088,21 @@ class Router:
         # A table we could not open is not a table we can route. CREATE and
         # CONVERT are exempt: there is no log to open yet.
         if table.open_error is not None and operation not in _NO_LOG_YET and not sql_fallback:
+            reason = (
+                "the table's Delta log could not be read, so no direct engine can "
+                f"serve this ({table.open_error})"
+            )
+            if _geospatial(table):
+                # The kernel fails parsing the schema's geometry(...) type
+                # before the feature table (capability.py) is ever consulted.
+                reason = (
+                    "the table has a GEOMETRY or GEOGRAPHY column (the geospatial "
+                    "feature), which no direct engine reads or writes"
+                )
             return Capability(
                 operation,
                 ok=False,
-                reason=(
-                    "the table's Delta log could not be read, so no direct engine can "
-                    f"serve this ({table.open_error})"
-                ),
+                reason=reason,
                 remedy=_open_error_remedy(table, warehouse=self.warehouse_catalog),
             )
 

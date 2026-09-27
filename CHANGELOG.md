@@ -78,6 +78,32 @@ First release.
 
 ### Known limits
 
+- `INTERVAL DAY TO SECOND` columns read as `duration[us]` and year-month
+  intervals as Spark's text (`INTERVAL '1-2' YEAR TO MONTH`) on every engine,
+  warehouse included; both append back unchanged. A duration nested in a
+  struct, list or map cannot be staged for the warehouse.
+- A predicate on a `CHAR(n)` column needs the SQL fallback: Spark compares
+  CHAR values padded to `n`, the direct engines compare bytes.
+- Time travel to a timestamp after the latest commit is refused
+  (`InvalidArgumentError`), as Databricks refuses it.
+- A `Table` opened by catalog name re-resolves the name on every read, as it
+  does before every write: after DROP TABLE a read raises
+  `TableNotFoundError`, and after a re-create under the same name
+  `CorruptTableError`. A handle pinned to a version reads that snapshot.
+- GEOMETRY and GEOGRAPHY columns are written through the warehouse only, as
+  EWKT/WKT text or WKB with the column's own SRID; text naming another SRID
+  fails to parse rather than being relabelled. No direct engine reads them.
+- PyIceberg (0.12) cannot parse Iceberg v3 metadata holding a VARIANT, so the
+  Iceberg engine refuses such a table and the Delta engines or the warehouse
+  serve it. Databricks cannot SHALLOW CLONE a managed Iceberg table;
+  `clone(target, shallow=False)` makes a deep one.
+- `can()` refuses up front what the warehouse would: values for a GENERATED
+  ALWAYS AS IDENTITY column, `when_matched_update_all()` over a source
+  carrying an identity column, `drop_feature("checkConstraints")` while a
+  constraint exists, and ADD COLUMNS of a name with `' ,;{}()\n\t='` on a
+  table without column mapping. A missing privilege is `SqlPermissionError`
+  (a `SqlStatementError` and a `PreflightError`) naming the grant.
+
 - A kernel create with `delta.targetFileSize`, `delta.isolationLevel`,
   `delta.autoOptimize.*`, `delta.tuneFileSizesForRewrites`,
   `delta.randomizeFilePrefixes` or `delta.checkpointRetentionDuration` writes
@@ -139,12 +165,14 @@ First release.
   warehouse. An added column reads as null in older rows, and `changes()`
   yields each version under the schema it was written with. A range crossing
   a version with the feed off raises `UnreachableTableError` naming it
-  (`.version`); `changes()` yields the versions before it first. A schema
-  change the range reverses (a RESTORE to an older schema) is found only
-  once the read reaches it, so a consumer of `__arrow_c_stream__`
-  (`pa.table(t.cdf(...))`, polars, DuckDB) gets that error's message as an
-  `ArrowInvalid`; iterate the stream, or call `read_all()`, for the typed
-  error.
+  (`.version`); `changes()` yields the versions before it first. Every
+  version's schema is compared in a range of up to 200 versions, so a change
+  the range reverses (ADD COLUMN, then a RESTORE to before it) is refused up
+  front too; in a longer range such a change is found only once the read
+  reaches it, and a consumer of `__arrow_c_stream__` (`pa.table(t.cdf(...))`,
+  polars, DuckDB) gets that error's message as an `ArrowInvalid`. With the SQL
+  fallback, a range the direct engines stop at (a column-mapping RENAME or
+  DROP) goes to the warehouse's `table_changes()`, which serves what it can.
 - Databricks managed Iceberg (`USING ICEBERG`) takes appends through the
   Iceberg REST endpoint only; overwrite by predicate, DELETE, UPDATE and
   MERGE need the SQL fallback (the endpoint takes one snapshot per commit,

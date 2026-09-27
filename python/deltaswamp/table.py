@@ -30,6 +30,7 @@ from .credentials import Operation as CredentialOperation
 from .engine.base import TranslatingStream, merge_clause, translating_stream
 from .engine.boundary import engine_cause
 from .engine.deltars import DeltaRsEngine
+from .engine.intervals import interval_paths, interval_schema, interval_stream, storage_columns
 from .engine.kernel import KernelEngine
 from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
@@ -267,6 +268,10 @@ def _default_column(pa: Any, field: Any, rows: int) -> Any:
 #: The features that let a table hold VARIANT columns.
 _VARIANT_FEATURES: frozenset[str] = frozenset({"variantType", "variantType-preview"})
 
+#: The engines that read a change feed across a schema change only by
+#: splitting it there (`Table._feed_segments`).
+_DIRECT_FEED_ENGINES: frozenset[EngineKind] = frozenset({EngineKind.KERNEL, EngineKind.DELTARS})
+
 
 def _log_schema(engine: Any, table: Any, version: int | None) -> Any:
     """The table's schema as the log records it (`schemaString`, parsed), or None.
@@ -296,6 +301,47 @@ def _shredded_variant_error(exc: Exception) -> Exception | None:
         "read the other columns (columns=[...]), or ds.connect(..., allow_sql_fallback=True) "
         "to read through a SQL warehouse",
     )
+
+
+def _dotted_keys(targets: Any) -> Any:
+    """UPDATE targets with a tuple path (``("s", "a")``) spelled as ``"s.a"``.
+
+    A nested field was settable only as the dotted string; the tuple -- how
+    `columns=` and the alter methods take a path -- was refused as "not a
+    string". A part holding a dot or a backtick has no unambiguous dotted
+    spelling, so it is refused.
+    """
+    if not isinstance(targets, Mapping) or not any(isinstance(k, tuple) for k in targets):
+        return targets
+    out: dict[Any, Any] = {}
+    for key, value in targets.items():
+        if isinstance(key, tuple):
+            if not key or not all(isinstance(p, str) and p for p in key):
+                raise InvalidArgumentError(f"an update path is a tuple of field names, got {key!r}")
+            odd = [p for p in key if "." in p or "`" in p]
+            if odd and len(key) > 1:
+                raise InvalidArgumentError(
+                    f"update path {key!r}: a nested field name holding '.' or '`' ({odd[0]!r}) "
+                    "cannot be set by path"
+                )
+            key = ".".join(key) if len(key) > 1 else key[0]
+        out[key] = value
+    return out
+
+
+def _data_column_names(data: Any) -> list[str]:
+    """The column names of table data, where known without consuming it."""
+    schema = getattr(data, "schema", None)
+    names = getattr(schema, "names", None)
+    if isinstance(names, list):
+        return [str(n) for n in names]
+    columns = getattr(data, "columns", None)
+    module = type(data).__module__ or ""
+    if module.startswith(("pandas", "polars")) and columns is not None:
+        return [str(c) for c in columns]
+    if isinstance(data, list) and data and isinstance(data[0], Mapping):
+        return [str(k) for k in data[0]]
+    return []
 
 
 def _is_plain_primitive(arrow_type: Any) -> bool:
@@ -479,20 +525,63 @@ def _store_assignable(pa: Any, given: Any, wanted: Any) -> bool:
     return False
 
 
-def _refuse_lossy_types(pa: Any, schema: Any, by_name: dict[str, Any], canonical: Any) -> None:
-    """Raise InvalidArgumentError for a column Delta would not write as the table's type."""
+def _refuse_lossy_types(
+    pa: Any, schema: Any, by_name: dict[str, Any], canonical: Any, data: Any = None
+) -> Any:
+    """Raise InvalidArgumentError for a column Delta would not write as the table's type.
+
+    A narrower numeric type (BIGINT data into an INT column, DOUBLE into
+    FLOAT) is what Python ints and floats arrive as, and the warehouse's own
+    INSERT takes it when every value fits. So with the rows to hand (`data`,
+    an Arrow table with `schema`) such a column is cast when the cast keeps
+    every value exactly, and only a value that would change is refused; the
+    table is returned with those casts made. A stream cannot be checked
+    without consuming it, so there the type decides.
+    """
     bad = []
-    for field in schema:
+    for index, field in enumerate(schema):
         wanted = by_name.get(canonical(field.name))
-        if wanted is not None and not _store_assignable(pa, field.type, wanted.type):
-            bad.append(f"{wanted.name} ({field.type} into {wanted.type})")
+        if wanted is None or _store_assignable(pa, field.type, wanted.type):
+            continue
+        if data is not None and _numeric(pa, field.type) and _numeric(pa, wanted.type):
+            cast = _exact_cast(pa, data.column(index), wanted.type)
+            if cast is not None:
+                data = data.set_column(
+                    index, pa.field(field.name, wanted.type, field.nullable), cast
+                )
+                continue
+            bad.append(f"{wanted.name} ({field.type} into {wanted.type}: a value does not fit)")
+            continue
+        bad.append(f"{wanted.name} ({field.type} into {wanted.type})")
     if bad:
         raise InvalidArgumentError(
-            "the data does not fit the table's column types, and writing it would change "
-            f"values: {', '.join(bad)}. Delta refuses a write that narrows or reinterprets a "
-            "type; cast the data to the table's types first, or widen the column with "
-            "alter_column_type()"
+            "the data does not fit the table's column types: "
+            f"{', '.join(bad)}. Delta refuses a write that would change a value or "
+            "reinterpret a type; cast the data to the table's types first, or widen the "
+            "column with alter_column_type()"
         )
+    return data
+
+
+def _numeric(pa: Any, arrow_type: Any) -> bool:
+    t = pa.types
+    return bool(t.is_integer(arrow_type) or t.is_floating(arrow_type) or t.is_decimal(arrow_type))
+
+
+def _exact_cast(pa: Any, column: Any, wanted: Any) -> Any:
+    """`column` cast to `wanted` if that keeps every value exactly, else None."""
+    import pyarrow.compute as pc
+
+    try:
+        cast = column.cast(wanted, safe=True)
+        back = cast.cast(column.type, safe=True)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, ValueError):
+        return None
+    same = pc.equal(back, column)
+    if pa.types.is_floating(column.type):
+        # NaN is NaN in either width, and equal() says it is not.
+        same = pc.or_(same, pc.and_(pc.is_nan(back), pc.is_nan(column)))
+    return cast if pc.all(same.fill_null(True)).as_py() is not False else None
 
 
 def _fill_stream(pa: Any, reader: Any, target: Any, canonical: Any, partitions: set[str]) -> Any:
@@ -762,6 +851,19 @@ class Table:
         ):
             self._refresh_commit_tail()
 
+    def _check_still_named(self) -> None:
+        """Refuse a read through a handle whose catalog name no longer names its table.
+
+        A write already re-resolves the name (and fails TableNotFoundError
+        once the table is dropped), but a read went on with the location and
+        credentials resolved at open: after DROP TABLE it returned the dropped
+        table's rows, and after a re-create under the same name, still the old
+        table's. A handle opened at a version reads that snapshot as asked.
+        """
+        if self._version is not None or self._resolved.ref.kind is not RefKind.CATALOG:
+            return
+        self._refresh_commit_tail(before_write=True)
+
     def _refresh_commit_tail(self, *, before_write: bool = False) -> None:
         """Re-read a catalog-managed table's ratified commits from the catalog.
 
@@ -796,7 +898,7 @@ class Table:
                 raise CorruptTableError(
                     f"{ref} was dropped and re-created since this handle opened it (the "
                     f"catalog's table id is now {fresh.table_id or fresh.table_uuid!r}); "
-                    "re-open it with conn.table(...) to write to the new table"
+                    "re-open it with conn.table(...) to use the new table"
                 )
             return
         self._resolved = dataclasses.replace(
@@ -968,6 +1070,7 @@ class Table:
 
         if warehouse_reason(predicate) is not None:
             needs.add("spark_sql")
+        needs |= self._char_needs(predicate)
         table = self._enrich()
         if not table.features & {"collations", "collations-preview"}:
             return needs
@@ -988,6 +1091,37 @@ class Table:
                 return needs
         needs.add("collation_free")
         return needs
+
+    def _char_needs(self, predicate: Any) -> set[str]:
+        """``char_padding`` when a predicate reads a CHAR(n) column.
+
+        Spark compares a CHAR(n) value padded with spaces to n: in a CHAR(3)
+        column holding 'a', ``c = 'a  '`` and ``c = 'a '`` match and
+        ``c < 'a '`` does not. The direct engines compare the stored bytes, so
+        such a read silently missed rows the warehouse returns (and a DELETE
+        through the warehouse removed rows the same predicate did not read).
+        Only the warehouse evaluates it.
+        """
+        if not isinstance(predicate, str) or not predicate.strip():
+            return set()
+        from .predicate import columns_of, parse
+
+        try:
+            schema = self.schema()
+            chars = {
+                f.name.lower()
+                for f in schema
+                if (f.metadata or {})
+                .get(b"__CHAR_VARCHAR_TYPE_STRING", b"")
+                .lower()
+                .startswith(b"char(")
+            }
+            if not chars:
+                return set()
+            paths = columns_of(parse(predicate))
+        except Exception:
+            return set()
+        return {"char_padding"} if any(p[0].lower() in chars for p in paths) else set()
 
     def _variant_needs(self, columns: Any, predicate: Any) -> set[str]:
         """``variant_free`` when a read on a variant-shredding table skips every VARIANT column.
@@ -1021,13 +1155,18 @@ class Table:
         """
         if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
             return data
-        if not self._enrich().features & _VARIANT_FEATURES:
-            return data
         try:
             import pyarrow as pa
         except ImportError:
             return data
         if not isinstance(data, pa.Table):
+            return data
+        # A read gives an interval as a duration or as text; the direct
+        # engines store the integers underneath (`engine.intervals`).
+        groups = interval_paths(self._raw_schema(with_log=True)[1])
+        if groups:
+            data = storage_columns(pa, data, groups)
+        if not self._enrich().features & _VARIANT_FEATURES:
             return data
         from ._variant import binary_columns
 
@@ -1072,7 +1211,13 @@ class Table:
             ),
         )
 
-    def _read(self, request: Request | Operation, call: Callable[[Any], Any]) -> Any:
+    def _read(
+        self,
+        request: Request | Operation,
+        call: Callable[[Any], Any],
+        *,
+        exclude: frozenset[EngineKind] = frozenset(),
+    ) -> Any:
         """Serve a read-only request, moving to the next engine if one breaks.
 
         Routing decides from the protocol, but an engine can still choke on a
@@ -1090,8 +1235,9 @@ class Table:
         """
         if isinstance(request, Operation):
             request = self._request(request, {})
+        self._check_still_named()
         operation, needs, shape = request.operation, request.needs, request.shape
-        tried: set[EngineKind] = set()
+        tried: set[EngineKind] = set(exclude)
         refusals: list[EngineLimitError] = []
         while True:
             try:
@@ -1176,6 +1322,8 @@ class Table:
         )
 
         def scan(engine: Any) -> Any:
+            if timestamp is not None and isinstance(engine, (KernelEngine, DeltaRsEngine)):
+                self._refuse_future_timestamp(timestamp)
             stream = engine.scan(
                 self._resolved,
                 columns=columns,
@@ -1186,14 +1334,16 @@ class Table:
             )
             if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
                 return stream
+            log = _log_schema(
+                engine, self._resolved, version if version is not None else self._version
+            )
             if self._enrich().features & _VARIANT_FEATURES:
                 # The warehouse sends VARIANT as JSON text; so does this.
                 from ._variant import json_text_stream, variant_paths
 
-                log = _log_schema(
-                    engine, self._resolved, version if version is not None else self._version
-                )
                 stream = json_text_stream(stream, None if log is None else variant_paths(log))
+            # And a day-time interval as a duration, not bare microseconds.
+            stream = interval_stream(stream, interval_paths(log))
             # A file VACUUM (or a manual delete) removed fails only once reading
             # reaches it, as a bare OSError/ArrowInvalid; name it instead.
             where = self._resolved.location or str(self._resolved.ref)
@@ -1283,7 +1433,7 @@ class Table:
         elif isinstance(data, pa.RecordBatch):
             data = pa.Table.from_batches([data])
 
-        _refuse_lossy_types(pa, data.schema, by_name, canonical)
+        data = _refuse_lossy_types(pa, data.schema, by_name, canonical, data)
         names = [canonical(n) for n in data.column_names]
         if len(set(names)) != len(names):
             return data  # two columns fold to one name; let the engine refuse
@@ -1576,6 +1726,7 @@ class Table:
             engine=engine,
             table=self._enrich(),
             variant_paths=tuple(sorted(self._variant_paths())),
+            interval_paths=self._interval_plan(),
             table_identity=identity,
             mode=mode,
             version=self.version,
@@ -1625,6 +1776,8 @@ class Table:
                 "distributed": True,
             },
         )
+        # Asked before routing: learning the schema routes a read of its own.
+        intervals = self._interval_plan()
         engine = self._route(request)
         splits = engine.plan_scan(
             self._resolved,
@@ -1651,6 +1804,7 @@ class Table:
             snapshot_version=planned,
             ship_catalog_auth=bool(ship_catalog_auth),
             variant_paths=tuple(sorted(self._variant_paths())),
+            interval_paths=intervals,
         )
 
     def to_ray_dataset(self, *, override_num_blocks: int | None = None, **kwargs: Any) -> Any:
@@ -1752,12 +1906,17 @@ class Table:
         not used.
         """
         _check_predicate(predicate, "count")
+        self._check_still_named()
         exact = self._count_from_log(predicate)
         if exact is not None:
             return exact
         pa = _require("pyarrow", "pyarrow")
         schema = self.schema()
         names = list(getattr(schema, "names", None) or [f.name for f in schema])
+        # Not a VARIANT column when there is another: that read is what the
+        # direct engines cannot do on a shredded table (see can("count")).
+        variants = {p[0] for p in self._variant_paths()}
+        names = [n for n in names if n not in variants] or names
         narrow = [names[0]] if names and predicate is None else None
         total = 0
         stream = self.scan(columns=narrow, predicate=predicate)
@@ -1877,12 +2036,59 @@ class Table:
             if key in kwargs:
                 kwargs[key] = _timestamp_arg(kwargs[key], key)
         given = _given(kwargs)
-        segments = self._feed_segments(start, end) if split and start is not None else None
-        if segments is not None and len(segments) > 1:
-            return self._stitched_cdf(given, segments)
-        return self._cdf_read(given, start, end)
+        if not split or start is None:
+            return self._cdf_read(given, start, end)
+        # Splitting at schema changes is how the direct engines read across
+        # one; the warehouse's table_changes() reads the range itself. Asked
+        # first, as can() asks it: a table whose feed no engine can read was
+        # refused with a schema-change error found on the way, not the
+        # reason can() gave.
+        engine = self._cdf_engine()
+        if engine.kind not in _DIRECT_FEED_ENGINES:
+            return self._cdf_read(given, start, end)
+        segments = self._feed_segments(start, end)
+        if segments is None or len(segments) == 1:
+            return self._cdf_read(given, start, end)
+        from .errors import ChangeFeedSchemaChangeError
 
-    def _cdf_read(self, given: dict[str, Any], start: int | None, end: int | None) -> Any:
+        try:
+            return self._stitched_cdf(given, segments)
+        except ChangeFeedSchemaChangeError as exc:
+            refusal = exc
+        # A column renamed or dropped is where the direct engines stop; the
+        # warehouse still reads such a range (a column-mapping table under its
+        # latest schema), so it takes over where there is one.
+        try:
+            self._cdf_engine(exclude=_DIRECT_FEED_ENGINES)
+        except DeltaSwampError:
+            raise refusal from refusal.__cause__
+        return self._cdf_read(given, start, end, exclude=_DIRECT_FEED_ENGINES)
+
+    def _cdf_engine(self, exclude: frozenset[EngineKind] = frozenset()) -> Any:
+        """The engine a change-feed read routes to (raises the refusal can() gives)."""
+        request = self._request(Operation.CDF, {})
+        return _strict(
+            self._connection.router.engine_for(
+                Operation.CDF, self._enrich(), needs=request.needs, exclude=exclude, **request.shape
+            ),
+            Operation.CDF,
+            lambda kind: self._connection.router.capability(
+                Operation.CDF,
+                self._resolved,
+                needs=request.needs,
+                exclude=exclude | {kind},
+                **request.shape,
+            ),
+        )
+
+    def _cdf_read(
+        self,
+        given: dict[str, Any],
+        start: int | None,
+        end: int | None,
+        *,
+        exclude: frozenset[EngineKind] = frozenset(),
+    ) -> Any:
         """One change-feed read, its failures translated."""
         # A file VACUUM removed, or rows written under a schema a later commit
         # replaced, failed as a raw ArrowInvalid (with a Python traceback
@@ -1916,10 +2122,15 @@ class Table:
 
         def call(engine: Any) -> Any:
             served["kind"] = getattr(engine, "kind", None)
-            return engine.cdf(self._resolved, **given)
+            stream = engine.cdf(self._resolved, **given)
+            if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
+                return stream
+            # Intervals typed as the warehouse's table_changes() types them.
+            log = _log_schema(engine, self._resolved, end)
+            return interval_stream(stream, interval_paths(log))
 
         try:
-            stream = _cdf_types(self._read(Operation.CDF, call))
+            stream = _cdf_types(self._read(Operation.CDF, call, exclude=exclude))
         except Exception as exc:
             from .engine.base import missing_file_error
 
@@ -1963,8 +2174,12 @@ class Table:
         The kernel reads a change feed under one schema only (and a range
         that crossed an ADD COLUMN failed with a Parquet decode error on
         files Photon wrote), so a range spanning a schema change is read as
-        one range per schema. Only the ends are compared on the common path;
-        the change versions are found by bisection when they differ.
+        one range per schema. A range of up to `_FEED_SCHEMA_WALK` versions has
+        every version's schema compared: a change later undone (ADD COLUMN,
+        then RESTORE to before it) leaves the ends equal, and the kernel then
+        failed mid-stream, which reached ``pa.table(t.cdf())`` as a bare
+        ArrowInvalid. A longer range compares the ends and finds the change
+        versions by bisection when they differ.
         """
         try:
             fields = self._schema_reader()
@@ -1974,9 +2189,18 @@ class Table:
             if start >= high:
                 return None
             first = fields(start)[1]
+            segments: list[tuple[int, int]] = []
+            if high - start <= self._FEED_SCHEMA_WALK:
+                low, current = start, first
+                for version in range(start + 1, high + 1):
+                    here = last if version == high else fields(version)[1]
+                    if here != current:
+                        segments.append((low, version - 1))
+                        low, current = version, here
+                segments.append((low, high))
+                return segments
             if first == last:
                 return [(start, high)]
-            segments: list[tuple[int, int]] = []
             low, current = start, first
             while True:
                 if fields(high)[1] == current:
@@ -2041,6 +2265,9 @@ class Table:
 
     #: How many versions back `_feed_schema_change` looks for the change.
     _FEED_SCHEMA_SEARCH = 200
+
+    #: The longest range `_feed_segments` compares version by version.
+    _FEED_SCHEMA_WALK = 200
 
     def _feed_schema_change(
         self, exc: BaseException, start: int | None, end: int | None
@@ -2192,14 +2419,28 @@ class Table:
         A VARIANT column is ``string``: reads return it as JSON text on every
         engine, and writes take JSON text (see `deltaswamp._variant`).
         """
-        schema, paths = self._schema_and_variants()
-        if not paths:
+        schema, log = self._raw_schema(with_log=True)
+        paths = self._variants_in(schema, log)
+        try:
+            import pyarrow as pa
+        except ImportError:
             return schema
-        import pyarrow as pa
+        if not isinstance(schema, pa.Schema):
+            return schema
+        if paths:
+            from ._variant import text_schema
 
-        from ._variant import text_schema
+            schema = text_schema(pa, schema, paths)
+        # A day-time interval reads as a duration and a year-month one as text.
+        return interval_schema(pa, schema, interval_paths(log))
 
-        return text_schema(pa, schema, paths)
+    def _interval_plan(self) -> tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]:
+        """The table's interval columns (`engine.intervals`), in a form a plan can carry."""
+        try:
+            groups = interval_paths(self._raw_schema(with_log=True)[1])
+        except DeltaSwampError:
+            return ()
+        return tuple(sorted((group, tuple(sorted(paths))) for group, paths in groups.items()))
 
     def _variant_paths(self) -> frozenset[tuple[str, ...]]:
         """The table's VARIANT columns (top level and nested in structs), as paths."""
@@ -2217,19 +2458,23 @@ class Table:
         on a table with the variantType feature is taken as one.
         """
         schema, log = self._raw_schema(with_log=True)
+        return schema, self._variants_in(schema, log)
+
+    def _variants_in(self, schema: Any, log: Any) -> frozenset[tuple[str, ...]]:
+        """Where `schema`'s VARIANT columns are, by the log's schema `log` if known."""
         if not self._enrich().features & _VARIANT_FEATURES:
-            return schema, frozenset()
+            return frozenset()
         try:
             import pyarrow as pa
         except ImportError:
-            return schema, frozenset()
+            return frozenset()
         from ._variant import is_variant_struct, variant_paths
 
         if log is not None:
-            return schema, variant_paths(log)
+            return variant_paths(log)
         if not isinstance(schema, pa.Schema):
-            return schema, frozenset()
-        return schema, frozenset((f.name,) for f in schema if is_variant_struct(pa, f.type))
+            return frozenset()
+        return frozenset((f.name,) for f in schema if is_variant_struct(pa, f.type))
 
     def _raw_schema(self, with_log: bool = False) -> Any:
         """The schema as the engines read and write it (VARIANT as its binary struct).
@@ -2325,6 +2570,45 @@ class Table:
             needs.add("writer_properties")
         if partition_overwrite == "dynamic":
             needs.add("dynamic_overwrite")
+        return frozenset(needs)
+
+    def _identity_needs(self, data: Any, clauses: list[str] | None = None) -> frozenset[str]:
+        """``identity_insert`` / ``identity_update`` when the data sets an identity column.
+
+        Delta refuses a value given for a GENERATED ALWAYS AS IDENTITY column
+        (DELTA_IDENTITY_COLUMNS_EXPLICIT_INSERT_NOT_SUPPORTED), and a MERGE
+        ``UPDATE SET *`` that would assign any identity column
+        (DELTA_IDENTITY_COLUMNS_UPDATE_NOT_SUPPORTED). can() said yes to both
+        and the warehouse then failed the statement. `clauses` are a MERGE's
+        builder methods; without them the data is an append's or overwrite's.
+        """
+        names = _data_column_names(data)
+        if not names or "identityColumns" not in self._enrich().writer_features:
+            return frozenset()
+        try:
+            import pyarrow as pa
+
+            schema = self.schema()
+        except (ImportError, DeltaSwampError):
+            return frozenset()
+        if not isinstance(schema, pa.Schema):
+            return frozenset()
+        given = {n.lower() for n in names}
+        always, identity = set(), set()
+        for field in schema:
+            metadata = field.metadata or {}
+            if field.name.lower() not in given:
+                continue
+            if any(k.startswith(b"delta.identity.") for k in metadata):
+                identity.add(field.name)
+                if metadata.get(b"delta.identity.allowExplicitInsert", b"").lower() != b"true":
+                    always.add(field.name)
+        needs = set()
+        inserts = clauses is None or "when_not_matched_insert_all" in clauses
+        if always and inserts:
+            needs.add("identity_insert")
+        if identity and clauses is not None and "when_matched_update_all" in clauses:
+            needs.add("identity_update")
         return frozenset(needs)
 
     def _data_needs(self, data: Any, partition_by: list[str] | None = None) -> frozenset[str]:
@@ -2858,6 +3142,7 @@ class Table:
                 )
         if not updates and not new_values:
             raise InvalidArgumentError("update needs at least one column to set")
+        updates, new_values = _dotted_keys(updates), _dotted_keys(new_values)
         request = self._request(
             Operation.UPDATE,
             {"updates": updates, "new_values": new_values, "predicate": predicate, **kwargs},
@@ -3037,7 +3322,7 @@ class Table:
             # (an UPDATE or DELETE clause removes rows, which an append-only
             # table forbids). Routed again with them, before anything runs,
             # exactly as can("merge", ..., clauses=[...]) answers.
-            extra = self._request(Operation.MERGE, {"clauses": clauses}).needs
+            extra = self._request(Operation.MERGE, {"clauses": clauses}, source).needs
             if extra <= request.needs:
                 return
             self._connection.router.engine_for(
@@ -3227,6 +3512,31 @@ class Table:
         result = engine.restore(self._resolved, target, **kwargs)
         self._invalidate()
         return _results.restore(result, getattr(engine, "kind", None))
+
+    def _refuse_future_timestamp(self, timestamp: Any) -> None:
+        """Refuse time travel to a time after the latest commit, as the warehouse does.
+
+        The direct engines resolve such a timestamp to the latest version and
+        read it; Databricks refuses it (DELTA_TIMESTAMP_GREATER_THAN_COMMIT),
+        since no version exists at that time yet -- the same timestamp read
+        different data once the next commit landed.
+        """
+        kernel = self._connection.router.engines.get(EngineKind.KERNEL)
+        if not isinstance(kernel, KernelEngine) or self._resolved.location is None:
+            return
+        try:
+            millis = timestamp_ms(timestamp)
+            latest = kernel.snapshot(self._resolved)
+            last = int(latest.timestamp())
+        except Exception:
+            return  # the read reports what is wrong
+        if millis > last:
+            raise InvalidArgumentError(
+                f"cannot time travel to {timestamp}: it is after the latest commit (version "
+                f"{int(latest.version)}), so no version of the table exists at that time "
+                "(DELTA_TIMESTAMP_GREATER_THAN_COMMIT); read the latest version without a "
+                "timestamp"
+            )
 
     def _restore_version(self, timestamp: Any) -> Any:
         """The version a restore to `timestamp` means: the one a read at it sees.
@@ -4086,6 +4396,12 @@ def _check_options(what: str, given: dict[str, Any], known: frozenset[str]) -> N
 def _asked_operation(operation: Any, shape: dict[str, Any]) -> tuple[Operation, dict[str, Any]]:
     """The operation `can()` was asked about, from its name or a method's."""
     shape = dict(shape)
+    if operation == "count":
+        # count() reads no column but the ones its predicate names (or it
+        # counts from the log), so a VARIANT column the direct engines cannot
+        # decode does not stop it; can(SCAN) answers for reading every column.
+        shape.setdefault("columns", [])
+        return Operation.SCAN, shape
     alias = METHOD_OPERATIONS.get(operation) if isinstance(operation, str) else None
     if alias is not None:
         op, implied = alias
@@ -4094,12 +4410,17 @@ def _asked_operation(operation: Any, shape: dict[str, Any]) -> tuple[Operation, 
         shape.update(implied)
         return op, shape
     try:
-        return Operation(operation), shape
+        op = Operation(operation)
     except ValueError:
-        names = sorted([o.value for o in Operation] + list(METHOD_OPERATIONS))
+        names = sorted([o.value for o in Operation] + list(METHOD_OPERATIONS) + ["count"])
         raise InvalidArgumentError(
             f"{operation!r} is not an operation or a Table method; one of {names}"
         ) from None
+    if op is Operation.ZORDER and "columns" in shape and "zorder_by" not in shape:
+        # z_order(columns) is the call, so can(Operation.ZORDER, columns=...)
+        # is how it is asked; only the string alias took that spelling.
+        shape["zorder_by"] = shape.pop("columns")
+    return op, shape
 
 
 def _check_can_options(op: Operation, shape: dict[str, Any]) -> None:

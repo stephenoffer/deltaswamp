@@ -138,6 +138,7 @@ def _write(
         needs |= table._data_needs(data, get("partition_by"))
         if schema_mode != "overwrite":
             needs |= table._default_needs(data)
+        needs |= table._identity_needs(data)
     return op, needs
 
 
@@ -154,7 +155,7 @@ def _delete(
     table: Table, op: Operation, shape: dict[str, Any], data: Any
 ) -> tuple[Operation, set[str]]:
     return Operation.DELETE, set(table._expression_needs(shape.get("predicate"))) | (
-        _commit_options(table, shape)
+        _commit_options(table, shape) | table._char_needs(shape.get("predicate"))
     )
 
 
@@ -169,6 +170,7 @@ def _update(
         {k: defaults.get(k, v) for k, v in updates.items()} if isinstance(updates, dict) else None
     )
     needs |= table._expression_needs(shape.get("predicate"), spelled)
+    needs |= table._char_needs(shape.get("predicate"))
     return Operation.UPDATE, needs | _commit_options(table, shape)
 
 
@@ -191,6 +193,8 @@ def _merge(
         str(c).startswith(_REMOVING_CLAUSES) for c in clauses
     ):
         needs.add("removes_rows")
+    if data is not NO_DATA and isinstance(clauses, (list, tuple)):
+        needs |= table._identity_needs(data, [str(c) for c in clauses])
     return Operation.MERGE, needs
 
 
