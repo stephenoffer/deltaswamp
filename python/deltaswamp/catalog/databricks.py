@@ -33,6 +33,7 @@ from ..credentials.databricks import (
     _config_attributes,
     _error_kind,
     credentials_from_response,
+    sdk_message,
 )
 from ..errors import (
     DeltaSwampError,
@@ -586,7 +587,7 @@ class DatabricksUnityCatalog:
             return PreflightError(
                 f"could not resolve {ref.full_name}: the Databricks credentials were "
                 "rejected (expired or invalid token, or the wrong workspace host). "
-                f"Underlying error: {exc}"
+                f"Underlying error: {sdk_message(exc)}"
             )
         if kind == "transient":
             # Text heuristics below would read a throttling message that happens
@@ -671,7 +672,7 @@ class DatabricksUnityCatalog:
             return PreflightError(
                 f"cannot {action} ({full_name}): the Databricks credentials were rejected "
                 "(expired or invalid token, or the wrong workspace host). "
-                f"Underlying error: {exc}"
+                f"Underlying error: {sdk_message(exc)}"
             )
         # Databricks allowlists which connectors may WRITE through the UC Delta
         # API, by product User-Agent. deltaswamp sets one (see _sdk.py), but an

@@ -99,10 +99,12 @@ problems, empty when ready, and it checks the settings that block everything
 else: external data access on the metastore, which is off by default and needs
 an account admin, and, when the connection has `default_catalog` and
 `default_schema`, EXTERNAL USE SCHEMA on that schema. With the SQL fallback on
-it also checks the warehouse and notes a missing `staging_volume`. It cannot
-see per-table limits: Unity Catalog accepts external writes only for some
-table kinds (external and catalog-managed tables), which `t.can("append")`
-reports table by table.
+it also checks the warehouse (a missing or malformed `warehouse_id` is named)
+and notes a missing `staging_volume`. It cannot see per-table limits: Unity
+Catalog accepts external writes only for some table kinds (external and
+catalog-managed tables), so on most workspaces an ordinary managed table is
+readable directly but writable only through the SQL fallback, even when
+`preflight()` returns `[]`. `t.can("append")` reports that table by table.
 
 ### Storage options
 
@@ -227,8 +229,16 @@ item as a DOUBLE, as Spark does.
 Timestamps honor in-commit timestamps where a table has them, on delta-rs as
 on the kernel, and a timestamp earlier than the oldest reconstructable version
 is refused rather than silently clamped. A timestamp after the latest commit
-reads the latest version on the direct engines; the warehouse refuses it
-(`DELTA_TIMESTAMP_GREATER_THAN_COMMIT`).
+is refused with `InvalidArgumentError` on every engine, as the warehouse
+refuses it (`DELTA_TIMESTAMP_GREATER_THAN_COMMIT`): no version exists at that
+time yet, and the same read would return other data once the next commit
+lands. Read the latest version without a timestamp.
+
+A predicate on a `CHAR(n)` column is evaluated by the warehouse: Spark pads a
+CHAR value with spaces to `n` before comparing (`c = 'a  '` matches `'a'` in a
+CHAR(3) column), which the direct engines, comparing bytes, do not. Without the
+SQL fallback such a read, DELETE or UPDATE is refused; a predicate on the other
+columns reads directly. VARCHAR compares as it is stored, as in Spark.
 
 Dates and timestamps before 1582-10-15 that Databricks or Spark wrote in the
 legacy hybrid calendar (Parquet files marked `org.apache.spark.legacyDateTime`)
@@ -321,10 +331,25 @@ DataFrame, or anything else exporting the Arrow PyCapsule interface.
 A column's data must fit the table's type as Delta's schema enforcement
 decides it: the same type, or a widening that keeps every value (a narrower
 integer, int to double, float to double, a decimal with room for all its
-digits). A write that would change values -- 4.7 into a BIGINT, '12' into an
-INT, a DECIMAL(15,3) into a DECIMAL(10,2) -- raises `InvalidArgumentError`, as
-Spark refuses it, where delta-rs cast it silently. Cast the data first, or
-widen the column with `alter_column_type()`.
+digits). A narrower numeric column type is taken too when every value fits it
+exactly, which is how Python ints and floats (int64, double) reach an INT,
+SMALLINT or FLOAT column; the warehouse's INSERT takes them the same way. A
+write that would change values -- 4.7 into a BIGINT, 2**40 into an INT, 0.1
+into a FLOAT, '12' into an INT, a DECIMAL(15,3) into a DECIMAL(10,2) -- raises
+`InvalidArgumentError`, where delta-rs cast it silently. A stream is judged by
+its types alone, since its values cannot be checked without reading it. Cast
+the data first, or widen the column with `alter_column_type()`.
+
+Databricks' ANSI interval columns read as the warehouse returns them on every
+engine: `INTERVAL DAY TO SECOND` (and its narrower day-time forms) as a
+microsecond `duration`, `INTERVAL YEAR TO MONTH`, `YEAR` and `MONTH` as Spark's
+own text (`INTERVAL '1-2' YEAR TO MONTH`), since pyarrow, pandas and polars
+cannot hold Arrow's `month_interval`. Both write back unchanged: a duration is
+staged for the warehouse as microseconds and multiplied back into an interval
+(Databricks casts a bare BIGINT to an interval as *seconds*), and the kernel and
+delta-rs store the integers Databricks stores. A plain integer bound for a
+day-time interval column is refused. A duration nested in a struct, list or map
+cannot be staged for the warehouse.
 
 A Delta timestamp holds microseconds. A nanosecond timestamp (pandas'
 `datetime64[ns]`, `pa.timestamp("ns")`) creates a microsecond column, as Spark
@@ -860,11 +885,14 @@ Capability(ok=True, engine=Engine.KERNEL, ...)
 for that exact request. When it says ok, the engine it names is the one the
 call uses. When it refuses, the call refuses the same way before writing
 anything. A method name (`z_order`, `compact_logs`, `plan_write`,
-`plan_scan`) can stand in for the operation. A MERGE clause with a condition
-is given as `(name, condition)`, e.g.
-`clauses=[("when_not_matched_insert_all", "s.v > 0")]`: on a change-feed table
-delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. On a handle
-opened with `version=`, every write is refused.
+`plan_scan`, `count`) can stand in for the operation. `can("count")` differs
+from `can("scan")`: a count reads no column but the ones its predicate names,
+so a table whose shredded VARIANT columns the direct engines cannot read still
+counts directly. `can(Operation.ZORDER, columns=[...])` takes `z_order()`'s
+own spelling. A MERGE clause with a condition is given as `(name, condition)`,
+e.g. `clauses=[("when_not_matched_insert_all", "s.v > 0")]`: on a change-feed
+table delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. On a
+handle opened with `version=`, every write is refused.
 
 `Capability` is truthy when `ok`. Every refusal carries a reason, and a remedy
 whenever one exists.
@@ -899,6 +927,7 @@ What no rule recognises arrives as `EngineError`.
 | `ChangeFeedSchemaChangeError` | an `UnreachableTableError`: the change feed range crosses a schema change its rows cannot be read across; `.version` names the commit that changed it |
 | `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
 | `SqlStatementError` | the SQL warehouse rejected or failed a statement; the message carries its error |
+| `SqlPermissionError` | a `SqlStatementError` that is also a `PreflightError`: the warehouse refused a missing privilege, named in `.privilege` / `.securable`, with the grant to ask for in `.remedy` |
 | `EnginePanicError` | an engine panicked across the FFI boundary |
 | `EngineError` | an engine failed in a way no error above describes; `.engine`, `.operation` and `.original` (the engine's exception, also the `__cause__`) say where. The error stays an instance of the original's class too: an engine's `OSError` becomes an `EngineError` that is also an `OSError`, a `pyarrow.ArrowInvalid` one that is also an `ArrowInvalid`. The class combined is the original's own, or its nearest ancestor that can be: one below `Exception` that can be subclassed and built from a message, and is not a Rust extension's type (delta-rs's `DeltaError` family, this library's native errors, pyo3 panics, Polars'). delta-rs's own types map to this library's: `TableNotFoundError` to `TableNotFoundError`, `DeltaProtocolError` to `EngineLimitError` (or `InvalidArgumentError` for invariant violations), a non-conflict `CommitFailedError` to `CommitRefusedError`. An exception raised by your own data source -- a `__arrow_c_stream__` of yours, or the iterator behind a `RecordBatchReader` you pass -- reaches you as it was raised, not translated. A read that fails this way moves on to the next capable engine, with an `EngineFallbackWarning` |
 
