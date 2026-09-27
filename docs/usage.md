@@ -129,6 +129,11 @@ table's vended credentials in this order:
    `AWS_REGION`, `AWS_ACCESS_KEY_ID`, ...) on `s3://`, as delta-rs reads them;
    the credential ones only when nothing above gave a credential.
 
+The client retry policy is set the way delta-rs reads it, on both engines:
+`max_retries`, `retry_timeout` (`30s`, `500ms`, `2m`),
+`backoff_config.init_backoff`, `backoff_config.max_backoff` and
+`backoff_config.base`.
+
 S3 keys with a region and no endpoint get an explicit one,
 `https://s3.<region>.amazonaws.com` (`.amazonaws.com.cn` in China regions).
 Azure sovereign clouds work with the URL alone:

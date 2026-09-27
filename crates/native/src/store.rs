@@ -28,10 +28,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use delta_kernel::object_store::client::StaticCredentialProvider;
 use delta_kernel::object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
-use delta_kernel::object_store::{parse_url_opts, DynObjectStore};
+use delta_kernel::object_store::{parse_url_opts, BackoffConfig, DynObjectStore, RetryConfig};
 use url::Url;
 
 use crate::error::{NativeError, Result};
@@ -163,10 +164,133 @@ fn azure_target(
     Ok((rewritten, out))
 }
 
+/// Storage-option keys for the client's retry policy, as delta-rs reads them.
+/// object_store has no configuration key for any of these, so without this
+/// the kernel retried 10 times over up to 180 s whatever the caller asked.
+const RETRY_KEYS: [&str; 5] = [
+    "max_retries",
+    "retry_timeout",
+    "backoff_config.init_backoff",
+    "backoff_config.max_backoff",
+    "backoff_config.base",
+];
+
+/// A duration as delta-rs spells one: `30s`, `500ms`, `2m`, `1h 30m`, or
+/// bare seconds.
+fn parse_duration(text: &str) -> Result<Duration> {
+    let invalid = || NativeError::Invalid(format!("{text:?} is not a duration (e.g. 30s, 500ms)"));
+    let trimmed = text.trim();
+    if let Ok(secs) = trimmed.parse::<f64>() {
+        return if secs.is_finite() && secs >= 0.0 {
+            Ok(Duration::from_secs_f64(secs))
+        } else {
+            Err(invalid())
+        };
+    }
+    let mut total = Duration::ZERO;
+    let mut rest = trimmed;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .ok_or_else(invalid)?;
+        let value: f64 = rest[..digits].parse().map_err(|_| invalid())?;
+        rest = &rest[digits..];
+        let unit_end = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let factor = match &rest[..unit_end] {
+            "ms" => 0.001,
+            "s" | "sec" | "secs" => 1.0,
+            "m" | "min" | "mins" => 60.0,
+            "h" | "hr" | "hrs" => 3600.0,
+            _ => return Err(invalid()),
+        };
+        total += Duration::from_secs_f64(value * factor);
+        rest = rest[unit_end..].trim_start();
+    }
+    Ok(total)
+}
+
+/// The retry policy the options ask for, or None to keep object_store's.
+fn retry_config(options: &HashMap<String, String>) -> Result<Option<RetryConfig>> {
+    let get = |key: &str| {
+        options
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_str())
+    };
+    if RETRY_KEYS.iter().all(|k| get(k).is_none()) {
+        return Ok(None);
+    }
+    let mut config = RetryConfig::default();
+    let mut backoff = BackoffConfig::default();
+    if let Some(v) = get("max_retries") {
+        config.max_retries = v.trim().parse().map_err(|_| {
+            NativeError::Invalid(format!("max_retries must be an integer, got {v:?}"))
+        })?;
+    }
+    if let Some(v) = get("retry_timeout") {
+        config.retry_timeout = parse_duration(v)?;
+    }
+    if let Some(v) = get("backoff_config.init_backoff") {
+        backoff.init_backoff = parse_duration(v)?;
+    }
+    if let Some(v) = get("backoff_config.max_backoff") {
+        backoff.max_backoff = parse_duration(v)?;
+    }
+    if let Some(v) = get("backoff_config.base") {
+        backoff.base = v.trim().parse().map_err(|_| {
+            NativeError::Invalid(format!("backoff_config.base must be a number, got {v:?}"))
+        })?;
+    }
+    config.backoff = backoff;
+    Ok(Some(config))
+}
+
+/// `parse_url_opts`, with a retry policy: object_store's URL parser takes no
+/// retry settings, so the builder for the URL's cloud is built here, with the
+/// same key handling (unknown keys are ignored, as there).
+fn build_with_retry(
+    url: &Url,
+    options: &HashMap<String, String>,
+    retry: RetryConfig,
+) -> Result<Arc<DynObjectStore>> {
+    use delta_kernel::object_store::aws::AmazonS3Builder;
+    use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
+
+    macro_rules! build {
+        ($builder:ty) => {{
+            let builder = options.iter().fold(
+                <$builder>::new().with_url(url.to_string()),
+                |builder, (key, value)| match key.to_ascii_lowercase().parse() {
+                    Ok(k) => builder.with_config(k, value),
+                    Err(_) => builder,
+                },
+            );
+            Ok(Arc::new(builder.with_retry(retry).build()?) as Arc<DynObjectStore>)
+        }};
+    }
+    match url.scheme() {
+        "s3" | "s3a" => build!(AmazonS3Builder),
+        "gs" | "gcs" => build!(GoogleCloudStorageBuilder),
+        "abfs" | "abfss" | "az" | "adl" | "azure" => build!(MicrosoftAzureBuilder),
+        _ => {
+            // Local files and memory make no network requests to retry.
+            let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+            let (store, _path) = parse_url_opts(url, pairs)?;
+            Ok(Arc::from(store))
+        }
+    }
+}
+
 /// Build an object store for `url`, honoring vended credentials.
 pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
+    let retry = retry_config(options)?;
     if is_azure(url) {
         let (target, options) = azure_target(url, options)?;
+        if let Some(retry) = retry {
+            return build_with_retry(&target, &options, retry);
+        }
         let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
         let (store, _path) = parse_url_opts(&target, pairs)?;
         return Ok(Arc::from(store));
@@ -174,10 +298,13 @@ pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<D
 
     if is_gcs(url) {
         if let Some(token) = gcs_bearer_token(options) {
-            return build_gcs_with_bearer(url, options, token);
+            return build_gcs_with_bearer(url, options, token, retry);
         }
     }
 
+    if let Some(retry) = retry {
+        return build_with_retry(url, options, retry);
+    }
     let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     let (store, _path) = parse_url_opts(url, pairs)?;
     Ok(Arc::from(store))
@@ -229,8 +356,12 @@ fn build_gcs_with_bearer(
     url: &Url,
     options: &HashMap<String, String>,
     token: &str,
+    retry: Option<RetryConfig>,
 ) -> Result<Arc<DynObjectStore>> {
     let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_str());
+    if let Some(retry) = retry {
+        builder = builder.with_retry(retry);
+    }
 
     // Forward everything except our own token keys; object_store would reject
     // them as unknown configuration.
@@ -254,6 +385,45 @@ fn build_gcs_with_bearer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_parse_as_delta_rs_spells_them() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("2").unwrap(), Duration::from_secs(2));
+        assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("-1").is_err());
+    }
+
+    #[test]
+    fn retry_options_become_a_retry_config() {
+        assert!(retry_config(&opts(&[("aws_region", "us-east-1")]))
+            .unwrap()
+            .is_none());
+        let config = retry_config(&opts(&[("max_retries", "0"), ("RETRY_TIMEOUT", "1s")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.max_retries, 0);
+        assert_eq!(config.retry_timeout, Duration::from_secs(1));
+        assert!(retry_config(&opts(&[("max_retries", "many")])).is_err());
+    }
+
+    #[test]
+    fn a_store_with_a_retry_policy_builds_on_every_cloud() {
+        let retry = opts(&[("max_retries", "1"), ("retry_timeout", "2s")]);
+        for url in ["s3://b/t", "gs://b/t", "file:///tmp/t"] {
+            build_store(&Url::parse(url).unwrap(), &retry).unwrap();
+        }
+        let mut azure = retry.clone();
+        azure.insert("azure_storage_account_name".into(), "acct".into());
+        azure.insert("azure_storage_account_key".into(), "a2V5".into());
+        build_store(
+            &Url::parse("abfss://c@acct.dfs.core.windows.net/t").unwrap(),
+            &azure,
+        )
+        .unwrap();
+    }
 
     fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
