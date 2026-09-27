@@ -506,7 +506,9 @@ impl PySnapshot {
         files = None,
         row_positions = false,
         row_ids = false,
+        file_groups = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn scan(
         &self,
         py: Python<'_>,
@@ -515,7 +517,14 @@ impl PySnapshot {
         files: Option<Vec<String>>,
         row_positions: bool,
         row_ids: bool,
+        file_groups: Option<Vec<usize>>,
     ) -> PyResult<PyRecordBatchReader> {
+        if file_groups.is_some() && (row_positions || files.is_none()) {
+            return Err(NativeError::Invalid(
+                "file_groups=... takes files=... and not row_positions=True".to_string(),
+            )
+            .into());
+        }
         if row_ids && !row_positions {
             return Err(
                 NativeError::Invalid("row_ids=True needs row_positions=True".to_string()).into(),
@@ -573,6 +582,15 @@ impl PySnapshot {
             if row_positions {
                 let paths = files.map(|f| f.into_iter().collect());
                 return KernelBatchReader::try_new_positional(&scan, engine, paths);
+            }
+            if let (Some(files), Some(groups)) = (&files, file_groups) {
+                let reader =
+                    KernelBatchReader::try_new_grouped(&scan, engine, files.clone(), groups)?;
+                return Ok(if only_partitions {
+                    reader.without_column(crate::scan::ROW_COUNT_COLUMN)
+                } else {
+                    reader
+                });
             }
             let reader = match files {
                 Some(files) => KernelBatchReader::try_new_restricted(
@@ -754,6 +772,8 @@ impl PySnapshot {
         overwrite = false,
         txn = None,
         commit_metadata = None,
+        operation_parameters = None,
+        blind_append = None,
     ))]
     fn append(
         &self,
@@ -765,6 +785,8 @@ impl PySnapshot {
         overwrite: bool,
         txn: Option<(String, i64)>,
         commit_metadata: Option<HashMap<String, String>>,
+        operation_parameters: Option<HashMap<String, String>>,
+        blind_append: Option<bool>,
     ) -> PyResult<u64> {
         let reader = data.into_reader()?;
 
@@ -783,6 +805,10 @@ impl PySnapshot {
                 overwrite,
                 txn,
                 commit_metadata,
+                commit::CommitInfoPatch {
+                    operation_parameters,
+                    blind_append,
+                },
             )
         })?;
         Ok(version)
@@ -842,6 +868,8 @@ impl PySnapshot {
         overwrite = false,
         txn = None,
         commit_metadata = None,
+        operation_parameters = None,
+        blind_append = None,
     ))]
     fn commit_files(
         &self,
@@ -853,6 +881,8 @@ impl PySnapshot {
         overwrite: bool,
         txn: Option<(String, i64)>,
         commit_metadata: Option<HashMap<String, String>>,
+        operation_parameters: Option<HashMap<String, String>>,
+        blind_append: Option<bool>,
     ) -> PyResult<u64> {
         let version = py.detach(|| {
             commit::commit_files(
@@ -865,6 +895,10 @@ impl PySnapshot {
                 overwrite,
                 txn,
                 commit_metadata,
+                commit::CommitInfoPatch {
+                    operation_parameters,
+                    blind_append,
+                },
             )
         })?;
         Ok(version)
@@ -892,6 +926,8 @@ impl PySnapshot {
         txn = None,
         commit_metadata = None,
         data_change = true,
+        operation_parameters = None,
+        blind_append = None,
     ))]
     fn commit_dml(
         &self,
@@ -905,31 +941,42 @@ impl PySnapshot {
         txn: Option<(String, i64)>,
         commit_metadata: Option<HashMap<String, String>>,
         data_change: bool,
+        operation_parameters: Option<HashMap<String, String>>,
+        blind_append: Option<bool>,
     ) -> PyResult<(u64, u64, usize, usize)> {
         let deletions = deletions.into_reader()?;
         let data = data.map(|d| d.into_reader()).transpose()?;
         let outcome = py.detach(|| -> Result<dml::DmlOutcome> {
             let deletions: std::result::Result<Vec<_>, _> = deletions.collect();
             let deletions = dml::deletions_from_batches(&deletions.map_err(NativeError::from)?)?;
-            let batches = match data {
+            let data = match data {
+                // A compaction's rows are pulled as they are written: its
+                // input can be far larger than memory.
+                Some(reader) if !data_change => dml::DmlData::Stream(Box::new(
+                    reader.map(|batch| batch.map_err(NativeError::from)),
+                )),
                 Some(reader) => {
                     let batches: std::result::Result<Vec<_>, _> = reader.collect();
-                    batches.map_err(NativeError::from)?
+                    dml::DmlData::Batches(batches.map_err(NativeError::from)?)
                 }
-                None => Vec::new(),
+                None => dml::DmlData::Batches(Vec::new()),
             };
             dml::commit_dml(
                 self.inner.clone(),
                 self.engine.clone(),
                 deletions,
                 whole_files.unwrap_or_default().into_iter().collect(),
-                batches,
+                data,
                 uc,
                 engine_info,
                 operation,
                 txn,
                 commit_metadata,
                 data_change,
+                commit::CommitInfoPatch {
+                    operation_parameters,
+                    blind_append,
+                },
             )
         })?;
         Ok((

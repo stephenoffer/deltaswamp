@@ -147,12 +147,46 @@ First release.
   conflict check ignores a concurrent compaction's `dataChange=false`
   removes, and its OPTIMIZE takes neither `max_commit_retries` nor app
   transactions, so two runs over the same files both committed (150 rows
-  became 450). The rewritten files are now committed by the kernel on the
-  snapshot they were planned from; a loser re-plans from the new snapshot.
-  delta-rs still commits where the kernel cannot write the table (row
-  tracking, CHECK constraints, generated or identity columns) or with
-  `writer_properties`/`min_commit_interval`, with the old after-the-fact
-  check.
+  became 450). Every compaction is now committed by the kernel on the
+  snapshot it was planned from, and a loser re-plans from the new snapshot;
+  delta-rs never commits one (its after-the-fact rollback undid only the
+  newest duplicate). CHECK constraints, generated and identity columns,
+  invariants and the writer versions 3-6 that imply them (every table delta-rs
+  gave a change data feed) no longer stand in the way: a compaction writes back
+  the values it read. The kernel's OPTIMIZE is its own capability, so
+  kernel-only connections and tables delta-rs cannot open (in-commit
+  timestamps, type widening, `vacuumProtocolCheck`) compact too. Refused, typed
+  and before any work, rather than run unsafely: `writer_properties`,
+  `min_commit_interval`, app transactions, `cleanup_expired_logs=True`,
+  row-tracked, liquid-clustered and name/id column-mapped tables (DuckDB's
+  delta reader reads the partition columns of kernel-written column-mapped
+  files as NULL), and files holding legacy-calendar or out-of-range INT96
+  values (the kernel writer does not yet mark its files proleptic, so
+  Databricks would read the rewritten values shifted). An OPTIMIZE that loses
+  to a protocol change it cannot write raises `CommitConflictError`.
+- OPTIMIZE reads each step's files with one scan, in bin order and several at
+  a time, and writes several output files at once (20,000 files: 16 s before,
+  3 s now, delta-rs 2.2 s; 5,000 commits without a checkpoint: 173 s, now
+  10 s). Its rows stream into the commit: memory is bounded by
+  `KernelEngine.compaction_max_file_bytes` (512 MiB of decoded rows per output
+  file, and per Z-order sort; about four times that at peak) whatever the table
+  or partition size. Where rows decode to more than that per target-sized
+  file, output files come out smaller than the target and are left alone
+  afterwards. A Z-order sorts a large partition in chunks of that size, and
+  sizes its files by how the sorted rows encode (they were 40% over the
+  target).
+- `partition_filters` on the kernel's OPTIMIZE follow delta-rs: timestamp
+  values in ISO 8601 with a `T` and an offset, `<`/`>` on timestamps, a NULL
+  partition matching no comparison (`!=` and `not in` included), and `= ''`
+  meaning NULL. A value that is not of the column's type is an
+  `InvalidArgumentError`. Z-ORDER by a STRUCT, ARRAY or MAP column is refused
+  (`InvalidArgumentError`) for every engine.
+- Kernel commits record `operationParameters` (mode, partitionBy, predicate;
+  OPTIMIZE's zOrderBy) and `isBlindAppend`. A concurrent winner counts as a
+  blind append only when its `isBlindAppend` says so, or, where the writer
+  records none (delta-rs), when it is a WRITE in `Append` mode: a replaceWhere
+  that matched nothing (only adds) had read as one, so concurrent loads of one
+  range on a deletion-vector table each committed (four writers, four copies).
 - A kernel MERGE, DELETE or UPDATE that lost a commit race rebases only over
   blind appends and over commits that added nothing its read could match;
   concurrent MERGE upserts of one new key each inserted it before. The

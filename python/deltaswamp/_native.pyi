@@ -15,7 +15,7 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
-"compaction". Gate on this
+"compaction", "commit_info_patch", "streaming_compaction". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
 
@@ -271,6 +271,7 @@ class Snapshot:
         files: list[str] | None = None,
         row_positions: bool = False,
         row_ids: bool = False,
+        file_groups: list[int] | None = None,
     ) -> Any:
         """Read the table as an Arrow stream, with deletion vectors applied.
 
@@ -279,6 +280,12 @@ class Snapshot:
         position in that file): the address a deletion vector uses. `row_ids`
         (which needs `row_positions`, and row tracking enabled) also appends
         `__deltaswamp_row_id`, each row's stable row id.
+
+        `files` are read in the order given, a few ahead in the background.
+        `file_groups` (with `files`, not `row_positions`) splits them into runs
+        of that many files each: every batch holds rows of one run only,
+        consecutive files' batches merged, tagged by `__deltaswamp_file`
+        (dictionary-encoded) -- a compaction's bins.
 
         `predicate` is a JSON string used ONLY to skip files (by statistics and
         partition values); rows that do not match can still be returned, so the
@@ -395,8 +402,14 @@ class Snapshot:
         overwrite: bool = False,
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, str] | None = None,
+        operation_parameters: dict[str, str] | None = None,
+        blind_append: bool | None = None,
     ) -> int:
         """Append Arrow data as one transaction; returns the committed version.
+
+        `operation_parameters` and `blind_append` are written into the commit's
+        commitInfo as `operationParameters` and `isBlindAppend`, which kernel
+        otherwise writes as `{}` and (unless true) not at all.
 
         Pass `uc` for a catalog-managed table, where the commit is staged and
         then ratified by the catalog rather than written directly.
@@ -439,6 +452,8 @@ class Snapshot:
         overwrite: bool = False,
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, str] | None = None,
+        operation_parameters: dict[str, str] | None = None,
+        blind_append: bool | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
 
@@ -458,11 +473,17 @@ class Snapshot:
         commit_metadata: dict[str, str] | None = None,
         whole_files: list[str] | None = None,
         data_change: bool = True,
+        operation_parameters: dict[str, str] | None = None,
+        blind_append: bool | None = None,
     ) -> tuple[int, int, int, int]:
         """Commit row-level DML as deletion vectors, in one transaction.
 
         `whole_files` are removed outright; `data_change=False` commits the
-        whole thing as a compaction (OPTIMIZE), the same rows in new files.
+        whole thing as a compaction (OPTIMIZE), the same rows in new files:
+        `data` is then pulled one batch at a time and each batch written as
+        one file as it arrives, and the table's CHECK constraints, generated
+        and identity columns and invariants do not stop it (they constrain
+        new values, and a compaction writes the ones it read).
 
         `deletions` is an Arrow stream of `path` and `row_index` columns, as a
         positional scan reports them. Each touched file's new deletions are

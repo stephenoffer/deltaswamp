@@ -174,10 +174,11 @@ class TestRewritesKeepTheCalendar:
             (101, dt.date(1, 1, 1)),
         ]
 
-    def test_proleptic_files_still_go_to_delta_rs(self, conn: Any, tmp_path: Any) -> None:
+    def test_proleptic_files_are_still_compacted(self, conn: Any, tmp_path: Any) -> None:
         path = _spark_table(tmp_path / "t", legacy=False)
         t = conn.open_table(path)
-        assert t.can("optimize").engine is ds.Engine.DELTARS
+        # By the kernel, which commits every compaction now.
+        assert t.can("optimize").engine is ds.Engine.KERNEL
         t.optimize()
         assert [d for _, d in _rows(conn, path)] == EXPECTED_DATES
 
@@ -219,7 +220,7 @@ class TestRewritesKeepTheCalendar:
             "\n".join(json.dumps(a) for a in actions) + "\n"
         )
         t = conn.open_table(str(root))
-        assert t.can("optimize").engine is ds.Engine.DELTARS
+        assert t.can("optimize").engine is ds.Engine.KERNEL
 
     def test_old_int96_files_are_refused_too(self, conn: Any, tmp_path: Any) -> None:
         # Not legacy at all, but delta-rs decodes INT96 as nanoseconds.

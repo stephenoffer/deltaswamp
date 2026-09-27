@@ -3547,6 +3547,16 @@ class Table:
                     f"cannot z-order by {column!r}: it is a partition column, constant "
                     "within every file"
                 )
+            kind = self.schema().field(column).type
+            if _nested_type(kind):
+                # Refused for every engine, as Databricks refuses it: files
+                # keep no min/max for a nested value, so ordering by one buys
+                # no skipping, and the kernel's ranking cannot order them.
+                raise InvalidArgumentError(
+                    f"cannot z-order by {column!r}: it is a {kind} column, and Z-ORDER "
+                    "takes columns with min/max statistics (numbers, strings, dates, "
+                    "timestamps); order by one of its fields' values in a column of its own"
+                )
 
     def vacuum(
         self,
@@ -4446,6 +4456,21 @@ def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
 
 #: The tuning options DELETE and UPDATE pass to the engine.
 _DML_OPTIONS = frozenset({"commit_metadata", "writer_properties", "max_commit_retries"})
+
+
+def _nested_type(kind: Any) -> bool:
+    """Whether an Arrow type is a STRUCT, ARRAY or MAP (VARIANT included)."""
+    import pyarrow as pa
+
+    storage = getattr(kind, "storage_type", kind)
+    return bool(
+        pa.types.is_struct(storage)
+        or pa.types.is_list(storage)
+        or pa.types.is_large_list(storage)
+        or pa.types.is_fixed_size_list(storage)
+        or pa.types.is_map(storage)
+    )
+
 
 #: What every committing maintenance and ALTER call passes on: this library's
 #: commit options and delta-rs's own. A misspelt one was silently ignored when

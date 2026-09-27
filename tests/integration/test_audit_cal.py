@@ -110,7 +110,7 @@ class TestInt96PastNanoseconds:
         read = conn.open_table(path).to_arrow().sort_by("rid")
         assert read.column("ts").cast(pa.int64()).to_pylist() == values[:2]
 
-    def test_modern_int96_still_goes_to_delta_rs(self, conn: Any, tmp_path: Any) -> None:
+    def test_modern_int96_is_still_compacted(self, conn: Any, tmp_path: Any) -> None:
         values = [1704067200000000]
         path = _ts_table(tmp_path / "t", values, {"org.apache.spark.version": "3.5.0"}, int96=True)
         _with_stats(
@@ -122,7 +122,9 @@ class TestInt96PastNanoseconds:
                 "nullCount": {"rid": 0, "ts": 0},
             },
         )
-        assert conn.open_table(path).can("optimize").engine is ds.Engine.DELTARS
+        # The kernel commits every compaction now (see test_audit_compact.py);
+        # modern INT96 values are not refused.
+        assert conn.open_table(path).can("optimize").engine is ds.Engine.KERNEL
 
 
 class TestLazyHandOffsPinTheirVersion:

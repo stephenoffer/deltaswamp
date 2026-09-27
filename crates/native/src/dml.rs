@@ -129,6 +129,117 @@ struct Touched {
     remove: bool,
 }
 
+/// The rows a DML commit adds.
+pub enum DmlData {
+    /// Collected up front: an UPDATE's or MERGE's rewritten rows.
+    Batches(Vec<RecordBatch>),
+    /// Pulled one batch at a time and written as each arrives: a compaction's
+    /// output files, each one batch.
+    Stream(Box<dyn Iterator<Item = Result<RecordBatch>> + Send>),
+}
+
+/// Features that constrain only the values a commit writes.
+///
+/// A compaction writes back exactly the values it read (`dataChange=false`),
+/// already checked when they were first written: a CHECK constraint, an
+/// invariant or a generation expression holds for them as it did, and an
+/// identity column's values and high-water mark are untouched. delta-kernel
+/// refuses any transaction on a table carrying one of these -- a writer
+/// version 3 or 4 table implies two of them, so every table delta-rs gave a
+/// change data feed was refused -- which left those tables to delta-rs's
+/// OPTIMIZE, whose commit duplicates rows under a concurrent compaction.
+const VALUE_CONSTRAINTS: &[&str] = &[
+    "checkConstraints",
+    "generatedColumns",
+    "identityColumns",
+    "invariants",
+];
+
+/// The writer features a legacy writer version implies, in protocol order.
+fn legacy_writer_features(version: i32) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if version >= 2 {
+        features.extend(["appendOnly", "invariants"]);
+    }
+    if version >= 3 {
+        features.push("checkConstraints");
+    }
+    if version >= 4 {
+        features.extend(["changeDataFeed", "generatedColumns"]);
+    }
+    if version >= 5 {
+        features.push("columnMapping");
+    }
+    if version >= 6 {
+        features.push("identityColumns");
+    }
+    features
+}
+
+/// `snapshot` as a compaction's transaction sees it: the same log segment,
+/// metadata and version, with [`VALUE_CONSTRAINTS`] left out of the protocol
+/// kernel checks the write against.
+///
+/// Only the transaction's pre-commit check ever sees this protocol. A
+/// compaction's commit carries no protocol action (the table's own protocol
+/// stays in force, for every reader and writer after it), its conflict check
+/// is the object store's put-if-absent of the next version, and the post-
+/// commit snapshot kernel builds from it is dropped: checkpoints are written
+/// from a snapshot read back from storage.
+pub(crate) fn compaction_snapshot(snapshot: &SnapshotRef) -> Result<SnapshotRef> {
+    use delta_kernel::actions::Protocol;
+    use delta_kernel::snapshot::Snapshot;
+    use delta_kernel::table_configuration::TableConfiguration;
+
+    let config = snapshot.table_configuration();
+    let protocol = config.protocol();
+    let writer = protocol.min_writer_version();
+    let listed: Vec<String> = match protocol.writer_features() {
+        Some(features) => features.iter().map(|f| f.to_string()).collect(),
+        None => legacy_writer_features(writer)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    };
+    if !listed
+        .iter()
+        .any(|f| VALUE_CONSTRAINTS.contains(&f.as_str()))
+    {
+        return Ok(snapshot.clone());
+    }
+    let kept: Vec<&String> = listed
+        .iter()
+        .filter(|f| !VALUE_CONSTRAINTS.contains(&f.as_str()))
+        .collect();
+    let reader = protocol.min_reader_version();
+    let reader_features: Option<Vec<String>> = protocol
+        .reader_features()
+        .map(|features| features.iter().map(|f| f.to_string()).collect());
+    // A legacy writer version becomes the same features listed explicitly
+    // (writer version 7), the only form in which some can be left out.
+    let protocol: Protocol = serde_json::from_value(serde_json::json!({
+        "minReaderVersion": reader,
+        "minWriterVersion": 7,
+        "readerFeatures": reader_features,
+        "writerFeatures": kept,
+    }))
+    .map_err(|e| {
+        NativeError::Invalid(format!(
+            "could not restate the table's protocol for its compaction: {e}"
+        ))
+    })?;
+    let config = TableConfiguration::try_new(
+        config.metadata().clone(),
+        protocol,
+        snapshot.table_root().clone(),
+        snapshot.version(),
+    )?;
+    Ok(Arc::new(Snapshot::new(
+        snapshot.log_segment().clone(),
+        config,
+    )?))
+}
+
 /// Commit a DELETE (and, with `batches`, an UPDATE's new rows) as deletion vectors.
 ///
 /// `deletions` maps a data file's log path to the physical row indexes to
@@ -148,13 +259,14 @@ pub fn commit_dml(
     engine: SharedEngine,
     deletions: HashMap<String, RoaringTreemap>,
     whole_files: HashSet<String>,
-    batches: Vec<RecordBatch>,
+    data: DmlData,
     uc: Option<UcCommitConfig>,
     engine_info: Option<String>,
     operation: Option<String>,
     txn: Option<(String, i64)>,
     commit_metadata: Option<HashMap<String, String>>,
     data_change: bool,
+    info: commit::CommitInfoPatch,
 ) -> Result<DmlOutcome> {
     let deletions: HashMap<String, RoaringTreemap> = deletions
         .into_iter()
@@ -305,6 +417,19 @@ pub fn commit_dml(
     }
 
     let deleted_rows: u64 = touched.values().map(|t| t.newly_deleted).sum();
+    let (batches, stream) = match data {
+        DmlData::Batches(batches) => (batches, None),
+        DmlData::Stream(_) if data_change => {
+            return Err(NativeError::Invalid(
+                "only a compaction (data_change=False) streams its rows".to_string(),
+            ))
+        }
+        // Nothing to remove: whatever the stream holds is all there is to commit.
+        DmlData::Stream(stream) if touched.is_empty() => {
+            (stream.collect::<Result<Vec<_>>>()?, None)
+        }
+        DmlData::Stream(stream) => (Vec::new(), Some(stream)),
+    };
     if touched.is_empty() && batches.is_empty() {
         // Nothing to change: no commit, as Spark writes none for a no-op DELETE.
         return Ok(DmlOutcome {
@@ -364,14 +489,23 @@ pub fn commit_dml(
         .map(|(p, _)| p.as_str())
         .collect();
 
+    // A compaction commits on the table's own snapshot with the features
+    // that only constrain the values a commit writes set aside; see
+    // `compaction_snapshot`.
+    let committing = if data_change {
+        snapshot.clone()
+    } else {
+        compaction_snapshot(&snapshot)?
+    };
     let mut transaction = commit::begin_transaction(
-        snapshot.clone(),
+        committing,
         &engine,
         &uc,
         engine_info,
         operation,
         txn,
         commit_metadata,
+        info,
     )?;
     if !data_change {
         // A compaction: the same rows, moved from the removed files into the
@@ -440,15 +574,27 @@ pub fn commit_dml(
         }
         None => None,
     };
-    let staged = match &materialized_row_ids {
-        None => commit::stage_batches(
+    let staged = match (&materialized_row_ids, stream) {
+        (_, Some(stream)) => commit::stage_stream(
+            &mut transaction,
+            &engine,
+            &partition_columns,
+            &table_schema,
+            stream.map(|batch| {
+                // One batch is one file: each is conformed on its own and
+                // written as it arrives, so the rows of a whole compaction
+                // step are never in memory at once.
+                batch.and_then(|b| commit::prepare_batches(&snapshot, vec![b]))
+            }),
+        ),
+        (None, None) => commit::stage_batches(
             &mut transaction,
             &engine,
             &partition_columns,
             &table_schema,
             batches,
         ),
-        Some(column) => stage_with_row_ids(
+        (Some(column), None) => stage_with_row_ids(
             &mut transaction,
             &engine,
             &partition_columns,
@@ -795,6 +941,23 @@ pub fn deletions_from_batches(batches: &[RecordBatch]) -> Result<HashMap<String,
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn legacy_writer_versions_imply_their_features() {
+        assert_eq!(super::legacy_writer_features(1), Vec::<&str>::new());
+        assert_eq!(
+            super::legacy_writer_features(4),
+            [
+                "appendOnly",
+                "invariants",
+                "checkConstraints",
+                "changeDataFeed",
+                "generatedColumns"
+            ]
+        );
+        assert!(super::legacy_writer_features(6).contains(&"identityColumns"));
+    }
+
     use super::*;
 
     #[test]

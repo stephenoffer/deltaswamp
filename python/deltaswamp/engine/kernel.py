@@ -14,6 +14,7 @@ import os
 import re
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from .. import predicate as sqlpred
@@ -30,6 +31,7 @@ from ..capability import (
     Support,
     TableFeature,
     feature_from_wire,
+    implied_features,
 )
 from ..capability import (
     Engine as EngineKind,
@@ -48,6 +50,7 @@ from ..properties import (
     KERNEL_CREATE_DEFERRED,
     checkpoint_drops_stats,
     effect_for,
+    parse_byte_size,
 )
 from . import metadata as meta
 from .base import missing_method
@@ -309,8 +312,68 @@ def _enter_native(what: str) -> None:
         )
 
 
-#: commitInfo operations that are appends when their commit removes nothing.
-_APPEND_OPERATIONS = frozenset({"WRITE", "STREAMING UPDATE", "APPEND"})
+def _commit_info(*, blind: bool, **parameters: Any) -> dict[str, Any]:
+    """`operationParameters` and `isBlindAppend` for a kernel commit, as the binding takes them.
+
+    Kernel 0.28 writes an empty parameter map and writes `isBlindAppend` only
+    when true, so a replaceWhere that matched nothing (only adds) read as a
+    blind append to every concurrent writer's conflict check, and four
+    concurrent loads of one range each committed. Values follow Spark's
+    history: strings as they are, anything else as JSON (``partitionBy``
+    ``[]``, ``predicate`` ``["day = '2026-09-27'"]``).
+    """
+    if not _native_has("commit_info_patch"):
+        return {}
+    return {
+        "operation_parameters": {
+            key: value if isinstance(value, str) else json.dumps(value)
+            for key, value in parameters.items()
+            if value is not None
+        },
+        "blind_append": blind,
+    }
+
+
+def _blind_append(info: dict[str, Any]) -> bool:
+    """Whether a winner's commitInfo says it was a blind append (given it only adds).
+
+    `isBlindAppend` decides wherever it is written: Spark writes it, false
+    for an INSERT ... SELECT, and so does this library. delta-rs never writes
+    it, but records ``mode: Append`` for exactly its appends -- writes built
+    from data it was handed, which read nothing of the table, as Spark's
+    DataFrame appends are blind. A WRITE without either (a replaceWhere, or a
+    kernel commit from before the flag was written) is not.
+    """
+    flag = info.get("isBlindAppend")
+    if flag is not None:
+        return flag is True
+    parameters = info.get("operationParameters") or {}
+    return (
+        str(info.get("operation", "")).upper() == "WRITE"
+        and str(parameters.get("mode", "")).lower() == "append"
+        and not parameters.get("predicate")
+    )
+
+
+def _write_info(snapshot: Any, *, overwrite: bool, predicate: str | None = None) -> dict[str, Any]:
+    """`_commit_info` for a WRITE: an append (blind) or an overwrite / replaceWhere."""
+    try:
+        partitions = list(snapshot.partition_columns)
+    except Exception:
+        partitions = []
+    return _commit_info(
+        blind=not overwrite and predicate is None,
+        mode="Overwrite" if overwrite or predicate is not None else "Append",
+        partitionBy=partitions,
+        predicate=None if predicate is None else [predicate],
+    )
+
+
+def _dml_info(operation: str, predicate: str | None, snapshot: Any) -> dict[str, Any]:
+    """`_commit_info` for a DELETE, UPDATE, MERGE or replaceWhere: never a blind append."""
+    if operation.upper() == "WRITE":
+        return _write_info(snapshot, overwrite=True, predicate=predicate)
+    return _commit_info(blind=False, predicate=[predicate] if predicate is not None else [])
 
 
 def _native_has(*features: str) -> bool:
@@ -337,6 +400,8 @@ def _implemented() -> frozenset[Operation]:
         ops.add(Operation.FILES)
     if _native_has("checkpoint"):
         ops.add(Operation.CHECKPOINT)
+    if _native_has(*_COMPACTION_NATIVE):
+        ops |= {Operation.OPTIMIZE, Operation.ZORDER}
     return frozenset(ops)
 
 
@@ -488,6 +553,10 @@ class KernelEngine:
                     + ", ".join(sorted(blockers))
                 ),
             )
+
+        if operation in (Operation.OPTIMIZE, Operation.ZORDER):
+            # Its own gate, not the write gate below: see _compaction_capability.
+            return self._compaction_capability(operation, table, shape)
 
         if operation in METADATA_OPERATIONS:
             refusal = self._metadata_refusal(operation, table)
@@ -1296,6 +1365,7 @@ class KernelEngine:
                         txn=txn,
                         commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
                         or None,
+                        **_write_info(snapshot, overwrite=overwrite),
                     )
                 except _native.CommitConflictError:
                     if attempt + 1 >= attempts or self._txn_won_race(snapshot, table, txn):
@@ -1748,6 +1818,7 @@ class KernelEngine:
                         txn=txn,
                         commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
                         or None,
+                        **_dml_info(operation, predicate, snapshot),
                     )
                 break
             except CommitConflictError:
@@ -1870,6 +1941,7 @@ class KernelEngine:
             commit_metadata=commit_metadata,
             engine_info=engine_info,
             read_predicate=skipping,
+            predicate=predicate,
         )
         return {"version": version, "num_affected_rows": touched}
 
@@ -1929,6 +2001,7 @@ class KernelEngine:
         commit_metadata: dict[str, Any] | None = None,
         engine_info: str | None = None,
         read_predicate: str | None = None,
+        predicate: str | None = None,
     ) -> int:
         """Commit `deletions` (path, row_index) as vectors plus `data`, in one transaction.
 
@@ -1955,6 +2028,7 @@ class KernelEngine:
                             txn=txn,
                             commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
                             or None,
+                            **_dml_info(operation, predicate, snapshot),
                         )
                     break
                 except CommitConflictError:
@@ -2064,11 +2138,14 @@ class KernelEngine:
         """Whether a commit after `read` that was not a blind append added rows it could read.
 
         Judged from the winners' own commit files: which were blind appends
-        (only adds; isBlindAppend, or a plain WRITE -- the kernel's appends
-        do not set the flag), and which data files the others added. An added
-        file the read predicate skips could not hold a row this transaction
-        would have matched; one already gone again (compacted since) cannot
-        be judged and counts as read.
+        (only adds, and `_blind_append` says so), and which data files the
+        others added. A replaceWhere or INSERT ... SELECT is a WRITE with only
+        adds too, and taking every such WRITE for a blind append let four
+        concurrent replaceWhere loads of one range each commit their rows. An
+        added file
+        the read predicate skips could not hold a row this transaction would
+        have matched; one already gone again (compacted since) cannot be
+        judged and counts as read.
         """
         import pyarrow as pa
 
@@ -2079,10 +2156,9 @@ class KernelEngine:
         for _version, text in fresh.commit_log(int(read.version)):
             actions = [json.loads(line) for line in text.splitlines() if line.strip()]
             info = next((a["commitInfo"] for a in actions if "commitInfo" in a), None) or {}
-            if not any(k in a for a in actions for k in ("remove", "metaData", "protocol")) and (
-                info.get("isBlindAppend") is True
-                or str(info.get("operation", "")).upper() in _APPEND_OPERATIONS
-            ):
+            if not any(
+                k in a for a in actions for k in ("remove", "metaData", "protocol")
+            ) and _blind_append(info):
                 continue
             added.update(
                 a["add"]["path"]
@@ -2102,35 +2178,153 @@ class KernelEngine:
 
     # ------------------------------------------------------------ compaction
 
-    def compaction_refusal(self, table: ResolvedTable) -> str | None:
-        """Why the kernel cannot commit an OPTIMIZE of this table, or None.
+    def compaction_refusal(self, table: ResolvedTable, **shape: Any) -> str | None:
+        """Why the kernel cannot run this OPTIMIZE of this table, or None.
 
         delta-rs's own OPTIMIZE commit rebases over a concurrent compaction
         of the same files (its conflict check ignores `dataChange=false`
         removes) and duplicates every row both compacted; the kernel commits
-        on the snapshot it read, so the loser conflicts instead. DeltaRsEngine
-        uses this path wherever it is open.
+        on the snapshot it read, so the loser conflicts instead. It is the one
+        compaction path: `supports(OPTIMIZE)` and delta-rs's `optimize` both
+        ask this.
         """
-        if not self.available() or not _native_has("compaction", "commit_log"):
-            return "the native extension has no kernel compaction"
-        if _forked_on_macos():
-            return "the kernel cannot run in this forked process"
-        if table.location is None or table.is_catalog_managed or table.is_shallow_clone:
-            return "the kernel compacts path-based tables that own their files only"
-        if "rowTracking" in table.effective_writer_features:
-            return "rows moved to a new file would get new row ids"
-        cap = self.supports(Operation.APPEND, table)
-        if not cap.ok:
-            return cap.reason
+        cap = self.supports(Operation.OPTIMIZE, table, **shape)
+        return None if cap.ok else cap.reason
+
+    def _compaction_capability(
+        self, operation: Operation, table: ResolvedTable, shape: dict[str, Any]
+    ) -> Capability:
+        """`supports()` for OPTIMIZE and Z-ORDER, past the checks every operation gets.
+
+        Not the write gate: a compaction writes back the values it read, so
+        CHECK constraints, generated and identity columns and invariants (and
+        the writer versions 3-6 that imply them) do not constrain it -- the
+        native commit sets exactly those aside (`compaction_snapshot`).
+        """
+        refusal = (
+            _compaction_option_refusal(shape)
+            or self._compaction_table_refusal(table)
+            or _compaction_feature_refusal(table.effective_writer_features, table.properties)
+        )
+        if refusal is not None:
+            reason, remedy = refusal
+            return Capability(operation, ok=False, reason=reason, remedy=remedy or "")
+        return Capability(operation, ok=True, engine=self.kind)
+
+    def _compaction_table_refusal(self, table: ResolvedTable) -> tuple[str, str | None] | None:
+        if not _native_has(*_COMPACTION_NATIVE):
+            return "the native extension has no streaming kernel compaction", None
+        if table.is_catalog_managed:
+            return (
+                "a catalog-managed table's commits are ratified by Unity Catalog, and the "
+                "kernel's compaction commits to storage directly",
+                SQL_FALLBACK_REMEDY,
+            )
+        if table.is_shallow_clone:
+            return "a shallow clone's data files belong to its source table", None
+        if table.properties.get("delta.enableVariantShredding", "").lower() == "true":
+            return (
+                "the table shreds VARIANT values (delta.enableVariantShredding), and the "
+                "kernel cannot decode a shredded file to rewrite it",
+                SQL_FALLBACK_REMEDY,
+            )
+        if table.has_datetime_columns:
+            found = self._legacy_files(table)
+            if found:
+                return _legacy_refusal(found), SQL_FALLBACK_REMEDY
         return None
+
+    def _legacy_files(self, table: ResolvedTable, snapshot: Any = None) -> tuple[str, ...]:
+        """Live files written in Spark's legacy calendar or with INT96 timestamps."""
+        if not _native_has("legacy_calendar_files"):
+            return ()
+        from .calendar import legacy_calendar_files
+
+        try:
+            return tuple(legacy_calendar_files(snapshot or self.snapshot(table)))
+        except Exception as exc:
+            # Unknown is not "none": a wrong guess rewrites them shifted.
+            return (f"<could not check: {type(exc).__name__}: {str(exc)[:120]}>",)
 
     #: Commits of one OPTIMIZE's rewritten files that lost a race, re-made on
     #: the new snapshot (or re-planned from it) before giving up.
     compaction_commit_retries = 15
 
-    #: Rows read into memory before their compaction is committed, in bytes
-    #: of input files; a larger OPTIMIZE commits in several steps.
+    #: Input (compressed file bytes) committed per step; a larger OPTIMIZE
+    #: commits in several. Rows are streamed, so this bounds how much work a
+    #: lost race repeats, not memory.
     compaction_batch_bytes = 1 << 30
+
+    #: Decoded (Arrow) bytes held for one output file, and for one Z-order
+    #: sort. The kernel writes each output file from a single batch, so this
+    #: bounds what an OPTIMIZE holds in memory: about twice it, whatever the
+    #: size of the table or of a partition (the whole bin, and for a Z-order
+    #: the whole partition, used to be read into memory at once). Where rows
+    #: decode to more than this per target-sized file, output files come out
+    #: smaller than the target; the planner then leaves such files alone.
+    compaction_max_file_bytes = 512 << 20
+
+    def optimize(
+        self,
+        table: ResolvedTable,
+        *,
+        zorder_by: list[str] | str | None = None,
+        full: bool = False,
+        predicate: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """OPTIMIZE (bin-packing, or Z-order with `zorder_by`), committed by the kernel.
+
+        delta-rs's options as delta-rs takes them. `partition_filters` scopes
+        it; `target_size` (default `delta.targetFileSize`, else 100 MiB) sizes
+        the output; `commit_properties` / `commit_metadata` /
+        `max_commit_retries` and `post_commithook_properties(create_checkpoint=)`
+        are honoured. delta-rs's executor knobs (`max_concurrent_tasks`,
+        `max_spill_size`, `max_temp_directory_size`) have nothing to bound
+        here. `writer_properties`, `min_commit_interval`, app transactions and
+        log cleanup are refused (see `supports`).
+        """
+        if isinstance(zorder_by, str):
+            zorder_by = [zorder_by]
+        shape = {"zorder_by": zorder_by, "full": full, "predicate": predicate, **kwargs}
+        unknown = sorted(set(kwargs) - _COMPACTION_OPTIONS)
+        if unknown:
+            raise InvalidArgumentError(
+                f"optimize got unexpected option(s) {unknown}; it takes "
+                f"{sorted(_COMPACTION_OPTIONS)}"
+            )
+        refusal = _compaction_option_refusal(shape)
+        if refusal is not None:
+            raise EngineLimitError("optimize on the kernel", refusal[0], refusal[1])
+        properties = kwargs.get("commit_properties")
+        metadata = {
+            **dict(getattr(properties, "custom_metadata", None) or {}),
+            **dict(kwargs.get("commit_metadata") or {}),
+        }
+        retries = kwargs.get("max_commit_retries")
+        if retries is None:
+            retries = getattr(properties, "max_commit_retries", None)
+        target = kwargs.get("target_size")
+        if target is None:
+            target = parse_byte_size(table.properties.get("delta.targetFileSize"))
+        hooks = kwargs.get("post_commithook_properties")
+        return self.compact(
+            table,
+            zorder_by=list(zorder_by) if zorder_by else None,
+            target_size=target,
+            partition_filters=kwargs.get("partition_filters"),
+            commit_metadata=metadata or None,
+            max_commit_retries=retries,
+            checkpoint=getattr(hooks, "create_checkpoint", True) is not False,
+        )
+
+    def zorder(
+        self, table: ResolvedTable, columns: list[str] | str, **kwargs: Any
+    ) -> dict[str, Any]:
+        columns = [columns] if isinstance(columns, str) else list(columns or [])
+        if not columns:
+            raise InvalidArgumentError("Z-ORDER needs at least one column")
+        return self.optimize(table, zorder_by=columns, **kwargs)
 
     def compact(
         self,
@@ -2141,6 +2335,7 @@ class KernelEngine:
         partition_filters: list[Any] | None = None,
         commit_metadata: dict[str, Any] | None = None,
         max_commit_retries: int | None = None,
+        checkpoint: bool = True,
     ) -> dict[str, Any]:
         """OPTIMIZE (bin-packing, or Z-order with `zorder_by`), committed by the kernel.
 
@@ -2149,15 +2344,18 @@ class KernelEngine:
         committed on the new snapshot if it left every file this one removes
         as it was read (Delta's rule for compactions); otherwise the rest is
         planned again from the new snapshot, so a file some other OPTIMIZE
-        compacted first is never compacted twice.
+        compacted first is never compacted twice. Each step's rows stream from
+        one scan (one log replay) into the commit that writes them.
         """
         import pyarrow as pa
 
+        _enter_native("compact the table with the kernel")
         retries = (
             self.compaction_commit_retries
             if max_commit_retries is None
             else int(max_commit_retries)
         )
+        target = int(target_size or _DEFAULT_TARGET_SIZE)
         metrics: dict[str, Any] = {
             "numFilesAdded": 0,
             "numFilesRemoved": 0,
@@ -2173,11 +2371,30 @@ class KernelEngine:
         partitions: set[Any] = set()
         conflicts = 0
         first_plan = True
+        read = None
         while True:
             snapshot = self.snapshot(table, write=True)
+            if read is not None and (
+                snapshot.protocol_json() != read.protocol_json()
+                or snapshot.metadata_json() != read.metadata_json()
+            ):
+                # A concurrent protocol or metadata change (row tracking
+                # enabled, a feature the kernel cannot write) won the race;
+                # the table may no longer be one this path can compact, and
+                # re-planning into the native commit's refusal raised an
+                # untyped ValueError.
+                refused = _snapshot_compaction_refusal(snapshot)
+                if refused is not None:
+                    raise CommitConflictError(
+                        int(snapshot.version),
+                        "a concurrent commit changed the table's protocol or metadata, and "
+                        f"the kernel can no longer compact it: {refused}. What this OPTIMIZE "
+                        "committed before then stands; nothing else was committed",
+                    )
+            read = snapshot
             files = pa.table(snapshot.files())
             bins, considered, skipped = self._plan_compaction(
-                snapshot, files, zorder_by, target_size, partition_filters, done
+                snapshot, files, zorder_by, target, partition_filters, done
             )
             if first_plan:
                 metrics["totalConsideredFiles"] = considered
@@ -2185,19 +2402,31 @@ class KernelEngine:
                 first_plan = False
             if not bins:
                 break
-            step: list[tuple[Any, list[str], list[int]]] = []
+            step: list[_Bin] = []
             budget = 0
-            for key, paths, sizes in bins:
-                step.append((key, paths, sizes))
-                budget += sum(sizes)
+            for item in bins:
+                step.append(item)
+                budget += sum(item.sizes)
                 if budget >= self.compaction_batch_bytes:
                     break
-            data, out_files = self._compacted_rows(snapshot, step, zorder_by, target_size)
-            removing = [p for _, paths, _ in step for p in paths]
+            removing = [p for item in step for p in item.paths]
+            legacy = set(self._legacy_files(table, snapshot)) & set(removing)
+            if legacy:
+                raise EngineLimitError(
+                    "optimize on the kernel", _legacy_refusal(sorted(legacy)), SQL_FALLBACK_REMEDY
+                )
+            before = set(files.column("path").to_pylist())
             while True:
                 try:
                     version = self._commit_compaction(
-                        table, snapshot, removing, data, commit_metadata
+                        table,
+                        snapshot,
+                        step,
+                        zorder_by,
+                        target,
+                        commit_metadata,
+                        checkpoint,
+                        [_filter_text(f) for f in partition_filters or []],
                     )
                     break
                 except CommitConflictError:
@@ -2215,17 +2444,18 @@ class KernelEngine:
                         # as it is now.
                         version = None
                         break
+                    # Every file this step removes is as it was read: the same
+                    # rows, streamed again, commit on the new snapshot.
                     snapshot = rebased
+                    before = set(pa.table(snapshot.files()).column("path").to_pylist())
             if version is None:
                 continue
             done.update(removing)
-            partitions.update(key for key, _, _ in step)
+            partitions.update(item.key for item in step)
             metrics["numBatches"] += len(step)
             metrics["numFilesRemoved"] += len(removing)
-            metrics["numFilesAdded"] += out_files
-            removed_sizes.extend(size for _, _, sizes in step for size in sizes)
+            removed_sizes.extend(size for item in step for size in item.sizes)
             after = pa.table(self.snapshot(table, version=version).files())
-            before = set(pa.table(snapshot.files()).column("path").to_pylist())
             for path, size in zip(
                 after.column("path").to_pylist(), after.column("size").to_pylist(), strict=True
             ):
@@ -2234,37 +2464,39 @@ class KernelEngine:
                     # Written by this OPTIMIZE: planning again (a Z-order
                     # rewrites whole partitions) must not take it back up.
                     done.add(path)
+        metrics["numFilesAdded"] = len(added_sizes)
         metrics["partitionsOptimized"] = len(partitions)
         metrics["filesAdded"] = _size_stats(added_sizes)
         metrics["filesRemoved"] = _size_stats(removed_sizes)
-        return metrics
+        return _Compacted(metrics)
 
     def _plan_compaction(
         self,
         snapshot: Any,
         files: Any,
         zorder_by: list[str] | None,
-        target_size: int | None,
+        target: int,
         partition_filters: list[Any] | None,
         exclude: set[str],
-    ) -> tuple[list[tuple[Any, list[str], list[int]]], int, int]:
-        """Bins of files to rewrite together: `(partition, paths, sizes)`, and the counts.
+    ) -> tuple[list[_Bin], int, int]:
+        """Bins of files to rewrite together, and the considered and skipped counts.
 
         As delta-rs plans them: per partition, files below the target size
         packed greedily up to it, a bin of one file left alone -- unless it
         carries a deletion vector, whose deleted rows the rewrite drops. A
         Z-order rewrites every file of each partition as one bin.
         """
-        target = int(target_size or _DEFAULT_TARGET_SIZE)
         physical = _physical_partition_names(snapshot)
         keep = _partition_filter(snapshot, partition_filters, physical)
-        groups: dict[Any, list[tuple[str, int, bool]]] = {}
+        width = _decoded_row_bytes(_arrow_schema(snapshot))
+        groups: dict[Any, list[tuple[str, int, bool, int | None]]] = {}
         considered = skipped = 0
-        for path, size, values, dv in zip(
+        for path, size, values, dv, records in zip(
             files.column("path").to_pylist(),
             files.column("size").to_pylist(),
             files.column("partition_values").to_pylist(),
             files.column("deletion_vector").to_pylist(),
+            files.column("num_records").to_pylist(),
             strict=True,
         ):
             values = dict(values or [])
@@ -2272,16 +2504,19 @@ class KernelEngine:
                 continue
             considered += 1
             key = tuple(sorted(values.items()))
-            groups.setdefault(key, []).append((path, int(size), dv is not None))
-        bins: list[tuple[Any, list[str], list[int]]] = []
+            live = None
+            if records is not None:
+                live = int(records) - (int(json.loads(dv).get("cardinality", 0)) if dv else 0)
+            groups.setdefault(key, []).append((path, int(size), dv is not None, live))
+        bins: list[_Bin] = []
         for key in sorted(groups, key=lambda k: [(n, v is None, v or "") for n, v in k]):
             members = groups[key]
             if zorder_by:
-                bins.append((key, [m[0] for m in members], [m[1] for m in members]))
+                bins.append(_Bin.of(key, members))
                 continue
-            current: list[tuple[str, int, bool]] = []
+            current: list[tuple[str, int, bool, int | None]] = []
             total = 0
-            packed: list[list[tuple[str, int, bool]]] = []
+            packed: list[list[tuple[str, int, bool, int | None]]] = []
             for member in sorted(members, key=lambda m: m[1]):
                 if member[1] >= target and not member[2]:
                     skipped += 1
@@ -2297,60 +2532,154 @@ class KernelEngine:
                 if len(group) == 1 and not group[0][2]:
                     skipped += 1
                     continue
-                bins.append((key, [m[0] for m in group], [m[1] for m in group]))
+                if not any(m[2] for m in group) and self._no_fewer_files(group, width):
+                    # Files the memory bound cut apart: rewriting them would
+                    # write as many again, on every OPTIMIZE.
+                    skipped += len(group)
+                    continue
+                bins.append(_Bin.of(key, group))
         return bins, considered, skipped
 
-    def _compacted_rows(
+    def _no_fewer_files(self, group: list[tuple[str, int, bool, int | None]], width: int) -> bool:
+        """Whether compacting `group` would write at least as many files as it holds.
+
+        Judged by its rows at `width` decoded bytes each against the memory
+        bound on one output file (`compaction_max_file_bytes`).
+        """
+        rows = [m[3] for m in group]
+        if any(r is None for r in rows):
+            return False
+        decoded = sum(r for r in rows if r is not None) * width
+        return -(-decoded // max(1, int(self.compaction_max_file_bytes))) >= len(group)
+
+    def _compacted_batches(
         self,
         snapshot: Any,
-        step: list[tuple[Any, list[str], list[int]]],
+        step: list[_Bin],
         zorder_by: list[str] | None,
-        target_size: int | None,
-    ) -> tuple[Any, int]:
-        """The rows of each bin, as one batch per output file, and the file count."""
+        target: int,
+    ) -> Any:
+        """The rows of each bin, as a stream of batches that are one output file each.
+
+        One scan reads every file of the step, in bin order (a log replay per
+        call used to cost 0.07-0.7 s per bin), with each batch tagged by its
+        file; the rows of a bin are held only until they make an output file,
+        and at most `compaction_max_file_bytes` of them at once -- about
+        twice that at the moment one is joined into a file's single batch.
+        """
         import pyarrow as pa
 
-        target = int(target_size or _DEFAULT_TARGET_SIZE)
-        batches: list[Any] = []
-        schema = None
-        for _key, paths, sizes in step:
-            rows = pa.table(snapshot.scan(files=paths))
-            if rows.num_rows == 0:
-                continue
-            schema = rows.schema
+        order = [p for item in step for p in item.paths]
+        owner = {p: i for i, item in enumerate(step) for p in item.paths}
+        stream = pa.RecordBatchReader.from_stream(
+            snapshot.scan(
+                files=order,
+                # Each batch tagged by its file, and a bin's files merged into
+                # few batches rather than one each.
+                file_groups=[len(item.paths) for item in step],
+            )
+        )
+        positions = [_FILE_COLUMN]
+        schema = pa.schema([f for f in stream.schema if f.name not in positions])
+        cap = max(1, int(self.compaction_max_file_bytes))
+
+        def files_of(index: int, batches: list[Any], final: bool) -> tuple[list[Any], list[Any]]:
+            """Output files cut from `batches` of bin `index`, and the rows left over.
+
+            At the bin's end (or at the memory cap) every row goes, in equal
+            slices so the last is not a sliver next to full files; before
+            it, only whole files of the size the bin's statistics give.
+            """
+            item = step[index]
+            rows = pa.Table.from_batches(batches, schema=schema)
+            per_file = item.rows_per_file(target, rows.num_rows)
+            if not final:
+                whole = rows.num_rows // per_file
+                if whole == 0:
+                    return [], batches
+                out = [_one_batch(rows.slice(i * per_file, per_file)) for i in range(whole)]
+                rest = rows.slice(whole * per_file)
+                return out, rest.to_batches() if rest.num_rows else []
             if zorder_by:
                 rows = rows.take(_zorder_indices(rows, zorder_by))
-            # One batch is one file (the native writer writes each batch it
-            # is given as a file): sized from the input, compressed as it is.
-            per_file = max(1, int(rows.num_rows * target / max(1, sum(sizes))))
-            for start in range(0, rows.num_rows, per_file):
-                batches.extend(rows.slice(start, per_file).combine_chunks().to_batches())
-        if schema is None:
-            return None, 0
-        return pa.Table.from_batches(batches, schema=schema), len(batches)
+                # Sorted rows compress worse than the input they came from
+                # (files came out 40% over the target): size them by how the
+                # first file's worth of them (a sample, at most) encodes.
+                sample = rows.slice(0, min(per_file, _SIZE_SAMPLE_ROWS))
+                per_file = _encoded_rows_per_file(sample, target, per_file)
+            # As many files as the target size asks, and enough that none
+            # holds more than the memory bound.
+            count = max(-(-rows.num_rows // per_file), -(-rows.nbytes // cap), 1)
+            size = max(1, -(-rows.num_rows // count))
+            return [_one_batch(rows.slice(i, size)) for i in range(0, rows.num_rows, size)], []
+
+        def generate() -> Any:
+            current: int | None = None
+            held: list[Any] = []
+            held_bytes = 0
+            for batch in stream:
+                if batch.num_rows == 0:
+                    continue
+                paths = batch.column(_FILE_COLUMN)
+                index = owner[paths[0].as_py()]
+                data = batch.drop_columns(positions)
+                if current is not None and index != current and held:
+                    out, held = files_of(current, held, final=True)
+                    yield from out
+                    held_bytes = 0
+                current = index
+                held.append(data)
+                held_bytes += data.nbytes
+                if held_bytes >= cap:
+                    # Past what one file (or one Z-order sort) may hold: cut
+                    # files from what is here rather than hold the whole bin.
+                    out, held = files_of(current, held, final=True)
+                    yield from out
+                    held_bytes = sum(b.nbytes for b in held)
+                elif not zorder_by and step[current].splits(target):
+                    out, held = files_of(current, held, final=False)
+                    yield from out
+                    held_bytes = sum(b.nbytes for b in held)
+            if current is not None and held:
+                out, _ = files_of(current, held, final=True)
+                yield from out
+
+        return pa.RecordBatchReader.from_batches(schema, generate())
 
     def _commit_compaction(
         self,
         table: ResolvedTable,
         snapshot: Any,
-        removing: list[str],
-        data: Any,
+        step: list[_Bin],
+        zorder_by: list[str] | None,
+        target: int,
         commit_metadata: dict[str, Any] | None,
+        checkpoint: bool = True,
+        predicate: list[str] | None = None,
     ) -> int:
         import pyarrow as pa
 
+        removing = [p for item in step for p in item.paths]
+        data = self._compacted_batches(snapshot, step, zorder_by, target)
         empty = pa.table({"path": pa.array([], pa.string()), "row_index": pa.array([], pa.int64())})
         with translating(EngineKind.KERNEL, "commit"):
             version, _deleted, _dvs, _removed = snapshot.commit_dml(
                 empty.to_reader(),
-                data=data.to_reader() if data is not None else None,
+                data=data,
                 whole_files=removing,
                 engine_info=_engine_info(),
                 operation="OPTIMIZE",
                 commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
                 data_change=False,
+                # As Spark records an OPTIMIZE; Databricks' history showed {}.
+                **_commit_info(
+                    blind=False,
+                    predicate=predicate or [],
+                    zOrderBy=list(zorder_by or []),
+                    auto="false",
+                ),
             )
-        if int(version) != int(snapshot.version):
+        if checkpoint and int(version) != int(snapshot.version):
             self._maybe_checkpoint(table, int(version), snapshot)
         return int(version)
 
@@ -3067,6 +3396,7 @@ class KernelEngine:
                 overwrite=overwrite,
                 txn=txn,
                 commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
+                **_write_info(snapshot, overwrite=overwrite),
             )
         self._maybe_checkpoint(table, committed, snapshot)
         return committed
@@ -3401,6 +3731,257 @@ def _dv_cardinalities(column: Any) -> Any:
 _DEFAULT_TARGET_SIZE = 104_857_600
 
 
+#: Native functions the kernel's OPTIMIZE needs: the DV commit with
+#: data_change=False, streamed and past the value-constraint features; commit
+#: logs for the conflict rules; ordered file-restricted scans.
+_COMPACTION_NATIVE = (
+    "compaction",
+    "commit_log",
+    "streaming_compaction",
+    "commit_info_patch",
+    "file_restricted_scan",
+)
+
+#: The OPTIMIZE options the kernel path takes (some only to refuse them).
+_COMPACTION_OPTIONS = frozenset(
+    {
+        "partition_filters",
+        "target_size",
+        "max_concurrent_tasks",
+        "max_spill_size",
+        "max_temp_directory_size",
+        "min_commit_interval",
+        "writer_properties",
+        "commit_metadata",
+        "max_commit_retries",
+        "commit_properties",
+        "post_commithook_properties",
+    }
+)
+
+
+def _compaction_option_refusal(shape: dict[str, Any]) -> tuple[str, str | None] | None:
+    """An OPTIMIZE option the kernel path does not implement, as (reason, remedy).
+
+    Refused rather than handed to delta-rs, which implements them all: its
+    OPTIMIZE commit rebases over a concurrent compaction of the same files
+    and leaves their rows in the table twice.
+    """
+    if shape.get("full"):
+        return (
+            "OPTIMIZE ... FULL reclusters a liquid-clustered table, which the kernel does "
+            "not implement",
+            SQL_FALLBACK_REMEDY,
+        )
+    if shape.get("predicate") is not None:
+        return (
+            "the kernel scopes OPTIMIZE by partition filters, not by a SQL predicate",
+            "pass partition_filters=[('col', '=', 'value')] instead",
+        )
+    if shape.get("writer_properties") is not None:
+        return (
+            "the kernel's OPTIMIZE writes Parquet with the kernel writer's settings and "
+            "does not take writer_properties (delta-rs's OPTIMIZE, which does, duplicates "
+            "rows under a concurrent compaction)",
+            "drop writer_properties",
+        )
+    if shape.get("min_commit_interval") is not None:
+        return (
+            "the kernel's OPTIMIZE commits after every compaction_batch_bytes of input, "
+            "not on a timer, and does not take min_commit_interval",
+            "drop min_commit_interval",
+        )
+    if getattr(shape.get("commit_properties"), "app_transactions", None):
+        return (
+            "an OPTIMIZE commits in steps, and the kernel's records no app transactions on them",
+            "drop app_transactions from commit_properties",
+        )
+    if getattr(shape.get("post_commithook_properties"), "cleanup_expired_logs", None):
+        return (
+            "the kernel's OPTIMIZE does not clean up expired log files after its commit",
+            "drop cleanup_expired_logs, or pass it as False",
+        )
+    return None
+
+
+#: Features that constrain only the values a commit writes. A compaction
+#: writes back the values it read, so none constrains it; the native commit
+#: sets them aside (`compaction_snapshot` in crates/native/src/dml.rs).
+_COMPACTION_NEUTRAL: frozenset[TableFeature] = frozenset(
+    {
+        TableFeature.CHECK_CONSTRAINTS,
+        TableFeature.GENERATED_COLUMNS,
+        TableFeature.IDENTITY_COLUMNS,
+        TableFeature.INVARIANTS,
+    }
+)
+
+
+def _compaction_feature_refusal(
+    writer_features: Any, properties: dict[str, Any]
+) -> tuple[str, str | None] | None:
+    """Why the kernel cannot compact a table with these writer features, or None."""
+    mode = str(properties.get("delta.columnMapping.mode", "none")).strip().lower()
+    mapped = mode not in ("", "none")
+    blockers: list[str] = []
+    for name in sorted(writer_features):
+        feature = feature_from_wire(name)
+        if feature is None:
+            blockers.append(f"{name} (unrecognized writer feature)")
+            continue
+        if feature in _COMPACTION_NEUTRAL:
+            continue
+        if feature is TableFeature.ROW_TRACKING:
+            return (
+                "the table tracks row ids, and rows a compaction moves to new files would "
+                "get new ids: delta-kernel 0.28 cannot carry them",
+                SQL_FALLBACK_REMEDY,
+            )
+        if feature is TableFeature.COLUMN_MAPPING and mapped:
+            # Protocol-correct files, but not ones every reader takes: DuckDB's
+            # delta reader resolves the Parquet field ids the kernel writes and
+            # reads each partition column of such a file as NULL.
+            return (
+                "the table maps column names (columnMapping), and the files the kernel's "
+                "compaction writes there are not yet read correctly by every reader "
+                "(DuckDB's delta_scan reads their partition columns as NULL)",
+                SQL_FALLBACK_REMEDY,
+            )
+        if feature is TableFeature.CLUSTERING:
+            return (
+                "the table is liquid-clustered, where OPTIMIZE reclusters its files; the "
+                "kernel only bin-packs and Z-orders",
+                SQL_FALLBACK_REMEDY,
+            )
+        if feature in _METADATA_BLOCKERS or FEATURE_SUPPORT[feature].kernel_write is Support.NO:
+            blockers.append(name)
+    if blockers:
+        return (
+            "the kernel cannot compact a table with these features: " + ", ".join(blockers),
+            SQL_FALLBACK_REMEDY,
+        )
+    return None
+
+
+def _snapshot_compaction_refusal(snapshot: Any) -> str | None:
+    """`_compaction_feature_refusal` for the table as `snapshot` has it now."""
+    reader, writer, _readers, writers = snapshot.protocol()
+    _, implied = implied_features(reader, writer)
+    properties = snapshot.table_properties() or {}
+    refusal = _compaction_feature_refusal(set(writers or ()) | implied, properties)
+    if refusal is not None:
+        return refusal[0]
+    if properties.get("delta.enableVariantShredding", "").lower() == "true":
+        return "the table now shreds VARIANT values, which the kernel cannot decode"
+    return None
+
+
+def _legacy_refusal(found: Any) -> str:
+    return (
+        f"{len(found)} data file(s) (such as {found[0]}) hold dates before 1582-10-15 or "
+        "timestamps before 1900 that Spark wrote in its legacy hybrid calendar, or INT96 "
+        "timestamps outside 1677-09-21 .. 2262-04-11. The kernel reads them correctly, but "
+        "the files a compaction writes do not yet say in their footer that the values are "
+        "proleptic Gregorian, so Databricks would read the rewritten values shifted"
+    )
+
+
+def _decoded_row_bytes(schema: Any) -> int:
+    """A lower estimate of one row's Arrow size: fixed-width columns exactly, others 16 bytes."""
+    import pyarrow as pa
+
+    def width(kind: Any) -> int:
+        if pa.types.is_struct(kind):
+            return sum(width(kind.field(i).type) for i in range(kind.num_fields))
+        try:
+            return max(1, int(kind.bit_width) // 8)
+        except ValueError:
+            return 16  # variable width: its offsets, and some of its bytes
+
+    return max(1, sum(width(field.type) for field in schema))
+
+
+#: Rows a Z-order encodes to learn how its sorted rows compress.
+_SIZE_SAMPLE_ROWS = 256 * 1024
+
+
+def _encoded_rows_per_file(sample: Any, target: int, fallback: int) -> int:
+    """Rows per `target` bytes of Parquet, judged by encoding `sample` as the kernel writes.
+
+    The kernel's writer stores pages uncompressed, dictionary-encoded where
+    it helps; pyarrow's with the same settings comes within a few percent.
+    """
+    import io
+
+    import pyarrow.parquet as pq
+
+    if sample.num_rows == 0:
+        return fallback
+    buffer = io.BytesIO()
+    try:
+        pq.write_table(sample, buffer, compression="none")
+    except Exception:
+        return fallback
+    size = buffer.tell()
+    return max(1, int(sample.num_rows * target / size)) if size else fallback
+
+
+def _filter_text(item: Any) -> str:
+    """One partition filter as the OPTIMIZE's recorded predicate shows it."""
+    column, op, value = item
+    return f"{column} {op} {value!r}"
+
+
+def _one_batch(rows: Any) -> Any:
+    """`rows` (a table) as one record batch: the native writer writes a batch per file."""
+    import pyarrow as pa
+
+    batches = rows.combine_chunks().to_batches()
+    return batches[0] if len(batches) == 1 else pa.concat_batches(batches)
+
+
+class _Compacted(dict):  # type: ignore[type-arg]
+    """An OPTIMIZE's metrics, which say the kernel committed it, whichever engine was asked."""
+
+    served_by = EngineKind.KERNEL
+
+
+@dataclass(frozen=True)
+class _Bin:
+    """Files an OPTIMIZE rewrites together: one partition's, up to the target size."""
+
+    key: Any
+    paths: list[str]
+    sizes: list[int]
+    #: Live rows by the files' statistics; None when a file has none.
+    expected_rows: int | None
+
+    @classmethod
+    def of(cls, key: Any, members: list[tuple[str, int, bool, int | None]]) -> _Bin:
+        counts = [m[3] for m in members]
+        return cls(
+            key,
+            [m[0] for m in members],
+            [m[1] for m in members],
+            None if any(c is None for c in counts) else sum(c for c in counts if c is not None),
+        )
+
+    def rows_per_file(self, target: int, seen: int) -> int:
+        """Rows per output file: the target size at the input's compression, evened out."""
+        rows = self.expected_rows if self.expected_rows is not None else seen
+        rows = max(1, rows)
+        raw = max(1, int(rows * target / max(1, sum(self.sizes))))
+        count = max(1, -(-rows // raw))
+        return max(1, -(-rows // count))
+
+    def splits(self, target: int) -> bool:
+        """Whether this bin makes more than one output file (by its statistics)."""
+        return (
+            self.expected_rows is not None
+            and self.rows_per_file(target, self.expected_rows) < self.expected_rows
+        )
+
+
 def _size_stats(sizes: list[int]) -> str:
     """delta-rs's filesAdded/filesRemoved metric: size statistics as a JSON string."""
     if not sizes:
@@ -3432,15 +4013,48 @@ def _physical_partition_names(snapshot: Any) -> dict[str, str]:
     return names
 
 
-def _partition_filter(snapshot: Any, filters: list[Any] | None, physical: dict[str, str]) -> Any:
-    """A test of a file's partition values against delta-rs-style `(column, op, value)` filters.
+def _partition_value(raw: Any, kind: Any, column: str) -> Any:
+    """A partition value (as the log stores it, or as a filter gives it) as `kind`.
 
-    Values compare as the column's type, as delta-rs compares them; a NULL
-    partition value matches no comparison (only `= None`/`!= None` test it).
+    As delta-rs reads them: an empty string is NULL, a timestamp is ISO 8601
+    in either the log's form (``2024-01-01 01:30:15.123456``, UTC) or with a
+    ``T`` and an offset, and a value that is not of the column's type is the
+    caller's mistake, not a filter that matches nothing.
     """
+    import datetime as dt
+
     import pyarrow as pa
     import pyarrow.compute as pc
 
+    if raw is None or raw == "":
+        return None
+    text = str(raw).strip()
+    try:
+        if pa.types.is_timestamp(kind):
+            value = dt.datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
+            if kind.tz is None:
+                # timestamp_ntz: wall-clock values, compared as given.
+                return value.replace(tzinfo=None) if value.tzinfo is None else value
+            return value if value.tzinfo is not None else value.replace(tzinfo=dt.UTC)
+        if pa.types.is_date(kind):
+            return dt.date.fromisoformat(text)
+        return pc.cast(pa.array([text]), kind)[0].as_py()
+    except (ValueError, TypeError, pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+        raise InvalidArgumentError(
+            f"partition_filters: {raw!r} is not a {kind} value for partition column {column!r}"
+        ) from exc
+
+
+def _partition_filter(snapshot: Any, filters: list[Any] | None, physical: dict[str, str]) -> Any:
+    """A test of a file's partition values against delta-rs-style `(column, op, value)` filters.
+
+    delta-rs's semantics, which are SQL's: values compare as the column's
+    type, and a NULL partition value satisfies no comparison -- ``!= 1``,
+    ``< 2`` and ``not in`` included. A NULL (or empty-string) filter value
+    tests for NULL instead: ``= ''`` / ``= None`` matches the NULL partition,
+    ``!= ''`` every other; as an IN-list element it matches nothing, and a
+    NOT IN list holding one matches nothing at all.
+    """
     if not filters:
         return lambda values: True
     schema = _arrow_schema(snapshot)
@@ -3452,30 +4066,32 @@ def _partition_filter(snapshot: Any, filters: list[Any] | None, physical: dict[s
             raise InvalidArgumentError(f"partition_filters name {column!r}, not a partition column")
         kind = schema.field(name).type
         op = str(op).strip().lower()
-
-        def typed(raw: Any, kind: Any = kind) -> Any:
-            if raw is None:
-                return None
-            try:
-                return pc.cast(pa.array([str(raw)]), kind)[0].as_py()
-            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-                return str(raw)
-
-        in_list = op in ("in", "not in")
-        wanted = [typed(v) for v in (value or [])] if in_list else typed(value)
-        tests.append((physical[name], op, wanted, typed))
+        if op not in ("=", "==", "!=", "<>", "in", "not in", "<", "<=", ">", ">="):
+            raise InvalidArgumentError(f"partition_filters: unknown operator {op!r}")
+        if op in ("in", "not in"):
+            if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set)):
+                raise InvalidArgumentError(
+                    f"partition_filters: {op!r} takes a list of values, got {value!r}"
+                )
+            wanted: Any = [_partition_value(v, kind, name) for v in value]
+        else:
+            wanted = _partition_value(value, kind, name)
+        tests.append((physical[name], op, wanted, kind, name))
 
     def keep(values: dict[str, Any]) -> bool:
-        for key, op, wanted, typed in tests:
-            have = typed(values.get(key))
+        for key, op, wanted, kind, name in tests:
+            try:
+                have = _partition_value(values.get(key), kind, name)
+            except InvalidArgumentError:
+                return False  # a value the log holds that no filter can equal
             if op in ("=", "=="):
-                ok = have == wanted
+                ok = have is None if wanted is None else have == wanted
             elif op in ("!=", "<>"):
-                ok = have != wanted
+                ok = have is not None if wanted is None else have is not None and have != wanted
             elif op == "in":
-                ok = have in wanted
+                ok = have is not None and have in [w for w in wanted if w is not None]
             elif op == "not in":
-                ok = have is not None and have not in wanted
+                ok = have is not None and None not in wanted and have not in wanted
             elif have is None or wanted is None:
                 ok = False
             elif op == "<":
@@ -3484,10 +4100,8 @@ def _partition_filter(snapshot: Any, filters: list[Any] | None, physical: dict[s
                 ok = have <= wanted
             elif op == ">":
                 ok = have > wanted
-            elif op == ">=":
-                ok = have >= wanted
             else:
-                raise InvalidArgumentError(f"partition_filters: unknown operator {op!r}")
+                ok = have >= wanted
             if not ok:
                 return False
         return True

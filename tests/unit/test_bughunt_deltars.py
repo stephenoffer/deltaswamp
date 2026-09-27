@@ -17,7 +17,11 @@ from deltaswamp.capability import Operation  # noqa: E402
 from deltaswamp.catalog.base import ResolvedTable  # noqa: E402
 from deltaswamp.engine import deltars  # noqa: E402
 from deltaswamp.engine.deltars import DeltaRsEngine  # noqa: E402
-from deltaswamp.errors import EnginePanicError, UnreachableTableError  # noqa: E402
+from deltaswamp.errors import (  # noqa: E402
+    EngineLimitError,
+    EnginePanicError,
+    UnreachableTableError,
+)
 from deltaswamp.identity import RefKind, TableRef  # noqa: E402
 
 
@@ -542,7 +546,11 @@ def test_writer_properties_dict_is_accepted(engine: DeltaRsEngine, plain: str) -
         pa.table({"id": [3], "name": ["c"]}),
         writer_properties={"compression": "ZSTD"},
     )
-    engine.optimize(_resolved(plain), writer_properties={"compression": "SNAPPY"})
+    # delta-rs's OPTIMIZE (the one engine that takes writer_properties)
+    # duplicates rows under a concurrent compaction, and the kernel, which
+    # commits compactions, does not take them: refused, typed.
+    with pytest.raises(EngineLimitError, match="writer_properties"):
+        engine.optimize(_resolved(plain), writer_properties={"compression": "SNAPPY"})
     assert len(_rows(plain)) == 3
 
 

@@ -253,6 +253,7 @@ class KernelMerger:
             # The rows read are the ones this bounds, so only files it keeps
             # can hold a row a concurrent MERGE added that this one must see.
             read_predicate=skipping,
+            predicate=self._predicate,
             **self._passthrough,
         )
         return {**metrics, "version": int(result_version)}

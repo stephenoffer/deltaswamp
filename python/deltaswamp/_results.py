@@ -83,6 +83,8 @@ def dml(raw: Any, engine: Any) -> OperationResult:
 
 def optimize(raw: Any, engine: Any) -> OperationResult:
     """OPTIMIZE and Z-ORDER: files added and removed."""
+    # delta-rs hands its compactions to the kernel, and the result says so.
+    engine = getattr(raw, "served_by", engine)
     r = raw if isinstance(raw, dict) else {}
     metrics = r.get("metrics")
     if isinstance(metrics, str):
