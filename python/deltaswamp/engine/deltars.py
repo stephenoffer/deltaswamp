@@ -51,7 +51,6 @@ from ..errors import (
     CommitConflictError,
     DeltaSwampError,
     EngineLimitError,
-    EnginePanicError,
     InvalidArgumentError,
     UnreachableTableError,
 )
@@ -64,6 +63,7 @@ from ..properties import (
 )
 from . import metadata as meta
 from .base import merge_clause, missing_method
+from .boundary import guard, translating
 from .calendar import has_datetime_columns
 
 __all__ = ["DeltaRsEngine"]
@@ -498,7 +498,10 @@ class DeltaRsEngine:
         from deltalake import DeltaTable
 
         uri, options = self._store(table, write=write)
-        with _no_panics("open the table"):
+        # Translated here as well as at the boundary: the engine's own probes
+        # open tables under `except Exception`, which a panic (a
+        # BaseException) would sail through.
+        with translating(EngineKind.DELTARS, "open the table"):
             dt = DeltaTable(uri, version=version, storage_options=options)
         return dt
 
@@ -551,10 +554,11 @@ class DeltaRsEngine:
 
         if not KernelEngine.available():
             return None
+        # Behind the boundary like any routed engine, so a refusal of the
+        # request arrives as this library's error and is told apart below.
+        kernel = guard(EngineKind.KERNEL, KernelEngine(storage_options=self._base_options))
         try:
-            snapshot = KernelEngine(storage_options=self._base_options).snapshot(
-                table, timestamp=timestamp
-            )
+            snapshot = kernel.snapshot(table, timestamp=timestamp)
         except DeltaSwampError:
             # A refusal about the request (before the table's history).
             raise
@@ -975,7 +979,7 @@ class DeltaRsEngine:
             attempts = 1 + retries if blind else 1
             for attempt in range(attempts):
                 try:
-                    with _no_panics(f"{mode} to the table"):
+                    with translating(EngineKind.DELTARS, f"{mode} to the table"):
                         write_deltalake(uri, data, mode=mode, **common, **extra)
                 except CommitConflictError as exc:
                     if attempt + 1 >= attempts or "changed since last commit" in str(exc):
@@ -1006,7 +1010,7 @@ class DeltaRsEngine:
                     "in the table",
                 )
             try:
-                with _no_panics(f"{mode} to the table"):
+                with translating(EngineKind.DELTARS, f"{mode} to the table"):
                     write_deltalake(dt, data, mode=mode, **common, **extra)
             except CommitConflictError:
                 if attempt + 1 >= attempts:
@@ -1056,7 +1060,7 @@ class DeltaRsEngine:
         # not replace anything commits exactly once.
         once = mode in ("error", "ignore")
         try:
-            with _no_panics("create the table"):
+            with translating(EngineKind.DELTARS, "create the table"):
                 DeltaTable.create(
                     uri,
                     schema,
@@ -1095,14 +1099,13 @@ class DeltaRsEngine:
             # pre-compaction files and reported success with every row still
             # in the compacted one. On its own snapshot it conflicts instead.
             max_commit_retries = 0
-        with _no_panics("delete"):
-            dt = self._open(table, write=True)
-            result: dict[str, Any] = dt.delete(
-                _datafusion_predicate(dt, predicate, dml="delete"),
-                writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
-                commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
-                post_commithook_properties=_hooks(table),
-            )
+        dt = self._open(table, write=True)
+        result: dict[str, Any] = dt.delete(
+            _datafusion_predicate(dt, predicate, dml="delete"),
+            writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
+            commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
+            post_commithook_properties=_hooks(table),
+        )
         if "num_deleted_rows" not in result:
             # A delete that only drops whole files (a partition predicate) on
             # files without statistics reports no row count at all, and
@@ -1132,32 +1135,29 @@ class DeltaRsEngine:
         if not updates:
             # An empty mapping is a silent no-op in delta-rs.
             raise InvalidArgumentError("update needs at least one column to set")
-        with _no_panics("update"):
-            dt = self._open(table, write=True)
-            variants = _variant_columns(table, dt)
-            if variants and new_values is not None:
-                for column, value in new_values.items():
-                    name = column.strip("`").lower() if isinstance(column, str) else ""
-                    if name in variants and isinstance(value, str):
-                        # JSON text, as every write takes a VARIANT.
-                        updates[column] = _variant_sql(column, value)
-            elif variants:
-                updates = _variant_updates(dt, updates, variants)
-            updates = _datafusion_updates(dt, updates, rendered=new_values is not None)
-            if new_values is None:
-                names = _column_names(dt)
-                updates = {
-                    k: _exact_decimals(_fold_case(v, {None: names})) for k, v in updates.items()
-                }
-            updates = _with_generated(dt, updates)
-            result: dict[str, Any] = dt.update(
-                updates=updates,
-                predicate=_datafusion_predicate(dt, predicate, dml="update"),
-                writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
-                error_on_type_mismatch=error_on_type_mismatch,
-                commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
-                post_commithook_properties=_hooks(table),
-            )
+        dt = self._open(table, write=True)
+        variants = _variant_columns(table, dt)
+        if variants and new_values is not None:
+            for column, value in new_values.items():
+                name = column.strip("`").lower() if isinstance(column, str) else ""
+                if name in variants and isinstance(value, str):
+                    # JSON text, as every write takes a VARIANT.
+                    updates[column] = _variant_sql(column, value)
+        elif variants:
+            updates = _variant_updates(dt, updates, variants)
+        updates = _datafusion_updates(dt, updates, rendered=new_values is not None)
+        if new_values is None:
+            names = _column_names(dt)
+            updates = {k: _exact_decimals(_fold_case(v, {None: names})) for k, v in updates.items()}
+        updates = _with_generated(dt, updates)
+        result: dict[str, Any] = dt.update(
+            updates=updates,
+            predicate=_datafusion_predicate(dt, predicate, dml="update"),
+            writer_properties=_exact_stats(writer_properties, _delta_schema(dt)),
+            error_on_type_mismatch=error_on_type_mismatch,
+            commit_properties=_commit_properties(commit_metadata, None, max_commit_retries),
+            post_commithook_properties=_hooks(table),
+        )
         return result
 
     def merge(
@@ -1289,8 +1289,7 @@ class DeltaRsEngine:
                 size = parse_byte_size(raw)
                 if size is not None and not str(raw).strip().isdigit():
                     kwargs["target_size"] = size
-            with _no_panics(what):
-                result: dict[str, Any] = run(dt, kwargs)
+            result: dict[str, Any] = run(dt, kwargs)
             self._check_rewrite(table, before, tag, result, what)
         return result
 
@@ -1336,10 +1335,7 @@ class DeltaRsEngine:
         if int(latest.version()) == version and "deletionVectors" not in table.reader_features:
             from deltalake import CommitProperties
 
-            with _no_panics(f"roll back the duplicating {what}"):
-                latest.restore(
-                    version - 1, commit_properties=CommitProperties(max_commit_retries=0)
-                )
+            latest.restore(version - 1, commit_properties=CommitProperties(max_commit_retries=0))
             raise CommitConflictError(
                 version,
                 f"a concurrent OPTIMIZE compacted the same files first, and delta-rs "
@@ -1399,10 +1395,9 @@ class DeltaRsEngine:
             dt = self._open(table, write=True)
             if dv_table and not lite:
                 return self._vacuum_keeping_vectors(dt, retention_hours, dry_run, kwargs)
-            with _no_panics("vacuum"):
-                result: list[str] = dt.vacuum(
-                    retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
-                )
+            result: list[str] = dt.vacuum(
+                retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
+            )
         except Exception as exc:
             if "Invalid retention period" not in str(exc):
                 raise
@@ -1432,10 +1427,9 @@ class DeltaRsEngine:
         table's own store. Unreferenced vector files are left behind, which
         costs a little storage and loses nothing.
         """
-        with _no_panics("vacuum"):
-            candidates: list[str] = dt.vacuum(
-                retention_hours=retention_hours, dry_run=True, full=True, **kwargs
-            )
+        candidates: list[str] = dt.vacuum(
+            retention_hours=retention_hours, dry_run=True, full=True, **kwargs
+        )
         removable = [
             path
             for path in candidates
@@ -1469,8 +1463,7 @@ class DeltaRsEngine:
             )
         dt = self._open(table, write=True)
         self._check_restored_column_mapping(dt, target)
-        with _no_panics("restore"):
-            result: dict[str, Any] = dt.restore(target, **kwargs)
+        result: dict[str, Any] = dt.restore(target, **kwargs)
         return result
 
     @staticmethod
@@ -1491,8 +1484,7 @@ class DeltaRsEngine:
         from deltalake import DeltaTable
 
         past = DeltaTable(dt.table_uri, storage_options=getattr(dt, "_storage_options", None))
-        with _no_panics("open the restore target"):
-            past.load_as_version(target)
+        past.load_as_version(target)
         restored = past.metadata().configuration
         old_mode = restored.get("delta.columnMapping.mode", "none").lower()
         now_max = int(current.get("delta.columnMapping.maxColumnId", "0") or 0)
@@ -1508,8 +1500,7 @@ class DeltaRsEngine:
 
     def repair(self, table: ResolvedTable, **kwargs: Any) -> dict[str, Any]:
         _commit_kwargs(kwargs)
-        with _no_panics("repair"):
-            result: dict[str, Any] = self._open(table, write=True).repair(**kwargs)
+        result: dict[str, Any] = self._open(table, write=True).repair(**kwargs)
         return result
 
     # ---------------------------------------------------------------- schema
@@ -1551,7 +1542,7 @@ class DeltaRsEngine:
         for attempt in range(self.metadata_commit_attempts):
             dt = self._open(table, write=True)
             try:
-                with _no_panics(what):
+                with translating(EngineKind.DELTARS, what):
                     change(dt)
                 return
             except CommitConflictError:
@@ -1744,6 +1735,10 @@ class DeltaRsEngine:
         """Turn a directory of Parquet into a Delta table in place."""
         from deltalake import convert_to_deltalake
 
+        from .._util import check_keywords
+
+        # A misspelt option was a TypeError naming convert_to_deltalake.
+        check_keywords("convert_to_delta", convert_to_deltalake, kwargs)
         partition_by = _partition_schema(partition_by)
         partition_dirs = _hive_partition_dirs(location)
         if partition_dirs and partition_by is None and partition_strategy == "hive":
@@ -1770,14 +1765,13 @@ class DeltaRsEngine:
             # As for create: delta-rs retried a convert that lost version 0 at
             # version 1, committing the whole directory a second time.
             kwargs["commit_properties"] = _commit_properties(None, None, 0)
-        with _no_panics("convert to Delta"):
-            convert_to_deltalake(
-                uri,
-                partition_by=partition_by,
-                partition_strategy=partition_strategy,
-                storage_options=_object_store_options(options),
-                **kwargs,
-            )
+        convert_to_deltalake(
+            uri,
+            partition_by=partition_by,
+            partition_strategy=partition_strategy,
+            storage_options=_object_store_options(options),
+            **kwargs,
+        )
 
     def plan_scan(self, table: ResolvedTable, **kwargs: Any) -> list[Any]:
         raise NotImplementedError("the delta-rs engine has no split-planning surface")
@@ -2873,89 +2867,6 @@ def _commit_properties(
     )
 
 
-@contextlib.contextmanager
-def _no_panics(what: str) -> Iterator[None]:
-    """Turn a Rust panic into a catchable error.
-
-    `pyo3_runtime.PanicException` inherits from BaseException, so it sails
-    straight through `except Exception` and past any retry logic.
-    """
-    try:
-        yield
-    except Exception as exc:
-        conflict = _as_commit_conflict(exc)
-        if conflict is not None:
-            raise conflict from exc
-        if type(exc).__name__ == "DeltaError" and "failed validation check" in str(exc):
-            # NOT NULL, CHECK constraints, invariants and generated columns all
-            # refuse bad rows with this one DeltaError, which `except
-            # DeltaSwampError` did not catch; the kernel path already raises
-            # InvalidArgumentError for the same input.
-            raise InvalidArgumentError(
-                f"the data violates the table's constraints, so nothing was written: {exc}"
-            ) from exc
-        refused = _datafusion_sql_error(what, exc)
-        if refused is not None:
-            raise refused from exc
-        raise
-    except BaseException as exc:
-        if type(exc).__name__ != "PanicException":
-            raise
-        if "Forked process detected" in str(exc):
-            # delta-rs keeps one tokio runtime per process and refuses to run
-            # in a forked child of a process that already used it. It is not
-            # a bug in the input or in the engine's logic, and the fix is the
-            # caller's start method.
-            _FORKED_RUNTIME.add(os.getpid())
-            raise UnreachableTableError(
-                what,
-                "delta-rs cannot run in a process forked from one that already used it "
-                "(its tokio runtime does not survive fork)",
-                "start worker processes with multiprocessing's 'spawn' or 'forkserver' "
-                "method, or open the table only in the children",
-            ) from exc
-        raise EnginePanicError(
-            f"delta-rs panicked while trying to {what}: {exc}. This is a bug in the "
-            "engine rather than in your input; deltaswamp validates properties up "
-            "front to avoid the known cases."
-        ) from exc
-
-
-#: DataFusion's words for SQL it could not parse, plan or type -- found before
-#: any row is read, so nothing has been written.
-_DATAFUSION_SQL_ERRORS = (
-    "SQL error: ParserError",
-    "Error during planning",
-    "This feature is not implemented",
-    "type_coercion",
-    "Invalid comparison operation",
-)
-
-
-def _datafusion_sql_error(what: str, exc: Exception) -> Exception | None:
-    """delta-rs's DeltaError for SQL DataFusion cannot evaluate, as this library's error.
-
-    Raw, it was not a DeltaSwampError, so `except DeltaSwampError` missed it
-    and a MERGE could not move on to an engine that evaluates Spark SQL.
-    """
-    if type(exc).__name__ != "DeltaError":
-        return None
-    message = str(exc)
-    first = message.strip().splitlines()[0][:300] if message.strip() else message
-    if "Schema error: No field named" in message:
-        return InvalidArgumentError(
-            f"cannot {what}: the SQL names a column that is not there: {first}"
-        )
-    if not any(marker in message for marker in _DATAFUSION_SQL_ERRORS):
-        return None
-    return EngineLimitError(
-        f"{what} with delta-rs",
-        f"DataFusion, which evaluates delta-rs's SQL, cannot run it ({first})",
-        "ds.connect(..., allow_sql_fallback=True) runs it on a SQL warehouse; or rewrite "
-        "the expression",
-    )
-
-
 #: commitInfo key marking a compaction this process ran, to find its commit.
 _REWRITE_TAG = "deltaswamp.rewriteId"
 
@@ -2990,33 +2901,6 @@ def _rewrite_lock(location: str) -> threading.Lock:
 #: Processes in which delta-rs refused to run because they were forked from
 #: one that had already started its runtime. Routing skips delta-rs there.
 _FORKED_RUNTIME: set[int] = set()
-
-#: delta-rs's wording for a commit that lost its race: a conflict found by its
-#: checker, a version someone else wrote, or retries used up (the bare number).
-_CONFLICT_MESSAGE = re.compile(
-    r"concurrent|changed since last commit|existing table version|"
-    r"Failed to commit transaction: \d+\s*$",
-    re.IGNORECASE,
-)
-
-
-def _as_commit_conflict(exc: BaseException) -> CommitConflictError | None:
-    """This library's CommitConflictError for a delta-rs lost commit race, else None.
-
-    delta-rs raises its own CommitFailedError, so `except CommitConflictError`
-    around a write caught the kernel's lost races but never delta-rs's.
-    """
-    if type(exc).__name__ != "CommitFailedError" or isinstance(exc, CommitConflictError):
-        return None
-    message = str(exc)
-    if not _CONFLICT_MESSAGE.search(message):
-        return None
-    found = re.search(r"version:? (\d+)", message)
-    return CommitConflictError(
-        int(found.group(1)) if found else -1,
-        f"another writer committed first: {message}. Re-read the table and retry",
-    )
-
 
 _COMMIT_FILE = re.compile(r"(?:^|/)(\d{20})\.json$")
 
@@ -3125,8 +3009,7 @@ class _CheckedMerger:
             # once per source row matching it, duplicating it in the table.
             # Spark leaves it alone; a MATCHED clause that never applies makes
             # delta-rs do the same.
-            with _no_panics("merge (when_matched_delete)"):
-                self._apply("when_matched_delete", predicate="false")
+            self._apply("when_matched_delete", predicate="false")
         merger = self._merger
         if self._bounded is not None and "not_matched_by_source" not in kinds:
             # delta-rs derives no target-side file filter from the source: a
@@ -3134,12 +3017,10 @@ class _CheckedMerger:
             # The ON clause is rebuilt with the bound its key equalities imply;
             # it changes no match, and lets delta-rs skip files. Not with a
             # NOT MATCHED BY SOURCE clause, which must see every target row.
-            with _no_panics("merge (execute)"):
-                merger = self._bounded()
-                for name, call_args, call_kwargs in self._calls:
-                    getattr(merger, name)(*call_args, **call_kwargs)
-        with _no_panics("merge (execute)"):
-            return merger.execute(*args, **kwargs)
+            merger = self._bounded()
+            for name, call_args, call_kwargs in self._calls:
+                getattr(merger, name)(*call_args, **call_kwargs)
+        return merger.execute(*args, **kwargs)
 
     def _recompute(self, updates: dict[str, str]) -> dict[str, str]:
         """`updates` plus SETs recomputing the generated columns they feed.
@@ -3169,8 +3050,7 @@ class _CheckedMerger:
         folded = self._fold(updates)
         if isinstance(folded, dict):
             folded = self._recompute(folded)
-        with _no_panics("merge (when_matched_update)"):
-            self._apply("when_matched_update", folded, self._fold(predicate))
+        self._apply("when_matched_update", folded, self._fold(predicate))
         return self
 
     def _fold(self, value: Any) -> Any:
@@ -3228,12 +3108,11 @@ class _CheckedMerger:
                     for k, v in kwargs.items()
                 }
             # execute() commits: a lost race is a CommitConflictError here too.
-            with _no_panics(f"merge ({name})"):
-                result = (
-                    self._apply(name, *args, **kwargs)
-                    if name.startswith("when_")
-                    else attr(*args, **kwargs)
-                )
+            result = (
+                self._apply(name, *args, **kwargs)
+                if name.startswith("when_")
+                else attr(*args, **kwargs)
+            )
             return self if result is self._merger else result
 
         return call
@@ -3880,9 +3759,8 @@ def _deltars_fields(fields: Any) -> list[Any]:
 
             out.append(Schema.from_arrow(pa.schema([item])).fields[0])
         else:
-            raise UnreachableTableError(
-                "add columns",
-                f"cannot interpret {type(item).__name__} as a column definition",
-                "pass pyarrow fields, deltalake Fields, or a {name: type} mapping",
+            raise InvalidArgumentError(
+                f"cannot add columns: cannot interpret {type(item).__name__} as a column "
+                "definition; pass pyarrow fields, deltalake Fields, or a {name: type} mapping"
             )
     return out

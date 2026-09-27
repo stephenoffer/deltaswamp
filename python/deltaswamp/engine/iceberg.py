@@ -32,7 +32,6 @@ import json
 import operator
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -276,23 +275,6 @@ def _conform(rows: Any, schema: Any) -> Any:
         )
         rows = pa.Table.from_arrays(columns, schema=out_schema)
     return rows
-
-
-@contextmanager
-def _schema_errors(what: str) -> Iterator[None]:
-    """PyIceberg's schema-mismatch ValueError -> an error that names the remedy."""
-    try:
-        yield
-    except ValueError as exc:
-        text = str(exc)
-        if "more columns" in text or "Mismatch in fields" in text:
-            raise UnreachableTableError(
-                what,
-                f"the data does not match the table's Iceberg schema: {text}",
-                "the Iceberg engine does not evolve schemas (no schema_mode='merge'); "
-                "ALTER the table first, or select and cast the data to its schema",
-            ) from exc
-        raise
 
 
 def _numeric(value: Any) -> Decimal | None:
@@ -982,8 +964,7 @@ class IcebergEngine:
             # A no-op, as the Delta engines treat it. PyIceberg committed an
             # empty snapshot, which moved the version and grew the history.
             return
-        with _schema_errors("append to an Iceberg table"):
-            iceberg.append(rows, snapshot_properties=properties)
+        iceberg.append(rows, snapshot_properties=properties)
 
     def overwrite(
         self,
@@ -1063,17 +1044,15 @@ class IcebergEngine:
                         f"do not match {predicate!r}",
                         "filter the data to the predicate before writing",
                     )
-            with _schema_errors("overwrite an Iceberg table"):
-                iceberg.overwrite(
-                    rows,
-                    overwrite_filter=row_filter,
-                    snapshot_properties=properties,
-                    case_sensitive=case_sensitive,
-                )
+            iceberg.overwrite(
+                rows,
+                overwrite_filter=row_filter,
+                snapshot_properties=properties,
+                case_sensitive=case_sensitive,
+            )
             return
 
-        with _schema_errors("overwrite an Iceberg table"):
-            iceberg.overwrite(rows, snapshot_properties=properties)
+        iceberg.overwrite(rows, snapshot_properties=properties)
 
     # ------------------------------------------------------ distributed path
 

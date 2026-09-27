@@ -214,7 +214,9 @@ class TestDeltaRsAlterValidation:
     )
     def test_invalid_property_values(self, table: Any, key: str, value: str, match: str) -> None:
         assert table.can("set_properties", properties={key: value}).engine is not None
-        with pytest.raises(UnreachableTableError, match=match):
+        # A stats column the table lacks is the caller's mistake
+        # (InvalidArgumentError); the other values are refused properties.
+        with pytest.raises((UnreachableTableError, InvalidArgumentError), match=match):
             table.set_properties({key: value})
         assert key not in table.properties()
 
@@ -289,7 +291,7 @@ class TestColumnPaths:
         t = _cm_table(conn, tmp_path)
         with pytest.raises(UnreachableTableError, match="nested field"):
             t.set_not_null("s.a")
-        with pytest.raises(UnreachableTableError, match="no column 'nosuch'"):
+        with pytest.raises(InvalidArgumentError, match="no column 'nosuch'"):
             t.set_not_null("nosuch")
 
 
@@ -388,7 +390,7 @@ class TestLogUpkeep:
 
     def test_drop_not_null_on_a_missing_column(self, conn: Any, tmp_path: Any) -> None:
         t, _ = _history_table(conn, tmp_path, commits=1)
-        with pytest.raises(UnreachableTableError, match="no column 'nosuch'"):
+        with pytest.raises(InvalidArgumentError, match="no column 'nosuch'"):
             t.drop_not_null("nosuch")
 
     @pytest.mark.parametrize(

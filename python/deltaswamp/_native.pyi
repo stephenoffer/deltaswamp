@@ -30,6 +30,13 @@ def runtime_is_multithreaded() -> bool:
     `UCCommitter` requires it and panics on a current-thread runtime.
     """
 
+# Every exception the extension raises (these classes, and the builtin
+# FileNotFoundError, OSError and ValueError it also raises) carries a `kind`
+# attribute: a stable code for what failed, one of "not_found", "storage",
+# "kernel", "unsupported", "arrow", "invalid_input", "commit_conflict",
+# "backfill_required", "retryable", "catalog_permission", "catalog_not_found"
+# and "catalog_rejected". Classify by it, not by the message.
+
 class CommitConflictError(RuntimeError):
     """Another writer committed this version first.
 

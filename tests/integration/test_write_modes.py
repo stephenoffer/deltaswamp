@@ -76,7 +76,7 @@ class TestDynamicPartitionOverwrite:
             plain.overwrite(pa.table({"id": [1], "city": ["x"]}), partition_overwrite="dynamic")
 
     def test_predicate_and_dynamic_are_mutually_exclusive(self, partitioned: Any) -> None:
-        with pytest.raises(UnreachableTableError, match="cannot be combined"):
+        with pytest.raises(InvalidArgumentError, match="cannot be combined"):
             partitioned.overwrite(
                 pa.table({"id": [1], "region": ["eu"]}),
                 predicate="region = 'eu'",

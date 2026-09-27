@@ -465,13 +465,16 @@ class TestRawEngineErrorsAreTyped:
             t.update({"name": "zzz"}, predicate="id = 1")
 
     def test_storage_failure_is_a_storage_error(self) -> None:
-        from deltaswamp.errors import StorageError
-        from deltaswamp.table import _library_error
+        from deltaswamp.capability import Engine
+        from deltaswamp.engine.boundary import translate
+        from deltaswamp.errors import EngineError, StorageError
 
-        error = _library_error(OSError("Generic S3 error: 503 Slow Down"), "append")
+        error = translate(Engine.DELTARS, "append", OSError("Generic S3 error: 503 Slow Down"))
         assert isinstance(error, StorageError)
         assert isinstance(error, OSError) and isinstance(error, DeltaSwampError)
-        assert _library_error(FileNotFoundError("x"), "append") is None
+        # A missing file keeps its class, inside the generic engine error.
+        missing = translate(Engine.DELTARS, "append", FileNotFoundError("x"))
+        assert isinstance(missing, EngineError) and isinstance(missing, FileNotFoundError)
 
 
 class TestSchemaArgumentsTakeSqlTypeNames:

@@ -832,7 +832,11 @@ whenever one exists.
 
 ## Errors
 
-All inherit from `DeltaSwampError`.
+All inherit from `DeltaSwampError`. Every engine is called through one
+translation boundary, so no engine's own exception type (delta-rs's
+`DeltaError`, a pyarrow or duckdb error, the extension's) reaches a caller --
+not from a call, and not later from the stream or MERGE builder it returned.
+What no rule recognises arrives as `EngineError`.
 
 | Error | Means |
 |---|---|
@@ -856,6 +860,7 @@ All inherit from `DeltaSwampError`.
 | `PredicateError` | a predicate uses SQL that cannot be evaluated outside a SQL engine |
 | `SqlStatementError` | the SQL warehouse rejected or failed a statement; the message carries its error |
 | `EnginePanicError` | an engine panicked across the FFI boundary |
+| `EngineError` | an engine failed in a way no error above describes; `.engine`, `.operation` and `.original` (the engine's exception, also the `__cause__`) say where. A builtin error stays an instance of its class too: an engine's `OSError` becomes an `EngineError` that is also an `OSError`. A read that fails this way moves on to the next capable engine, with an `EngineFallbackWarning` |
 
 Warnings all derive from `DeltaSwampWarning` (`SqlFallbackWarning`,
 `EngineFallbackWarning`, `IgnoredPropertyWarning`, `CredentialExpiryWarning`),

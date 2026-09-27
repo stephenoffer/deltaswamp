@@ -15,17 +15,18 @@ import importlib
 import json
 import re
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import _results
-from ._util import timestamp_ms
+from ._util import check_keywords, not_table_data, timestamp_ms
 from .capability import FEATURE_SUPPORT, Capability, FeatureKind, Operation, feature_from_wire
 from .capability import READ_OPERATIONS as _READ_OPERATIONS
 from .capability import Engine as EngineKind
 from .catalog import ResolvedTable, TableType
 from .credentials import Operation as CredentialOperation
 from .engine.base import TranslatingStream, merge_clause, translating_stream
+from .engine.boundary import engine_cause
 from .engine.deltars import DeltaRsEngine
 from .engine.kernel import KernelEngine
 from .engine.metadata import cdf_clash_error, cdf_name_clash
@@ -56,55 +57,42 @@ def _write_data(data: Any) -> Any:
     delta-rs with "Expected object with __arrow_c_array__", after write_table
     had already created the table from its inferred schema.
     """
-    if isinstance(data, dict):
-        pa = _require("pyarrow", "pyarrow")
-        return pa.table(data)
-    if isinstance(data, list) and data and all(isinstance(row, dict) for row in data):
-        pa = _require("pyarrow", "pyarrow")
-        return pa.Table.from_pylist(data)
     if data is None:
         raise InvalidArgumentError("no data given to write")
+    refusal = not_table_data(data)
+    if refusal is not None:
+        raise InvalidArgumentError(refusal)
+    if isinstance(data, dict):
+        pa = _require("pyarrow", "pyarrow")
+        try:
+            return pa.table(data)
+        except (TypeError, ValueError, pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+            # {"id": 1} (a row, not columns) raised a bare TypeError.
+            raise InvalidArgumentError(
+                f"a dict of data maps each column to its values, e.g. {{'id': [1, 2]}} ({exc})"
+            ) from exc
+    if isinstance(data, list) and data and all(isinstance(row, dict) for row in data):
+        pa = _require("pyarrow", "pyarrow")
+        try:
+            return pa.Table.from_pylist(data)
+        except (TypeError, ValueError, pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+            raise InvalidArgumentError(f"the rows do not form a table ({exc})") from exc
     return data
 
 
-def _library_error(exc: BaseException, what: str) -> Exception | None:
-    """An engine's raw error as this library's type, when it is one of the known kinds.
+def _engine_broke(exc: BaseException) -> bool:
+    """Whether a read's failure is the engine's, so the next engine may serve it.
 
-    delta-rs reported data that does not fit the table as its own
-    SchemaMismatchError (or a bare Exception naming an Arrow cast), an
-    UPDATE SET of an unknown column as a DeltaError, and both engines a
-    storage failure as a bare OSError: none was caught by `except
-    DeltaSwampError`. None for anything else, which propagates as it is.
+    The boundary's EngineError (a failure no rule recognised), or a storage
+    failure it translated, which another engine's client may not share. Not
+    the request's own mistake (InvalidArgumentError and the like): another
+    engine would refuse it too, and the warning would bury the real message.
     """
-    from .errors import StorageError
+    from .errors import EngineError, StorageError
 
-    if isinstance(exc, DeltaSwampError):
-        return None
-    text = str(exc)
-    detail = " ".join(line.strip() for line in text.splitlines() if line.strip())[:400]
-    name = type(exc).__name__
-    if name == "SchemaMismatchError":
-        return InvalidArgumentError(f"{what}: the data does not fit the table's schema ({detail})")
-    if name in ("DeltaError", "Exception") and re.search(
-        r"No field named|Cast error|Schema error", text
-    ):
-        return InvalidArgumentError(f"{what}: {detail}")
-    if isinstance(exc, OSError) and not isinstance(exc, (FileNotFoundError, PermissionError)):
-        error = StorageError(f"{what}: the table's storage failed the request ({detail})")
-        error.errno = exc.errno
-        return error
-    return None
-
-
-def _translated(what: str, call: Callable[[], Any]) -> Any:
-    """`call()`, with a known raw engine error raised as this library's type."""
-    try:
-        return call()
-    except Exception as exc:
-        translated = _library_error(exc, what)
-        if translated is None:
-            raise
-        raise translated from exc
+    return isinstance(exc, EngineError) or (
+        isinstance(exc, StorageError) and engine_cause(exc) is not exc
+    )
 
 
 #: Writes re-run after a concurrent schema or metadata change beat them.
@@ -372,20 +360,49 @@ def _timestamp_arg(value: Any, what: str = "timestamp") -> Any:
     back worked for a scan on the kernel but raised TypeError on the change
     data feed, so an int is turned into the datetime it names for every engine.
     """
+    import datetime as _dt
+
     if value is None:
         return None
     if isinstance(value, bool):
         raise InvalidArgumentError(f"{what} must be a timestamp, not bool")
     if isinstance(value, (int, float)):
-        import datetime as _dt
-
         if value < 0:
             raise InvalidArgumentError(f"{what} must not be before 1970, got {value}")
         epoch = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)
         return epoch + _dt.timedelta(milliseconds=value)
     if isinstance(value, str) and not value.strip():
         raise InvalidArgumentError(f"{what} is blank")
+    if isinstance(value, str):
+        # Malformed is the caller's mistake: the engines refused it as "cannot
+        # time travel", a routing refusal. timestamp_ms raises
+        # InvalidArgumentError for text that is not a time.
+        timestamp_ms(value)
+    elif not isinstance(value, _dt.date):
+        raise InvalidArgumentError(
+            f"{what} must be a datetime, a date, an ISO-8601 string or epoch milliseconds, "
+            f"not {type(value).__name__}"
+        )
     return value
+
+
+def _names(what: str, value: Any) -> list[str]:
+    """One name or a list of names, each a string.
+
+    ``unset_properties(1)`` and ``cluster_by(1)`` raised a bare TypeError
+    ("'int' object is not iterable") from deep inside an engine.
+    """
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        raise InvalidArgumentError(
+            f"{what} takes a name or a list of names, not {type(value).__name__}"
+        )
+    names = list(value)
+    for name in names:
+        if not isinstance(name, str):
+            raise InvalidArgumentError(f"{what} names must be strings, got {name!r}")
+    return names
 
 
 def _check_comment(comment: Any) -> None:
@@ -1144,9 +1161,9 @@ class Table:
             except EngineLimitError as exc:
                 tried.add(engine.kind)
                 refusals.append(exc)
-            except DeltaSwampError:
-                raise
-            except Exception as exc:
+            except DeltaSwampError as exc:
+                if not _engine_broke(exc):
+                    raise
                 tried.add(engine.kind)
                 try:
                     self._connection.router.engine_for(
@@ -1155,13 +1172,11 @@ class Table:
                 except DeltaSwampError:
                     if refusals:
                         raise refusals[0] from refusals[0].__cause__
-                    translated = _library_error(exc, operation.value)
-                    if translated is not None:
-                        raise translated from exc
-                    raise exc from None
+                    raise exc from exc.__cause__
+                cause = engine_cause(exc)
                 warnings.warn(
                     f"{engine.kind.value} failed to serve {operation.value} "
-                    f"({type(exc).__name__}: {str(exc)[:200]}); trying the next engine",
+                    f"({type(cause).__name__}: {str(cause)[:200]}); trying the next engine",
                     EngineFallbackWarning,
                     stacklevel=3,
                 )
@@ -1462,6 +1477,7 @@ class Table:
 
     def to_arrow(self, **kwargs: Any) -> Any:
         pa = _require("pyarrow", "pyarrow")
+        check_keywords("to_arrow", self.scan, kwargs)
         limit = kwargs.pop("limit", None)
         if limit is not None:
             # The scan treats `limit` as a hint that streaming engines ignore,
@@ -1486,6 +1502,7 @@ class Table:
         skipped); `columns=` and `predicate=` restrict it further.
         """
         pl = _require("polars", "polars")
+        check_keywords("to_polars", self.scan, kwargs)
         if lazy and "limit" not in kwargs:
             from ._lazy import polars_frame
 
@@ -2544,9 +2561,6 @@ class Table:
                     _lost_to_metadata_change(exc, raw)
                     or self._schema_moved(exc, raw, data, schema_mode)
                 ):
-                    translated = _library_error(exc, "append")
-                    if translated is not None:
-                        raise translated from exc
                     raise
         self._invalidate()
 
@@ -2637,6 +2651,13 @@ class Table:
             raise InvalidArgumentError(
                 f"partition_overwrite must be 'static' or 'dynamic', not {partition_overwrite!r}"
             )
+        if partition_overwrite == "dynamic" and predicate is not None:
+            # Contradictory arguments, which the engines refused as "cannot
+            # be served" as if the table were at fault.
+            raise InvalidArgumentError(
+                "partition_overwrite='dynamic' derives its own predicate from the data, so "
+                "it cannot be combined with predicate="
+            )
         _check_predicate(predicate, "overwrite")
         _check_txn(txn)
         data = _write_data(data)
@@ -2699,9 +2720,6 @@ class Table:
                 if attempt + 1 >= _REALIGN_ATTEMPTS or not self._schema_moved(
                     exc, raw, data, schema_mode
                 ):
-                    translated = _library_error(exc, "overwrite")
-                    if translated is not None:
-                        raise translated from exc
                     raise
                 data = self._align(raw, schema_mode)
         self._invalidate()
@@ -2755,7 +2773,7 @@ class Table:
 
     def _schema_moved(self, exc: Exception, raw: Any, aligned: Any, schema_mode: Any) -> bool:
         """Whether `exc` is a schema mismatch caused by a concurrent schema change."""
-        if type(exc).__name__ != "SchemaMismatchError":
+        if type(engine_cause(exc)).__name__ != "SchemaMismatchError":
             return False
         before = getattr(aligned, "schema", None)
         if before is None:
@@ -2836,7 +2854,7 @@ class Table:
             served.append(getattr(engine, "kind", None))
             return engine.delete(self._resolved, predicate, **_given(kwargs))
 
-        result = _translated("delete", lambda: self._backfilled(run))
+        result = self._backfilled(run)
         self._invalidate()
         return _results.dml(result, served[-1] if served else None)
 
@@ -2855,6 +2873,12 @@ class Table:
         _check_predicate(predicate, "update")
         if updates is not None and new_values is not None:
             raise InvalidArgumentError("pass updates (SQL expressions) or new_values, not both")
+        for given, name in ((updates, "updates"), (new_values, "new_values")):
+            if given is not None and not isinstance(given, Mapping):
+                raise InvalidArgumentError(
+                    f"{name} maps each column to its new value, e.g. {{'v': \"'a'\"}}; "
+                    f"got a {type(given).__name__}"
+                )
         if not updates and not new_values:
             raise InvalidArgumentError("update needs at least one column to set")
         needs = self._update_needs(updates, False) | self._update_needs(new_values, True)
@@ -2878,13 +2902,10 @@ class Table:
         if new_values is not None:
             kwargs["new_values"] = self._update_targets(new_values, deltars)
             self._refuse_zoned_ntz(kwargs["new_values"])
-        result: dict[str, Any] = _translated(
-            "update",
-            lambda: self._backfilled(
-                lambda: engine.update(
-                    self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
-                )
-            ),
+        result: dict[str, Any] = self._backfilled(
+            lambda: engine.update(
+                self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
+            )
         )
         self._invalidate()
         return _results.dml(result, getattr(engine, "kind", None))
@@ -3286,6 +3307,13 @@ class Table:
         {name: sql_type} mapping when the SQL fallback serves it."""
         self._check_writable("add a column")
         _check_options("add_column", kwargs, _COMMIT_OPTIONS)
+        if isinstance(fields, (str, bytes)) or fields is None:
+            # A bare name has no type; the engines refused it as "cannot be
+            # served", a routing refusal.
+            raise InvalidArgumentError(
+                "add_column takes pyarrow fields, deltalake Fields or a {name: type} mapping, "
+                f"not {type(fields).__name__}"
+            )
         if isinstance(fields, dict):
             new = list(fields)
         elif isinstance(fields, (list, tuple)):
@@ -3412,10 +3440,36 @@ class Table:
             "add_feature", kwargs, _COMMIT_OPTIONS | {"allow_protocol_versions_increase"}
         )
         names = list(feature) if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
+        self._check_feature_names(names)
         self._engine(Operation.ADD_FEATURE, features=names).add_feature(
             self._resolved, feature, **kwargs
         )
         self._invalidate()
+
+    def _check_feature_names(self, names: list[Any]) -> None:
+        """Refuse a feature name that is not text, or that no Delta protocol defines.
+
+        Both were refused by every engine in turn, as "no engine can add
+        teleportation" -- a routing refusal, for a typo. A name this library
+        does not know may still be one Databricks does, so with the SQL
+        fallback on the warehouse decides.
+        """
+        if not names:
+            raise InvalidArgumentError("add_feature needs a feature name")
+        for name in names:
+            if not isinstance(name, str) or not name:
+                raise InvalidArgumentError(
+                    f"a table feature is named by a string such as 'deletionVectors', not {name!r}"
+                )
+        router = self._connection.router
+        if router.allow_sql_fallback and router.engines.get(EngineKind.SQL) is not None:
+            return
+        unknown = [n for n in names if feature_from_wire(n) is None]
+        if unknown:
+            raise InvalidArgumentError(
+                f"{unknown[0]!r} is not a Delta table feature; features are named as the "
+                "protocol names them, e.g. 'deletionVectors', 'changeDataFeed', 'v2Checkpoint'"
+            )
 
     def drop_feature(self, feature: str, **kwargs: Any) -> dict[str, Any]:
         """Drop a table feature. Databricks-only, so it needs the SQL fallback."""
@@ -3451,7 +3505,7 @@ class Table:
     def unset_properties(self, keys: list[str] | str, *, if_exists: bool = True) -> None:
         """ALTER TABLE ... UNSET TBLPROPERTIES. delta-rs cannot remove a property."""
         self._check_writable("unset properties")
-        names = [keys] if isinstance(keys, str) else list(keys)
+        names = _names("unset_properties", keys)
         if not names:
             # The kernel committed an empty metadata change; SQL raised.
             return
@@ -3536,6 +3590,8 @@ class Table:
         written afterwards; existing files are reclustered by OPTIMIZE.
         """
         self._check_writable("change clustering")
+        if columns is not None:
+            _names("cluster_by", columns)
         auto = isinstance(columns, str) and columns.lower() == "auto"
         needs = frozenset({"auto_clustering"}) if auto else frozenset()
         self._engine(Operation.CLUSTER_BY, needs).cluster_by(self._resolved, columns)

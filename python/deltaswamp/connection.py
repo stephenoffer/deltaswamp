@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
+from ._util import check_keywords
 from .capability import Engine as EngineKind
 from .capability import Operation
 from .catalog import Catalog, ResolvedTable
@@ -19,6 +21,7 @@ from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
     SQL_FALLBACK_REMEDY,
     DeltaSwampError,
+    EngineError,
     FallbackRequiredError,
     InvalidArgumentError,
     InvalidReferenceError,
@@ -320,6 +323,47 @@ def _widen_unsigned(schema: Any) -> Any:
     fields = [f.with_type(widen(f.type, f.name)) for f in schema]
     widened = pa.schema(fields, metadata=schema.metadata)
     return schema if widened.equals(schema) else widened
+
+
+#: The local SQL engines' exceptions for a query that is wrong: it does not
+#: parse, or names a table, column or function that is not there.
+_BAD_QUERY = {
+    "duckdb": ("ParserException", "CatalogException", "BinderException", "SyntaxException"),
+    "polars": (
+        "SQLSyntaxError",
+        "SQLInterfaceError",
+        "ColumnNotFoundError",
+        "SchemaFieldNotFoundError",
+    ),
+}
+
+
+@contextlib.contextmanager
+def _local_sql_errors(engine: str, query: str) -> Iterator[None]:
+    """duckdb's or Polars' exceptions from running `query`, as this library's.
+
+    They escaped raw, so `except DeltaSwampError` around conn.sql() caught
+    nothing. A query that does not parse or names what is not there is the
+    caller's mistake; any other failure is the local engine's.
+    """
+    from .errors import engine_error
+
+    try:
+        yield
+    except DeltaSwampError:
+        raise
+    except Exception as exc:
+        names = {cls.__name__ for cls in type(exc).__mro__}
+        if names & set(_BAD_QUERY[engine]):
+            raise InvalidArgumentError(
+                f"sql(): {engine} refused the query: {str(exc).strip()[:400]}"
+            ) from exc
+        raise engine_error(
+            f"sql(): {engine} failed running the query: {type(exc).__name__}: {exc}",
+            engine=engine,
+            operation="sql",
+            original=exc,
+        ) from exc
 
 
 def _names_arg(value: Any, what: str) -> list[str] | None:
@@ -659,6 +703,12 @@ class Connection:
             raise InvalidArgumentError(
                 f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
             )
+        if properties is not None and not isinstance(properties, Mapping):
+            # A list failed with a bare AttributeError, or ValueError from dict().
+            raise InvalidArgumentError(
+                f"properties= maps property names to values, e.g. "
+                f"{{'delta.appendOnly': 'true'}}; got a {type(properties).__name__}"
+            )
         partition_by = _names_arg(partition_by, "partition_by")
         cluster_by = _names_arg(cluster_by, "cluster_by")
         if partition_by and cluster_by:
@@ -717,11 +767,6 @@ class Connection:
                     or "exist" not in str(exc).lower()
                     or not self.table_exists(name)
                 ):
-                    from .table import _library_error
-
-                    translated = _library_error(exc, f"create {name}")
-                    if translated is not None:
-                        raise translated from exc
                     raise
                 if mode == "ignore":
                     return self.table(name)
@@ -848,12 +893,10 @@ class Connection:
                 mode="error",
                 properties=properties,
             )
-        except DeltaSwampError:
-            raise
-        except Exception as exc:
-            # delta-rs' own DeltaError escaped here untranslated, so
-            # `except DeltaSwampError` missed the commonest failure of all:
-            # a table already at the location, which wants registering.
+        except EngineError as exc:
+            # delta-rs says only in its message (which the engine boundary's
+            # EngineError carries) that a table is already at the location:
+            # the commonest failure of all, and it wants registering.
             if "already exists" not in str(exc).lower():
                 raise
             raise UnreachableTableError(
@@ -1028,9 +1071,7 @@ class Connection:
         kernel: Any = self.router.engines[EngineKind.KERNEL]
         try:
             metadata = json.loads(kernel.snapshot(staged).metadata_json())
-        except DeltaSwampError:
-            raise
-        except Exception as exc:
+        except EngineError as exc:
             text = str(exc).lower()
             if any(m in text for m in ("no files in log segment", "not found", "no such file")):
                 raise UnreachableTableError(
@@ -1147,6 +1188,11 @@ class Connection:
             )
 
         data = _write_data(data)
+        # Checked before anything is created: a misspelt option failed the
+        # first write, as a TypeError naming Table.append, after the create.
+        check_keywords(
+            "write_table", Table.overwrite if mode == "overwrite" else Table.append, write_options
+        )
         exists = self.table_exists(name)
         if exists and mode == "error":
             raise UnreachableTableError(
@@ -1283,6 +1329,11 @@ class Connection:
         ``engine="warehouse"`` sends `query` verbatim to the SQL fallback, where
         names resolve in Unity Catalog and `tables` is not used.
         """
+        if not isinstance(query, str):
+            # duckdb refused it with its own InvalidInputException.
+            raise InvalidArgumentError(
+                f"sql() takes the query as a string, not {type(query).__name__}"
+            )
         if tables is not None and not isinstance(tables, Mapping):
             # A list failed with a bare AttributeError ('list' has no 'items').
             raise InvalidArgumentError(
@@ -1324,9 +1375,10 @@ class Connection:
             try:
                 for alias, frame in frames.items():
                     con.register(alias, frame)
-                relation = con.sql(query)
-                # A statement (CREATE, SET, ...) yields no relation to convert.
-                return relation.to_arrow_table() if relation is not None else None
+                with _local_sql_errors("duckdb", query):
+                    relation = con.sql(query)
+                    # A statement (CREATE, SET, ...) yields no relation to convert.
+                    return relation.to_arrow_table() if relation is not None else None
             finally:
                 # An in-memory database per call; leaving it open leaked it
                 # and every registered frame until garbage collection.
@@ -1334,7 +1386,8 @@ class Connection:
         from ._lazy import polars_frame
 
         ctx = module.SQLContext({alias: polars_frame(f) for alias, f in frames.items()})
-        return ctx.execute(query, eager=True).to_arrow()
+        with _local_sql_errors("polars", query):
+            return ctx.execute(query, eager=True).to_arrow()
 
     # ------------------------------------------------------------- namespaces
 

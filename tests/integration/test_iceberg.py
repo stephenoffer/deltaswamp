@@ -253,11 +253,12 @@ class TestSupports:
             engine.plan_scan(_resolved())
 
     def test_router_lets_iceberg_tables_through(self, engine: IcebergEngine) -> None:
+        from deltaswamp.engine.boundary import unwrap
         from deltaswamp.router import Router
 
         router = Router(engines={Engine.ICEBERG: engine})
         assert router.capability(Operation.SCAN, _resolved()).engine is Engine.ICEBERG
-        assert router.engine_for(Operation.APPEND, _resolved()) is engine
+        assert unwrap(router.engine_for(Operation.APPEND, _resolved())) is engine
 
 
 # ---------------------------------------------------------------------------

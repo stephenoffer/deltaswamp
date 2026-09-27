@@ -542,11 +542,15 @@ def json_text_stream(stream: Any, paths: Paths | None) -> Any:
     """
     import pyarrow as pa
 
-    reader = (
+    from .engine.base import TranslatingStream
+
+    # A TranslatingStream is read as it is: through the C stream interface
+    # its errors would arrive untyped.
+    reader: Any = (
         stream.to_reader()
         if isinstance(stream, pa.Table)
         else stream
-        if isinstance(stream, pa.RecordBatchReader)
+        if isinstance(stream, (pa.RecordBatchReader, TranslatingStream))
         else pa.RecordBatchReader.from_stream(stream)
     )
     schema = reader.schema

@@ -743,8 +743,13 @@ class TestIcebergSecondPass:
         assert _ids(engine.scan(_resolved())) == [5]
 
     def test_extra_column_is_a_clear_error(self, engine: IcebergEngine) -> None:
+        from deltaswamp.capability import Engine
+        from deltaswamp.engine.boundary import guard
+
+        # The translation is the engine boundary's, which the router puts
+        # every engine behind.
         with pytest.raises(UnreachableTableError, match="does not evolve schemas"):
-            engine.append(_resolved(), pa.table({"id": [1], "zzz": [1]}))
+            guard(Engine.ICEBERG, engine).append(_resolved(), pa.table({"id": [1], "zzz": [1]}))
 
 
 class _Snap:

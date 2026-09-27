@@ -470,6 +470,15 @@ class Router:
     #: Databricks, so the warehouse is never asked and never suggested.
     warehouse_catalog: bool = True
 
+    def __post_init__(self) -> None:
+        # Every engine is handed out behind the one error boundary, however it
+        # is reached (engine_for, or the engines mapping), so a raw engine
+        # exception never reaches a caller.
+        from .engine.boundary import GuardedEngines
+
+        if not isinstance(self.engines, GuardedEngines):
+            self.engines = GuardedEngines(self.engines)
+
     def _warehouse_names(self, table: ResolvedTable) -> bool:
         """Whether the warehouse this connection talks to can address `table`."""
         return self.warehouse_catalog and _warehouse_can_name(table)
