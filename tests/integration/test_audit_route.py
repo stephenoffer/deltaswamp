@@ -115,14 +115,15 @@ def test_writes_through_a_pinned_handle_are_refused_by_can(conn: Any, tmp_path: 
     conn.write_table(path, pa.table({"id": [1]}))
     conn.open_table(path).append(pa.table({"id": [2]}))
     t = conn.open_table(path, version=0)
-    for op, args in [
+    cases: list[tuple[str, dict[str, Any]]] = [
         ("append", {}),
         ("delete", {"predicate": "id = 1"}),
         ("merge", {}),
         ("optimize", {}),
         ("set_properties", {"properties": {"a.b": "1"}}),
         ("plan_write", {}),
-    ]:
+    ]
+    for op, args in cases:
         cap = t.can(op, **args)
         assert not cap.ok, op
         assert "pinned to version 0" in cap.reason
