@@ -4,17 +4,21 @@ Spark 2.x, and Spark 3 / Databricks writing with ``datetimeRebaseModeInWrite
 = LEGACY`` (Photon does), store DATE and TIMESTAMP values in the hybrid
 Julian/Gregorian calendar and say so in the Parquet footer. The kernel's reads
 rebase them (``crates/native/src/rebase.rs``); delta-rs does not, and neither
-does its INT96 decoding, which overflows before 1677. A read through delta-rs
-is merely wrong. Its DELETE, UPDATE, MERGE, replaceWhere and OPTIMIZE are
-worse: they copy the rows they did not change into new files, without the
-footer, so the misread values become the table's data -- ``0001-01-01`` is
+does its INT96 decoding, which holds nanoseconds in an ``i64`` and so
+overflows outside 1677-09-21 .. 2262-04-11: ``9999-12-31``, the usual SCD2
+"open" sentinel, comes back as ``1816-03-30``. A read through delta-rs is
+wrong, so the router sends neither reads nor rewrites of such a table there.
+Its DELETE, UPDATE, MERGE, replaceWhere and OPTIMIZE are worse than wrong:
+they copy the rows they did not change into new files, without the footer, so
+the misread values become the table's data -- ``0001-01-01`` is
 ``0000-12-30`` from then on, for every reader, statistics included.
 
-Only values before the last calendar switch (1582-10-15) move for a date, and
-before 1900-01-01T00:00:00Z for a timestamp (the bound of Spark's per-zone
-rebase tables), so the check reads a file's footer only when its statistics
-cannot rule such a value out. Most tables never have one, and cost nothing
-beyond the file listing.
+Only values before the last calendar switch (1582-10-15) move for a date;
+for a timestamp, values before 1900-01-01T00:00:00Z (the bound of Spark's
+per-zone rebase tables) and, stored as INT96, values past 2262-04-11, where
+nanoseconds overflow. So the check reads a file's footer only when its
+statistics cannot rule such a value out. Most tables never have one, and cost
+nothing beyond the file listing.
 """
 
 from __future__ import annotations
@@ -31,6 +35,10 @@ __all__ = ["has_datetime_columns", "legacy_calendar_files"]
 _DATE_LIMIT = dt.date(1582, 10, 15)
 #: Timestamps before this may be, depending on the writer's time zone.
 _TIMESTAMP_LIMIT = dt.datetime(1900, 1, 1, tzinfo=dt.UTC)
+#: Timestamps after this overflow an INT96 decoded as nanoseconds (the true
+#: bound is 2262-04-11T23:47:16.854775807Z; statistics are truncated to
+#: milliseconds, so the day before is the safe side of it).
+_INT96_LIMIT = dt.datetime(2262, 4, 10, tzinfo=dt.UTC)
 
 #: Results per (table root, version); a version's files never change.
 _CACHE: OrderedDict[tuple[str, int], tuple[str, ...]] = OrderedDict()
@@ -105,25 +113,46 @@ def _get(stats: Any, path: tuple[str, ...]) -> Any:
     return stats
 
 
-def _before_limit(value: Any, kind: str) -> bool:
-    """Whether a statistics minimum may be a value a legacy rebase moves."""
+def _parse_stat(value: Any, kind: str) -> dt.date | dt.datetime | None:
+    """A statistics bound, or None if it is missing or cannot be read."""
     if not isinstance(value, str):
-        return True
+        return None
     try:
         if kind == "date":
-            return dt.date.fromisoformat(value) < _DATE_LIMIT
+            return dt.date.fromisoformat(value)
         parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        return True  # a year Python cannot hold, or a form it cannot parse
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.UTC)
+        return None  # a year Python cannot hold, or a form it cannot parse
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.UTC)
+
+
+def _before_limit(value: Any, kind: str) -> bool:
+    """Whether a statistics minimum may be a value a legacy rebase moves."""
+    parsed = _parse_stat(value, kind)
+    if parsed is None:
+        return True
+    if kind == "date":
+        return parsed < _DATE_LIMIT
     return parsed < _TIMESTAMP_LIMIT
+
+
+def _after_limit(value: Any, kind: str) -> bool:
+    """Whether a statistics maximum may be a timestamp INT96 decoding overflows.
+
+    Whether the file stores the column as INT96 only its footer says, so any
+    file that may hold such a value is a suspect: Photon writes INT96 by
+    default, and a year-9999 sentinel is common.
+    """
+    if kind == "date":
+        return False  # days since the epoch fit an i32 for every year Delta allows
+    parsed = _parse_stat(value, kind)
+    return parsed is None or parsed >= _INT96_LIMIT
 
 
 def _suspects(
     files: Any, leaves: list[tuple[tuple[str, ...], str]], unstatted: bool
 ) -> list[tuple[str, int]]:
-    """The files whose statistics do not rule out a value before the limits."""
+    """The files whose statistics do not rule out a value outside the limits."""
     import pyarrow as pa
 
     out: list[tuple[str, int]] = []
@@ -143,7 +172,9 @@ def _suspects(
         for leaf, kind in leaves:
             if records is not None and _get(stats.get("nullCount"), leaf) == records:
                 continue  # every value null
-            if _before_limit(_get(stats.get("minValues"), leaf), kind):
+            if _before_limit(_get(stats.get("minValues"), leaf), kind) or _after_limit(
+                _get(stats.get("maxValues"), leaf), kind
+            ):
                 out.append((path, size))
                 break
     return out

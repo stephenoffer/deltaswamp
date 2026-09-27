@@ -315,6 +315,109 @@ def expression_to_sql(expression: Any, schema: Any) -> str | None:
     return _arrow_sql_or_none(tree, schema)
 
 
+# --------------------------------------------------- DuckDB's filters, as DuckDB
+
+
+def _duck_name(name: Any, schema: Any) -> str:
+    if not isinstance(name, str) or schema.get_field_index(name) < 0:
+        raise _Unsupported("not a top-level column")
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _duck_literal(scalar: Any) -> str:
+    """`scalar` as DuckDB SQL of the same value and type."""
+    t, types = scalar.type, pa.types
+    if not scalar.is_valid:
+        return "NULL"
+    if types.is_boolean(t):
+        return "TRUE" if scalar.as_py() else "FALSE"
+    if types.is_integer(t):
+        return str(int(scalar.as_py()))
+    if types.is_floating(t):
+        # repr is exact for a double, and for the double a float32 widens to;
+        # 'nan' and 'inf' are what DuckDB's cast reads.
+        return f"CAST('{float(scalar.as_py())!r}' AS {'FLOAT' if t.bit_width == 32 else 'DOUBLE'})"
+    if types.is_string(t) or types.is_large_string(t) or _is_string_view(t):
+        return "'" + str(scalar.as_py()).replace("'", "''") + "'"
+    if types.is_binary(t) or types.is_large_binary(t):
+        return f"unhex('{bytes(scalar.as_py()).hex()}')"
+    if types.is_date32(t):
+        days = int(scalar.cast(pa.int32()).as_py())
+        return f"CAST(DATE '1970-01-01' + {days} AS DATE)"
+    if types.is_timestamp(t):
+        raw = int(scalar.cast(pa.int64()).as_py())
+        if t.unit == "ns":
+            if raw % 1000:
+                raise _Unsupported("sub-microsecond timestamp")
+            micros = raw // 1000
+        else:
+            micros = raw * {"s": 1_000_000, "ms": 1_000, "us": 1}[t.unit]
+        naive = f"make_timestamp({micros})"
+        # The zoned cast reads the instant in the session zone, set to UTC.
+        return f"CAST({naive} AS TIMESTAMPTZ)" if t.tz else naive
+    if types.is_decimal(t) and t.precision <= 38:
+        return f"CAST('{scalar.as_py()}' AS DECIMAL({t.precision}, {t.scale}))"
+    raise _Unsupported(f"literal of type {t}")
+
+
+def _duck_sql(node: Any, schema: Any) -> str:
+    tag = node[0]
+    if tag == "field":
+        return _duck_name(node[1], schema)
+    if tag == "literal":
+        return _duck_literal(node[1])
+    _, name, args, options = node
+    if name in ("and", "and_kleene", "or", "or_kleene") and args:
+        joiner = " AND " if name.startswith("and") else " OR "
+        return "(" + joiner.join(_duck_sql(a, schema) for a in args) + ")"
+    if name == "invert" and len(args) == 1:
+        return f"(NOT {_duck_sql(args[0], schema)})"
+    if name in _COMPARISONS and len(args) == 2:
+        left, right = (_duck_sql(a, schema) for a in args)
+        return f"({left} {_COMPARISONS[name]} {right})"
+    if name in ("is_null", "is_valid", "is_nan") and len(args) == 1:
+        inner = _duck_sql(args[0], schema)
+        if name == "is_valid":
+            return f"({inner} IS NOT NULL)"
+        if name == "is_nan":
+            return f"isnan({inner})"
+        if options is not None and bool(options.as_py().get("nan_is_null")):
+            return f"({inner} IS NULL OR isnan({inner}))"
+        return f"({inner} IS NULL)"
+    if name == "is_in" and len(args) == 1 and options is not None:
+        inner = _duck_sql(args[0], schema)
+        values = options["value_set"]
+        behaviour = str(options.as_py().get("null_matching_behavior", "MATCH")).upper()
+        items = [values[i] for i in range(len(values))]
+        present = [_duck_literal(v) for v in items if v.is_valid]
+        has_null = len(present) != len(items)
+        parts = [f"{inner} IN ({', '.join(present)})"] if present else []
+        if has_null and behaviour in ("MATCH", "0"):
+            parts.append(f"{inner} IS NULL")
+        elif behaviour not in ("MATCH", "SKIP", "0", "1"):
+            raise _Unsupported("null matching")
+        return "(" + " OR ".join(parts) + ")" if parts else "FALSE"
+    raise _Unsupported(name)
+
+
+def expression_to_duckdb(expression: Any, schema: Any) -> str | None:
+    """The pyarrow `expression` as DuckDB SQL of the same meaning, or None.
+
+    DuckDB pushes its WHERE into a dataset as a pyarrow Expression and then
+    does not apply it itself, so whoever evaluates it answers the query:
+    pyarrow dropped NaN from ``x > 1`` (NaN is the largest double in DuckDB)
+    and missed -0.0 in ``x IN (0, 1.5)``. Rendered back into DuckDB SQL, the
+    rows are kept by DuckDB's own rules. None for a form not rendered here
+    (a nested field, say), which pyarrow then evaluates as before.
+    """
+    if expression is None:
+        return None
+    try:
+        return _duck_sql(_decode(expression), schema)
+    except (_Unsupported, KeyError, IndexError, TypeError, ValueError, pa.ArrowException):
+        return None
+
+
 # ------------------------------------------------------------ Polars filters
 
 _POLARS_OPS = {"Eq": "=", "NotEq": "<>", "Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">="}
@@ -433,7 +536,7 @@ def polars_frame(dataset: TableDataset) -> Any:
         n_rows: int | None,
         batch_size: int | None,
     ) -> Any:
-        pushed = polars_to_sql(predicate, arrow_schema)
+        pushed = polars_to_sql(predicate, dataset._push_schema)
         read = None
         if with_columns is not None:
             wanted = set(with_columns)
@@ -471,10 +574,16 @@ def referenced_columns(expression: Any, names: list[str]) -> set[str]:
 class TableDataset(pds.InMemoryDataset):  # type: ignore[misc]
     """A pyarrow Dataset over a `Table` that scans it only when read.
 
-    Every read is a fresh scan through the table's engine at the handle's
-    version, so the same relation or LazyFrame can be executed repeatedly.
+    Every read is a fresh scan through the table's engine at the version the
+    dataset was made for (see `Table._lazy_dataset`), so the same relation or
+    LazyFrame can be executed repeatedly and each run sees one snapshot.
     Methods pyarrow would answer from the (empty) in-memory placeholder
     materialize the table first instead.
+
+    `opaque` names columns no filter is pushed on (VARIANT, shown as JSON text
+    but filtered by the scan as its binary struct). With ``duckdb_filters``,
+    a filter handed to `scanner()` -- DuckDB's, which DuckDB then no longer
+    applies itself -- is evaluated by DuckDB rather than by pyarrow.
     """
 
     def __init__(
@@ -485,6 +594,8 @@ class TableDataset(pds.InMemoryDataset):  # type: ignore[misc]
         columns: list[str] | None = None,
         predicate: str | None = None,
         scan_options: dict[str, Any] | None = None,
+        opaque: frozenset[str] = frozenset(),
+        duckdb_filters: bool = False,
     ) -> None:
         super().__init__(schema.empty_table())
         self._table = table
@@ -492,6 +603,11 @@ class TableDataset(pds.InMemoryDataset):  # type: ignore[misc]
         self._predicate = predicate
         self._scan_options = dict(scan_options or {})
         self._schema_ = schema
+        self._opaque = frozenset(opaque)
+        self._duckdb_filters = duckdb_filters
+        #: The schema filters are translated against: without the opaque
+        #: columns, so nothing on them translates.
+        self._push_schema = pa.schema([f for f in schema if f.name not in self._opaque])
         self._base_filter: Any = None
 
     @property
@@ -500,7 +616,7 @@ class TableDataset(pds.InMemoryDataset):  # type: ignore[misc]
 
     def _reader(self, columns: list[str] | None, filter: Any) -> Any:
         names = list(self._schema_.names)
-        pushed = expression_to_sql(filter, self._schema_) if filter is not None else None
+        pushed = expression_to_sql(filter, self._push_schema) if filter is not None else None
         read = None
         if columns is not None:
             wanted = set(columns) | (
@@ -513,7 +629,38 @@ class TableDataset(pds.InMemoryDataset):  # type: ignore[misc]
         """A scan of `columns` (None: all) with `pushed` SQL added to the predicate."""
         predicate = " AND ".join(f"({p})" for p in (self._predicate, pushed) if p) or None
         stream = self._table.scan(columns=columns, predicate=predicate, **self._scan_options)
-        return pa.RecordBatchReader.from_stream(stream)
+        if not (hasattr(stream, "schema") and hasattr(stream, "__iter__")):
+            stream = pa.RecordBatchReader.from_stream(stream)
+        self._check_schema(stream.schema, columns)
+        # Iterated from Python, not re-exported through the C stream: a typed
+        # error (MissingDataFileError for a vacuumed file) stays typed.
+        return pa.RecordBatchReader.from_batches(stream.schema, iter(stream))
+
+    def _check_schema(self, got: Any, columns: list[str] | None) -> None:
+        """Raise if a scan no longer yields the schema this dataset declared.
+
+        Only reachable when following the latest version (or on a table that
+        cannot be read at one): a frame declared ``id: int64`` then yielded
+        strings after an overwrite, and Polars computed on them as declared.
+        """
+        want = (
+            self._schema_
+            if columns is None
+            else pa.schema([self._schema_.field(n) for n in columns if n in self._schema_.names])
+        )
+        shape = [(f.name, f.type) for f in want]
+        if [(f.name, f.type) for f in got] == shape:
+            return
+        from .errors import MetadataChangedError
+
+        version = self._scan_options.get("version", getattr(self._table, "_version", None))
+        raise MetadataChangedError(
+            -1 if version is None else int(version),
+            f"the table's schema changed after this dataset was made: it declared "
+            f"{', '.join(f'{n}: {t}' for n, t in shape)}, and the table now reads "
+            f"{', '.join(f'{f.name}: {f.type}' for f in got)}; make the frame (or relation) "
+            "again",
+        )
 
     def scanner(self, columns: Any = None, filter: Any = None, **kwargs: Any) -> Any:
         if self._base_filter is not None:
@@ -525,6 +672,12 @@ class TableDataset(pds.InMemoryDataset):  # type: ignore[misc]
         else:
             project = list(columns) if columns is not None else None
             reader = self._reader(project, filter)
+        if filter is not None and self._duckdb_filters:
+            text = expression_to_duckdb(filter, reader.schema)
+            if text is not None:
+                from .engine.duckfilter import RowFilter
+
+                reader, filter = RowFilter(text, reader.schema).filtered(reader), None
         return pds.Scanner.from_batches(
             reader,
             columns=project,
@@ -556,6 +709,8 @@ class TableDataset(pds.InMemoryDataset):  # type: ignore[misc]
             columns=self._columns,
             predicate=self._predicate,
             scan_options=self._scan_options,
+            opaque=self._opaque,
+            duckdb_filters=self._duckdb_filters,
         )
         base = self._base_filter
         out._base_filter = expression if base is None else (base & expression)

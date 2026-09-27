@@ -1129,6 +1129,13 @@ def _common_decimal(pa: Any, column: Any, literal: Any) -> Any:
     return pa.decimal256(min(digits, 76), scale_out)
 
 
+def _is_variant_struct(pa: Any, target: Any) -> bool:
+    return bool(pa.types.is_struct(target)) and sorted(f.name for f in target) == [
+        "metadata",
+        "value",
+    ]
+
+
 def _coerce(pa: Any, lit: Literal, target: Any) -> tuple[Any, Any]:
     """(cast for the column or None, scalar) to compare `lit` with a `target` column.
 
@@ -1143,6 +1150,14 @@ def _coerce(pa: Any, lit: Literal, target: Any) -> tuple[Any, Any]:
     if target is None:
         return None, _to_scalar(pa, value)
     types = pa.types
+    if types.is_nested(target):
+        # A VARIANT is read as struct<metadata, value>: `v = '"x"'` reached
+        # Arrow's `equal` on the struct and failed as NotImplementedError.
+        raise PredicateError(
+            f"a {'VARIANT' if _is_variant_struct(pa, target) else str(target)} column cannot "
+            f"be compared with the literal {value!r} (Spark raises a type mismatch); compare "
+            "one of its fields, or read the column and filter its values"
+        )
     numeric_target = (
         types.is_integer(target) or types.is_floating(target) or types.is_decimal(target)
     )

@@ -1365,9 +1365,13 @@ class Connection:
         _require("pyarrow", "pyarrow")
         module = _require(engine, engine)
         # Lazy datasets, not tables read in full: each engine pushes the
-        # query's projection and simple WHERE comparisons into the scan.
+        # query's projection and simple WHERE comparisons into the scan. Each
+        # is pinned to the version current now, so one statement reads one
+        # snapshot of each table however many times it scans it.
         frames = {
-            alias: (ref if isinstance(ref, Table) else self.table(ref))._lazy_dataset()
+            alias: (ref if isinstance(ref, Table) else self.table(ref))._lazy_dataset(
+                duckdb_filters=engine == "duckdb"
+            )
             for alias, ref in (tables or {}).items()
         }
         if engine == "duckdb":
