@@ -94,3 +94,34 @@ def test_managed_iceberg_is_recognised_for_both_writer_compat_versions(version: 
         properties={f"delta.enableIcebergWriterCompat{version}": "true"},
     )
     assert table.is_managed_iceberg
+
+
+def test_compaction_merges_lists_whose_element_fields_are_named_differently(
+    tmp_path: Any,
+) -> None:
+    """delta-rs names a list's element `item`; a rebased batch carries `element`."""
+    import datetime as dt
+
+    pa = pytest.importorskip("pyarrow")
+    deltalake = pytest.importorskip("deltalake")
+    import deltaswamp as ds
+
+    days = [dt.date(1, 1, 1), dt.date(1582, 10, 4), dt.date(2024, 1, 1)]
+
+    def rows(base: int) -> Any:
+        return pa.table(
+            {
+                "rid": pa.array([base + i for i in range(len(days))], pa.int64()),
+                "d": pa.array(days, pa.date32()),
+                "arr": pa.array([[x, None] for x in days], pa.list_(pa.date32())),
+            }
+        )
+
+    path = str(tmp_path / "t")
+    deltalake.write_deltalake(path, rows(0))
+    deltalake.write_deltalake(path, rows(100), mode="append")
+    conn = ds.connect("file://")
+    before = sorted(conn.open_table(path).to_arrow().to_pylist(), key=lambda r: r["rid"])
+    conn.open_table(path).optimize()
+    after = sorted(conn.open_table(path).to_arrow().to_pylist(), key=lambda r: r["rid"])
+    assert after == before and len(after) == 6

@@ -748,10 +748,38 @@ impl Coalesced {
         let merged = if held.len() == 1 {
             Ok(held.into_iter().next().expect("one batch"))
         } else {
-            arrow::compute::concat_batches(&held[0].schema(), &held).map_err(Error::from)
+            conform_to_first(held).and_then(|held| {
+                arrow::compute::concat_batches(&held[0].schema(), &held).map_err(Error::from)
+            })
         };
         Some(merged.map(|batch| Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>))
     }
+}
+
+/// `batches` cast to the first one's schema, so they concatenate.
+///
+/// Files from different writers name a list's element field differently
+/// (delta-rs `item`, Spark and the kernel `element`), and a rebased batch
+/// carries the logical name: the same column arrived as two Arrow types, and
+/// the compaction of a table delta-rs and the kernel had both written failed.
+fn conform_to_first(batches: Vec<RecordBatch>) -> DeltaResult<Vec<RecordBatch>> {
+    let schema = batches[0].schema();
+    batches
+        .into_iter()
+        .map(|batch| {
+            if batch.schema() == schema {
+                return Ok(batch);
+            }
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| arrow::compute::cast(column, field.data_type()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)?;
+            RecordBatch::try_new(schema.clone(), columns).map_err(Error::from)
+        })
+        .collect()
 }
 
 impl Iterator for Coalesced {
