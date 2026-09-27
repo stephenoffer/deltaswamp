@@ -86,7 +86,7 @@ Useful keyword arguments:
 
 | Argument | Effect |
 |---|---|
-| `allow_sql_fallback=True` | permits routing through a SQL warehouse; off by default |
+| `allow_sql_fallback=True` | permits routing through a SQL warehouse; off by default, and refused on any connection but Databricks, since a warehouse serves only its own workspace's tables |
 | `warehouse_id="..."` | which warehouse the fallback uses; chosen automatically when omitted |
 | `staging_volume="cat.schema.vol"` | lets the warehouse serve writes and MERGE, staging data in that volume |
 | `storage_options={...}` | extra object-store settings, merged under vended credentials |
@@ -578,7 +578,18 @@ conn.undrop_table("main.sales.orders")  # warehouse
 
 Open-source Unity Catalog lacks tags, lineage, key constraints, ownership
 changes and the Files API. Those calls come back as refusals that name the
-gap. Other catalogs have no governance API, and say so.
+gap. Other catalogs have no governance API, and say so. OSS Unity Catalog does
+not re-read an external table's log, so a schema, comment or property change
+made here is also written to its catalog entry (UC 0.6's Delta API
+update-table call); a server without that call gets a warning and a stale
+entry. A grant the server accepts but does not record (authorization disabled)
+warns.
+
+Hive Metastore and Glue have two levels, so `db.table` names a table on those
+connections (`hive_metastore.db.table`, `glue.db.table` or
+`<account-id>.db.table` also work; another first part is refused). Both
+list their databases with `list_schemas()` and drop registrations with
+`drop_table()`, keeping the files. Hive Metastore 2, 3 and 4 are supported.
 
 ## Delta Sharing
 
@@ -594,7 +605,16 @@ t.cdf(starting_version=10)  # when the provider shares history
 Shared files are read with pyarrow, keeping Delta's types. Tables with
 deletion vectors or column mapping use the client's delta-format path.
 Predicates are sent as hints and then applied exactly. Shares are read-only,
-and writes are refused with that reason.
+and writes are refused with that reason. Every file the server names is
+downloaded here over HTTP(S), including on the delta-format path, so a server
+URL is never opened as a local path.
+
+`can("cdf")` is refused when the shared metadata has no change data feed.
+Time travel and the change feed otherwise depend on the provider sharing the
+table WITH HISTORY, which no endpoint reports before the query; `can()` says
+so in its reason. `plan_scan()` and `to_ray_dataset()` are not available for
+shares: there is no split planning, and presigned URLs would expire on the way
+to workers.
 
 ## Iceberg
 
