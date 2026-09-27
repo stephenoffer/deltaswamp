@@ -15,7 +15,7 @@ import pytest
 from deltaswamp.errors import EngineFallbackWarning, MetadataChangedError
 from deltaswamp.predicate import PredicateError
 
-from tests.integration.test_audit_dialect import _variant_table
+from tests.integration.test_audit_dialect import _field, _protocol, _variant_table, _write_log
 from tests.integration.test_audit_read import _spark_table
 from tests.integration.test_audit_rebase import _ts_table
 
@@ -240,3 +240,61 @@ class TestCountThroughLazyHandOffs:
         context = pl.SQLContext(m=lf)
         assert context.execute("SELECT count(*) AS n FROM m").collect()["n"].to_list() == [3]
         assert t.to_duckdb(duckdb.connect()).count("*").fetchone()[0] == 3
+
+
+class TestMapOfVariants:
+    """HE-4: a NULL MAP<STRING, VARIANT> failed the kernel read mid-stream.
+
+    Spark stores a VARIANT as ``value, metadata``; the kernel asks for
+    ``metadata, value``, and its map reorder made the column non-nullable.
+    """
+
+    @pytest.mark.parametrize("disk_order", [("value", "metadata"), ("metadata", "value")])
+    def test_a_null_map_reads_as_null(
+        self, conn: Any, tmp_path: Any, disk_order: tuple[str, str]
+    ) -> None:
+        from deltaswamp._variant import encode
+
+        metadata, value = encode("1")
+        parts = {"value": value, "metadata": metadata}
+        variant = pa.struct([pa.field(n, pa.binary(), nullable=False) for n in disk_order])
+        maps = pa.array(
+            [[("k", {n: parts[n] for n in disk_order})], None, [("n", None)], []],
+            pa.map_(pa.string(), variant),
+        )
+        data = pa.table({"id": pa.array([0, 1, 2, 3], pa.int64()), "mv": maps})
+        kind = {
+            "type": "map",
+            "keyType": "string",
+            "valueType": "variant",
+            "valueContainsNull": True,
+        }
+        schema = {"type": "struct", "fields": [_field("id", "long"), _field("mv", kind)]}
+        path = _write_log(
+            str(tmp_path / "t"), schema, _protocol(["variantType"], ["variantType"]), data
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", EngineFallbackWarning)
+            rows = conn.open_table(path).to_arrow().sort_by("id").to_pylist()
+        assert [r["mv"] for r in rows] == [[("k", "1")], None, [("n", None)], []]
+
+
+def test_a_lazy_read_of_a_vacuumed_version_names_the_missing_file(conn: Any, tmp_path: Any) -> None:
+    """HB-3: the lazy hand-offs raised ArrowInvalid where to_arrow() raised MissingDataFileError."""
+    from deltaswamp.errors import MissingDataFileError
+
+    pl = pytest.importorskip("polars")
+    path = str(tmp_path / "t")
+    conn.write_table(path, pa.table({"id": pa.array([1, 2], pa.int64())}))
+    conn.open_table(path).overwrite(pa.table({"id": pa.array([3], pa.int64())}))
+    pinned = conn.open_table(path, version=1)
+    frame, dataset = pinned.to_polars(lazy=True), pinned.to_pyarrow_dataset()
+    log = pathlib.Path(path) / "_delta_log" / f"{1:020d}.json"
+    for line in log.read_text().splitlines():
+        if "add" in (action := json.loads(line)):
+            (pathlib.Path(path) / action["add"]["path"]).unlink()
+    with pytest.raises(MissingDataFileError):
+        dataset.to_table()
+    # Polars wraps whatever an IO source raises; the message keeps the type.
+    with pytest.raises(pl.exceptions.ComputeError, match="MissingDataFileError"):
+        frame.collect()

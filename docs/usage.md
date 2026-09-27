@@ -236,8 +236,13 @@ offsets. INT96 timestamps are decoded at microsecond precision, so values
 before 1677 read correctly. delta-rs does not rebase, so operations through
 which it would rewrite such files -- DELETE, UPDATE, MERGE, replaceWhere,
 OPTIMIZE, Z-ORDER -- are routed elsewhere (the kernel, the warehouse) or
-refused when a file holds a value the rebase moves; `can()` says so. The check
-reads a file's footer only when its statistics allow such a value.
+refused when a file holds a value the rebase moves, or an INT96 timestamp
+after 2262-04-11 (delta-rs decodes INT96 as nanoseconds, which overflow
+there: `9999-12-31` reads as `1816-03-30`); `can()` says so. Reads of such a
+table never go to delta-rs either: a predicate outside the kernel's grammar
+(`abs(x) > 0`, `year(d) = 1500`) is then evaluated after the kernel's read,
+by DuckDB in Spark's dialect (without DuckDB installed, the read is refused).
+The check reads a file's footer only when its statistics allow such a value.
 
 A VARIANT column reads as JSON text (`string`), as Databricks' `to_json`
 renders it, whichever engine serves the read: the warehouse can send nothing
@@ -727,9 +732,18 @@ with a literal of its own kind on integer, string, boolean, date and decimal
 columns, `IN`, `IS NULL`, and `AND`/`OR` of those. Nothing whose meaning could
 differ is pushed -- `NOT`, float and double comparisons (Spark, pyarrow and
 Polars order NaN differently), binary values -- and the consumer applies its
-whole filter itself afterwards, Polars with Polars' semantics. Pass
-`predicate=` (SQL) as well when a filter the engine cannot push should still
-skip files.
+whole filter itself afterwards, Polars with Polars' semantics and DuckDB with
+DuckDB's (DuckDB hands its filter to the scan and does not reapply it, so this
+library evaluates it in DuckDB). Nothing is pushed on a VARIANT column, which
+the hand-offs show as JSON text. Pass `predicate=` (SQL) as well when a filter
+the engine cannot push should still skip files.
+
+A lazy hand-off reads the version that was current when it was made, at every
+scan: a DuckDB statement that scans a relation twice (a self-join) sees one
+snapshot, and a frame made before a schema change keeps reading the schema it
+declared. Pass `follow_latest=True` to read the latest version at each scan
+instead; a scan whose schema no longer matches the declared one then raises
+`MetadataChangedError`. `Connection.sql` pins each table when it is called.
 `Connection.sql` runs on DuckDB by default (or `engine="polars"`), and can join
 tables from different catalogs. `engine="warehouse"` sends the query to
 Databricks as it stands.
