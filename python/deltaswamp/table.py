@@ -19,6 +19,8 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import _results
+from ._request import METHOD_OPERATIONS, NO_DATA, Request, derive
+from ._request import strict_engine as _strict
 from ._util import timestamp_ms
 from .capability import FEATURE_SUPPORT, Capability, FeatureKind, Operation, feature_from_wire
 from .capability import READ_OPERATIONS as _READ_OPERATIONS
@@ -41,7 +43,6 @@ from .errors import (
     UnreachableTableError,
 )
 from .identity import RefKind, parse_ref
-from .properties import with_checkpoint_stats
 
 if TYPE_CHECKING:
     from .connection import Connection
@@ -896,107 +897,44 @@ class Table:
     def can(self, operation: Operation | str, **shape: Any) -> Capability:
         """Whether an operation is possible, optionally for a specific request.
 
-        `shape` takes the same arguments as the call itself, so you can
-        preflight the write you actually intend::
+        `shape` takes the same arguments as the call itself -- the data too,
+        as ``data=`` -- so you can preflight the write you actually intend::
 
             t.can("create", properties={"delta.enableRowTracking": "true"})
-            t.can("append", schema_mode="merge")
-        """
-        try:
-            op = Operation(operation)
-        except ValueError:
-            raise InvalidArgumentError(
-                f"{operation!r} is not an operation; one of {sorted(o.value for o in Operation)}"
-            ) from None
-        method = _SHAPED_CALLS.get(op)
-        if method is not None:
-            # can("append", schema_mod="merge") answered for a plain append,
-            # so a typo preflighted fine and the call itself then did
-            # something else.
-            import inspect
+            t.can("append", schema_mode="merge", data=batch)
+            t.can("plan_write", mode="overwrite")
 
-            known = frozenset(inspect.signature(getattr(Table, method)).parameters) - {
-                "self",
-                "data",
-            }
-            _check_options("can", shape, known)
-        # Translate the call's arguments the way the call itself routes them.
-        # Passing them through as a bare shape let `can("append",
-        # schema_mode="merge")` answer for a plain APPEND (kernel: yes) while
-        # the append itself routed as MERGE_SCHEMA and was refused.
-        asked = op
-        if op is Operation.VACUUM:
-            # Judged as the call runs by default: t.vacuum() is a dry run,
-            # and can("vacuum") refused it by judging a real one.
-            shape.setdefault("dry_run", True)
-            shape.setdefault("lite", False)
-        op, needs = self._call_route(op, shape)
-        verdict = self._connection.router.capability(op, self._enrich(), needs=needs, **shape)
-        if asked is Operation.INCREMENTAL:
-            verdict = dataclasses.replace(verdict, operation=asked)
+        The answer is the router's verdict on the very request the call makes
+        (see `deltaswamp._request`), so an ok here is the engine the call uses.
+        A method name (``z_order``, ``compact_logs``, ``plan_write``, ...) is
+        accepted in place of the operation it performs.
+        """
+        op, shape = _asked_operation(operation, shape)
+        _check_can_options(op, shape)
+        data = shape.pop("data", NO_DATA)
+        if op is Operation.MERGE and "source" in shape:
+            data = shape.pop("source")
+        if data is not NO_DATA:
+            data = _write_data(data)
+            if op is not Operation.MERGE and not _consumable(data):
+                # Lined up as the call lines it up: a left-out column with a
+                # literal DEFAULT is filled in, and needs no SQL engine.
+                data = self._align(data, shape.get("schema_mode"))
+        request = self._request(op, shape, data)
+        verdict = self._connection.router.capability(
+            request.operation, self._enrich(), needs=request.needs, **request.shape
+        )
+        if request.asked is Operation.INCREMENTAL:
+            verdict = dataclasses.replace(verdict, operation=request.asked)
         return verdict
 
-    def _call_route(self, op: Operation, shape: dict[str, Any]) -> tuple[Operation, frozenset[str]]:
-        """The operation and needs a call with these arguments routes on."""
-        needs: set[str] = set()
-        get = shape.get
-        if op in (
-            Operation.APPEND,
-            Operation.OVERWRITE,
-            Operation.REPLACE_WHERE,
-            Operation.MERGE_SCHEMA,
-        ):
-            partition_overwrite = get("partition_overwrite") or "static"
-            needs |= self._write_needs(
-                get("schema_mode"),
-                get("commit_metadata"),
-                get("txn"),
-                get("writer_properties"),
-                partition_overwrite,
-            )
-            if op is Operation.APPEND and get("schema_mode") == "merge":
-                op = Operation.MERGE_SCHEMA
-            elif op is Operation.OVERWRITE and (
-                get("predicate") is not None or partition_overwrite == "dynamic"
-            ):
-                op = Operation.REPLACE_WHERE
-            if op is Operation.REPLACE_WHERE:
-                needs |= self._expression_needs(get("predicate"))
-        elif op in (Operation.DELETE, Operation.UPDATE):
-            needs |= self._expression_needs(get("predicate"), get("updates"))
-            if op is Operation.UPDATE:
-                needs |= self._update_defaults(get("updates"))[1]
-        elif op is Operation.MERGE and get("merge_schema"):
-            needs.add("schema_merge")
-        elif op in (Operation.SCAN, Operation.TIME_TRAVEL):
-            if get("predicate") is not None:
-                needs |= self._predicate_needs(get("predicate"))
-            needs |= self._variant_needs(get("columns"), get("predicate"))
-            if get("timestamp") is not None:
-                needs.add("timestamp_travel")
-            if (
-                get("version") is not None
-                or get("timestamp") is not None
-                or self._version is not None
-            ):
-                op = Operation.TIME_TRAVEL
-        elif op in (Operation.OPTIMIZE, Operation.ZORDER):
-            if get("zorder_by"):
-                op = Operation.ZORDER
-            if get("full"):
-                needs.add("optimize_full")
-            if get("predicate") is not None:
-                needs.add("optimize_predicate")
-        elif op is Operation.INCREMENTAL:
-            # changes() is the incremental read, and it follows the change
-            # data feed: can(INCREMENTAL) refused on every table while
-            # changes() served it.
-            op = Operation.CDF
-        elif op is Operation.CLUSTER_BY:
-            columns = get("columns")
-            if isinstance(columns, str) and columns.lower() == "auto":
-                needs.add("auto_clustering")
-        return op, frozenset(needs)
+    def _request(self, operation: Operation, args: dict[str, Any], data: Any = NO_DATA) -> Request:
+        """What a call of `operation` with these arguments routes on; see `_request`."""
+        return derive(self, operation, args, data)
+
+    def _route(self, request: Request, *, exclude: frozenset[EngineKind] = frozenset()) -> Any:
+        """The engine that serves `request`: the one `can()` names for it."""
+        return self._engine(request.operation, request.needs, exclude=exclude, **request.shape)
 
     def _predicate_needs(self, predicate: Any) -> set[str]:
         """``predicates``, and whether the predicate is clear of collated columns.
@@ -1105,15 +1043,20 @@ class Table:
                 f"there is no Delta table at this path ({resolved.open_error})",
                 "check the path, or create the table with create_table() / write_table()",
             )
-        return self._connection.router.engine_for(operation, resolved, needs=needs, **shape)
+        router = self._connection.router
+        return _strict(
+            router.engine_for(operation, resolved, needs=needs, **shape),
+            operation,
+            lambda kind: router.capability(
+                operation,
+                resolved,
+                needs=needs,
+                **{**shape, "exclude": frozenset(shape.get("exclude", ())) | {kind}},
+            ),
+        )
 
-    def _read(
-        self,
-        operation: Operation,
-        call: Callable[[Any], Any],
-        needs: frozenset[str] = frozenset(),
-    ) -> Any:
-        """Serve a read-only operation, moving to the next engine if one breaks.
+    def _read(self, request: Request | Operation, call: Callable[[Any], Any]) -> Any:
+        """Serve a read-only request, moving to the next engine if one breaks.
 
         Routing decides from the protocol, but an engine can still choke on a
         table it claims -- delta-rs cannot parse the file statistics Databricks
@@ -1128,12 +1071,25 @@ class Table:
         version, a timestamp before the history, a corrupt table, bad
         arguments) is about the request and propagates as it is.
         """
+        if isinstance(request, Operation):
+            request = self._request(request, {})
+        operation, needs, shape = request.operation, request.needs, request.shape
         tried: set[EngineKind] = set()
         refusals: list[EngineLimitError] = []
         while True:
             try:
-                engine: Any = self._connection.router.engine_for(
-                    operation, self._enrich(), needs=needs, exclude=frozenset(tried)
+                engine: Any = _strict(
+                    self._connection.router.engine_for(
+                        operation, self._enrich(), needs=needs, exclude=frozenset(tried), **shape
+                    ),
+                    operation,
+                    lambda kind: self._connection.router.capability(
+                        operation,
+                        self._resolved,
+                        needs=needs,
+                        exclude=frozenset(tried) | {kind},
+                        **shape,
+                    ),
                 )
             except DeltaSwampError:
                 if refusals:
@@ -1150,7 +1106,7 @@ class Table:
                 tried.add(engine.kind)
                 try:
                     self._connection.router.engine_for(
-                        operation, self._resolved, needs=needs, exclude=frozenset(tried)
+                        operation, self._resolved, needs=needs, exclude=frozenset(tried), **shape
                     )
                 except DeltaSwampError:
                     if refusals:
@@ -1188,19 +1144,21 @@ class Table:
         _check_count(limit, "limit")
         timestamp = _timestamp_arg(timestamp)
         version = self._travel_version(version, timestamp)
-        # `version or timestamp` would treat version 0 as no time travel. A
-        # handle opened at a version is time travel too, and must route as it:
-        # an engine that serves SCAN but not TIME_TRAVEL would read the latest.
-        travelling = version is not None or timestamp is not None
-        op = Operation.TIME_TRAVEL if travelling else Operation.SCAN
-        # A predicate or a timestamp narrows which engines can serve the call,
-        # so say so up front instead of letting one accept and then raise.
-        needs = set()
-        if predicate is not None:
-            needs |= self._predicate_needs(predicate)
-        if timestamp is not None:
-            needs.add("timestamp_travel")
-        needs |= self._variant_needs(columns, predicate)
+        # A handle opened at a version is time travel too, and routes as it
+        # (see `_request`): an engine that serves SCAN but not TIME_TRAVEL
+        # would read the latest. A predicate or a timestamp narrows which
+        # engines can serve the call, so it is said up front instead of
+        # letting one accept and then raise.
+        request = self._request(
+            Operation.SCAN,
+            {
+                "columns": columns,
+                "predicate": predicate,
+                "version": version,
+                "timestamp": timestamp,
+                "limit": limit,
+            },
+        )
 
         def scan(engine: Any) -> Any:
             stream = engine.scan(
@@ -1228,7 +1186,7 @@ class Table:
             context = f"{where}" + (f" at {at}" if at is not None else "")
             return translating_stream(stream, context, _shredded_variant_error)
 
-        return self._read(op, scan, frozenset(needs))
+        return self._read(request, scan)
 
     def _travel_version(self, version: int | None, timestamp: Any) -> int | None:
         """The version a read should use: the call's, else the handle's.
@@ -1577,12 +1535,11 @@ class Table:
         # txn=["job", 1] failed with TypeError at commit, after the job ran.
         txn = (txn[0], int(txn[1])) if txn is not None else None
         commit_metadata = _commit_metadata_arg(commit_metadata)
-        operation = Operation.OVERWRITE if mode == "overwrite" else Operation.APPEND
-        needs = {"distributed_write"}
-        if txn is not None:
-            needs.add("idempotent_txn")
-        if commit_metadata is not None:
-            needs.add("commit_metadata")
+        # can("plan_write", mode=...) asks about this very request.
+        request = self._request(
+            Operation.APPEND,
+            {"mode": mode, "txn": txn, "commit_metadata": commit_metadata, "distributed": True},
+        )
         if txn is not None and self._already_committed(txn):
             raise UnreachableTableError(
                 f"plan an idempotent write for {txn[0]!r} at version {txn[1]}",
@@ -1590,7 +1547,7 @@ class Table:
                 "duplicate work whose result is already in the table",
                 "raise the txn version, or drop txn= to write unconditionally",
             )
-        engine = self._engine(operation, frozenset(needs))
+        engine = self._route(request)
         identity = None
         if isinstance(engine, KernelEngine) and self.version is not None:
             # Read from storage, not the cache: this is the identity every
@@ -1641,14 +1598,17 @@ class Table:
         _check_predicate(predicate, "plan a scan")
         timestamp = _timestamp_arg(timestamp)
         version = self._travel_version(version, timestamp)
-        needs = {"distributed_scan"}
-        if predicate is not None:
-            needs |= self._predicate_needs(predicate)
-        if timestamp is not None:
-            needs.add("timestamp_travel")
-        travelling = version is not None or timestamp is not None
-        op = Operation.TIME_TRAVEL if travelling else Operation.SCAN
-        engine = self._engine(op, frozenset(needs))
+        request = self._request(
+            Operation.SCAN,
+            {
+                "columns": columns,
+                "predicate": predicate,
+                "version": version,
+                "timestamp": timestamp,
+                "distributed": True,
+            },
+        )
+        engine = self._route(request)
         splits = engine.plan_scan(
             self._resolved,
             columns=columns,
@@ -1800,10 +1760,11 @@ class Table:
         resolved = self._enrich()
         if resolved.features & _VARIANT_FEATURES or resolved.open_error is not None:
             return None
-        op = Operation.TIME_TRAVEL if self._version is not None else Operation.SCAN
-        needs = frozenset(self._predicate_needs(predicate) if predicate is not None else ())
+        request = self._request(Operation.SCAN, {"predicate": predicate})
         try:
-            engine: Any = self._connection.router.engine_for(op, resolved, needs=needs)
+            engine: Any = self._connection.router.engine_for(
+                request.operation, resolved, needs=request.needs, **request.shape
+            )
             if not isinstance(engine, KernelEngine):
                 return None
             counted = engine.metadata_count(
@@ -2428,8 +2389,11 @@ class Table:
                 for value in updates.values():
                     if isinstance(value, str):
                         sqlpred.parse_value(value)
-        except sqlpred.PredicateError:
-            return frozenset({"sql_expressions"})
+        except sqlpred.PredicateError as exc:
+            # Malformed in any SQL (`id ===`): no engine serves it, and the
+            # kernel's parser names the mistake where delta-rs's raises a raw
+            # parser error.
+            return frozenset({"sql_expressions"}) if exc.beyond_grammar else frozenset()
         return frozenset()
 
     def _update_needs(self, targets: Any, literal: bool) -> frozenset[str]:
@@ -2510,14 +2474,22 @@ class Table:
         self._check_cdf_columns(data, schema_mode, "append")
         for attempt in range(_REALIGN_ATTEMPTS):
             data = self._align(raw, schema_mode)
-            needs = self._write_needs(
-                schema_mode, commit_metadata, txn, writer_properties, "static"
+            request = self._request(
+                Operation.APPEND,
+                {
+                    "schema_mode": schema_mode,
+                    "partition_by": partition_by,
+                    "target_file_size": target_file_size,
+                    "writer_properties": writer_properties,
+                    "commit_metadata": commit_metadata,
+                    "txn": txn,
+                    "max_commit_retries": max_commit_retries,
+                },
+                data,
             )
-            needs |= self._data_needs(data, partition_by) | self._default_needs(data)
-            op = Operation.MERGE_SCHEMA if schema_mode == "merge" else Operation.APPEND
 
-            def write(data: Any = data, op: Operation = op, needs: Any = needs) -> None:
-                engine = self._engine(op, needs)
+            def write(data: Any = data, request: Request = request) -> None:
+                engine = self._route(request)
                 engine.append(
                     self._resolved,
                     self._variant_input(engine, data),
@@ -2655,23 +2627,23 @@ class Table:
         raw = data
         self._check_cdf_columns(data, schema_mode, "overwrite")
         data = self._align(raw, schema_mode)
-        needs = self._write_needs(
-            schema_mode, commit_metadata, txn, writer_properties, partition_overwrite
-        )
-        needs |= self._data_needs(data) | self._expression_needs(predicate)
-        if schema_mode != "overwrite":
-            needs |= self._default_needs(data)
-        op = (
-            Operation.REPLACE_WHERE
-            if (predicate is not None or partition_overwrite == "dynamic")
-            else Operation.OVERWRITE
-        )
+        options = {
+            "predicate": predicate,
+            "partition_overwrite": partition_overwrite,
+            "schema_mode": schema_mode,
+            "target_file_size": target_file_size,
+            "writer_properties": writer_properties,
+            "commit_metadata": commit_metadata,
+            "txn": txn,
+            "max_commit_retries": max_commit_retries,
+        }
         from .errors import CommitConflictError
 
         for attempt in range(_REALIGN_ATTEMPTS):
+            request = self._request(Operation.OVERWRITE, options, data)
 
-            def write(data: Any = data) -> None:
-                engine = self._engine(op, needs)
+            def write(data: Any = data, request: Request = request) -> None:
+                engine = self._route(request)
                 engine.overwrite(
                     self._resolved,
                     self._variant_input(engine, data),
@@ -2828,11 +2800,11 @@ class Table:
         self._check_writable("delete")
         _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
-        needs = self._expression_needs(predicate)
+        request = self._request(Operation.DELETE, {"predicate": predicate, **kwargs})
         served: list[Any] = []
 
         def run() -> Any:
-            engine = self._engine(Operation.DELETE, needs)
+            engine = self._route(request)
             served.append(getattr(engine, "kind", None))
             return engine.delete(self._resolved, predicate, **_given(kwargs))
 
@@ -2857,14 +2829,12 @@ class Table:
             raise InvalidArgumentError("pass updates (SQL expressions) or new_values, not both")
         if not updates and not new_values:
             raise InvalidArgumentError("update needs at least one column to set")
-        needs = self._update_needs(updates, False) | self._update_needs(new_values, True)
-        defaults, default_needs = self._update_defaults(updates)
-        needs |= default_needs
-        needs |= self._expression_needs(
-            predicate,
-            None if updates is None else {k: defaults.get(k, v) for k, v in updates.items()},
+        request = self._request(
+            Operation.UPDATE,
+            {"updates": updates, "new_values": new_values, "predicate": predicate, **kwargs},
         )
-        engine = self._engine(Operation.UPDATE, needs)
+        engine = self._route(request)
+        defaults = self._update_defaults(updates)[0]
         if defaults and isinstance(engine, (KernelEngine, DeltaRsEngine)):
             # The warehouse reads `DEFAULT` itself; a direct engine gets the
             # column's literal DEFAULT (or NULL) spelled out.
@@ -3027,23 +2997,31 @@ class Table:
             raise InvalidArgumentError("merge needs a join predicate")
         _check_predicate(predicate, "merge")
         source = _write_data(source)
-        needs = self._data_needs(source)
-        if kwargs.get("merge_schema"):
-            # The kernel MERGE cannot evolve the schema; routed without the
-            # need, can() said "via kernel" and the call then refused.
-            needs = needs | {"schema_merge"}
+        request = self._request(Operation.MERGE, {"predicate": predicate, **kwargs}, source)
 
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
-            engine = self._engine(Operation.MERGE, needs, exclude=exclude)
+            engine = self._route(request, exclude=exclude)
             builder = engine.merge(
                 self._resolved, self._variant_input(engine, source), predicate, **kwargs
             )
             return builder, getattr(engine, "kind", None)
 
+        def clauses_routed(clauses: list[str]) -> None:
+            # The clauses are known only at execute(), and they can add a need
+            # (an UPDATE or DELETE clause removes rows, which an append-only
+            # table forbids). Routed again with them, before anything runs,
+            # exactly as can("merge", ..., clauses=[...]) answers.
+            extra = self._request(Operation.MERGE, {"clauses": clauses}).needs
+            if extra <= request.needs:
+                return
+            self._connection.router.engine_for(
+                Operation.MERGE, self._enrich(), needs=request.needs | extra, **request.shape
+            )
+
         builder, kind = build(frozenset())
         # A consumed stream cannot be offered to a second engine.
         rebuild = None if _consumable(source) else build
-        return _InvalidatingMerger(builder, self._invalidate, rebuild, kind)
+        return _InvalidatingMerger(builder, self._invalidate, rebuild, kind, clauses_routed)
 
     # ------------------------------------------------------------ maintenance
 
@@ -3068,13 +3046,12 @@ class Table:
             zorder_by = [zorder_by]
         if zorder_by:
             self._check_zorder(list(zorder_by))
-        op = Operation.ZORDER if zorder_by else Operation.OPTIMIZE
-        needs = set()
-        if full:
-            needs.add("optimize_full")
-        if predicate is not None:
-            needs.add("optimize_predicate")
-        engine = self._engine(op, frozenset(needs))
+        engine = self._route(
+            self._request(
+                Operation.OPTIMIZE,
+                {"zorder_by": zorder_by, "full": full, "predicate": predicate, **kwargs},
+            )
+        )
         result = engine.optimize(
             self._resolved, zorder_by=zorder_by, full=full, predicate=predicate, **kwargs
         )
@@ -3089,7 +3066,7 @@ class Table:
         if not columns:
             raise InvalidArgumentError("z_order needs at least one column")
         self._check_zorder(columns)
-        engine = self._engine(Operation.ZORDER)
+        engine = self._route(self._request(Operation.ZORDER, {"zorder_by": columns, **kwargs}))
         result = engine.zorder(self._resolved, columns, **kwargs)
         self._invalidate()
         return _results.optimize(result, getattr(engine, "kind", None))
@@ -3171,10 +3148,11 @@ class Table:
             )
         if retention_hours is not None and retention_hours < 0:
             raise InvalidArgumentError(f"retention_hours must be >= 0, got {retention_hours}")
-        # The shape lets the router accept a dry run on tables a real VACUUM,
-        # which commits, cannot touch, and refuse a full one where delta-rs
-        # would delete live deletion vectors.
-        result = self._engine(Operation.VACUUM, dry_run=bool(dry_run), lite=bool(lite)).vacuum(
+        request = self._request(
+            Operation.VACUUM,
+            {"retention_hours": retention_hours, "dry_run": dry_run, "lite": lite, **kwargs},
+        )
+        result = self._route(request).vacuum(
             self._resolved, retention_hours=retention_hours, dry_run=dry_run, lite=lite, **kwargs
         )
         self._invalidate()
@@ -3203,7 +3181,7 @@ class Table:
             target = self._restore_version(target)
         # Routed before the no-op below: restore(current) returned success on
         # a table no engine may restore, while can(RESTORE) said no.
-        engine = self._engine(Operation.RESTORE)
+        engine = self._route(self._request(Operation.RESTORE, {"target": target, **kwargs}))
         if isinstance(target, (bool, int)):
             # -1 reached delta-rs as "either the version or datetime should
             # be provided"; True restored version 1.
@@ -3271,11 +3249,9 @@ class Table:
 
     def repair(self, **kwargs: Any) -> dict[str, Any]:
         _check_options("repair", kwargs, _COMMIT_OPTIONS | {"dry_run"})
-        # A dry run commits nothing, so the router may accept it on tables a
-        # real REPAIR (which commits removes) cannot touch.
-        result: dict[str, Any] = self._engine(
-            Operation.REPAIR, dry_run=kwargs.get("dry_run") is True
-        ).repair(self._resolved, **kwargs)
+        result: dict[str, Any] = self._route(self._request(Operation.REPAIR, kwargs)).repair(
+            self._resolved, **kwargs
+        )
         self._invalidate()
         return result
 
@@ -3334,7 +3310,9 @@ class Table:
                 "existing rows have no value for a new column, so it must be nullable",
                 "add the column as nullable, backfill it, then set_not_null()",
             )
-        self._engine(Operation.ADD_COLUMN).add_columns(self._resolved, fields, **kwargs)
+        self._route(self._request(Operation.ADD_COLUMN, {"fields": fields, **kwargs})).add_columns(
+            self._resolved, fields, **kwargs
+        )
         self._invalidate()
         self._sync_catalog()
 
@@ -3367,7 +3345,9 @@ class Table:
             raise InvalidArgumentError(f"cannot drop {top!r}: it is the last non-partition column")
         if top is not None and not rest:
             raise InvalidArgumentError(f"cannot drop {top!r}: it is the table's only column")
-        result = self._engine(Operation.DROP_COLUMN).drop_column(self._resolved, column)
+        result = self._route(self._request(Operation.DROP_COLUMN, {"column": column})).drop_column(
+            self._resolved, column
+        )
         self._invalidate()
         self._sync_catalog()
         return _metrics(result)
@@ -3381,7 +3361,8 @@ class Table:
         old = self._alter_path(old, "rename_column")
         if not isinstance(new, str) or not new:
             raise InvalidArgumentError(f"rename_column needs a new name, not {new!r}")
-        result = self._engine(Operation.RENAME_COLUMN).rename_column(self._resolved, old, new)
+        request = self._request(Operation.RENAME_COLUMN, {"old": old, "new": new})
+        result = self._route(request).rename_column(self._resolved, old, new)
         self._invalidate()
         self._sync_catalog()
         return _metrics(result)
@@ -3399,10 +3380,9 @@ class Table:
         if not properties:
             # Nothing to set; every engine would still commit an empty change.
             return
-        properties = with_checkpoint_stats(properties, self.properties()) or properties
-        self._engine(Operation.SET_PROPERTIES, properties=properties).set_properties(
-            self._resolved, properties, **kwargs
-        )
+        request = self._request(Operation.SET_PROPERTIES, {"properties": properties, **kwargs})
+        properties = request.shape["properties"]
+        self._route(request).set_properties(self._resolved, properties, **kwargs)
         self._invalidate()
         self._sync_catalog()
 
@@ -3411,17 +3391,16 @@ class Table:
         _check_options(
             "add_feature", kwargs, _COMMIT_OPTIONS | {"allow_protocol_versions_increase"}
         )
-        names = list(feature) if isinstance(feature, (list, tuple, set, frozenset)) else [feature]
-        self._engine(Operation.ADD_FEATURE, features=names).add_feature(
-            self._resolved, feature, **kwargs
-        )
+        request = self._request(Operation.ADD_FEATURE, {"feature": feature, **kwargs})
+        self._route(request).add_feature(self._resolved, feature, **kwargs)
         self._invalidate()
 
     def drop_feature(self, feature: str, **kwargs: Any) -> dict[str, Any]:
         """Drop a table feature. Databricks-only, so it needs the SQL fallback."""
         self._check_writable("drop a feature")
         _check_options("drop_feature", kwargs, frozenset({"truncate_history"}))
-        result: dict[str, Any] = self._engine(Operation.DROP_FEATURE, feature=feature).drop_feature(
+        request = self._request(Operation.DROP_FEATURE, {"feature": feature, **kwargs})
+        result: dict[str, Any] = self._route(request).drop_feature(
             self._resolved, feature, **kwargs
         )
         self._invalidate()
@@ -3438,14 +3417,14 @@ class Table:
             _check_predicate(expression, f"add constraint {cname}")
             if expression is None:
                 raise InvalidArgumentError(f"constraint {cname!r} has no expression")
-        self._engine(Operation.ADD_CONSTRAINT).add_constraint(self._resolved, constraints, **kwargs)
+        request = self._request(Operation.ADD_CONSTRAINT, {"constraints": constraints, **kwargs})
+        self._route(request).add_constraint(self._resolved, constraints, **kwargs)
         self._invalidate()
 
     def drop_constraint(self, name: str, *, if_exists: bool = False) -> None:
         self._check_writable("drop a constraint")
-        self._engine(Operation.DROP_CONSTRAINT).drop_constraint(
-            self._resolved, name, if_exists=if_exists
-        )
+        request = self._request(Operation.DROP_CONSTRAINT, {"name": name, "if_exists": if_exists})
+        self._route(request).drop_constraint(self._resolved, name, if_exists=if_exists)
         self._invalidate()
 
     def unset_properties(self, keys: list[str] | str, *, if_exists: bool = True) -> None:
@@ -3455,9 +3434,8 @@ class Table:
         if not names:
             # The kernel committed an empty metadata change; SQL raised.
             return
-        self._engine(Operation.UNSET_PROPERTIES).unset_properties(
-            self._resolved, names, if_exists=if_exists
-        )
+        request = self._request(Operation.UNSET_PROPERTIES, {"keys": names, "if_exists": if_exists})
+        self._route(request).unset_properties(self._resolved, names, if_exists=if_exists)
         self._invalidate()
         self._sync_catalog(tuple(names))
 
@@ -3465,7 +3443,8 @@ class Table:
         """The table comment (the Metadata action's description)."""
         self._check_writable("set the comment")
         _check_comment(comment)
-        self._engine(Operation.SET_COMMENT).set_comment(self._resolved, comment)
+        request = self._request(Operation.SET_COMMENT, {"comment": comment})
+        self._route(request).set_comment(self._resolved, comment)
         self._invalidate()
         self._sync_catalog()
 
@@ -3473,9 +3452,10 @@ class Table:
         self._check_writable("set a column comment")
         column = self._alter_path(column, "set_column_comment")
         _check_comment(comment)
-        self._engine(Operation.SET_COLUMN_COMMENT).set_column_comment(
-            self._resolved, column, comment
+        request = self._request(
+            Operation.SET_COLUMN_COMMENT, {"column": column, "comment": comment}
         )
+        self._route(request).set_column_comment(self._resolved, column, comment)
         self._invalidate()
         self._sync_catalog()
 
@@ -3492,9 +3472,10 @@ class Table:
             # Nothing to change, as Spark treats it. Checked here because the
             # router refuses a type change on a table without type widening.
             return
-        self._engine(Operation.ALTER_COLUMN_TYPE).alter_column_type(
-            self._resolved, column, new_type
+        request = self._request(
+            Operation.ALTER_COLUMN_TYPE, {"column": column, "new_type": new_type}
         )
+        self._route(request).alter_column_type(self._resolved, column, new_type)
         self._invalidate()
         self._sync_catalog()
 
@@ -3517,14 +3498,16 @@ class Table:
         """Add a NOT NULL constraint, after checking no existing row is null."""
         self._check_writable("set NOT NULL")
         column = self._alter_path(column, "set_not_null")
-        self._engine(Operation.SET_NOT_NULL).set_not_null(self._resolved, column)
+        request = self._request(Operation.SET_NOT_NULL, {"column": column})
+        self._route(request).set_not_null(self._resolved, column)
         self._invalidate()
         self._sync_catalog()
 
     def drop_not_null(self, column: str | list[str]) -> None:
         self._check_writable("drop NOT NULL")
         column = self._alter_path(column, "drop_not_null")
-        self._engine(Operation.DROP_NOT_NULL).drop_not_null(self._resolved, column)
+        request = self._request(Operation.DROP_NOT_NULL, {"column": column})
+        self._route(request).drop_not_null(self._resolved, column)
         self._invalidate()
         self._sync_catalog()
 
@@ -3536,9 +3519,8 @@ class Table:
         written afterwards; existing files are reclustered by OPTIMIZE.
         """
         self._check_writable("change clustering")
-        auto = isinstance(columns, str) and columns.lower() == "auto"
-        needs = frozenset({"auto_clustering"}) if auto else frozenset()
-        self._engine(Operation.CLUSTER_BY, needs).cluster_by(self._resolved, columns)
+        request = self._request(Operation.CLUSTER_BY, {"columns": columns})
+        self._route(request).cluster_by(self._resolved, columns)
         self._invalidate()
 
     # ------------------------------------------------------- log and layout
@@ -3550,7 +3532,8 @@ class Table:
         self._invalidate()
 
     def compact_logs(self, start: int | None = None, end: int | None = None) -> Any:
-        result = self._engine(Operation.LOG_COMPACTION).compact_logs(self._resolved, start, end)
+        request = self._request(Operation.LOG_COMPACTION, {"start": start, "end": end})
+        result = self._route(request).compact_logs(self._resolved, start, end)
         self._invalidate()
         return result
 
@@ -3568,7 +3551,10 @@ class Table:
 
     def analyze(self, *, columns: list[str] | None = None, delta_statistics: bool = False) -> Any:
         """ANALYZE TABLE. Databricks-only, so it needs the SQL fallback."""
-        return self._engine(Operation.ANALYZE).analyze(
+        request = self._request(
+            Operation.ANALYZE, {"columns": columns, "delta_statistics": delta_statistics}
+        )
+        return self._route(request).analyze(
             self._resolved, columns=columns, delta_statistics=delta_statistics
         )
 
@@ -3582,7 +3568,9 @@ class Table:
 
     def refresh(self, *, full: bool = False) -> Any:
         """REFRESH a materialized view or streaming table. Needs the SQL fallback."""
-        return self._engine(Operation.REFRESH).refresh(self._resolved, full=full)
+        return self._route(self._request(Operation.REFRESH, {"full": full})).refresh(
+            self._resolved, full=full
+        )
 
     def generate(self) -> None:
         """Write symlink manifests, for engines that read those instead of the log."""
@@ -3592,7 +3580,9 @@ class Table:
         """REORG TABLE. Databricks-only, so it needs the SQL fallback."""
         self._check_writable("reorg")
         _check_options("reorg", kwargs, frozenset({"purge", "iceberg_compat_version", "predicate"}))
-        result: dict[str, Any] = self._engine(Operation.REORG).reorg(self._resolved, **kwargs)
+        result: dict[str, Any] = self._route(self._request(Operation.REORG, kwargs)).reorg(
+            self._resolved, **kwargs
+        )
         self._invalidate()
         return result
 
@@ -3603,9 +3593,8 @@ class Table:
             kwargs,
             frozenset({"shallow", "replace", "if_not_exists", "version", "timestamp"}),
         )
-        result: dict[str, Any] = self._engine(Operation.CLONE).clone(
-            self._resolved, target, **kwargs
-        )
+        request = self._request(Operation.CLONE, {"target": target, **kwargs})
+        result: dict[str, Any] = self._route(request).clone(self._resolved, target, **kwargs)
         self._invalidate()
         return result
 
@@ -3972,16 +3961,6 @@ def _flat_files(pa: Any, files: Any, schema: Any) -> Any:
     return pa.table(columns)
 
 
-#: Operations whose `can()` shape is exactly the arguments of one call.
-_SHAPED_CALLS: dict[Operation, str] = {
-    Operation.APPEND: "append",
-    Operation.MERGE_SCHEMA: "append",
-    Operation.OVERWRITE: "overwrite",
-    Operation.REPLACE_WHERE: "overwrite",
-    Operation.SCAN: "scan",
-    Operation.TIME_TRAVEL: "scan",
-}
-
 #: The tuning options DELETE and UPDATE pass to the engine.
 _DML_OPTIONS = frozenset({"commit_metadata", "writer_properties", "max_commit_retries"})
 
@@ -4042,6 +4021,69 @@ def _check_options(what: str, given: dict[str, Any], known: frozenset[str]) -> N
         )
 
 
+def _asked_operation(operation: Any, shape: dict[str, Any]) -> tuple[Operation, dict[str, Any]]:
+    """The operation `can()` was asked about, from its name or a method's."""
+    shape = dict(shape)
+    alias = METHOD_OPERATIONS.get(operation) if isinstance(operation, str) else None
+    if alias is not None:
+        op, implied = alias
+        if operation == "z_order" and "columns" in shape:
+            shape["zorder_by"] = shape.pop("columns")
+        shape.update(implied)
+        return op, shape
+    try:
+        return Operation(operation), shape
+    except ValueError:
+        names = sorted([o.value for o in Operation] + list(METHOD_OPERATIONS))
+        raise InvalidArgumentError(
+            f"{operation!r} is not an operation or a Table method; one of {names}"
+        ) from None
+
+
+def _check_can_options(op: Operation, shape: dict[str, Any]) -> None:
+    """Refuse an argument the call does not take.
+
+    can("append", schema_mod="merge") answered for a plain append, so a typo
+    preflighted fine and the call itself then did something else.
+    """
+    import inspect
+
+    if "distributed" in shape:
+        method = "plan_write" if op in (Operation.APPEND, Operation.OVERWRITE) else "plan_scan"
+        known = {"distributed"}
+    else:
+        method = _CALL_METHODS.get(op, op.value)
+        known = set(_CALL_OPTIONS.get(op, ()))
+    owner: Any = Table
+    if op is Operation.CREATE:
+        from .connection import Connection
+
+        owner, method = Connection, "create_table"
+    call = getattr(owner, method, None)
+    if call is None:
+        return
+    params = inspect.signature(call).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()) and (
+        op not in _CALL_OPTIONS
+    ):
+        return  # options passed through to an engine this layer does not list
+    known |= set(params) - {"self", "kwargs"} - ({"name"} if op is Operation.CREATE else set())
+    _check_options("can", shape, frozenset(known))
+
+
+#: The Table method each operation is the call of, where it is not the
+#: operation's own name.
+_CALL_METHODS: dict[Operation, str] = {
+    Operation.TIME_TRAVEL: "scan",
+    Operation.MERGE_SCHEMA: "append",
+    Operation.REPLACE_WHERE: "overwrite",
+    Operation.INCREMENTAL: "changes",
+    Operation.ZORDER: "optimize",
+    Operation.LOG_COMPACTION: "compact_logs",
+    Operation.CONVERT: "convert_to_delta",
+}
+
+
 #: What `Table.cdf` takes, across every engine that serves it.
 _CDF_OPTIONS = frozenset(
     {
@@ -4054,6 +4096,29 @@ _CDF_OPTIONS = frozenset(
         "allow_out_of_range",
     }
 )
+
+#: What each call takes through ``**kwargs``, which `can()` accepts too.
+_CALL_OPTIONS: dict[Operation, frozenset[str]] = {
+    Operation.CDF: _CDF_OPTIONS,
+    Operation.DELETE: _DML_OPTIONS,
+    Operation.UPDATE: _DML_OPTIONS | {"error_on_type_mismatch"},
+    # The builder's clauses, by method name, which decide whether the MERGE
+    # removes rows; and `data=`, the spelling every other write's can() takes.
+    Operation.MERGE: _MERGE_OPTIONS | {"clauses", "data"},
+    Operation.OPTIMIZE: _OPTIMIZE_OPTIONS,
+    Operation.ZORDER: _OPTIMIZE_OPTIONS,
+    Operation.VACUUM: _VACUUM_OPTIONS,
+    Operation.RESTORE: _RESTORE_OPTIONS,
+    Operation.REPAIR: _COMMIT_OPTIONS | {"dry_run"},
+    Operation.ADD_COLUMN: _COMMIT_OPTIONS,
+    Operation.SET_PROPERTIES: _COMMIT_OPTIONS | {"raise_if_not_exists"},
+    # `features=` is the engines' spelling, which can() has always taken.
+    Operation.ADD_FEATURE: _COMMIT_OPTIONS | {"allow_protocol_versions_increase", "features"},
+    Operation.DROP_FEATURE: frozenset({"truncate_history"}),
+    Operation.ADD_CONSTRAINT: _COMMIT_OPTIONS,
+    Operation.REORG: frozenset({"purge", "iceberg_compat_version", "predicate"}),
+    Operation.CLONE: frozenset({"shallow", "replace", "if_not_exists", "version", "timestamp"}),
+}
 _CDF_META = ("_change_type", "_commit_version", "_commit_timestamp")
 
 
@@ -4223,7 +4288,15 @@ class _InvalidatingMerger:
     the next engine that serves the table, with the clauses replayed.
     """
 
-    _OWN = ("_builder", "_invalidate", "_rebuild", "_kind", "_calls", "_unconditional")
+    _OWN = (
+        "_builder",
+        "_invalidate",
+        "_rebuild",
+        "_kind",
+        "_calls",
+        "_unconditional",
+        "_preflight",
+    )
 
     def __init__(
         self,
@@ -4231,8 +4304,10 @@ class _InvalidatingMerger:
         invalidate: Any,
         rebuild: Callable[[frozenset[EngineKind]], tuple[Any, EngineKind | None]] | None = None,
         kind: EngineKind | None = None,
+        preflight: Callable[[list[str]], None] | None = None,
     ) -> None:
         self._builder = builder
+        self._preflight = preflight
         self._invalidate = invalidate
         self._rebuild = rebuild
         self._kind = kind
@@ -4290,6 +4365,8 @@ class _InvalidatingMerger:
         return call
 
     def _execute(self, execute: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if self._preflight is not None:
+            self._preflight([name for name, _, _ in self._calls])
         tried: set[EngineKind] = set()
         refusals: list[EngineLimitError] = []
         while True:

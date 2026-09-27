@@ -51,7 +51,17 @@ __all__ = [
 
 
 class PredicateError(DeltaSwampError):
-    """A predicate string could not be parsed, or uses unsupported SQL."""
+    """A predicate string could not be parsed, or uses unsupported SQL.
+
+    `beyond_grammar` tells the two apart: True for SQL this parser does not
+    read (an operator it has no token for, a function call, a keyword such as
+    CASE), which an engine that evaluates SQL may serve; False for text that is
+    malformed in any SQL (``id ===``, ``id >``), which no engine will.
+    """
+
+    def __init__(self, message: str, *, beyond_grammar: bool = False) -> None:
+        super().__init__(message)
+        self.beyond_grammar = beyond_grammar
 
 
 # --------------------------------------------------------------------------- AST
@@ -114,7 +124,8 @@ def _tokenize(text: str) -> list[_Tok]:
         match = _TOKEN.match(stripped, pos)
         if match is None or match.end() == pos:
             raise PredicateError(
-                f"cannot parse predicate {text!r} at position {pos}: {stripped[pos : pos + 20]!r}"
+                f"cannot parse predicate {text!r} at position {pos}: {stripped[pos : pos + 20]!r}",
+                beyond_grammar=True,
             )
         kind = match.lastgroup or ""
         tokens.append(_Tok(kind, match.group(kind)))
@@ -271,7 +282,9 @@ class _Parser:
             op = "ilike" if self.take().text.upper() == "ILIKE" else "like"
             pattern = self.value()
             if not (isinstance(pattern, Literal) and isinstance(pattern.value, str)):
-                raise PredicateError(f"LIKE needs a string pattern in {self.text!r}")
+                raise PredicateError(
+                    f"LIKE needs a string pattern in {self.text!r}", beyond_grammar=True
+                )
             if self.keyword("ESCAPE"):
                 self.i += 1
                 escape = self.value()
@@ -295,7 +308,7 @@ class _Parser:
             return Node("column", (left,))
         if isinstance(left, Literal) and isinstance(left.value, bool):
             return Node("true" if left.value else "false")
-        raise PredicateError(f"{self.text!r} is not a boolean predicate")
+        raise PredicateError(f"{self.text!r} is not a boolean predicate", beyond_grammar=True)
 
     def _matching_paren(self) -> int:
         """Index of the `)` closing the `(` at the cursor (past the end if none)."""
@@ -356,11 +369,15 @@ class _Parser:
                 raw = _unescape(self.take().text)
                 return _typed(upper, raw, self.text)
             if tok.kind == "word" and upper in _KEYWORDS:
-                raise PredicateError(f"unexpected keyword {tok.text} in predicate {self.text!r}")
+                raise PredicateError(
+                    f"unexpected keyword {tok.text} in predicate {self.text!r}",
+                    beyond_grammar=True,
+                )
             if self.symbol("("):
                 raise PredicateError(
                     f"function calls such as {tok.text}(...) are not supported in predicates "
-                    "evaluated outside a SQL engine"
+                    "evaluated outside a SQL engine",
+                    beyond_grammar=True,
                 )
             path = [_ident(tok)]
             while self.symbol("."):
@@ -617,11 +634,13 @@ def parse_value(text: str) -> Column | Literal:
         value = parser.value()
     except PredicateError as exc:
         raise PredicateError(
-            f"{text!r} is not a plain value; only a literal or a column is supported here"
+            f"{text!r} is not a plain value; only a literal or a column is supported here",
+            beyond_grammar=exc.beyond_grammar,
         ) from exc
     if parser.peek() is not None:
         raise PredicateError(
-            f"{text!r} is an expression; only a literal or a column is supported here"
+            f"{text!r} is an expression; only a literal or a column is supported here",
+            beyond_grammar=True,
         )
     return value
 

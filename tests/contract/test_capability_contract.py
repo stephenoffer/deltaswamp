@@ -126,6 +126,8 @@ class Case:
     #: The engine methods that do this call's work; others (the Table reading
     #: the log to route, a commit listing files) are not service.
     serves: tuple[str, ...] = ()
+    #: What to ask can() when it is not `op`: the method the call makes.
+    ask: str | None = None
 
     def serving_methods(self) -> frozenset[str]:
         if self.serves:
@@ -147,6 +149,10 @@ def _keys_are(cx: Ctx, result: Any, wanted: list[int] | None = None) -> None:
     table = pa.table(result) if not isinstance(result, pa.Table) else result
     got = sorted(table.column(cx.key).to_pylist())
     assert got == (wanted if wanted is not None else cx.keys(cx.before))
+
+
+#: The clauses `_merge` adds, as can() takes them.
+_MERGE_CLAUSES = ["when_matched_update_all", "when_not_matched_insert_all"]
 
 
 def _merge_args(cx: Ctx) -> dict[str, Any]:
@@ -291,6 +297,7 @@ CASES: list[Case] = [
         "plan_write",
         lambda t, cx: _plan_write(cx, t),
         serves=_WRITE_PLAN,
+        ask="plan_write",
         expect=lambda cx, b: sorted(b + [k + 100 for k in b]),
     ),
     Case(
@@ -299,6 +306,7 @@ CASES: list[Case] = [
         lambda t, cx: _plan_write(cx, t, txn=("contract", 1), commit_metadata={"contract": "yes"}),
         lambda cx: {"txn": ("contract", 1), "commit_metadata": {"contract": "yes"}},
         serves=_WRITE_PLAN,
+        ask="plan_write",
         expect=lambda cx, b: sorted(b + [k + 100 for k in b]),
     ),
     Case(
@@ -344,7 +352,9 @@ CASES: list[Case] = [
         P.OVERWRITE,
         "plan_write_overwrite",
         lambda t, cx: _plan_write(cx, t, mode="overwrite"),
+        lambda cx: {"mode": "overwrite"},
         serves=_WRITE_PLAN,
+        ask="plan_write",
         expect=lambda cx, b: [k + 100 for k in b],
     ),
     Case(
@@ -409,7 +419,7 @@ CASES: list[Case] = [
         P.MERGE,
         "merge",
         lambda t, cx: _merge(cx, t),
-        _merge_args,
+        lambda cx: {**_merge_args(cx), "clauses": _MERGE_CLAUSES},
         expect=lambda cx, b: sorted([*b, 1001]),
     ),
     Case(
@@ -440,7 +450,11 @@ CASES: list[Case] = [
         .when_matched_update_all()
         .when_not_matched_insert_all()
         .execute(),
-        lambda cx: {**_merge_args(cx), "commit_metadata": {"contract": "yes"}},
+        lambda cx: {
+            **_merge_args(cx),
+            "commit_metadata": {"contract": "yes"},
+            "clauses": _MERGE_CLAUSES,
+        },
         expect=lambda cx, b: sorted([*b, 1001]),
     ),
     # --- ddl
@@ -675,10 +689,6 @@ def test_every_operation_has_a_case() -> None:
 
 # ------------------------------------------------------------ known findings
 
-#: Tables whose writes delta-rs serves (the rest go to the kernel).
-_KERNEL_WRITES = {"clustered", "defaults", "ict", "row_tracking", "type_widening", UC}
-_ALL = set(TABLES)
-
 try:
     import pytz  # type: ignore[import-untyped]  # noqa: F401
 
@@ -689,51 +699,7 @@ except ImportError:
 #: case id -> (finding, tables it fails on). Each entry is a strict xfail: a
 #: finding written down, which fails the suite (XPASS) once it is fixed.
 #: The findings are described with repros in the contract findings report.
-KNOWN: dict[str, tuple[str, set[str]]] = {
-    "scan_beyond_grammar": (
-        "C1: can(scan, predicate=<arithmetic>) says ok via kernel; scan raises PredicateError",
-        _ALL,
-    ),
-    "plan_write": (
-        "C3: plan_write routes on distributed_write, which can() cannot express: "
-        "can(append) names delta-rs, the plan uses the kernel or refuses",
-        _ALL - _KERNEL_WRITES,
-    ),
-    "plan_write_txn_metadata": (
-        "C3: plan_write routes on distributed_write, which can() cannot express",
-        _ALL - _KERNEL_WRITES,
-    ),
-    "plan_write_overwrite": (
-        "C3: plan_write routes on distributed_write, which can() cannot express",
-        _ALL - _KERNEL_WRITES - {"append_only"},
-    ),
-    "add_feature": (
-        "C4: can(add_feature, feature=...) names delta-rs; the call routes on features= "
-        "and the kernel serves",
-        _ALL - _KERNEL_WRITES,
-    ),
-    "delete_commit_metadata": (
-        "C5: can(delete, commit_metadata=...) says ok via kernel; the kernel refuses the option",
-        _KERNEL_WRITES - {"row_tracking"} | {"dv", "dv_cdf", "legacy_calendar"},
-    ),
-    "update_commit_metadata": (
-        "C5: can(update, commit_metadata=...) says ok via kernel; the kernel refuses the option",
-        _KERNEL_WRITES - {"row_tracking"} | {"dv", "legacy_calendar"},
-    ),
-    "merge": (
-        "C6: MERGE on an appendOnly table: can() says ok; delta-rs's raw CommitFailedError escapes",
-        {"append_only"},
-    ),
-    "merge_commit_metadata": (
-        "C6: MERGE on an appendOnly table: can() says ok; delta-rs's raw CommitFailedError escapes",
-        {"append_only"},
-    ),
-    "overwrite_dynamic_partitions": (
-        "C9: can(overwrite, partition_overwrite='dynamic') says ok on an unpartitioned table "
-        "delta-rs writes; the call refuses",
-        _ALL - _KERNEL_WRITES - {"partitioned", "append_only", "legacy_calendar"},
-    ),
-}
+KNOWN: dict[str, tuple[str, set[str]]] = {}
 if not _HAS_PYTZ:
     KNOWN["to_duckdb"] = (
         "C7: to_duckdb on a zoned timestamp column without pytz: duckdb's raw "
@@ -812,7 +778,7 @@ def test_can_agrees_with_the_call(contract_tables: Tables, fixture: str, case: C
             cx.extra["ts"] = _latest_timestamp(cx.name)
         before_keys = cx.keys(cx.before)
 
-        verdict = cx.table.can(case.op, **case.shape(cx))
+        verdict = cx.table.can(case.ask or case.op, **case.shape(cx))
         served.active = True
         error: BaseException | None = None
         result: Any = None
@@ -895,11 +861,6 @@ def test_can_create_agrees_with_create_table(contract_tables: Tables, shape: str
     assert conn.open_table(path).to_arrow().num_rows == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="C8: can(convert) on a Parquet directory refuses (no Delta log to read); "
-    "convert_to_delta converts it",
-)
 def test_can_convert_agrees_with_convert_to_delta(contract_tables: Tables) -> None:
     import pyarrow.parquet as pq
 
@@ -932,11 +893,6 @@ def test_incremental_is_refused_everywhere(contract_tables: Tables, fixture: str
     assert not cx.table.can(P.INCREMENTAL).ok
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="C10: a catalog-managed table without vacuumProtocolCheck: can(append) says ok via "
-    "kernel; the kernel's committer refuses with a generic InvalidArgumentError",
-)
 def test_catalog_managed_without_vacuum_protocol_check(contract_tables: Tables) -> None:
     conn = connect_uc(contract_tables.uc)
     name = contract_tables.catalog_managed(writable=True, vacuum_protocol_check=False)

@@ -825,7 +825,17 @@ Capability(ok=False, engine=None,
 Capability(ok=True, engine=Engine.KERNEL, ...)
 
 >>> t.can("create", properties={"delta.enableRowTracking": "true"})
+>>> t.can("append", data=batch, schema_mode="merge")
+>>> t.can("plan_write", mode="overwrite")
+>>> t.can("merge", source=updates, predicate="t.id = s.id",
+...       clauses=["when_matched_update_all", "when_not_matched_insert_all"])
 ```
+
+`can()` takes the arguments the call takes, including the data, and answers
+for that exact request. When it says ok, the engine it names is the one the
+call uses. When it refuses, the call refuses the same way before writing
+anything. A method name (`z_order`, `compact_logs`, `plan_write`,
+`plan_scan`) can stand in for the operation.
 
 `Capability` is truthy when `ok`. Every refusal carries a reason, and a remedy
 whenever one exists.

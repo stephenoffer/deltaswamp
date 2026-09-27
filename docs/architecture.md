@@ -90,6 +90,43 @@ schema merge, `OPTIMIZE FULL` or `CLUSTER BY AUTO` each maps to a
 `supports_<shape>` flag, and an engine without the flag is skipped before it can
 accept the call and fail halfway.
 
+There is one path from a call's arguments to that decision, and `can()` takes
+it too. `_request.derive(table, operation, args, data)` turns the arguments
+into a frozen `Request`: the operation the call really is (an append with
+`schema_mode="merge"` is MERGE_SCHEMA, an overwrite with a predicate is
+REPLACE_WHERE, a pinned handle's scan is TIME_TRAVEL), the needs the arguments
+and the data imply, and the shape each engine's `supports()` judges. There is
+one rule per operation. Every `Table` method builds its `Request` and routes it
+with `Table._route`. `t.can(op, **args)` builds the same `Request` from the same
+arguments and returns the router's verdict on it, so when `can()` says ok, the
+engine it names is the engine the call uses. `can()` takes the call's own
+argument names and refuses one the call would not take. It takes the data as
+`data=` (or `source=` for MERGE), and a MERGE's clauses as
+`clauses=["when_matched_update_all", ...]`. A method name such as `z_order`,
+`compact_logs`, `plan_write` or `plan_scan` works in place of the operation.
+
+A refusal that depends only on the table and the arguments belongs in
+`supports()` or in a need, not in the engine method. There it moves routing on
+to an engine that can serve the call, and `can()` reports it. Examples are the
+options a kernel write path does not implement (`_UNIMPLEMENTED_OPTIONS` in
+`engine/kernel.py`), a dynamic partition overwrite of an unpartitioned table,
+and the features Unity Catalog's committer requires. MERGE clauses are known
+only at `execute()`, so the builder routes once more with them before anything
+runs. That is how a MERGE with UPDATE clauses on an append-only table is
+refused, exactly as `can("merge", ..., clauses=[...])` refuses it.
+
+With `DELTASWAMP_STRICT_ROUTING=1` (the test suite sets it in
+`tests/conftest.py`), each engine the router hands out is wrapped. Suppose a
+serving method then raises a routing refusal (`UnreachableTableError`) while the
+router would have sent the same request to another engine. That refusal becomes
+`RoutingContractViolation`, a gap between `supports()` and the engine.
+`EngineLimitError` is exempt, because it is the declared read-time limit that
+`Table` hands to the next engine. The gaps still open are listed in
+`STRICT_ROUTING_GAPS` in `tests/conftest.py`, and those tests run with the check
+off. In each of them the request itself is wrong: a bad property value, a
+missing column, or a version the log does not hold. The error is raised as a
+routing refusal where `InvalidArgumentError` is meant.
+
 A Delta Sharing table has one way in, the sharing engine. So does an Iceberg
 table, through the catalog's Iceberg REST endpoint.
 

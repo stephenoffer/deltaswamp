@@ -63,7 +63,7 @@ from ..properties import (
     validate_properties,
 )
 from . import metadata as meta
-from .base import merge_clause, missing_method
+from .base import merge_clause, missing_method, unpartitioned_dynamic_overwrite
 from .calendar import has_datetime_columns
 
 __all__ = ["DeltaRsEngine"]
@@ -166,7 +166,7 @@ class DeltaRsEngine:
         """Why a request need this engine has in general fails on `table`."""
         if needs & {"schema_merge", "schema_overwrite"} and _column_mapped(table):
             return _CM_SCHEMA_EVOLUTION
-        return None
+        return unpartitioned_dynamic_overwrite(needs, table)
 
     def supports(self, operation: Operation, table: ResolvedTable, **shape: Any) -> Capability:
         if os.getpid() not in _FORKED_RUNTIME and not self.available():

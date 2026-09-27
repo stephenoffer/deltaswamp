@@ -375,12 +375,21 @@ _COLLATIONS: frozenset[str] = frozenset({"collations", "collations-preview"})
 #: Needs that describe the request to the router rather than ask anything of an
 #: engine, so no engine is judged on them. ``collation_free``: the caller has
 #: checked the predicate against the schema and it touches no collated column.
-#: ``variant_free``: the read touches no VARIANT column.
-_ROUTER_HINTS: frozenset[str] = frozenset({"collation_free", "variant_free"})
+#: ``variant_free``: the read touches no VARIANT column. ``removes_rows``: the
+#: MERGE's clauses rewrite or delete target rows, which an append-only table
+#: forbids whichever engine runs it.
+_ROUTER_HINTS: frozenset[str] = frozenset({"collation_free", "variant_free", "removes_rows"})
+#: Operations on a directory with no Delta log yet: can("convert") refused a
+#: Parquet directory because its (absent) log could not be read.
+_NO_LOG_YET: frozenset[Operation] = frozenset({Operation.CREATE, Operation.CONVERT})
 #: Reads that decode data files, so meet whatever a shredded variant file holds.
 _DATA_READS: frozenset[Operation] = frozenset(
     {Operation.SCAN, Operation.TIME_TRAVEL, Operation.CDF, Operation.INCREMENTAL}
 )
+
+
+def _append_only(table: ResolvedTable) -> bool:
+    return str(table.properties.get("delta.appendOnly", "")).strip().lower() == "true"
 
 
 def shreds_variants(table: ResolvedTable) -> bool:
@@ -521,6 +530,19 @@ class Router:
         blocked = self._catalog_level_block(operation, table)
         if blocked is not None:
             return blocked
+        if "removes_rows" in needs and _append_only(table):
+            # A MERGE with an UPDATE or DELETE clause: delta-rs accepted it and
+            # failed at commit with a raw CommitFailedError.
+            return Capability(
+                operation,
+                ok=False,
+                reason=(
+                    "the table is append-only (delta.appendOnly=true), and this MERGE's "
+                    "UPDATE or DELETE clauses would remove or rewrite rows"
+                ),
+                remedy="merge with WHEN NOT MATCHED INSERT clauses only, or "
+                "t.set_properties({'delta.appendOnly': 'false'}) if that is intended",
+            )
 
         # A shared table has exactly one way in, so its engine's verdict is the
         # whole answer -- including "shares are read-only" for a write, which is
@@ -783,7 +805,7 @@ class Router:
                 "the table is catalog-managed, and its commit protocol refuses protocol and "
                 "metadata changes after version 0"
             )
-        if table.open_error is not None and operation is not Operation.CREATE:
+        if table.open_error is not None and operation not in _NO_LOG_YET:
             return f"the table's Delta log could not be read ({table.open_error})"
         return None
 
@@ -1027,9 +1049,9 @@ class Router:
                 remedy=self._fallback_remedy(table),
             )
 
-        # A table we could not open is not a table we can route. CREATE is
-        # exempt: there is nothing to open yet.
-        if table.open_error is not None and operation is not Operation.CREATE and not sql_fallback:
+        # A table we could not open is not a table we can route. CREATE and
+        # CONVERT are exempt: there is no log to open yet.
+        if table.open_error is not None and operation not in _NO_LOG_YET and not sql_fallback:
             return Capability(
                 operation,
                 ok=False,

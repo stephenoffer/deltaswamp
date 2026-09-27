@@ -29,6 +29,21 @@ __all__ = [
 ]
 
 
+def unpartitioned_dynamic_overwrite(needs: frozenset[str], table: ResolvedTable) -> str | None:
+    """Why a dynamic partition overwrite cannot run on `table`, if it cannot.
+
+    The partitions it replaces are the ones the data holds, and an
+    unpartitioned table has none. The engines refused this only inside the
+    write, after can() had said yes.
+    """
+    if "dynamic_overwrite" in needs and not table.partition_columns:
+        return (
+            "the table is not partitioned, so a dynamic partition overwrite has no "
+            "partitions to replace; use a plain overwrite, or a predicate"
+        )
+    return None
+
+
 def missing_method(engine: object, operation: Operation) -> Capability | None:
     """A refusal if `engine` has no method for `operation`, else None.
 

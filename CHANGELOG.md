@@ -18,7 +18,10 @@ First release.
 - Per-operation routing across delta-kernel, delta-rs, PyIceberg, the
   `delta-sharing` client and an opt-in Databricks SQL warehouse.
 - `capabilities()` and `can()`, which report what a table supports, which
-  engine serves it, and why not when nothing does.
+  engine serves it, and why not when nothing does. `can(op, **args)` takes the
+  call's own arguments (the data as `data=`, MERGE clauses as `clauses=`, and
+  method names such as `plan_write` or `z_order`) and derives the request the
+  call itself routes on, so the engine it names is the engine the call uses.
 - Reads with projection, predicates, time travel by version or timestamp,
   change data feed, file listing and `changes()` for following a table.
 - Every write mode: append, overwrite, `replaceWhere`, dynamic partition

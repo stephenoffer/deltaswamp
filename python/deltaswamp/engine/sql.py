@@ -54,7 +54,7 @@ from ..errors import (
 )
 from ..identity import RefKind, split_identifier
 from . import sql_text as sq
-from .base import missing_method
+from .base import missing_method, unpartitioned_dynamic_overwrite
 from .sql_backend import (
     ParameterBinder,
     SdkStatementBackend,
@@ -797,6 +797,11 @@ class SqlEngine:
         return state
 
     # ----------------------------------------------------------- capabilities
+
+    @staticmethod
+    def need_refusal(needs: frozenset[str], table: ResolvedTable) -> str | None:
+        """Why a request need this engine has in general fails on `table`."""
+        return unpartitioned_dynamic_overwrite(needs, table)
 
     def supports(self, operation: Operation, table: ResolvedTable, **shape: Any) -> Capability:
         if self._backend is None and not self.available():

@@ -109,6 +109,60 @@ _REWRITE_OPS: frozenset[Operation] = frozenset(
     {Operation.REPLACE_WHERE, Operation.DELETE, Operation.UPDATE}
 )
 
+#: Call options the kernel's write paths do not implement, by operation. One
+#: table for both sides: `supports()` refuses a call that passes one, so the
+#: router moves on to an engine that takes it and `Table.can()` says so, and
+#: the write path refuses the same set rather than dropping it. Refused only
+#: inside the write, can() named the kernel and the call then failed.
+_UNIMPLEMENTED_OPTIONS: dict[Operation, frozenset[str]] = {
+    Operation.APPEND: frozenset({"target_file_size", "writer_properties", "partition_by"}),
+    Operation.OVERWRITE: frozenset({"target_file_size", "writer_properties", "schema_mode"}),
+    Operation.REPLACE_WHERE: frozenset(
+        {"target_file_size", "writer_properties", "schema_mode", "max_commit_retries"}
+    ),
+    # A rewrite is staged against the snapshot it read and is not re-staged on
+    # a conflict, so it has no retries to bound.
+    Operation.DELETE: frozenset({"writer_properties", "max_commit_retries"}),
+    Operation.UPDATE: frozenset(
+        {"writer_properties", "max_commit_retries", "error_on_type_mismatch"}
+    ),
+}
+
+
+def _options_refusal(operation: Operation, shape: dict[str, Any]) -> str | None:
+    given = sorted(k for k in _UNIMPLEMENTED_OPTIONS.get(operation, ()) if shape.get(k) is not None)
+    if not given:
+        return None
+    return f"the kernel {operation.value} path does not implement {', '.join(given)}"
+
+
+#: What Unity Catalog's committer checks on every commit to a catalog-managed
+#: table, and refuses with a generic error once the data files are written.
+_UC_COMMIT_FEATURES = ("vacuumProtocolCheck", "inCommitTimestamp")
+
+
+def _uc_commit_refusal(table: ResolvedTable) -> str | None:
+    missing = [f for f in _UC_COMMIT_FEATURES if f not in table.effective_writer_features]
+    if "vacuumProtocolCheck" not in table.effective_reader_features:
+        missing = sorted({*missing, "vacuumProtocolCheck"})
+    if missing:
+        return (
+            "Unity Catalog's committer requires a catalog-managed table to carry the "
+            f"{', '.join(missing)} table feature(s), and this one does not"
+        )
+    if table.properties.get("io.unitycatalog.tableId") is None:
+        return (
+            "Unity Catalog's committer requires io.unitycatalog.tableId in the table's "
+            "configuration, and this catalog-managed table has none"
+        )
+    if str(table.properties.get("delta.enableInCommitTimestamps", "")).lower() != "true":
+        return (
+            "Unity Catalog's committer requires delta.enableInCommitTimestamps=true on a "
+            "catalog-managed table"
+        )
+    return None
+
+
 #: Operations whose commit stages remove actions. Kernel 0.28 refuses those on
 #: a row-tracked table: it cannot preserve the row ids of what it removes, and
 #: it refuses at commit -- after the data files are already written.
@@ -445,6 +499,19 @@ class KernelEngine:
             refusal = self._add_feature_refusal(table, shape["features"])
             if refusal is not None:
                 return refusal
+
+        unimplemented = _options_refusal(operation, shape)
+        if unimplemented is not None:
+            return Capability(operation, ok=False, reason=unimplemented)
+
+        if (
+            (operation in _WRITE_OPS or operation in METADATA_OPERATIONS)
+            and operation is not Operation.CREATE
+            and table.is_catalog_managed
+        ):
+            uncommittable = _uc_commit_refusal(table)
+            if uncommittable is not None:
+                return Capability(operation, ok=False, reason=uncommittable)
 
         if operation is Operation.MERGE:
             refusal = self._merge_refusal(table)
@@ -1943,7 +2010,12 @@ class KernelEngine:
         return KernelMerger(self, table, _as_record_batch_reader(source), predicate, **kwargs)
 
     def delete(
-        self, table: ResolvedTable, predicate: str | None = None, **unsupported: Any
+        self,
+        table: ResolvedTable,
+        predicate: str | None = None,
+        *,
+        commit_metadata: dict[str, Any] | None = None,
+        **unsupported: Any,
     ) -> dict[str, Any]:
         """DELETE by rewriting the table without the matching rows.
 
@@ -1952,10 +2024,16 @@ class KernelEngine:
         """
         _refuse_options("delete", unsupported)
         if self._dv_path(table):
-            result = self._dv_dml(table, predicate, operation="DELETE")
+            result = self._dv_dml(
+                table, predicate, operation="DELETE", commit_metadata=commit_metadata
+            )
         else:
             result = self._rewrite(
-                table, predicate, lambda current, keep: current.filter(keep), operation="DELETE"
+                table,
+                predicate,
+                lambda current, keep: current.filter(keep),
+                operation="DELETE",
+                commit_metadata=commit_metadata,
             )
         return {"num_deleted_rows": result["num_affected_rows"], "version": result["version"]}
 
@@ -1966,6 +2044,7 @@ class KernelEngine:
         updates: dict[str, str] | None = None,
         new_values: dict[str, Any] | None = None,
         predicate: str | None = None,
+        commit_metadata: dict[str, Any] | None = None,
         **unsupported: Any,
     ) -> dict[str, Any]:
         """UPDATE by rewriting the table. Assignments are plain values.
@@ -2049,9 +2128,12 @@ class KernelEngine:
                 transform=lambda matched: assign(
                     matched, pa.nulls(matched.num_rows, pa.bool_()).fill_null(False)
                 ),
+                commit_metadata=commit_metadata,
             )
         else:
-            result = self._rewrite(table, predicate, assign, operation="UPDATE")
+            result = self._rewrite(
+                table, predicate, assign, operation="UPDATE", commit_metadata=commit_metadata
+            )
         return {"num_updated_rows": result["num_affected_rows"], "version": result["version"]}
 
     def publish(self, table: ResolvedTable) -> int:

@@ -372,7 +372,6 @@ _FINDINGS: dict[str, tuple[str, ...]] = {
         "add_constraint_garbage",
     ),
     "E5: a list/int where a dict/str is expected escapes as a raw Python error": (
-        "update_not_a_dict",
         "unset_properties_int",
         "cluster_by_int",
         "create_table_properties_list",
