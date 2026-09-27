@@ -419,7 +419,9 @@ _COLLATIONS: frozenset[str] = frozenset({"collations", "collations-preview"})
 #: ``variant_free``: the read touches no VARIANT column. ``removes_rows``: the
 #: MERGE's clauses rewrite or delete target rows, which an append-only table
 #: forbids whichever engine runs it.
-_ROUTER_HINTS: frozenset[str] = frozenset({"collation_free", "variant_free", "removes_rows"})
+_ROUTER_HINTS: frozenset[str] = frozenset(
+    {"collation_free", "variant_free", "removes_rows", "conditional_insert_with_feed"}
+)
 #: Operations on a directory with no Delta log yet: can("convert") refused a
 #: Parquet directory because its (absent) log could not be read.
 _NO_LOG_YET: frozenset[Operation] = frozenset({Operation.CREATE, Operation.CONVERT})

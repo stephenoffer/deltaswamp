@@ -95,6 +95,12 @@ def connect(
             f"pass a connection URI or catalog=, not both (got {uri!r} and a "
             f"{type(catalog).__name__})"
         )
+    if storage_options is not None and not isinstance(storage_options, Mapping):
+        # A list of pairs or a string reached the engines, which failed with a
+        # raw AttributeError ('list' object has no attribute 'items').
+        raise InvalidArgumentError(
+            f"storage_options is a {{key: value}} dict, not {type(storage_options).__name__}"
+        )
     resolved_catalog = catalog or _default_catalog(
         uri, profile=profile, host=host, token=token, config=config
     )
@@ -1073,7 +1079,17 @@ class Connection:
             metadata = json.loads(kernel.snapshot(staged).metadata_json())
         except EngineError as exc:
             text = str(exc).lower()
-            if any(m in text for m in ("no files in log segment", "not found", "no such file")):
+            if any(
+                m in text
+                for m in (
+                    "no files in log segment",
+                    "not found",
+                    "no such file",
+                    # The kernel's words for a local path that is not there.
+                    "path does not exist",
+                    "invalid table location",
+                )
+            ):
                 raise UnreachableTableError(
                     f"register {ref}",
                     f"there is no Delta log at {location} ({str(exc).splitlines()[0][:200]})",

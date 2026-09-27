@@ -319,3 +319,66 @@ class TestWrapper:
         copied = conn.router.engines.copy()
         copied[Engine.KERNEL] = object()
         assert type(copied[Engine.KERNEL]) is Boundary
+
+
+# ------------------------------------------------------------------ r5rg items
+
+
+def test_a_conditional_last_insert_on_a_feed_table_is_refused_by_can(feed: Any) -> None:
+    """r5rg M11: can("merge") named delta-rs, whose execute() then refused."""
+    conditional = [("when_not_matched_insert_all", "source.id > 1")]
+    cap = feed.can("merge", clauses=conditional)
+    assert not cap.ok and "conditional WHEN NOT MATCHED" in cap.reason
+    assert feed.can("merge", clauses=["when_not_matched_insert_all"]).ok
+    builder = feed.merge(pa.table({"id": [5]}), "target.id = source.id")
+    with pytest.raises(ds.UnreachableTableError, match="conditional WHEN NOT MATCHED"):
+        builder.when_not_matched_insert_all(predicate="source.id > 1").execute()
+    assert feed.count() == 3
+
+
+def test_date_appends_into_a_column_widened_to_timestamp_ntz(conn: Any, tmp_path: Any) -> None:
+    """r5rg M1: refused as "narrows or reinterprets"; Delta widens DATE to TIMESTAMP_NTZ."""
+    path = str(tmp_path / "tw")
+    conn.create_table(
+        path,
+        pa.schema([("id", pa.int64()), ("d", pa.date32())]),
+        properties={"delta.enableTypeWidening": "true"},
+    )
+    conn.open_table(path).append(pa.table({"id": [1], "d": pa.array([19000], pa.date32())}))
+    conn.open_table(path).alter_column_type("d", "timestamp_ntz")
+    conn.open_table(path).append(pa.table({"id": [2], "d": pa.array([19001], pa.date32())}))
+    rows = sorted(conn.open_table(path).to_arrow().to_pylist(), key=lambda r: r["id"])
+    assert [r["d"].isoformat() for r in rows] == ["2022-01-08T00:00:00", "2022-01-09T00:00:00"]
+
+
+@pytest.mark.parametrize("kind", ["generated", "check"])
+def test_replace_refuses_to_keep_generated_columns_or_checks(
+    conn: Any, tmp_path: Any, kind: str
+) -> None:
+    """r5rg M10: replace() carried them into the new table, or failed half-way."""
+    path = str(tmp_path / kind)
+    if kind == "generated":
+        gen = pa.field("g", pa.int64(), metadata={"delta.generationExpression": "id * 2"})
+        conn.create_table(path, pa.schema([("id", pa.int64()), gen]))
+    else:
+        conn.create_table(path, pa.schema([("id", pa.int64())]))
+        conn.open_table(path).add_constraint({"idpos": "id > 0"})
+    t = conn.open_table(path)
+    t.append(pa.table({"id": [1]}))
+    new = pa.table({"x": pa.array([1.5])})
+    assert not t.can("overwrite", schema_mode="overwrite", data=new).ok
+    with pytest.raises(ds.UnreachableTableError, match="would keep"):
+        t.replace(new)
+    assert conn.open_table(path).to_arrow().column("id").to_pylist() == [1]
+
+
+def test_storage_options_must_be_a_dict() -> None:
+    """r5rg low: a list of pairs raised a raw AttributeError."""
+    with pytest.raises(InvalidArgumentError, match="storage_options"):
+        ds.connect(storage_options=[("a", "b")])
+
+
+def test_a_version_the_log_does_not_hold_is_not_a_contract_violation(table: Any) -> None:
+    """r5rg low: under strict routing (on in this suite) it raised RoutingContractViolation."""
+    with pytest.raises(ds.UnreachableTableError, match="no such version"):
+        table.to_arrow(version=99)

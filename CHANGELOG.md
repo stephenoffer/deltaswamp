@@ -70,7 +70,13 @@ First release.
   `DeltaSwampError` reaches a caller, from a call or later from the stream or
   MERGE builder it returned. What no rule recognises is the new `EngineError`
   (`.engine`, `.operation`, `.original`), still an instance of the original's
-  builtin class. The extension's exceptions carry a stable `kind` code.
+  class where that class can be combined (a `pyarrow.ArrowInvalid`, a
+  `KeyError`; not delta-rs's Rust `DeltaError` family, which maps to
+  `TableNotFoundError`, `EngineLimitError`, `InvalidArgumentError` or the new
+  `CommitRefusedError`). `StorageError` stays a `TimeoutError` or
+  `ConnectionResetError`; a truncated or replaced data file is
+  `CorruptTableError`. An exception your own data source raises reaches you
+  as it was raised. The extension's exceptions carry a stable `kind` code.
   Malformed input (an unparseable timestamp, a missing column, an unknown
   table feature, contradictory `partition_overwrite`/`predicate`, a misspelt
   keyword, data that is not a table) is `InvalidArgumentError`, no longer an

@@ -20,7 +20,7 @@ import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from .capability import ENGINE_METHODS, Capability, Operation
+from .capability import ENGINE_METHODS, READ_OPERATIONS, Capability, Operation
 from .errors import ChangeFeedSchemaChangeError, EngineLimitError, UnreachableTableError
 
 if TYPE_CHECKING:
@@ -112,6 +112,18 @@ def refusal(table: Table, request: Request) -> Capability | None:
     asked only the router, which judged the latest table and said yes.
     """
     version = table._version
+    if request.operation is Operation.OVERWRITE and request.shape.get("schema_mode") == "overwrite":
+        kept = _replace_keeps(table)
+        if kept:
+            return Capability(
+                request.asked,
+                ok=False,
+                reason=f"replacing the schema would keep the table's {kept}: delta-rs carries "
+                "them over into the new table, where REPLACE TABLE drops them, and fails or "
+                "enforces them on data that may not have their columns",
+                remedy="drop the constraints first (drop_constraint()), or write the data as "
+                "a new table (write_table() at another location)",
+            )
     if version is None or request.operation not in _PINNED_REFUSED:
         return None
     return Capability(
@@ -121,6 +133,24 @@ def refusal(table: Table, request: Request) -> Capability | None:
         "latest version",
         remedy="open the table without version= to write to it",
     )
+
+
+def _replace_keeps(table: Table) -> str:
+    """What of the old table a schema-replacing overwrite would wrongly keep ("" if nothing)."""
+    from .errors import DeltaSwampError
+
+    kept = []
+    properties = table._enrich().properties
+    if any(str(k).lower().startswith("delta.constraints.") for k in properties):
+        kept.append("CHECK constraints")
+    try:
+        fields = list(table.schema())
+    except (DeltaSwampError, ImportError):
+        fields = []
+    computed = (b"delta.generationExpression", b"delta.identity.")
+    if any(f.metadata and any(k.startswith(computed) for k in f.metadata) for f in fields):
+        kept.append("generated or identity columns")
+    return " and ".join(kept)
 
 
 # ------------------------------------------------------------------- reads
@@ -262,11 +292,34 @@ def _merge(
         # One clause named on its own; a set or a single string was ignored,
         # and can() said yes on an append-only table the call then refused.
         clauses = (clauses,)
-    if isinstance(clauses, (list, tuple, set, frozenset)) and any(
-        str(c).startswith(_REMOVING_CLAUSES) for c in clauses
-    ):
+    if not isinstance(clauses, (list, tuple, set, frozenset)):
+        return Operation.MERGE, needs
+    # Each clause is its method name, or (name, condition) for one with a
+    # condition, as the builder reports them at execute().
+    named = [
+        (str(c[0]), c[1] if len(c) > 1 else None)
+        if isinstance(c, (list, tuple)) and c
+        else (str(c), None)
+        for c in clauses
+    ]
+    if any(name.startswith(_REMOVING_CLAUSES) for name, _ in named):
         needs.add("removes_rows")
+    inserts = [
+        condition
+        for name, condition in named
+        if name.startswith("when_not_matched") and not name.startswith("when_not_matched_by")
+    ]
+    if inserts and inserts[-1] is not None and _change_feed_on(table):
+        # delta-rs inserts an all-NULL row for each source row the last
+        # NOT MATCHED condition rejects on a change-feed table, and refuses
+        # at execute(); can() named it all the same.
+        needs.add("conditional_insert_with_feed")
     return Operation.MERGE, needs
+
+
+def _change_feed_on(table: Table) -> bool:
+    properties = table._enrich().properties
+    return str(properties.get("delta.enableChangeDataFeed", "false")).lower() == "true"
 
 
 # ------------------------------------------------------------- maintenance
@@ -419,16 +472,21 @@ class RoutingContractViolation(BaseException):
 
 
 def strict_engine(
-    engine: Any, operation: Operation, elsewhere: Callable[[Any], Any] | None = None
+    engine: Any,
+    operation: Operation,
+    elsewhere: Callable[[Any], Any] | None = None,
+    engines: Mapping[Any, Any] | None = None,
 ) -> Any:
     """`engine`, checked for refusals after routing when strict routing is on.
 
     `elsewhere(kind)` is the router's verdict on the same request with engine
-    `kind` excluded.
+    `kind` excluded. With `engines` (the router's), a read's refusal is put to
+    the engine named there as well: a read changes nothing, and one that both
+    refuse (a version the log does not hold) is about the request.
     """
     if os.environ.get(STRICT_ROUTING_ENV) != "1" or engine is None:
         return engine
-    return _StrictEngine(engine, operation, elsewhere)
+    return _StrictEngine(engine, operation, elsewhere, engines)
 
 
 class _StrictEngine:
@@ -438,14 +496,19 @@ class _StrictEngine:
     that routed it runs as it would without the check.
     """
 
-    __slots__ = ("_elsewhere", "_inner", "_operation")
+    __slots__ = ("_elsewhere", "_engines", "_inner", "_operation")
 
     def __init__(
-        self, inner: Any, operation: Operation, elsewhere: Callable[[Any], Any] | None
+        self,
+        inner: Any,
+        operation: Operation,
+        elsewhere: Callable[[Any], Any] | None,
+        engines: Mapping[Any, Any] | None = None,
     ) -> None:
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_operation", operation)
         object.__setattr__(self, "_elsewhere", elsewhere)
+        object.__setattr__(self, "_engines", engines)
 
     @property  # type: ignore[misc]
     def __class__(self) -> type:
@@ -472,6 +535,7 @@ class _StrictEngine:
             return attr
         kind = getattr(self._inner, "kind", None)
         elsewhere = self._elsewhere
+        engines = self._engines if operation in READ_OPERATIONS else None
 
         def call(*args: Any, **kwargs: Any) -> Any:
             try:
@@ -484,6 +548,10 @@ class _StrictEngine:
                 other = elsewhere(kind) if elsewhere is not None else None
                 if other is None or not getattr(other, "ok", False):
                     raise
+                if engines is not None and _refused_there_too(
+                    engines.get(other.engine), name, args, kwargs
+                ):
+                    raise
                 raise RoutingContractViolation(
                     f"strict routing: {operation.value} was routed to "
                     f"{getattr(kind, 'value', kind)}, whose {name}() then refused it, while "
@@ -491,3 +559,21 @@ class _StrictEngine:
                 ) from exc
 
         return call
+
+
+def _refused_there_too(engine: Any, name: str, args: Any, kwargs: Any) -> bool:
+    """Whether `engine` refuses the same read as a request error (not by a limit of its own)."""
+    from .errors import DeltaSwampError
+
+    if engine is None:
+        return False
+    try:
+        result = getattr(engine, name)(*args, **kwargs)
+    except EngineLimitError:
+        return False
+    except DeltaSwampError:
+        return True
+    close = getattr(result, "close", None)
+    if callable(close):
+        close()
+    return False

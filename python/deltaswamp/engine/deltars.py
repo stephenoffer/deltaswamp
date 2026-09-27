@@ -169,6 +169,12 @@ class DeltaRsEngine:
         """Why a request need this engine has in general fails on `table`."""
         if needs & {"schema_merge", "schema_overwrite"} and _column_mapped(table):
             return _CM_SCHEMA_EVOLUTION
+        if "conditional_insert_with_feed" in needs:
+            # The MERGE builder's own refusal at execute(), stated up front.
+            return (
+                "the table has the change data feed enabled, and delta-rs 1.6.5 inserts an "
+                "all-NULL row for each source row a conditional WHEN NOT MATCHED clause rejects"
+            )
         return unpartitioned_dynamic_overwrite(needs, table)
 
     def supports(self, operation: Operation, table: ResolvedTable, **shape: Any) -> Capability:

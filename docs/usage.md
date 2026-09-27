@@ -835,7 +835,11 @@ Capability(ok=True, engine=Engine.KERNEL, ...)
 for that exact request. When it says ok, the engine it names is the one the
 call uses. When it refuses, the call refuses the same way before writing
 anything. A method name (`z_order`, `compact_logs`, `plan_write`,
-`plan_scan`) can stand in for the operation.
+`plan_scan`) can stand in for the operation. A MERGE clause with a condition
+is given as `(name, condition)`, e.g.
+`clauses=[("when_not_matched_insert_all", "s.v > 0")]`: on a change-feed table
+delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. On a handle
+opened with `version=`, every write is refused.
 
 `Capability` is truthy when `ok`. Every refusal carries a reason, and a remedy
 whenever one exists.

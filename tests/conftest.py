@@ -40,30 +40,6 @@ STRICT_ROUTING_GAPS: dict[str, str] = {
     "test_audit_alter.py::TestLogUpkeep::test_drop_not_null_on_a_missing_column": (
         "G2: an ALTER naming a missing column is refused inside the engine"
     ),
-    "test_audit_read.py::TestDeltaRsTimeTravel::test_timestamp_before_the_table_is_refused": (
-        "G3: time travel to a version or timestamp the log does not hold"
-    ),
-    "test_local_table.py::TestRequestShapeRouting::test_timestamp_before_history_is_named": (
-        "G3: time travel to a version or timestamp the log does not hold"
-    ),
-    "test_bughunt_w4_golden.py::test_scan_at_cleaned_version_is_a_library_error": (
-        "G3: time travel to a version or timestamp the log does not hold"
-    ),
-    "[table::scan_version_future]": (
-        "G3: time travel to a version or timestamp the log does not hold"
-    ),
-    "[table::scan_timestamp_before": (
-        "G3: time travel to a version or timestamp the log does not hold"
-    ),
-    "[table::scan_date_object]": (
-        "G3: time travel to a version or timestamp the log does not hold"
-    ),
-    "test_bughunt_w4_golden.py::test_cdf_disabled_mid_range_is_a_clear_error": (
-        "G4: a change-feed range the table's history cannot serve"
-    ),
-    "test_bughunt_w4_golden.py::test_cdf_from_cleaned_version_is_a_clear_error": (
-        "G4: a change-feed range the table's history cannot serve"
-    ),
 }
 
 

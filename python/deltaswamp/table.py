@@ -475,7 +475,9 @@ def _store_assignable(pa: Any, given: Any, wanted: Any) -> bool:
         # nanosecond is truncated to Delta's microsecond, as Spark does).
         return bool(t.is_timestamp(wanted))
     if t.is_date(given):
-        return bool(t.is_date(wanted))
+        # DATE widens to TIMESTAMP_NTZ (type widening), a date as its midnight;
+        # not to a zoned TIMESTAMP, whose midnight depends on the session zone.
+        return bool(t.is_date(wanted) or (t.is_timestamp(wanted) and wanted.tz is None))
     return False
 
 
@@ -1110,6 +1112,7 @@ class Table:
                         exclude=frozenset(tried) | {kind},
                         **shape,
                     ),
+                    self._connection.router.engines,
                 )
             except DeltaSwampError:
                 if refusals:
@@ -2672,6 +2675,12 @@ class Table:
 
         for attempt in range(_REALIGN_ATTEMPTS):
             request = self._request(Operation.OVERWRITE, options, data)
+            refused = refusal(self, request)
+            if refused is not None:
+                # Before anything is written, as can() refuses it.
+                raise UnreachableTableError(
+                    "replace the table's schema", refused.reason or "", refused.remedy
+                )
 
             def write(data: Any = data, request: Request = request) -> None:
                 engine = self._route(request)
@@ -3039,7 +3048,7 @@ class Table:
             )
             return builder, getattr(engine, "kind", None)
 
-        def clauses_routed(clauses: list[str]) -> None:
+        def clauses_routed(clauses: list[tuple[str, Any]]) -> None:
             # The clauses are known only at execute(), and they can add a need
             # (an UPDATE or DELETE clause removes rows, which an append-only
             # table forbids). Routed again with them, before anything runs,
@@ -4373,7 +4382,7 @@ class _InvalidatingMerger:
         invalidate: Any,
         rebuild: Callable[[frozenset[EngineKind]], tuple[Any, EngineKind | None]] | None = None,
         kind: EngineKind | None = None,
-        preflight: Callable[[list[str]], None] | None = None,
+        preflight: Callable[[list[tuple[str, Any]]], None] | None = None,
     ) -> None:
         self._builder = builder
         self._preflight = preflight
@@ -4435,7 +4444,11 @@ class _InvalidatingMerger:
 
     def _execute(self, execute: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         if self._preflight is not None:
-            self._preflight([name for name, _, _ in self._calls])
+            clauses = []
+            for name, call_args, call_kwargs in self._calls:
+                clause = merge_clause(name, call_args, call_kwargs)
+                clauses.append((name, "condition" if clause and clause[1] else None))
+            self._preflight(clauses)
         tried: set[EngineKind] = set()
         refusals: list[EngineLimitError] = []
         while True:

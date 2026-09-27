@@ -19,9 +19,9 @@ from typing import Any, ClassVar
 import pytest
 from deltaswamp.capability import Engine, Operation
 from deltaswamp.errors import (
-    EngineLimitError,
     InvalidArgumentError,
     MissingDataFileError,
+    UnreachableTableError,
 )
 
 pa = pytest.importorskip("pyarrow")
@@ -106,7 +106,11 @@ class TestChangeFeedMergeWithConditionalInsert:
         path = _table(conn, tmp_path, _ids(2), CDF)
         t = conn.open_table(path)
         assert t.can(Operation.MERGE).engine is Engine.DELTARS
-        with pytest.raises(EngineLimitError, match="all-NULL row"):
+        assert not t.can(
+            Operation.MERGE, clauses=[("when_not_matched_insert_all", "s.s LIKE 'a%'")]
+        ).ok
+        # Refused by the router as the clauses arrive, as can() refuses it.
+        with pytest.raises(UnreachableTableError, match="all-NULL row"):
             t.merge(
                 self.SOURCE, "t.id = s.id", source_alias="s", target_alias="t"
             ).when_not_matched_insert_all(predicate="s.s LIKE 'a%'").execute()
