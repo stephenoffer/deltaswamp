@@ -291,7 +291,8 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _Y,
             "delta-kernel refuses every write to a table with the feature; the kernel "
             "paths here evaluate each constraint in DuckDB over the rows they write and "
-            "commit past the refusal. Its checkpoint writer still refuses the table",
+            "commit past the refusal, and checkpoint and checksum it past the refusal too "
+            "(they write no rows), with the real protocol in the files",
         ),
         _row(TableFeature.CHANGE_DATA_FEED, _W, _Y, _Y, _Y, _Y),
         _row(
@@ -301,7 +302,8 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             _Y,
             _Y,
-            "delta-rs evaluates generated columns via DataFusion; kernel refuses to write",
+            "delta-rs evaluates generated columns via DataFusion; kernel refuses to write "
+            "(it checkpoints and checksums the table, which computes no value)",
         ),
         _row(
             TableFeature.IDENTITY_COLUMNS,
@@ -1041,6 +1043,20 @@ UNIFORM_STALE_WRITES: frozenset[Operation] = frozenset(
 #: schema, and any writer feature it cannot write -- but supports() never
 #: checked, so CHECKPOINT was claimed and then failed.
 KERNEL_LOG_WRITE_OPERATIONS: frozenset[Operation] = frozenset({Operation.CHECKPOINT})
+
+#: Features that bind only the values of the rows a commit writes. A
+#: checkpoint writes none, and a build with "value_constrained_checkpoint"
+#: writes it from a snapshot whose checked protocol sets these aside (the
+#: checkpoint holds the table's own protocol, from the log): the kernel's
+#: refusal of them does not bind a KERNEL_LOG_WRITE_OPERATIONS operation.
+VALUE_CONSTRAINT_FEATURES: frozenset[TableFeature] = frozenset(
+    {
+        TableFeature.CHECK_CONSTRAINTS,
+        TableFeature.GENERATED_COLUMNS,
+        TableFeature.IDENTITY_COLUMNS,
+        TableFeature.INVARIANTS,
+    }
+)
 
 #: Features delta-rs may ignore for one operation, because that operation writes
 #: no commit and reads nothing the feature changes. delta-rs refuses to *commit*

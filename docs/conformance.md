@@ -70,8 +70,13 @@ paths here evaluate every CHECK constraint in DuckDB over the rows they write
 (a NULL result passes, a FALSE one fails the write before anything is
 committed), and commit past the kernel's refusal of `checkConstraints`, and of
 `generatedColumns` where no column is generated; a constraint DuckDB cannot
-evaluate as Databricks does is refused up front. The kernel's checkpoint
-writer and its version checksums still refuse a table with the feature.
+evaluate as Databricks does is refused up front. Checkpoints and version
+checksums write no row, so the kernel writes both past `checkConstraints`,
+`generatedColumns` (generated columns included), `identityColumns` and
+`invariants`, from a snapshot whose checked protocol sets them aside; each
+file's protocol and metadata come from the log, so they are the table's own,
+features and `delta.constraints.*` included. A table with a real generation
+expression is still written only by delta-rs.
 
 Unknown feature names must not raise. The kernel tolerates unknown writer-only
 features when reading, and so must deltaswamp, or the first table to adopt a
@@ -143,7 +148,7 @@ serve.
 | `vacuum` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel's log replay for the rest (clustering, row tracking, in-commit timestamps, type widening, vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files delta-rs cannot tell apart from orphans |
 | `restore` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel re-adds the target version's files as logged (deletion vectors, row ids) on deletion-vector tables, which delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write |
 | `repair` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel removes the missing files as logged (row ids kept) on the rest |
-| `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first |
+| `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first, and tables with CHECK constraints, generated or identity columns or invariants |
 | `log_compaction` | deltars | kernel's log_compaction_writer is a no-op stub (kernel#2337) |
 | `publish` | kernel | Snapshot::publish; only kernel implements staged->published |
 | `reorg` | sql | Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM) |

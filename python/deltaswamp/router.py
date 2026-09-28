@@ -33,6 +33,7 @@ from .capability import (
     OPERATION_FEATURE_BLOCKERS,
     READ_OPERATIONS,
     UNIFORM_STALE_WRITES,
+    VALUE_CONSTRAINT_FEATURES,
     Capability,
     Operation,
     Support,
@@ -241,26 +242,40 @@ def _operation_blocker(
     if hit:
         return f"{operation.value} is not supported on a table with {', '.join(hit)}"
     if kind is EngineKind.KERNEL and operation in KERNEL_LOG_WRITE_OPERATIONS:
+        # A build that checkpoints past the value-constraint features sets
+        # them aside (crates/native/src/restate.rs, log_writing_snapshot):
+        # a checkpoint writes no row for them to bind.
+        past = getattr(engine, "checkpoints_past_value_constraints", None)
+        exempt = VALUE_CONSTRAINT_FEATURES if callable(past) and past() else frozenset()
         writer = table.min_writer_version or 0
-        if 3 <= writer <= 6:
+        if 3 <= writer <= 6 and not exempt:
             return (
                 f"the table uses the legacy writer protocol version {writer}, which implies "
                 "checkConstraints, and the kernel refuses to write its log"
             )
-        # checkConstraints binds a checkpoint too: the kernel's data writes
-        # commit past it (constraints evaluated here), its checkpoint writer
-        # does not.
+        # checkConstraints binds a checkpoint too on an older build: the
+        # kernel's data writes commit past it (constraints evaluated here),
+        # its checkpoint writer did not.
         unwritable = sorted(
             name
             for name in table.writer_features
             if (feature := feature_from_wire(name)) is None
-            or FEATURE_SUPPORT[feature].kernel_write is Support.NO
-            or feature is TableFeature.CHECK_CONSTRAINTS
+            or (
+                feature not in exempt
+                and (
+                    FEATURE_SUPPORT[feature].kernel_write is Support.NO
+                    or feature is TableFeature.CHECK_CONSTRAINTS
+                )
+            )
         )
         if unwritable:
             return f"the kernel cannot write the log of a table with {', '.join(unwritable)}"
         has_invariants = getattr(engine, "_has_invariants", None)
-        if (writer == 2 or "invariants" in table.writer_features) and callable(has_invariants):
+        if (
+            TableFeature.INVARIANTS not in exempt
+            and (writer == 2 or "invariants" in table.writer_features)
+            and callable(has_invariants)
+        ):
             try:
                 present = bool(has_invariants(table))
             except Exception:

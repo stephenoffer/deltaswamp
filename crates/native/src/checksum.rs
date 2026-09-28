@@ -56,28 +56,104 @@ pub fn write_best_effort(snapshot: &SnapshotRef, engine: &dyn Engine) -> bool {
     write(snapshot, engine, false)
 }
 
+/// Whether the kernel resolves `snapshot`'s checksum cheaply from a restated
+/// copy of it (see [`write`]): by replaying a short log that has no checkpoint.
+///
+/// A restated snapshot carries no checksum in memory, so neither the one a
+/// post-commit snapshot holds nor a stale one a few commits back can root it:
+/// past the first checkpoint the kernel would read the checkpoint on every
+/// commit. A commit is carried from the checksum just before it instead
+/// ([`carry_forward`]), and the checksum at each checkpoint is written with
+/// it ([`write_at_checkpoint`]), which starts the chain again after a commit
+/// neither could count.
+pub fn worth_replaying(snapshot: &SnapshotRef) -> bool {
+    if snapshot.table_configuration().is_catalog_managed() {
+        return false;
+    }
+    let segment = snapshot.log_segment();
+    let end = snapshot.version();
+    if segment
+        .listed
+        .latest_crc_file
+        .as_ref()
+        .is_some_and(|crc| crc.version == end)
+    {
+        return false; // already there
+    }
+    segment.checkpoint_version.is_none() && end <= MAX_TAIL
+}
+
 /// As [`write_best_effort`]; `always` skips the cost check (an explicit call).
+///
+/// A table the kernel refuses to write for a feature binding only the values
+/// of rows written (CHECK constraints, generated or identity columns,
+/// invariants) has its checksum resolved from a restated snapshot
+/// (`restate::log_writing_snapshot`): the kernel builds a checksum's protocol
+/// and metadata from the log, so the file holds the table's own, and writes
+/// no row, so nothing is left unchecked.
 pub fn write(snapshot: &SnapshotRef, engine: &dyn Engine, always: bool) -> bool {
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if snapshot.table_configuration().is_catalog_managed() {
             return false;
         }
-        if always || worth_writing(snapshot) {
-            match snapshot.write_checksum(engine) {
-                Ok((ChecksumWriteResult::Written, _)) => return true,
-                Ok((ChecksumWriteResult::AlreadyExists, _)) => return false,
-                Err(_) => {}
+        let target =
+            crate::restate::log_writing_snapshot(snapshot).unwrap_or_else(|_| snapshot.clone());
+        let kernel = |target: &SnapshotRef| match target.write_checksum(engine) {
+            Ok((ChecksumWriteResult::Written, _)) => Some(true),
+            Ok((ChecksumWriteResult::AlreadyExists, _)) => Some(false),
+            Err(_) => None,
+        };
+        if std::sync::Arc::ptr_eq(&target, snapshot) {
+            if always || worth_writing(snapshot) {
+                if let Some(written) = kernel(snapshot) {
+                    return written;
+                }
             }
+            if snapshot.version() == 0 {
+                return first_commit(snapshot, engine).unwrap_or(false);
+            }
+            return carry_forward(snapshot, engine).unwrap_or(false);
         }
+        // Restated: the kernel would replay what the previous checksum
+        // already holds (see `worth_replaying`), so that is carried first.
         if snapshot.version() == 0 {
-            return first_commit(snapshot, engine).unwrap_or(false);
+            if first_commit(snapshot, engine).unwrap_or(false) {
+                return true;
+            }
+        } else if carry_forward(snapshot, engine).unwrap_or(false) {
+            return true;
         }
-        carry_forward(snapshot, engine).unwrap_or(false)
+        if always || worth_replaying(snapshot) {
+            return kernel(&target).unwrap_or(false);
+        }
+        false
     }));
     attempt.unwrap_or(false)
 }
 
-/// The previous version's checksum, carried over a commit that changed no file.
+/// Write the checksum of `checkpointed`, a snapshot whose log segment ends
+/// in the checkpoint just written at its version; true if one was written.
+///
+/// The kernel builds it from that checkpoint and the commit's in-commit
+/// timestamp. Called after a checkpoint of a restated table, whose commits
+/// past its first checkpoint get no checksum of their own (see
+/// [`worth_replaying`]); never fails, as [`write_best_effort`].
+pub fn write_at_checkpoint(checkpointed: &SnapshotRef, engine: &dyn Engine) -> bool {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if checkpointed.table_configuration().is_catalog_managed()
+            || checkpointed.log_segment().checkpoint_version != Some(checkpointed.version())
+        {
+            return false;
+        }
+        matches!(
+            checkpointed.write_checksum(engine),
+            Ok((ChecksumWriteResult::Written, _))
+        )
+    }));
+    attempt.unwrap_or(false)
+}
+
+/// The previous version's checksum, carried over one commit.
 ///
 /// The kernel counts file stats only across operations it knows are
 /// incremental (WRITE, MERGE, DELETE, ...), and gives up on the rest: a SET
@@ -118,8 +194,8 @@ fn carry_forward(snapshot: &SnapshotRef, engine: &dyn Engine) -> crate::Result<b
     }
     let files_changed = actions
         .iter()
-        .any(|a| a.contains_key("add") || a.contains_key("remove") || a.contains_key("cdc"));
-    if files_changed {
+        .any(|a| a.contains_key("add") || a.contains_key("remove"));
+    if files_changed && !count_files(&mut crc, &actions) {
         return Ok(false);
     }
     // A transaction id names one commit; the carried checksum is another's.
@@ -236,6 +312,134 @@ fn first_commit(snapshot: &SnapshotRef, engine: &dyn Engine) -> crate::Result<bo
     Ok(storage.put(&target, body.into(), false).is_ok())
 }
 
+/// The operations whose adds and removes net to the change in the table's
+/// files: delta-kernel's own list (`crc::file_stats::INCREMENTAL_SAFE_OPS`,
+/// crate-private). Any other -- ANALYZE STATS re-adding live files with new
+/// statistics, a RESTORE, an unknown engine's -- is not counted.
+const INCREMENTAL_SAFE_OPS: &[&str] = &[
+    "WRITE",
+    "STREAMING UPDATE",
+    "MERGE",
+    "UPDATE",
+    "DELETE",
+    "OPTIMIZE",
+    "CREATE TABLE",
+    "REPLACE TABLE",
+    "CREATE TABLE AS SELECT",
+    "REPLACE TABLE AS SELECT",
+    "CREATE OR REPLACE TABLE AS SELECT",
+];
+
+/// Advance `crc`'s file statistics over one commit's `actions`, as the
+/// kernel's replay does (`LogSegment::build_crc_from_base`): every add counts
+/// a file of its size in, every remove one out, in `numFiles`,
+/// `tableSizeBytes` and the bins of `fileSizeHistogram`.
+///
+/// False -- nothing is written -- where the kernel would give up too: an
+/// operation not incremental-safe, an add or remove without its size, or a
+/// count that would go negative (a checksum or a commit that is not what it
+/// says). The deletion-vector counts are dropped where a file with a vector
+/// comes or goes (they are optional; nothing here counts them), and so is a
+/// file list (`allFiles`, optional too).
+fn count_files(
+    crc: &mut serde_json::Map<String, serde_json::Value>,
+    actions: &[serde_json::Map<String, serde_json::Value>],
+) -> bool {
+    use serde_json::{json, Value};
+
+    let operation = actions
+        .iter()
+        .find_map(|a| a.get("commitInfo"))
+        .and_then(|info| info.get("operation"))
+        .and_then(Value::as_str);
+    if !operation.is_some_and(|op| INCREMENTAL_SAFE_OPS.contains(&op)) {
+        return false;
+    }
+    let (Some(mut files), Some(mut bytes)) = (
+        crc.get("numFiles").and_then(Value::as_i64),
+        crc.get("tableSizeBytes").and_then(Value::as_i64),
+    ) else {
+        return false;
+    };
+    let mut histogram = match crc.get("fileSizeHistogram") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let list = |key: &str| -> Option<Vec<i64>> {
+                value
+                    .get(key)?
+                    .as_array()?
+                    .iter()
+                    .map(Value::as_i64)
+                    .collect()
+            };
+            match (
+                list("sortedBinBoundaries"),
+                list("fileCounts"),
+                list("totalBytes"),
+            ) {
+                (Some(bounds), Some(counts), Some(sizes))
+                    if !bounds.is_empty()
+                        && bounds[0] == 0
+                        && counts.len() == bounds.len()
+                        && sizes.len() == bounds.len() =>
+                {
+                    Some((bounds, counts, sizes))
+                }
+                _ => return false, // a histogram we cannot keep true
+            }
+        }
+    };
+    let mut vectors_changed = false;
+    for action in actions {
+        let (file, sign) = match (action.get("add"), action.get("remove")) {
+            (Some(add), _) => (add, 1),
+            (None, Some(remove)) => (remove, -1),
+            _ => continue,
+        };
+        let Some(size) = file.get("size").and_then(Value::as_i64).filter(|s| *s >= 0) else {
+            return false;
+        };
+        if file.get("deletionVector").is_some_and(|dv| !dv.is_null()) {
+            vectors_changed = true;
+        }
+        files += sign;
+        bytes += sign * size;
+        if let Some((bounds, counts, sizes)) = histogram.as_mut() {
+            let bin = match bounds.binary_search(&size) {
+                Ok(i) => i,
+                Err(i) => i - 1, // bounds[0] is 0 and size >= 0, so i >= 1
+            };
+            counts[bin] += sign;
+            sizes[bin] += sign * size;
+        }
+    }
+    if files < 0 || bytes < 0 {
+        return false;
+    }
+    if let Some((bounds, counts, sizes)) = histogram {
+        if counts.iter().chain(&sizes).any(|n| *n < 0) {
+            return false;
+        }
+        crc.insert(
+            "fileSizeHistogram".into(),
+            json!({"sortedBinBoundaries": bounds, "fileCounts": counts, "totalBytes": sizes}),
+        );
+    }
+    crc.insert("numFiles".into(), json!(files));
+    crc.insert("tableSizeBytes".into(), json!(bytes));
+    crc.remove("allFiles");
+    if vectors_changed {
+        for key in [
+            "numDeletedRecordsOpt",
+            "numDeletionVectorsOpt",
+            "deletedRecordCountsHistogramOpt",
+        ] {
+            crc.remove(key);
+        }
+    }
+    true
+}
+
 /// Replace (or drop, when `removed`) the entry of `list` whose `key` matches `entry`'s.
 fn upsert(
     crc: &mut serde_json::Map<String, serde_json::Value>,
@@ -259,8 +463,93 @@ fn upsert(
 
 #[cfg(test)]
 mod tests {
-    use super::upsert;
+    use super::{count_files, upsert};
     use serde_json::json;
+
+    fn actions(values: &[serde_json::Value]) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        values
+            .iter()
+            .map(|v| v.as_object().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_commit_s_files_are_counted_into_the_previous_checksum() {
+        let mut crc = json!({
+            "numFiles": 2, "tableSizeBytes": 300, "allFiles": [],
+            "numDeletionVectorsOpt": 0, "numDeletedRecordsOpt": 0,
+            "fileSizeHistogram": {
+                "sortedBinBoundaries": [0, 150], "fileCounts": [1, 1], "totalBytes": [100, 200]
+            },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let commit = actions(&[
+            json!({"commitInfo": {"operation": "DELETE"}}),
+            json!({"remove": {"path": "a", "size": 100}}),
+            json!({"add": {"path": "c", "size": 150}}),
+            json!({"add": {"path": "d", "size": 10}}),
+        ]);
+        assert!(count_files(&mut crc, &commit));
+        assert_eq!(crc["numFiles"], json!(3));
+        assert_eq!(crc["tableSizeBytes"], json!(360));
+        assert_eq!(
+            crc["fileSizeHistogram"],
+            json!({"sortedBinBoundaries": [0, 150], "fileCounts": [1, 2], "totalBytes": [10, 350]})
+        );
+        assert!(!crc.contains_key("allFiles"));
+        // No file with a deletion vector came or went: its counts still hold.
+        assert_eq!(crc["numDeletionVectorsOpt"], json!(0));
+
+        let vector = actions(&[
+            json!({"commitInfo": {"operation": "DELETE"}}),
+            json!({"remove": {"path": "c", "size": 150}}),
+            json!({"add": {"path": "c", "size": 150, "deletionVector": {"cardinality": 1}}}),
+        ]);
+        assert!(count_files(&mut crc, &vector));
+        assert_eq!(crc["numFiles"], json!(3));
+        assert!(!crc.contains_key("numDeletionVectorsOpt"));
+        assert!(!crc.contains_key("numDeletedRecordsOpt"));
+    }
+
+    #[test]
+    fn a_commit_the_kernel_would_not_count_is_not_counted() {
+        let crc = json!({"numFiles": 1, "tableSizeBytes": 100})
+            .as_object()
+            .unwrap()
+            .clone();
+        let add = json!({"add": {"path": "b", "size": 5}});
+        for commit in [
+            // Not incremental-safe: ANALYZE re-adds live files.
+            vec![
+                json!({"commitInfo": {"operation": "ANALYZE STATS"}}),
+                add.clone(),
+            ],
+            vec![add.clone()], // no commitInfo at all
+            vec![
+                json!({"commitInfo": {"operation": "WRITE"}}),
+                json!({"remove": {"path": "a"}}), // no size
+            ],
+            vec![
+                json!({"commitInfo": {"operation": "DELETE"}}),
+                json!({"remove": {"path": "a", "size": 100}}),
+                json!({"remove": {"path": "z", "size": 100}}), // more than the table holds
+            ],
+        ] {
+            let mut copy = crc.clone();
+            assert!(!count_files(&mut copy, &actions(&commit)), "{commit:?}");
+        }
+        let mut broken = json!({
+            "numFiles": 1, "tableSizeBytes": 100,
+            "fileSizeHistogram": {"sortedBinBoundaries": [0], "fileCounts": [], "totalBytes": []},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let commit = actions(&[json!({"commitInfo": {"operation": "WRITE"}}), add]);
+        assert!(!count_files(&mut broken, &commit));
+    }
 
     #[test]
     fn a_domain_is_replaced_or_dropped_and_an_untracked_list_left_alone() {

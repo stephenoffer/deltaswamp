@@ -46,6 +46,7 @@ use roaring::RoaringTreemap;
 
 use crate::commit::{self, SharedEngine, UcCommitConfig};
 use crate::error::{NativeError, Result};
+use crate::restate::VALUE_CONSTRAINTS;
 use crate::runtime;
 
 /// What a DML commit did.
@@ -143,23 +144,6 @@ pub enum DmlData {
     /// output files, each one batch.
     Stream(Box<dyn Iterator<Item = Result<RecordBatch>> + Send>),
 }
-
-/// Features that constrain only the values a commit writes.
-///
-/// A compaction writes back exactly the values it read (`dataChange=false`),
-/// already checked when they were first written: a CHECK constraint, an
-/// invariant or a generation expression holds for them as it did, and an
-/// identity column's values and high-water mark are untouched. delta-kernel
-/// refuses any transaction on a table carrying one of these -- a writer
-/// version 3 or 4 table implies two of them, so every table delta-rs gave a
-/// change data feed was refused -- which left those tables to delta-rs's
-/// OPTIMIZE, whose commit duplicates rows under a concurrent compaction.
-const VALUE_CONSTRAINTS: &[&str] = &[
-    "checkConstraints",
-    "generatedColumns",
-    "identityColumns",
-    "invariants",
-];
 
 /// `snapshot` as a compaction's transaction sees it: the same log segment,
 /// metadata and version, with [`VALUE_CONSTRAINTS`] left out of the protocol

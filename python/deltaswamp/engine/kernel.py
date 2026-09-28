@@ -2331,6 +2331,17 @@ class KernelEngine:
             )
         return None
 
+    @staticmethod
+    def checkpoints_past_value_constraints() -> bool:
+        """Whether this build checkpoints (and checksums) a table whose protocol
+        carries CHECK constraints, generated or identity columns, or invariants.
+
+        A checkpoint writes no row, so none of them binds it; the build writes
+        it from a snapshot whose checked protocol sets them aside, and the
+        checkpoint holds the table's own protocol and metadata from the log.
+        """
+        return _native_has("value_constrained_checkpoint")
+
     def _has_invariants(self, table: ResolvedTable) -> bool:
         import json
 

@@ -117,6 +117,24 @@ First release.
   never had one does not start a chain; never on a catalog-managed table (the
   catalog's writer keeps those); and never at the cost of the write.
 
+- Checkpoints and version checksums of the tables only the kernel writes
+  (in-commit timestamps, row tracking, liquid clustering, type widening,
+  column defaults) once they carry a CHECK constraint, a generated or identity
+  column, or an invariant. Both were refused ("the kernel cannot write the log
+  of a table with checkConstraints"): after `add_constraint` the log grew
+  forever, automatic checkpoints at `delta.checkpointInterval` failed
+  silently, `cleanup_metadata` could expire nothing, and the `.crc` chain
+  stopped at the constraint. The kernel now writes them from a snapshot whose
+  checked protocol sets those features aside (a checkpoint writes no row);
+  the checkpoint (classic or v2), `_last_checkpoint` and the checksum hold
+  the table's own protocol and metadata, read from the log. A commit's
+  checksum is counted from the previous one over its adds and removes (the
+  kernel's incremental-safe operations only, histogram included), and each
+  kernel checkpoint of such a table writes its version's checksum too. Legacy
+  writer versions 3-6 and schemas with invariants are checkpointed the same
+  way; data writes to a table with a generation expression or invariants are
+  still refused.
+
 - `Table.added_since(version, until=None, ...)` reads the rows added after a
   version without the change data feed (delta-rs#4554,
   delta-kernel-rs#1177), from the kernel's incremental scan bound as
