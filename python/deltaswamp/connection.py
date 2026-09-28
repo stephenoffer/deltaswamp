@@ -7,7 +7,7 @@ import dataclasses
 import os
 import re
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._util import check_keywords
 from .capability import Engine as EngineKind
@@ -32,6 +32,9 @@ from .identity import RefKind, TableRef, parse_ref
 from .properties import with_checkpoint_stats
 from .router import Router
 from .table import Table, _call, _check_version, _governed, _require, _write_data
+
+if TYPE_CHECKING:
+    from .governance import FunctionSummary, Grant, TableSummary, Volume, VolumeSummary
 
 __all__ = ["Connection", "connect"]
 
@@ -64,8 +67,11 @@ def connect(
     the SDK find one. A PAT cannot be refreshed, so prefer OAuth M2M for anything
     that runs longer than the token's lifetime.
 
-    `uri` may name an OSS Unity Catalog server (``uc://http://host:8080``) or a
-    Hive metastore (``hms://thrift://host:9083``). Omit it for Databricks.
+    `uri` may name an OSS Unity Catalog server (``uc://http://host:8080``), a
+    Hive metastore (``hms://thrift://host:9083``), AWS Glue (``glue://``), a
+    Delta Sharing profile (``sharing:///path/config.share``), or no catalog at
+    all (``file://``), for tables opened by path with `Connection.table` or
+    `Connection.open_table`. Omit it for Databricks.
 
     Set `allow_sql_fallback=True` to permit routing through a SQL warehouse for
     operations no open-source engine implements. Without `warehouse_id` one is
@@ -76,8 +82,8 @@ def connect(
     reroute is exactly the kind of surprise this library exists to avoid.
 
     `storage_options` reach every engine: the kernel and delta-rs take them as
-    object_store options (see docs/storage.md for how they merge with vended
-    credentials); Iceberg tables get their PyIceberg FileIO equivalents
+    object_store options (see "Storage options" in docs/usage.md for how they
+    merge with vended credentials); Iceberg tables get their PyIceberg FileIO equivalents
     (``s3.endpoint``, ``s3.region``, ``s3.proxy-uri``, ...), and Delta Sharing
     downloads their ``proxy_url`` and ``timeout``. `iceberg_properties` are
     PyIceberg catalog and FileIO properties passed verbatim, over those.
@@ -787,6 +793,7 @@ class Connection:
         return _call(what, fn, *args)
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
+        """The tables in `catalog.schema`, as the catalog resolves them."""
         what = f"list tables in {catalog}.{schema}"
         return list(self._catalog_call("list_tables", what, catalog, schema))
 
@@ -1553,10 +1560,12 @@ class Connection:
     def create_catalog(
         self, name: str, *, comment: str | None = None, storage_root: str | None = None
     ) -> None:
+        """Create a catalog, optionally with a comment and a managed storage root."""
         cat = self._namespaces(f"create catalog {name}")
         _call(f"create catalog {name}", cat.create_catalog, name, comment, storage_root)
 
     def drop_catalog(self, name: str, *, force: bool = False) -> None:
+        """Drop a catalog; `force` drops it even when it still holds schemas."""
         cat = self._namespaces(f"drop catalog {name}")
         _call(f"drop catalog {name}", cat.drop_catalog, name, force)
 
@@ -1573,6 +1582,10 @@ class Connection:
         _call(f"create schema {name}", cat.create_schema, catalog, schema, comment, storage_root)
 
     def drop_schema(self, name: str, *, force: bool = False) -> None:
+        """Drop `catalog.schema` (or `schema` under the default catalog).
+
+        `force` drops it even when it still holds tables.
+        """
         catalog, schema = self._schema_parts(name)
         cat = self._namespaces(f"drop schema {name}")
         _call(f"drop schema {name}", cat.drop_schema, catalog, schema, force)
@@ -1593,7 +1606,7 @@ class Connection:
         *,
         schema_pattern: str | None = None,
         table_pattern: str | None = None,
-    ) -> list[Any]:
+    ) -> list[TableSummary]:
         """Table summaries matching SQL LIKE patterns, in one listing call."""
         target = catalog or self.default_catalog
         if target is None:
@@ -1603,12 +1616,14 @@ class Connection:
             _call("search tables", cat.search_tables, target, schema_pattern, table_pattern)
         )
 
-    def list_functions(self, schema: str) -> list[Any]:
+    def list_functions(self, schema: str) -> list[FunctionSummary]:
+        """The functions in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list functions")
         return list(_call("list functions", cat.list_functions, catalog, name))
 
-    def list_volumes(self, schema: str) -> list[Any]:
+    def list_volumes(self, schema: str) -> list[VolumeSummary]:
+        """The volumes in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list volumes")
         return list(_call("list volumes", cat.list_volumes, catalog, name))
@@ -1620,10 +1635,11 @@ class Connection:
         volume_type: str = "MANAGED",
         storage_location: str | None = None,
         comment: str | None = None,
-    ) -> Any:
+    ) -> VolumeSummary:
+        """Create a Unity Catalog volume, ``MANAGED`` or ``EXTERNAL`` at `storage_location`."""
         ref = self._bound_ref(name, "create the volume")
         cat = self._namespaces(f"create volume {name}")
-        return _call(
+        summary: VolumeSummary = _call(
             f"create volume {name}",
             cat.create_volume,
             ref.catalog,
@@ -1633,21 +1649,24 @@ class Connection:
             storage_location,
             comment,
         )
+        return summary
 
     def drop_volume(self, name: str) -> None:
+        """Drop a Unity Catalog volume."""
         ref = self._bound_ref(name, "drop the volume")
         cat = self._namespaces(f"drop volume {name}")
         _call(f"drop volume {name}", cat.drop_volume, ref.catalog, ref.schema, ref.table)
 
-    def volume(self, name: str) -> Any:
+    def volume(self, name: str) -> Volume:
         """A Unity Catalog volume: list, read, write and delete its files."""
         ref = self._bound_ref(name, "open the volume")
         cat = self._namespaces(f"open volume {name}")
-        return _call(f"open volume {name}", cat.volume, ref)
+        volume: Volume = _call(f"open volume {name}", cat.volume, ref)
+        return volume
 
     def grants(
         self, securable: str, *, securable_type: str = "SCHEMA", principal: str | None = None
-    ) -> list[Any]:
+    ) -> list[Grant]:
         """Grants on a catalog, schema, volume or function. Tables: `Table.grants()`."""
         cat = _governed(self.catalog, "GovernedCatalog", f"read grants on {securable}")
         return list(
@@ -1664,10 +1683,17 @@ class Connection:
         self,
         securable: str,
         principal: str,
-        privileges: list[str],
+        privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
-    ) -> list[Any]:
+    ) -> list[Grant]:
+        """Grant privileges on a catalog, schema, volume or function to a principal.
+
+        `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);
+        tables: `Table.grant`. Returns the securable's grants afterwards.
+        """
+        # A bare string was iterated into one privilege per character.
+        names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = _governed(self.catalog, "GovernedCatalog", f"grant on {securable}")
         return list(
             _call(
@@ -1675,7 +1701,7 @@ class Connection:
                 cat.grant,
                 securable,
                 principal,
-                privileges,
+                names,
                 securable_type=securable_type,
             )
         )
@@ -1684,10 +1710,17 @@ class Connection:
         self,
         securable: str,
         principal: str,
-        privileges: list[str],
+        privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
-    ) -> list[Any]:
+    ) -> list[Grant]:
+        """Revoke privileges on a catalog, schema, volume or function from a principal.
+
+        `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);
+        tables: `Table.revoke`. Returns the securable's grants afterwards.
+        """
+        # A bare string was iterated into one privilege per character.
+        names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = _governed(self.catalog, "GovernedCatalog", f"revoke on {securable}")
         return list(
             _call(
@@ -1695,7 +1728,7 @@ class Connection:
                 cat.revoke,
                 securable,
                 principal,
-                privileges,
+                names,
                 securable_type=securable_type,
             )
         )

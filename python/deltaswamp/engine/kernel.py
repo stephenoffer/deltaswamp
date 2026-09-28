@@ -2889,7 +2889,9 @@ class KernelEngine:
         compacted first is never compacted twice. Each step's rows stream from
         one scan (one log replay) into the commit that writes them.
         """
-        import pyarrow as pa
+        from ..table import _require
+
+        pa = _require("pyarrow", "pyarrow", "OPTIMIZE and Z-ORDER")
 
         _enter_native("compact the table with the kernel")
         retries = (
@@ -5902,7 +5904,7 @@ def _require_pyarrow(what: str) -> None:
     except ImportError as exc:
         raise UnreachableTableError(
             what,
-            "pyarrow is needed to evaluate the row filter",
+            "pyarrow is not installed",
             "pip install 'deltaswamp[pyarrow]'",
         ) from exc
 

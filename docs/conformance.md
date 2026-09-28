@@ -11,7 +11,7 @@ of truth is `python/deltaswamp/capability.py` (features and operations) and
 |---|---|
 | `FEATURE_SUPPORT` | 36 table features x {kernel, delta-rs} x {read, write} |
 | `OPERATION_ENGINES` | 46 operations -> engines in preference order |
-| `PROPERTY_SUPPORT` | 30 table properties x {create, set} x engine |
+| `PROPERTY_SUPPORT` | 32 table properties x {create, set} x engine |
 | `FEATURE_DEPENDENCIES` | what the kernel enforces before a write |
 
 ## Read this before changing routing
@@ -104,7 +104,7 @@ serve.
 | `scan` | kernel, deltars, sharing, iceberg, sql | kernel reads through writer-only features delta-rs rejects |
 | `time_travel` | kernel, deltars, sharing, iceberg, sql | history_manager handles the ICT-enablement boundary |
 | `cdf` | kernel, deltars, sharing, sql | the kernel's TableChanges comes first: delta-rs cannot decode the CDF files Databricks writes (arrow-rs fails with 'cannot skip miniblock' on their DELTA_BINARY_PACKED pages), double-encodes a partition path containing '%' (a value 'a b' is looked up as k=a%2520b), and refuses column-mapped tables outright. Catalog-managed tables have no CDF outside Databricks |
-| `incremental` | *(none)* | reading only the files added since a version needs the kernel's incremental_scan, which is not bound yet; Table.changes() follows the change data feed instead |
+| `incremental` | *(none)* | Table.changes() follows the change data feed, and is routed as cdf() is; Table.added_since() reads the files the kernel's incremental scan lists, and is routed as a scan |
 | `history` | deltars, iceberg, sql | kernel exposes no history() API, only commit_range primitives |
 | `detail` | kernel, deltars, sharing, iceberg, sql | kernel CRC path gives O(1) stats with zero I/O when a .crc exists |
 | `files` | deltars, kernel | delta-rs lists add actions with stats; the kernel lists the files of tables delta-rs cannot open |

@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "One Python connector for every Delta table: Unity Catalog managed and external, Hive Metastore, Glue, and plain object storage."
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Stephen Offer" }]
 keywords = ["delta", "delta-lake", "unity-catalog", "databricks", "lakehouse", "arrow"]
@@ -15,8 +16,13 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Database",
+    "Typing :: Typed",
 ]
 
 # Arrow leaves through the PyCapsule interface, so pyarrow is optional: Polars,

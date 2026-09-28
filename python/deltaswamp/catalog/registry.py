@@ -174,9 +174,18 @@ def catalog_for_uri(uri: str | None, **kwargs: Any) -> Catalog:
     name = kwargs.pop("catalog_name", None) or scheme_to_catalog.get(scheme)
     if name is None:
         known = ", ".join(sorted(k for k in scheme_to_catalog if k))
+        hint = ""
+        if uri is not None and (
+            "://" not in uri or scheme in ("s3", "s3a", "gs", "abfss", "az", "azure")
+        ):
+            # A table's own location, the most common first guess.
+            hint = (
+                " To open a table by its path, connect with ds.connect('file://') "
+                "(or any catalog) and call conn.table(path)."
+            )
         raise InvalidReferenceError(
-            f"unrecognized connection URI {uri!r}. Known schemes: {known}. "
-            "Pass catalog=... to supply a catalog object directly."
+            f"unrecognized connection URI {uri!r}. Known schemes: {known}."
+            f"{hint} Pass catalog=... to supply a catalog object directly."
         )
 
     cls = load_catalog_class(name)

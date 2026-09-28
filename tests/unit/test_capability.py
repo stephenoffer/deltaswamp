@@ -234,6 +234,13 @@ class TestDocsMatchTheMatrices:
         missing = [key for key in PROPERTY_SUPPORT if f"`{key}`" not in text]
         assert not missing, f"undocumented properties: {sorted(missing)}"
 
+    def test_table_sizes_are_stated_correctly(self) -> None:
+        # The page said 30 properties after two more were added.
+        text = self._conformance()
+        assert f"| `FEATURE_SUPPORT` | {len(FEATURE_SUPPORT)} table features" in text
+        assert f"| `OPERATION_ENGINES` | {len(OPERATION_ENGINES)} operations" in text
+        assert f"| `PROPERTY_SUPPORT` | {len(PROPERTY_SUPPORT)} table properties" in text
+
     def test_every_write_operation_is_documented(self) -> None:
         from deltaswamp.capability import Operation as Op
 

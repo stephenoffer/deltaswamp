@@ -112,6 +112,13 @@ class TestUriDispatch:
         with pytest.raises(InvalidReferenceError, match="Known schemes"):
             catalog_for_uri("ftp://host", profile=None, host=None, config=None)
 
+    @pytest.mark.parametrize("uri", ["/tmp/tables/orders", "s3://bucket/orders"])
+    def test_a_table_path_says_how_to_open_one(self, uri: str) -> None:
+        # ds.connect(path) is a new user's first guess; the error named only
+        # the known schemes, not conn.table(path).
+        with pytest.raises(InvalidReferenceError, match=r"ds\.connect\('file://'\)"):
+            catalog_for_uri(uri, profile=None, host=None, config=None)
+
     def test_glue_catalog_id_is_taken_from_the_uri(self) -> None:
         catalog = catalog_for_uri("glue://123456789012", profile=None, host=None, config=None)
         assert catalog._catalog_id == "123456789012"  # type: ignore[attr-defined]

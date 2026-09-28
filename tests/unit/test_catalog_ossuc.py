@@ -65,6 +65,21 @@ class TestOSSGovernance:
         assert info.partition_columns == ("region",)
         assert info.created_at == 1700000000000
 
+    def test_connection_grant_takes_one_privilege_as_a_string(
+        self, oss: OSSUnityCatalog, fake: FakeUnityCatalog
+    ) -> None:
+        # Table.grant took "SELECT"; Connection.grant iterated it into one
+        # privilege per character.
+        import deltaswamp as ds
+
+        conn = ds.connect(catalog=oss)
+        conn.grant("main", "analysts", "USE_CATALOG", securable_type="CATALOG")
+        body = fake.requests[-1][2]
+        assert body == {"changes": [{"principal": "analysts", "add": ["USE CATALOG"]}]}
+        conn.revoke("main", "analysts", "USE_CATALOG", securable_type="CATALOG")
+        body = fake.requests[-1][2]
+        assert body == {"changes": [{"principal": "analysts", "remove": ["USE CATALOG"]}]}
+
     def test_grant_revoke_round_trip_uses_space_spelling(
         self, oss: OSSUnityCatalog, fake: FakeUnityCatalog
     ) -> None:

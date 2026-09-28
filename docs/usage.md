@@ -32,16 +32,16 @@ pip install deltaswamp
 The base install pulls in `deltalake` and `databricks-sdk` and nothing else.
 Data leaves through the Arrow PyCapsule interface, so pyarrow is optional.
 Without it, creating a table from an Arrow-exporting schema (arro3, for
-example), appends, merges, unfiltered scans, schema, history and table
-maintenance all work; the calls in the `pyarrow` row below raise an
-`ImportError` naming the extra.
+example), appends, merges on delta-rs, unfiltered scans, schema, history,
+VACUUM, RESTORE, checkpoints and ALTER TABLE all work; the calls in the
+`pyarrow` row below raise an `ImportError` naming the extra.
 
 | Extra | Adds | You need it for |
 |---|---|---|
-| `pyarrow` | pyarrow | `to_arrow`, `count`, `head`, `plan_scan`, predicates on the kernel path, `delete`/`update`/predicate `overwrite`, `create_table` with a list or dict schema, the SQL fallback |
+| `pyarrow` | pyarrow, NumPy (Z-ORDER) | `to_arrow`, `count`, `head`, `plan_scan`, predicates on the kernel path, `delete`/`update`/predicate `overwrite`, a MERGE on the kernel (deletion-vector tables), `optimize`/`z_order`, `create_table` with a list or dict schema, the SQL fallback |
 | `pandas` | pandas, pyarrow | `to_pandas` |
 | `polars` | Polars, pyarrow | `to_polars`, `Connection.sql(engine="polars")` |
-| `duckdb` | DuckDB | `to_duckdb`, `Connection.sql` |
+| `duckdb` | DuckDB, pyarrow, pytz | `to_duckdb`, `Connection.sql` |
 | `daft` | Daft | `to_daft` |
 | `ray` | Ray Data | `to_ray_dataset` |
 | `sql` | pyarrow | the SQL warehouse fallback (the warehouse itself is reached through `databricks-sdk`) |
@@ -80,6 +80,7 @@ conn = ds.connect("hms://thrift://metastore:9083")  # Hive Metastore
 conn = ds.connect("glue://")  # AWS Glue, ambient region
 conn = ds.connect("glue://123456789012")  # a specific Glue catalog id
 conn = ds.connect("sharing:///path/to/config.share")  # a Delta Sharing profile
+conn = ds.connect("file://")  # no catalog: tables by path only
 ```
 
 Useful keyword arguments:
@@ -360,8 +361,9 @@ does: a range ending before an ADD COLUMN reads that column as null. On a
 column-mapping table, Delta reads a batch feed under its end version's
 schema instead, and so does `cdf()`. A `columns=` projection is left as asked.
 
-delta-rs serves CDF on tables it can open and the kernel serves the others.
-A catalog-managed table's feed needs the warehouse, since the kernel's change
+The kernel serves CDF first, and delta-rs what the kernel cannot (a read past
+the table's last version, a predicate outside the kernel's grammar). A
+catalog-managed table's feed needs the warehouse, since the kernel's change
 feed cannot take the catalog's commit tail. Guards fire before any read.
 A table without `delta.enableChangeDataFeed` is refused, because enabling it is
 not retroactive. A table whose `delta.deletedFileRetentionDuration` is shorter
@@ -542,10 +544,14 @@ Through the warehouse, `update` sets a struct field by its dotted path
 bytes, dicts (a struct) and lists (an array) as well as scalars.
 
 `delete`, `update`, `merge(...).execute()`, `optimize`, `z_order` and
-`restore` return an `OperationResult`, a dict with the same keys on every
-engine (`num_deleted_rows`, `num_updated_rows`, `num_inserted_rows`,
-`num_affected_rows`, `num_files_added`, `num_files_removed`, `version` where
-known) next to the serving engine's own metrics; `.engine` names the engine.
+`restore` return an `OperationResult`, a dict whose keys are named the same on
+every engine, next to the serving engine's own metrics; `.engine` names the
+engine. DML reports `num_deleted_rows`, `num_updated_rows`,
+`num_inserted_rows`, `num_affected_rows`, `num_files_added`,
+`num_files_removed` and `version`; OPTIMIZE and Z-ORDER `num_files_added` and
+`num_files_removed`; RESTORE `num_removed_files` and `num_restored_files`. A key
+is left out where the engine does not report it: a deletion-vector DELETE, for
+one, reports rows and the version but no file counts. Read with `.get()`.
 
 `merge` returns a builder with delta-rs's clause API, whichever engine serves
 it. When the warehouse serves it, the builder generates one `MERGE INTO`
@@ -858,7 +864,7 @@ t.detail()  # version, location, protocol, properties
 t.history(limit=10)
 t.version
 t.location
-t.table_type  # MANAGED, EXTERNAL, VIEW, ...
+t.table_type  # MANAGED, EXTERNAL, VIEW, ...; None for a table opened by path
 t.is_catalog_managed
 ```
 
@@ -1079,12 +1085,15 @@ engine, and why not when it cannot.
 
 ```python
 >>> t.capabilities()[ds.Operation.DELETE]
-Capability(ok=False, engine=None,
-  reason="table has row filters; UC credential vending refuses it",
-  remedy="ds.connect(..., allow_sql_fallback=True)")
+Capability(operation=<Operation.DELETE: 'delete'>, ok=False, engine=None,
+  reason='table has row filters; UC credential vending refuses it',
+  remedy='ds.connect(..., allow_sql_fallback=True)', blockers=())
 
 >>> t.can("scan")
-Capability(ok=True, engine=Engine.KERNEL, ...)
+Capability(operation=<Operation.SCAN: 'scan'>, ok=True, engine=<Engine.KERNEL: 'kernel'>, ...)
+
+>>> print(t.can("scan"))
+scan: via kernel
 
 >>> t.can("create", properties={"delta.enableRowTracking": "true"})
 >>> t.can("append", data=batch, schema_mode="merge")

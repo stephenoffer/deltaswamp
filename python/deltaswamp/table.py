@@ -54,7 +54,10 @@ from .errors import (
 from .identity import RefKind, parse_ref
 
 if TYPE_CHECKING:
+    import datetime
+
     from .connection import Connection
+    from .governance import ColumnLineage, Grant, Lineage, TableInfo
 
 __all__ = ["Table"]
 
@@ -824,23 +827,31 @@ class Table:
 
     @property
     def resolved(self) -> ResolvedTable:
+        """The catalog's resolution of this table: location, type, protocol and credentials."""
         return self._resolved
 
     @property
     def location(self) -> str | None:
+        """The table's storage root, or None where the catalog exposes none (a view, a share)."""
         return self._resolved.location
 
     @property
     def table_type(self) -> str | None:
+        """The catalog's table type: ``"MANAGED"``, ``"EXTERNAL"``, ``"VIEW"``, ...
+
+        None for a table opened by path.
+        """
         t = self._resolved.table_type
         return t.value if t else None
 
     @property
     def securable_kind(self) -> str | None:
+        """Unity Catalog's securable kind for the table, when the catalog reports one."""
         return self._resolved.securable_kind
 
     @property
     def is_catalog_managed(self) -> bool:
+        """True when the catalog, not the log, ratifies commits (the ``catalogManaged`` feature)."""
         return self._resolved.is_catalog_managed
 
     # ------------------------------------------------------------- enrichment
@@ -1414,10 +1425,14 @@ class Table:
         columns: list[str] | None = None,
         predicate: str | None = None,
         version: int | None = None,
-        timestamp: str | None = None,
+        timestamp: str | datetime.date | int | None = None,
         limit: int | None = None,
     ) -> Any:
         """Read the table as an Arrow stream (exports `__arrow_c_stream__`).
+
+        `columns` projects, `predicate` is a Spark SQL boolean expression, and
+        `version` or `timestamp` (a datetime, a date, an ISO-8601 string or
+        epoch milliseconds; naive values are UTC) travels back in time.
 
         `limit` is a hint passed to the engine. Streaming engines ignore it and
         the caller simply stops reading; the SQL warehouse turns it into a real
@@ -1800,6 +1815,11 @@ class Table:
             raise
 
     def to_arrow(self, **kwargs: Any) -> Any:
+        """The table as a ``pyarrow.Table``, read eagerly.
+
+        Takes `scan()`'s arguments (`columns`, `predicate`, `version`,
+        `timestamp`, `limit`). Needs ``deltaswamp[pyarrow]``.
+        """
         pa = _require("pyarrow", "pyarrow")
         check_keywords("to_arrow", self.scan, kwargs)
         limit = kwargs.pop("limit", None)
@@ -1813,6 +1833,10 @@ class Table:
         return stream.read_all() if isinstance(stream, TranslatingStream) else pa.table(stream)
 
     def to_pandas(self, **kwargs: Any) -> Any:
+        """The table as a pandas DataFrame, through `to_arrow()` and its arguments.
+
+        Needs ``deltaswamp[pandas]``.
+        """
         _require("pandas", "pandas")
         return self.to_arrow(**kwargs).to_pandas()
 
@@ -2295,6 +2319,7 @@ class Table:
         return result
 
     def detail(self) -> dict[str, Any]:
+        """Version, location, protocol, properties and size, as DESCRIBE DETAIL reports them."""
         result: dict[str, Any] = self._read(
             Operation.DETAIL, lambda engine: engine.detail(self._resolved, version=self._version)
         )
@@ -2302,6 +2327,10 @@ class Table:
 
     def cdf(self, **kwargs: Any) -> Any:
         """The change data feed, by version or timestamp range.
+
+        Takes `starting_version` / `ending_version` or `starting_timestamp` /
+        `ending_timestamp` (both ends inclusive), `columns`, `predicate`, and
+        `allow_out_of_range` to read past the table's last version.
 
         Rows carry `_change_type`, `_commit_version` and `_commit_timestamp`.
         A range that ends before a column was added reads it as null, as
@@ -2936,6 +2965,7 @@ class Table:
         return self._enrich()
 
     def protocol(self) -> tuple[int | None, int | None]:
+        """``(min_reader_version, min_writer_version)``."""
         r = self._current()
         return (r.min_reader_version, r.min_writer_version)
 
@@ -2951,6 +2981,7 @@ class Table:
         return r.effective_reader_features | r.effective_writer_features
 
     def properties(self) -> dict[str, str]:
+        """The table's properties (``delta.*`` and any others), as the log holds them."""
         return dict(self._current().properties)
 
     @property
@@ -3891,6 +3922,7 @@ class Table:
         return _results.optimize(result, getattr(engine, "kind", None))
 
     def z_order(self, columns: list[str] | str, **kwargs: Any) -> dict[str, Any]:
+        """OPTIMIZE ZORDER BY `columns`; the same as ``optimize(zorder_by=columns)``."""
         self._check_writable("z-order")
         _check_options("z_order", kwargs, _OPTIMIZE_OPTIONS)
         self._check_optimize_args(kwargs)
@@ -4118,6 +4150,10 @@ class Table:
         return int(snapshot.version)
 
     def repair(self, **kwargs: Any) -> dict[str, Any]:
+        """FSCK REPAIR TABLE: drop log entries for data files that are missing from storage.
+
+        ``dry_run=True`` lists them without committing.
+        """
         _check_options("repair", kwargs, _COMMIT_OPTIONS | {"dry_run"})
         result: dict[str, Any] = self._route(self._request(Operation.REPAIR, kwargs)).repair(
             self._resolved, **kwargs
@@ -4128,8 +4164,9 @@ class Table:
     # ----------------------------------------------------------------- schema
 
     def add_column(self, fields: Any, **kwargs: Any) -> None:
-        """Add columns. `fields` is a list of Arrow/Delta fields, or a
-        {name: sql_type} mapping when the SQL fallback serves it."""
+        """Add columns: an Arrow schema, a list of Arrow or deltalake fields, or a
+        ``{name: type}`` mapping of SQL, Delta or pyarrow type names. New columns
+        must be nullable."""
         self._check_writable("add a column")
         _check_options("add_column", kwargs, _COMMIT_OPTIONS)
         if isinstance(fields, (str, bytes)) or fields is None:
@@ -4245,6 +4282,11 @@ class Table:
         return _metrics(result)
 
     def set_properties(self, properties: dict[str, str], **kwargs: Any) -> None:
+        """ALTER TABLE ... SET TBLPROPERTIES.
+
+        A value that implies a table feature (``delta.enableDeletionVectors``,
+        ``delta.columnMapping.mode``, ...) raises the protocol with it.
+        """
         self._check_writable("set properties")
         _check_options("set_properties", kwargs, _COMMIT_OPTIONS | {"raise_if_not_exists"})
         if properties is not None and not isinstance(properties, dict):
@@ -4264,6 +4306,11 @@ class Table:
         self._sync_catalog()
 
     def add_feature(self, feature: Any, **kwargs: Any) -> None:
+        """Add a table feature (or a list of them) by its protocol name, e.g. ``"deletionVectors"``.
+
+        Features a feature depends on are added alongside; one that needs a
+        backfill (row tracking) is refused.
+        """
         self._check_writable("add a feature")
         _check_options(
             "add_feature", kwargs, _COMMIT_OPTIONS | {"allow_protocol_versions_increase"}
@@ -4311,6 +4358,7 @@ class Table:
         return result
 
     def add_constraint(self, constraints: dict[str, str], **kwargs: Any) -> None:
+        """Add CHECK constraints, ``{name: SQL expression}``; existing rows are checked first."""
         self._check_writable("add a constraint")
         _check_options("add_constraint", kwargs, _COMMIT_OPTIONS)
         if not isinstance(constraints, dict) or not constraints:
@@ -4327,6 +4375,7 @@ class Table:
         self._invalidate()
 
     def drop_constraint(self, name: str, *, if_exists: bool = False) -> None:
+        """Drop a CHECK constraint; with `if_exists`, a missing one is not an error."""
         self._check_writable("drop a constraint")
         request = self._request(Operation.DROP_CONSTRAINT, {"name": name, "if_exists": if_exists})
         self._route(request).drop_constraint(self._resolved, name, if_exists=if_exists)
@@ -4354,6 +4403,10 @@ class Table:
         self._sync_catalog()
 
     def set_column_comment(self, column: str | list[str], comment: str | None) -> None:
+        """Set a column's comment (None clears it).
+
+        A dotted name or a list is a field inside a struct.
+        """
         self._check_writable("set a column comment")
         column = self._alter_path(column, "set_column_comment")
         _check_comment(comment)
@@ -4409,6 +4462,7 @@ class Table:
         self._sync_catalog()
 
     def drop_not_null(self, column: str | list[str]) -> None:
+        """Drop a NOT NULL constraint; a dotted name or a list is a field inside a struct."""
         self._check_writable("drop NOT NULL")
         column = self._alter_path(column, "drop_not_null")
         request = self._request(Operation.DROP_NOT_NULL, {"column": column})
@@ -4433,12 +4487,17 @@ class Table:
     # ------------------------------------------------------- log and layout
 
     def checkpoint(self) -> None:
+        """Write a checkpoint at the current version.
+
+        On a catalog-managed table staged commits are published first.
+        """
         self._engine(Operation.CHECKPOINT).checkpoint(self._resolved)
         # The log changed shape under the cached state (a checkpoint, and on
         # a catalog-managed table a published tail), as after any write.
         self._invalidate()
 
     def compact_logs(self, start: int | None = None, end: int | None = None) -> Any:
+        """Write a log compaction file for commits `start` to `end` (default: the whole log)."""
         request = self._request(Operation.LOG_COMPACTION, {"start": start, "end": end})
         result = self._route(request).compact_logs(self._resolved, start, end)
         self._invalidate()
@@ -4539,29 +4598,33 @@ class Table:
         )
         return _governed(catalog, "GovernedCatalog", what)
 
-    def info(self) -> Any:
+    def info(self) -> TableInfo:
         """The catalog's view of the table: owner, comment, columns, row filter,
         column masks, predictive optimization, audit timestamps."""
         cat = self._governance("read table info")
-        return _call("read table info", cat.table_info, self._resolved.ref)
+        info: TableInfo = _call("read table info", cat.table_info, self._resolved.ref)
+        return info
 
-    def grants(self, principal: str | None = None) -> list[Any]:
+    def grants(self, principal: str | None = None) -> list[Grant]:
+        """Direct grants on the table, optionally for one principal. Unity Catalog only."""
         cat = self._governance("read grants")
         return list(_call("read grants", cat.grants, self._resolved.ref, principal))
 
-    def effective_grants(self, principal: str | None = None) -> list[Any]:
+    def effective_grants(self, principal: str | None = None) -> list[Grant]:
         """Grants including those inherited from the schema and catalog."""
         cat = self._governance("read effective grants")
         return list(
             _call("read effective grants", cat.effective_grants, self._resolved.ref, principal)
         )
 
-    def grant(self, principal: str, privileges: list[str] | str) -> list[Any]:
+    def grant(self, principal: str, privileges: list[str] | str) -> list[Grant]:
+        """Grant privileges (``"SELECT"``, ``["SELECT", "MODIFY"]``) on the table to a principal."""
         names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = self._governance("grant")
         return list(_call("grant", cat.grant, self._resolved.ref, principal, names))
 
-    def revoke(self, principal: str, privileges: list[str] | str) -> list[Any]:
+    def revoke(self, principal: str, privileges: list[str] | str) -> list[Grant]:
+        """Revoke privileges on the table from a principal."""
         names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = self._governance("revoke")
         return list(_call("revoke", cat.revoke, self._resolved.ref, principal, names))
@@ -4590,35 +4653,45 @@ class Table:
         )
 
     def tags(self, column: str | None = None) -> dict[str, str]:
+        """The table's tags, or a column's with `column`. Databricks Unity Catalog only."""
         cat = self._governance("read tags")
         column = self._tag_column(column, "read tags")
         return dict(_call("read tags", cat.tags, self._resolved.ref, column))
 
     def set_tags(self, tags: dict[str, str], *, column: str | None = None) -> None:
+        """Set tags ``{key: value}`` on the table, or on a column with `column`."""
         cat = self._governance("set tags")
         column = self._tag_column(column, "set tags")
         _call("set tags", cat.set_tags, self._resolved.ref, tags, column)
 
     def unset_tags(self, keys: list[str] | str, *, column: str | None = None) -> None:
+        """Remove tags by key from the table, or from a column with `column`."""
         names = [keys] if isinstance(keys, str) else list(keys)
         cat = self._governance("unset tags")
         column = self._tag_column(column, "unset tags")
         _call("unset tags", cat.unset_tags, self._resolved.ref, names, column)
 
     def set_owner(self, principal: str) -> None:
+        """Transfer ownership of the table to a user, group or service principal."""
         cat = self._governance("set owner")
         _call("set owner", cat.set_owner, self._resolved.ref, principal)
 
-    def lineage(self, direction: str = "both") -> Any:
+    def lineage(self, direction: str = "both") -> Lineage:
         """Upstream and downstream tables, notebooks, jobs and dashboards."""
         cat = self._governance("read lineage")
-        return _call("read lineage", cat.lineage, self._resolved.ref, direction)
+        lineage: Lineage = _call("read lineage", cat.lineage, self._resolved.ref, direction)
+        return lineage
 
-    def column_lineage(self, column: str, direction: str = "both") -> Any:
+    def column_lineage(self, column: str, direction: str = "both") -> ColumnLineage:
+        """Upstream and downstream lineage of one column.
+
+        `direction` is ``"upstream"``, ``"downstream"`` or ``"both"``.
+        """
         cat = self._governance("read column lineage")
-        return _call(
+        lineage: ColumnLineage = _call(
             "read column lineage", cat.column_lineage, self._resolved.ref, column, direction
         )
+        return lineage
 
     def add_primary_key(self, name: str, columns: list[str], *, rely: bool = False) -> None:
         """An informational PRIMARY KEY constraint in Unity Catalog (not enforced)."""
@@ -4748,22 +4821,29 @@ class Table:
         self._invalidate()
 
     def set_row_filter(self, function_name: str, columns: list[str]) -> None:
+        """ALTER TABLE ... SET ROW FILTER `function_name` ON (`columns`). Needs the SQL fallback."""
         self._warehouse("set a row filter").set_row_filter(self._resolved, function_name, columns)
         self._refresh_from_catalog()
 
     def drop_row_filter(self) -> None:
+        """ALTER TABLE ... DROP ROW FILTER. Needs the SQL fallback."""
         self._warehouse("drop a row filter").drop_row_filter(self._resolved)
         self._refresh_from_catalog()
 
     def set_column_mask(
         self, column: str, function_name: str, *, using_columns: list[str] | None = None
     ) -> None:
+        """ALTER COLUMN ... SET MASK `function_name` USING COLUMNS (`using_columns`).
+
+        Needs the SQL fallback.
+        """
         self._warehouse("set a column mask").set_column_mask(
             self._resolved, column, function_name, using_columns
         )
         self._refresh_from_catalog()
 
     def drop_column_mask(self, column: str) -> None:
+        """ALTER COLUMN ... DROP MASK. Needs the SQL fallback."""
         self._warehouse("drop a column mask").drop_column_mask(self._resolved, column)
         self._refresh_from_catalog()
 

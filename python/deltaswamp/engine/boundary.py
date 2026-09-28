@@ -536,8 +536,13 @@ def _deltars_schema(exc: BaseException, what: str) -> BaseException | None:
     """
     name = type(exc).__name__
     if name == "SchemaMismatchError":
+        detail = _detail(exc)
+        hint = ""
+        if "number of fields does not match" in detail:
+            # delta-rs's text says only that the counts differ.
+            hint = "; if the data has columns the table lacks, pass schema_mode='merge' to add them"
         return InvalidArgumentError(
-            f"{what}: the data does not fit the table's schema ({_detail(exc)})"
+            f"{what}: the data does not fit the table's schema ({detail}){hint}"
         )
     if _is_read(what):
         # A read has no data of the caller's to not fit: this is delta-rs

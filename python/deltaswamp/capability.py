@@ -670,9 +670,9 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         _op(
             Operation.INCREMENTAL,
             (),
-            "reading only the files added since a version needs the kernel's "
-            "incremental_scan, which is not bound yet; Table.changes() follows the change "
-            "data feed instead",
+            "Table.changes() follows the change data feed, and is routed as cdf() is; "
+            "Table.added_since() reads the files the kernel's incremental scan lists, "
+            "and is routed as a scan",
         ),
         _op(
             Operation.HISTORY,
