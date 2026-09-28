@@ -25,6 +25,7 @@ refused with a reason.
 
 from __future__ import annotations
 
+import http.client
 import importlib
 import itertools
 import json
@@ -703,6 +704,81 @@ class _ExpiredUrlError(UnreachableTableError):
 _EXPIRED_STATUSES = frozenset({400, 401, 403})
 
 
+#: Opt-in for presigned URLs on plain http or on private, loopback and
+#: link-local addresses: a local sharing server in development or a test.
+ALLOW_PRIVATE_URLS_ENV = "DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS"
+
+
+def _private_urls_allowed() -> bool:
+    return os.environ.get(ALLOW_PRIVATE_URLS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _public_address(host: str) -> bool:
+    """Whether `host` (an IP literal) is a public unicast address."""
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return True  # a name: judged by the address it connects to
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return bool(address.is_global) and not address.is_multicast
+
+
+def _refuse_private_peer(sock: Any, host: str) -> None:
+    peer = sock.getpeername()[0]
+    if _public_address(peer) or _private_urls_allowed():
+        return
+    sock.close()
+    raise UnreachableTableError(
+        "read a shared data file",
+        f"the presigned URL's host {host} resolves to {peer}, a private, loopback or "
+        "link-local address; a sharing server's presigned URLs point at public object "
+        "storage",
+        f"set {ALLOW_PRIVATE_URLS_ENV}=1 for a sharing server on a private network",
+    )
+
+
+class _GuardedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        if not getattr(self, "_tunnel_host", None):
+            _refuse_private_peer(self.sock, self.host)
+
+
+class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        super().connect()
+        if not getattr(self, "_tunnel_host", None):
+            _refuse_private_peer(self.sock, self.host)
+
+
+class _GuardedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: Any) -> Any:
+        if req.has_proxy():
+            return super().http_open(req)  # the proxy resolves the name
+        return self.do_open(_GuardedHTTPConnection, req)
+
+
+class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: Any) -> Any:
+        if getattr(req, "_tunnel_host", None):
+            return super().https_open(req)
+        return self.do_open(_GuardedHTTPSConnection, req, context=self._context)
+
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    """Every redirect hop meets the rules the first URL did."""
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Any:
+        SharingEngine._check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class _UrlBook:
     """Presigned URLs by file key, re-issued by a fresh query when they expire.
 
@@ -960,8 +1036,32 @@ class SharingEngine:
 
     @staticmethod
     def _check_url(url: str) -> None:
+        """Refuse a presigned URL this process must not fetch.
+
+        The server chooses these URLs, and this process fetches them with its
+        own network position: an http:// URL to 127.0.0.1 or 169.254.169.254
+        reached internal services and cloud metadata (SSRF). So a URL is
+        https, to a host that is not an IP literal outside public unicast;
+        the address a name resolves to is checked when it connects
+        (`_GuardedHTTPSConnection`), and so is every redirect hop. A local
+        development server opts in with ``DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS=1``.
+        """
         parts = urlparse(url)
         scheme = parts.scheme.lower()
+        if scheme == "http" and not _private_urls_allowed():
+            raise UnreachableTableError(
+                "read a shared data file",
+                "the sharing server issued a plain http:// URL, which anyone on the network "
+                "path can read or alter; presigned URLs are https",
+                f"set {ALLOW_PRIVATE_URLS_ENV}=1 for a local development server",
+            )
+        if parts.hostname and not _public_address(parts.hostname) and not _private_urls_allowed():
+            raise UnreachableTableError(
+                "read a shared data file",
+                f"the sharing server issued a URL to {parts.hostname}, a private, loopback or "
+                "link-local address, not to public object storage",
+                f"set {ALLOW_PRIVATE_URLS_ENV}=1 for a sharing server on a private network",
+            )
         if scheme not in ("https", "http"):
             # A presigned URL is always HTTP(S); anything else (file://, ftp://)
             # from a server would make this process read local or foreign
@@ -1044,10 +1144,12 @@ class SharingEngine:
                 cls._check_url(str(dv.get("pathOrInlineDv", "")))
 
     def _urlopen(self, url: str) -> Any:
-        if not self._proxy_url:
-            return urllib.request.urlopen(url, timeout=self._timeout)
-        proxy = urllib.request.ProxyHandler({"http": self._proxy_url, "https": self._proxy_url})
-        return urllib.request.build_opener(proxy).open(url, timeout=self._timeout)
+        handlers: list[Any] = [_GuardedHTTPHandler(), _GuardedHTTPSHandler(), _CheckedRedirect()]
+        if self._proxy_url:
+            handlers.append(
+                urllib.request.ProxyHandler({"http": self._proxy_url, "https": self._proxy_url})
+            )
+        return urllib.request.build_opener(*handlers).open(url, timeout=self._timeout)
 
     def _download(self, url: str) -> bytes:
         self._check_url(url)

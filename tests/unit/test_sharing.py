@@ -447,6 +447,13 @@ def _rows(ids: list[int], day: str) -> FakeFile:
     return FakeFile(id=f"f-{day}-{ids[0]}", data=_parquet(data), partition_values={"day": day})
 
 
+@pytest.fixture(autouse=True)
+def _local_presigned_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fake sharing servers here issue http:// URLs on 127.0.0.1, which a
+    # real one never does; the SSRF guard lets them through only on opt-in.
+    monkeypatch.setenv("DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS", "1")
+
+
 @pytest.fixture(scope="module")
 def server() -> Any:
     srv = FakeSharingServer().start()

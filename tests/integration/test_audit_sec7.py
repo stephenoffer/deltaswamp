@@ -406,3 +406,63 @@ class TestLogPathsStayInTheTable:
             t.z_order("id")
         files = [f for f in os.listdir(root) if f.endswith(".parquet")]
         assert len(files) == 2  # nothing was written into the table
+
+
+class TestSharingPresignedUrls:
+    """SEC-P3 / SEC-C5: Sharing replay fetched any http(s) URL, internal hosts included."""
+
+    @pytest.fixture(autouse=True)
+    def _no_opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS", raising=False)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://s3.amazonaws.com/b/x.parquet?sig=1",
+            "https://127.0.0.1/latest/meta-data/x.parquet",
+            "https://169.254.169.254/latest/meta-data/iam/",
+            "https://10.0.0.5/x.parquet",
+            "https://[::1]/x.parquet",
+            "https://[::ffff:127.0.0.1]/x.parquet",
+        ],
+    )
+    def test_plain_http_and_internal_addresses_are_refused(self, url: str) -> None:
+        from deltaswamp.engine.sharing import SharingEngine
+        from deltaswamp.errors import UnreachableTableError
+
+        with pytest.raises(UnreachableTableError):
+            SharingEngine._check_url(url)
+
+    def test_public_https_passes(self) -> None:
+        from deltaswamp.engine.sharing import SharingEngine
+
+        SharingEngine._check_url("https://bucket.s3.amazonaws.com/x.parquet?X-Amz-Signature=1")
+
+    def test_a_name_that_resolves_to_loopback_is_refused_on_connect(self) -> None:
+        import socket
+
+        from deltaswamp.engine.sharing import _refuse_private_peer
+        from deltaswamp.errors import UnreachableTableError
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client = socket.create_connection(listener.getsockname())
+        try:
+            with pytest.raises(UnreachableTableError, match=r"resolves to 127\.0\.0\.1"):
+                _refuse_private_peer(client, "innocent.example")
+        finally:
+            client.close()
+            listener.close()
+
+    def test_every_redirect_hop_is_checked(self) -> None:
+        import urllib.request
+
+        from deltaswamp.engine.sharing import _CheckedRedirect
+        from deltaswamp.errors import UnreachableTableError
+
+        request = urllib.request.Request("https://bucket.s3.amazonaws.com/x.parquet")
+        with pytest.raises(UnreachableTableError):
+            _CheckedRedirect().redirect_request(
+                request, None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data/"
+            )

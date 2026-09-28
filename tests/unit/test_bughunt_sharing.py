@@ -206,6 +206,13 @@ def _file(ids: list[int | None]) -> bytes:
     )
 
 
+@pytest.fixture(autouse=True)
+def _local_presigned_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fake sharing servers here issue http:// URLs on 127.0.0.1, which a
+    # real one never does; the SSRF guard lets them through only on opt-in.
+    monkeypatch.setenv("DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS", "1")
+
+
 @pytest.fixture
 def mini() -> Any:
     srv = MiniServer().start()
