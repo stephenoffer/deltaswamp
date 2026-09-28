@@ -262,8 +262,10 @@ See docs/usage.md, "Security notes".
 - The change feed fails when the range crosses an incompatible schema change
   (a dropped, renamed or retyped column), with `ChangeFeedSchemaChangeError`
   naming the version. Start the range at the change, or read it through the
-  warehouse. An added column reads as null in older rows, and `changes()`
-  yields each version under the schema it was written with. A range crossing
+  warehouse. An added column reads as null in older rows, also in a range
+  that ends before it was added (as `table_changes()` returns it; on
+  column-mapping tables the end version's schema, as Delta reads those), and
+  `changes()` yields each version under the schema it was written with. A range crossing
   a version with the feed off raises `UnreachableTableError` naming it
   (`.version`); `changes()` yields the versions before it first. Every
   version's schema is compared in a range of up to 200 versions, so a change

@@ -322,3 +322,39 @@ class TestVariantMergeNullElements:
         assert rows[key]["arr"] == ["[3]", None]
         assert rows[key]["s"] == {"v2": None, "n": 2}
         assert rows[key]["m"] == [("k", None), ("j", "1")]
+
+
+# ------------------------------------------- 5: cdf() under the current schema
+
+
+@pytest.mark.parametrize("mapping", ["none", "name"])
+def test_a_feed_ending_before_add_column_has_the_column(
+    conn: Any, tmp_path: Any, mapping: str
+) -> None:
+    """Databricks' table_changes() returns the current columns; cdf(s, e) gave e's.
+
+    Without column mapping only, as verified live.
+    """
+    path = str(tmp_path / "t")
+    props = {"delta.enableChangeDataFeed": "true", "delta.columnMapping.mode": mapping}
+    t = conn.create_table(path, pa.schema([("id", pa.int64())]), properties=props)
+    t.append(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    t.add_column(pa.schema([("newc", pa.string())]))
+    t.append(pa.table({"id": pa.array([3], pa.int64()), "newc": ["a"]}))
+    feed = pa.table(conn.open_table(path).cdf(starting_version=1, ending_version=1))
+    if mapping == "name":
+        # Delta reads a column-mapped table's batch feed under the end
+        # version's schema (Databricks, live), so newc is not there.
+        assert feed.column_names[0] == "id" and "newc" not in feed.column_names
+        return
+    assert feed.column_names[:2] == ["id", "newc"]
+    assert feed.column_names[2:] == ["_change_type", "_commit_version", "_commit_timestamp"]
+    assert sorted(feed.select(["id", "newc"]).to_pylist(), key=lambda r: r["id"]) == [
+        {"id": 1, "newc": None},
+        {"id": 2, "newc": None},
+    ]
+    # A projection is left as asked.
+    projected = pa.table(
+        conn.open_table(path).cdf(starting_version=1, ending_version=1, columns=["id"])
+    )
+    assert "newc" not in projected.column_names

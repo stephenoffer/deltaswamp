@@ -2197,8 +2197,61 @@ class Table:
         """The change data feed, by version or timestamp range.
 
         Rows carry `_change_type`, `_commit_version` and `_commit_timestamp`.
+        A range that ends before a column was added reads it as null, as
+        Databricks' `table_changes()` does: without column mapping the feed
+        has the table's current columns, whatever version it ends at (with
+        column mapping, Delta reads a batch feed under its end version's
+        schema, and so does this).
         """
-        return self._cdf(kwargs, split=True)
+        bounded = kwargs.get("columns") is None and (
+            kwargs.get("ending_version") is not None or kwargs.get("ending_timestamp") is not None
+        )
+        result = self._cdf(kwargs, split=True)
+        if not bounded:
+            return result
+        mode = str(self.properties().get("delta.columnMapping.mode", "none") or "none")
+        return self._with_current_columns(result) if mode.lower() == "none" else result
+
+    def _with_current_columns(self, feed: Any) -> Any:
+        """`feed` with the columns the table has now and it lacks, as nulls.
+
+        Only added columns: a feed whose columns were since dropped, renamed or
+        retyped is returned as read (the direct engines refuse a range across
+        such a change; a range ending before it keeps the older columns).
+        """
+        try:
+            import pyarrow as pa
+
+            current = self.schema()
+            have = {n.lower() for n in feed.schema.names}
+        except Exception:
+            return feed
+        if not isinstance(current, pa.Schema):
+            return feed
+        missing = [f for f in current if f.name.lower() not in have]
+        if not missing:
+            return feed
+        added = {f.name for f in missing}
+        order = [f.name for f in current if f.name.lower() in have or f.name in added]
+        by_lower = {n.lower(): n for n in feed.schema.names}
+        names = [by_lower.get(n.lower(), n) for n in order]
+        names += [n for n in feed.schema.names if n not in names]
+        fields = {f.name: f for f in feed.schema}
+        fields.update({f.name: f.with_nullable(True) for f in missing})
+        schema = pa.schema([fields[n] for n in names], metadata=feed.schema.metadata)
+
+        def batches() -> Any:
+            for batch in feed:
+                columns = {n: batch.column(n) for n in batch.schema.names}
+                yield pa.RecordBatch.from_arrays(
+                    [
+                        columns[n] if n in columns else pa.nulls(batch.num_rows, fields[n].type)
+                        for n in names
+                    ],
+                    schema=schema,
+                )
+
+        return pa.RecordBatchReader.from_batches(schema, batches())
 
     def _cdf(self, kwargs: dict[str, Any], *, split: bool) -> Any:
         """`cdf()`; `split=False` for a range already known to cross no schema change."""

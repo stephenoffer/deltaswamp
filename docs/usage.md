@@ -343,6 +343,11 @@ for batch in t.cdf(starting_version=5, ending_version=9):
 t.cdf(starting_timestamp="2026-09-01T00:00:00Z", predicate="region = 'eu'")
 ```
 
+The feed has the table's current columns, as Databricks' `table_changes()`
+does: a range ending before an ADD COLUMN reads that column as null. On a
+column-mapping table, Delta reads a batch feed under its end version's
+schema instead, and so does `cdf()`. A `columns=` projection is left as asked.
+
 delta-rs serves CDF on tables it can open and the kernel serves the others.
 A catalog-managed table's feed needs the warehouse, since the kernel's change
 feed cannot take the catalog's commit tail. Guards fire before any read.
