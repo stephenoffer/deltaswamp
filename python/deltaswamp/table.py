@@ -2328,6 +2328,10 @@ class Table:
     def cdf(self, **kwargs: Any) -> Any:
         """The change data feed, by version or timestamp range.
 
+        Takes `starting_version` / `ending_version` or `starting_timestamp` /
+        `ending_timestamp` (both ends inclusive), `columns`, `predicate`, and
+        `allow_out_of_range` to read past the table's last version.
+
         Rows carry `_change_type`, `_commit_version` and `_commit_timestamp`.
         A range that ends before a column was added reads it as null, as
         Databricks' `table_changes()` does: without column mapping the feed

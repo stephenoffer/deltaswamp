@@ -864,7 +864,7 @@ t.detail()  # version, location, protocol, properties
 t.history(limit=10)
 t.version
 t.location
-t.table_type  # MANAGED, EXTERNAL, VIEW, ...
+t.table_type  # MANAGED, EXTERNAL, VIEW, ...; None for a table opened by path
 t.is_catalog_managed
 ```
 
