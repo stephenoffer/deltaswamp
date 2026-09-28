@@ -135,7 +135,7 @@ serve.
 | `zorder` | kernel, deltars, sql | as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one |
 | `vacuum` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel's log replay for the rest (clustering, row tracking, in-commit timestamps, type widening, vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files delta-rs cannot tell apart from orphans |
 | `restore` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel re-adds the target version's files as logged (deletion vectors, row ids) on deletion-vector tables, which delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write |
-| `repair` | deltars, sql | kernel has no FSCK |
+| `repair` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel removes the missing files as logged (row ids kept) on the rest |
 | `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first |
 | `log_compaction` | deltars | kernel's log_compaction_writer is a no-op stub (kernel#2337) |
 | `publish` | kernel | Snapshot::publish; only kernel implements staged->published |

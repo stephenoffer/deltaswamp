@@ -591,5 +591,7 @@ def test_repair_dry_run_on_an_in_commit_timestamp_table(conn: Any, tmp_path: Pat
     os.remove(glob.glob(os.path.join(path, "*.parquet"))[0])
     result = conn.table(path).repair(dry_run=True)
     assert result["dry_run"] is True and len(result["files_removed"]) == 1
-    with pytest.raises(UnreachableTableError):
-        conn.table(path).repair()
+    # delta-rs cannot commit the repair; the kernel does.
+    assert conn.table(path).can("repair").engine is Engine.KERNEL
+    assert conn.table(path).repair()["files_removed"] == result["files_removed"]
+    assert conn.table(path).repair(dry_run=True)["files_removed"] == []

@@ -441,6 +441,8 @@ def _implemented() -> frozenset[Operation]:
         ops.add(Operation.CLEANUP_METADATA)
     if _native_has("symlink_manifest"):
         ops.add(Operation.GENERATE)
+    if _native_has("fsck", "commit_raw", "metadata_json"):
+        ops.add(Operation.REPAIR)
     if _native_has("restore", "commit_raw", "metadata_json"):
         ops.add(Operation.RESTORE)
     if _native_has("path_clone", "commit_raw", "files", "metadata_json"):
@@ -659,6 +661,8 @@ class KernelEngine:
             return self._cleanup_capability(table)
         if operation is Operation.GENERATE:
             return self._generate_capability(table)
+        if operation is Operation.REPAIR:
+            return self._repair_capability(table, shape)
         if operation is Operation.RESTORE:
             return self._restore_capability(table, shape)
 
@@ -3931,6 +3935,117 @@ class KernelEngine:
                 "remaining checkpoint",
                 "check the credential's delete permission and run cleanup_metadata again",
             )
+
+    # -------------------------------------------------------------- fsck
+
+    def _repair_capability(self, table: ResolvedTable, shape: dict[str, Any]) -> Capability:
+        """FSCK REPAIR: the live files whose data file is gone, removed.
+
+        Needs no kernel transaction (the removes are written as the adds
+        logged them, row ids included), so the tables delta-rs cannot commit
+        to are served. A dry run commits nothing.
+        """
+        refusal = self._file_operation_refusal(Operation.REPAIR, table)
+        if refusal is None and not shape.get("dry_run"):
+            if str(table.properties.get("delta.appendOnly", "")).strip().lower() == "true":
+                refusal = (
+                    "the table is append-only (delta.appendOnly=true), so no commit may remove "
+                    "its files, and a repair does"
+                )
+            elif table.has_iceberg_compat:
+                refusal = (
+                    "the table has Iceberg reads enabled, and a repair written here would "
+                    "leave its Iceberg metadata stale"
+                )
+        if refusal is not None:
+            return Capability(
+                Operation.REPAIR, ok=False, reason=refusal, remedy=SQL_FALLBACK_REMEDY
+            )
+        return Capability(Operation.REPAIR, ok=True, engine=self.kind)
+
+    def repair(
+        self, table: ResolvedTable, *, dry_run: bool = False, **kwargs: Any
+    ) -> dict[str, Any]:
+        """FSCK REPAIR TABLE [DRY RUN], shaped like delta-rs's result.
+
+        Every live file whose data file is gone from storage is removed, with
+        `dataChange` true as delta-rs removes it, and its deletion vector,
+        statistics and row ids as the add logged them. Returns `{"dry_run",
+        "files_removed"}` (paths as logged), and the version committed.
+        """
+        from deltaswamp import _native
+
+        capability = self._repair_capability(table, {"dry_run": dry_run})
+        if not capability.ok:
+            raise UnreachableTableError("repair", capability.reason, capability.remedy or None)
+        properties = kwargs.pop("commit_properties", None)
+        metadata = {
+            **dict(getattr(properties, "custom_metadata", None) or {}),
+            **dict(kwargs.pop("commit_metadata", None) or {}),
+        }
+        kwargs.pop("max_commit_retries", None)
+        hooks = kwargs.pop("post_commithook_properties", None)
+        if kwargs:
+            raise InvalidArgumentError(f"repair got unexpected option(s) {sorted(kwargs)}")
+        _enter_native("repair the table")
+        import time
+
+        last_error: Exception | None = None
+        for _ in range(self.metadata_commit_attempts):
+            current, state = self._state(table)
+            with translating(EngineKind.KERNEL, "repair"):
+                missing = [json.loads(add) for add in current.missing_data_files()]
+            paths = sorted(add["path"] for add in missing)
+            if dry_run or not missing:
+                return {"dry_run": dry_run, "files_removed": paths}
+            now_ms = int(time.time() * 1000)
+            files = []
+            for add in missing:
+                remove = {
+                    "path": add["path"],
+                    "deletionTimestamp": now_ms,
+                    "dataChange": True,
+                    "extendedFileMetadata": True,
+                    "partitionValues": add.get("partitionValues") or {},
+                    "size": add.get("size"),
+                }
+                for field in ("tags", "deletionVector", "baseRowId", "defaultRowCommitVersion"):
+                    if add.get(field) is not None:
+                        remove[field] = add[field]
+                files.append({"remove": remove})
+            actions = build_actions(
+                state, meta.Change(operation="FSCK", parameters={}), engine_info=_engine_info()
+            )
+            info = json.loads(actions[0])
+            info["commitInfo"].update({k: str(v) for k, v in metadata.items()})
+            info["commitInfo"]["operationMetrics"] = {
+                "dry_run": "false",
+                "files_removed": json.dumps(paths),
+            }
+            actions[0] = json.dumps(info, separators=(",", ":"))
+            actions.extend(json.dumps(a, separators=(",", ":")) for a in files)
+            try:
+                assert table.location is not None  # supports() refused otherwise
+                version: int = _native.commit_raw(
+                    table.location,
+                    state.version + 1,
+                    actions,
+                    options=self._options(table, write=True) or None,
+                )
+            except _native.CommitConflictError as exc:
+                # Recomputed on the table as it now is: a file another
+                # writer removed meanwhile is no longer this repair's.
+                last_error = exc
+                continue
+            if getattr(hooks, "create_checkpoint", True) is not False:
+                self._maybe_checkpoint(table, version)
+            return {"dry_run": False, "files_removed": paths, "version": version}
+        raise CommitConflictError(
+            conflict_version(str(last_error)),
+            f"cannot commit the repair: another writer committed first on each of "
+            f"{self.metadata_commit_attempts} attempts ({last_error}); retry when the table "
+            "is less busy",
+        )
 
     # -------------------------------------------------------- symlink manifest
 

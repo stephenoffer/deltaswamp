@@ -802,6 +802,39 @@ impl PySnapshot {
         })?)
     }
 
+    /// The live files whose data file is gone from storage (FSCK REPAIR):
+    /// their add actions as JSON, as `add_actions` gives them. A deletion
+    /// vector is not looked for; a file outside the table root counts as
+    /// gone, so callers refuse shallow clones.
+    fn missing_data_files(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| -> Result<Vec<String>> {
+            let root = self.inner.table_root();
+            let adds = files::add_actions(self.inner.clone(), self.engine.as_ref())?;
+            let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+            let mut urls = Vec::new();
+            for add in adds {
+                let parsed: serde_json::Value = serde_json::from_str(&add)
+                    .map_err(|e| NativeError::Invalid(format!("bad add action: {e}")))?;
+                let path = parsed
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| NativeError::Invalid("an add action without a path".into()))?;
+                let url = match url::Url::parse(path) {
+                    Ok(url) => url,
+                    Err(_) => root.join(path)?,
+                };
+                by_url.entry(url.to_string()).or_default().push(add);
+                urls.push(url);
+            }
+            let missing = crate::vacuum::missing(self.store()?, root, urls)?;
+            let mut out = Vec::new();
+            for url in missing {
+                out.extend(by_url.remove(&url).unwrap_or_default());
+            }
+            Ok(out)
+        })?)
+    }
+
     /// Which of `files` (`(path, size)` pairs, paths as `files()` reports
     /// them) hold values a reader that does not rebase would misread: written
     /// by Spark in its legacy hybrid calendar, or storing INT96 timestamps.

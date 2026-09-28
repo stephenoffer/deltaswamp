@@ -843,7 +843,12 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             "files as logged (deletion vectors, row ids) on deletion-vector tables, which "
             "delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write",
         ),
-        _op(Operation.REPAIR, (_D, _S), "kernel has no FSCK"),
+        _op(
+            Operation.REPAIR,
+            (_D, _K, _S),
+            "delta-rs for tables it can commit to; the kernel removes the missing files as "
+            "logged (row ids kept) on the rest",
+        ),
         _op(Operation.CONVERT, (_D,), "kernel has no CONVERT TO DELTA"),
         _op(
             Operation.GENERATE,

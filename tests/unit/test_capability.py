@@ -92,11 +92,7 @@ class TestEnginesFailInOppositeDirections:
         so the kernel is listed last and promoted only on DV-enabled tables."""
         assert OPERATION_ENGINES[Operation.MERGE].engines[-1] is Engine.KERNEL
 
-    def test_repair_never_routes_to_kernel(self) -> None:
-        """Kernel has no FSCK."""
-        assert Engine.KERNEL not in OPERATION_ENGINES[Operation.REPAIR].engines
-
-    @pytest.mark.parametrize("op", [Operation.VACUUM, Operation.RESTORE])
+    @pytest.mark.parametrize("op", [Operation.VACUUM, Operation.RESTORE, Operation.REPAIR])
     def test_vacuum_and_restore_fall_back_to_the_kernel(self, op: Operation) -> None:
         """delta-rs serves the tables it can commit to; the kernel the rest."""
         assert OPERATION_ENGINES[op].engines == (Engine.DELTARS, Engine.KERNEL, Engine.SQL)

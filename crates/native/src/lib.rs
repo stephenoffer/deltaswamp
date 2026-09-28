@@ -106,6 +106,8 @@ pub const FEATURES: &[&str] = &[
     "log_cleanup",
     // `write_symlink_manifest`: GENERATE symlink_format_manifest.
     "symlink_manifest",
+    // `missing_data_files`: FSCK REPAIR from the kernel's file listing.
+    "fsck",
 ];
 
 #[pyfunction]

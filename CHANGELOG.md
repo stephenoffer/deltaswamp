@@ -331,6 +331,11 @@ See docs/usage.md, "Security notes".
   manifests of partitions with no files deleted. It was refused. Tables with
   deletion vectors or column mapping stay refused on every engine, as Spark
   refuses them.
+- `repair()` (FSCK REPAIR) on the tables delta-rs cannot commit to --
+  clustering, row tracking, in-commit timestamps, type widening, column
+  defaults -- is committed by the kernel as delta-rs commits it: each live
+  file whose data file is gone is removed (`dataChange` true, operation
+  FSCK), carrying the add's deletion vector and row ids. It was refused.
 - Adding a NOT NULL column is refused on every engine, as Databricks refuses
   it: add it nullable, backfill, then `set_not_null()`.
 - On a kernel-only table without deletion vectors, DML is a whole-table

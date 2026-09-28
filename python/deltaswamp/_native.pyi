@@ -18,7 +18,7 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
 "path_clone", "log_cleanup",
-"symlink_manifest". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
+"symlink_manifest", "fsck". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -421,6 +421,13 @@ class Snapshot:
         unpartitioned table), and the manifests of partitions with no files
         deleted. Returns the manifests written, relative to the table root.
         Requires "symlink_manifest".
+        """
+
+    def missing_data_files(self) -> list[str]:
+        """The add actions (JSON, as `add_actions`) of live files whose data file is gone.
+
+        Deletion vectors are not looked for; a file outside the table root
+        counts as gone. Requires "fsck".
         """
 
     def missing_files(self, adds: list[str]) -> list[str]:
