@@ -19,7 +19,7 @@ import deltaswamp as ds
 import pytest
 from deltaswamp.capability import Capability, Engine, Operation
 from deltaswamp.catalog import ResolvedTable
-from deltaswamp.errors import FallbackRequiredError, UnreachableTableError
+from deltaswamp.errors import FallbackRequiredError, InvalidArgumentError, UnreachableTableError
 from deltaswamp.identity import parse_ref
 from deltaswamp.router import Router
 
@@ -199,15 +199,19 @@ def test_history_of_a_vacuum_protocol_check_table(conn: Any, tmp_path: Path) -> 
         {"delta.enableRowTracking": "true"},
     ],
 )
-def test_vacuum_dry_run_is_served_but_a_real_vacuum_is_not(
+def test_vacuum_dry_run_and_a_real_vacuum_are_served(
     conn: Any, tmp_path: Path, props: dict[str, str]
 ) -> None:
-    """A dry run deletes nothing and commits nothing; a real VACUUM commits
-    VACUUM START/END, which delta-rs refuses on these tables."""
+    """A real VACUUM commits VACUUM START/END, which delta-rs refuses on these
+    tables; the kernel plans and commits it (it was refused before)."""
     path = _make(conn, tmp_path, props)
+    assert conn.table(path).can("vacuum", dry_run=False).engine is Engine.KERNEL
     assert conn.table(path).vacuum() == []  # the default is a dry run
-    with pytest.raises(UnreachableTableError):
+    with pytest.raises(InvalidArgumentError, match="deletedFileRetentionDuration"):
         conn.table(path).vacuum(dry_run=False, retention_hours=0)
+    rows = conn.table(path).to_arrow().num_rows
+    conn.table(path).vacuum(dry_run=False, retention_hours=0, enforce_retention_duration=False)
+    assert conn.table(path).to_arrow().num_rows == rows
 
 
 @needs_native
