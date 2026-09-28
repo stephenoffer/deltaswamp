@@ -81,17 +81,19 @@ class _Yes:
 
 
 @needs_native
-def test_optimize_on_a_column_mapped_table_is_refused_up_front(conn: Any, tmp_path: Path) -> None:
+def test_optimize_on_a_column_mapped_table_routes_to_the_kernel(conn: Any, tmp_path: Path) -> None:
     """delta-rs raised "Column mapping is not supported for write operation
     'OPTIMIZE'" after being chosen; the mapping here is on a legacy protocol
-    (writer 5), so no feature list names it."""
+    (writer 5), so no feature list names it. The kernel compacts it (it was
+    refused, over a DuckDB bug that reads every mapped table's partition
+    columns as NULL, whoever wrote it)."""
     path = _make(conn, tmp_path, {"delta.columnMapping.mode": "name"})
     t = conn.table(path)
-    assert not t.can("optimize").ok
-    assert "columnMapping" in t.can("optimize").reason
-    assert not t.can("zorder").ok
-    with pytest.raises(UnreachableTableError, match="columnMapping"):
-        t.optimize()
+    assert t.can("optimize").engine is Engine.KERNEL
+    assert t.can("zorder", columns=["id"]).engine is Engine.KERNEL
+    before = sorted(t.to_arrow().column("id").to_pylist())
+    t.optimize()
+    assert sorted(conn.table(path).to_arrow().column("id").to_pylist()) == before
 
 
 @needs_native
@@ -141,16 +143,15 @@ def test_rename_column_without_column_mapping_is_refused_at_routing(
 
 
 @needs_native
-def test_overwrite_of_a_row_tracking_table_is_refused_up_front(conn: Any, tmp_path: Path) -> None:
-    """The kernel's transaction refused at commit: "Remove actions are not yet
-    supported on tables with rowTracking"."""
+def test_overwrite_of_a_row_tracking_table_routes_to_the_kernel(conn: Any, tmp_path: Path) -> None:
+    """The kernel's transaction refuses every remove on a row-tracked table
+    ("Remove actions are not yet supported"); the overwrite stages them by
+    hand, and was refused up front until it did."""
     path = _make(conn, tmp_path, {"delta.enableRowTracking": "true"})
     verdict = conn.table(path).can("overwrite")
-    assert not verdict.ok
-    assert "overwrite is not supported on a table with rowTracking" in verdict.reason
-    with pytest.raises(UnreachableTableError, match="rowTracking"):
-        conn.table(path).overwrite(_data(10))
-    assert conn.table(path).to_arrow().num_rows == 6
+    assert verdict.ok and verdict.engine is Engine.KERNEL
+    conn.table(path).overwrite(_data(10))
+    assert sorted(conn.table(path).to_arrow().column("id").to_pylist()) == [11, 12, 13]
 
 
 @needs_native

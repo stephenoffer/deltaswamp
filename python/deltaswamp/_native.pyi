@@ -16,7 +16,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
-"restore". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
+"restore", "row_tracking_compaction", "add_tags". Gate on this list, not `hasattr`, so a
+stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -278,6 +279,7 @@ class Snapshot:
         row_positions: bool = False,
         row_ids: bool = False,
         file_groups: list[int] | None = None,
+        row_tracking: bool = False,
     ) -> Any:
         """Read the table as an Arrow stream, with deletion vectors applied.
 
@@ -285,7 +287,10 @@ class Snapshot:
         the log stores its path) and `__deltaswamp_row_index` (its physical
         position in that file): the address a deletion vector uses. `row_ids`
         (which needs `row_positions`, and row tracking enabled) also appends
-        `__deltaswamp_row_id`, each row's stable row id.
+        `__deltaswamp_row_id`, each row's stable row id. `row_tracking` (with
+        `file_groups`, row tracking enabled) appends `__deltaswamp_row_id` and
+        `__deltaswamp_row_commit_version`: each row's id and commit version as
+        Databricks' `_metadata` reads them, for a compaction to write back.
 
         `files` are read in the order given, a few ahead in the background.
         `file_groups` (with `files`, not `row_positions`) splits them into runs
@@ -324,7 +329,7 @@ class Snapshot:
         scan -- the building block for distributed reads.
         """
 
-    def files(self, predicate: str | None = None) -> Any:
+    def files(self, predicate: str | None = None, tags: bool = False) -> Any:
         """One row per live data file, as an Arrow table (arro3 Table).
 
         Columns: `path` (string, as stored in the log: usually relative to the
@@ -336,6 +341,7 @@ class Snapshot:
         if present, rows in the file are deleted and must be masked) and
         `num_records` (int64 from stats, nullable; counts rows *before* the
         deletion vector). `predicate` skips files exactly as in `scan`.
+        `tags=True` appends `tags`: each add's tags as a JSON object (nullable).
         """
 
     def add_actions(self) -> list[str]:
@@ -518,6 +524,7 @@ class Snapshot:
         data_change: bool = True,
         operation_parameters: dict[str, str] | None = None,
         blind_append: bool | None = None,
+        add_tags: dict[str, str] | None = None,
     ) -> tuple[int, int, int, int]:
         """Commit row-level DML as deletion vectors, in one transaction.
 
@@ -526,7 +533,11 @@ class Snapshot:
         `data` is then pulled one batch at a time and each batch written as
         one file as it arrives, and the table's CHECK constraints, generated
         and identity columns and invariants do not stop it (they constrain
-        new values, and a compaction writes the ones it read).
+        new values, and a compaction writes the ones it read). On a row-tracked
+        table a compaction's removes are staged here (kernel refuses them), and
+        its `__deltaswamp_row_id` / `__deltaswamp_row_commit_version` columns
+        are written to the materialized row-tracking columns. `add_tags` are
+        written as the `tags` of every add.
 
         `deletions` is an Arrow stream of `path` and `row_index` columns, as a
         positional scan reports them. Each touched file's new deletions are

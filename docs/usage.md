@@ -672,7 +672,8 @@ t.cluster_by("auto")
 ```python
 t.optimize()  # bin-packing compaction
 t.optimize(zorder_by=["customer_id"])  # or t.z_order([...])
-t.optimize(full=True)  # OPTIMIZE FULL; warehouse
+t.optimize(full=True)  # OPTIMIZE FULL of a liquid-clustered table
+t.optimize(min_file_size=64 << 20, sort_by=["day", "id"])  # bin-pack only small files, sorted
 t.vacuum(retention_hours=168)  # a dry run by default
 t.vacuum(retention_hours=168, dry_run=False, lite=True)
 t.restore(3)  # or a datetime
@@ -708,6 +709,18 @@ bounded by `KernelEngine.compaction_max_file_bytes` (512 MiB of decoded rows
 per output file or Z-order sort). `partition_filters` compare as the column's
 type, as delta-rs does: a NULL partition matches no comparison, `= ''` means
 NULL, and timestamps take ISO 8601 with or without the `T` and an offset.
+
+A Z-order tags its files as Databricks does (`ZCUBE_ID`, `ZCUBE_ZORDER_BY`), and
+the next Z-order by the same columns leaves a partition's cubes of at least
+`min_cube_size` (default: the target size) alone, rewriting only new files and
+small cubes; Databricks' own incremental ZORDER reads the same tags. On a
+liquid-clustered table `optimize()` is that Z-order over the clustering keys
+(`zorder_by` is refused, as Databricks refuses it), and `full=True` rewrites
+every file. On a row-tracked table every row a compaction moves keeps its row
+id and commit version, written into the table's materialized columns; an
+overwrite there gives the new rows fresh ids. Kernel 0.28 refuses to stage the
+removes of either commit on such a table, so the native commit writes them
+itself; its post-commit snapshot and checksum delta do not count them.
 
 `vacuum` defaults to a dry run because the real thing deletes files. `lite=True`
 considers only files the log records as removed. `vacuum` returns the paths it

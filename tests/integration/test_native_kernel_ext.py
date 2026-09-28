@@ -91,6 +91,9 @@ class TestFiles:
             "deletion_vector",
             "num_records",
         ]
+        assert (
+            pa.table(helpers.snapshot(two_file_table).files(tags=True)).column_names[-1] == "tags"
+        )
         assert files.num_rows == 2
         assert sorted(files.column("num_records").to_pylist()) == [2, 3]
         assert files.column("deletion_vector").null_count == 2

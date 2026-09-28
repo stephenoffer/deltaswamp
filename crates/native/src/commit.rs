@@ -271,6 +271,12 @@ pub fn write(
         .map(|b| partition::conform_to_table(b, table_schema.as_ref(), &partition_columns))
         .collect::<Result<Vec<_>>>()?;
     let batches = partition::coalesce(batches)?;
+    // Remove everything the snapshot can see, in this same commit.
+    let removes = if overwrite {
+        overwrite_removes(&scan_source, &engine, &info)?
+    } else {
+        Vec::new()
+    };
     let mut transaction = begin_transaction(
         snapshot,
         &engine,
@@ -281,14 +287,8 @@ pub fn write(
         commit_metadata,
         info,
     )?;
-
-    if overwrite {
-        // Remove everything the snapshot can see, in this same commit.
-        let scan = scan_source.scan_builder().build()?;
-        let scan_metadata = runtime::block_on(async { scan.scan_metadata(engine.as_ref()) })?;
-        for filtered in Transaction::scan_metadata_to_engine_data(scan_metadata) {
-            transaction.remove_files(filtered?);
-        }
+    for filtered in removes {
+        transaction.remove_files(filtered);
     }
 
     // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
@@ -442,6 +442,11 @@ const WRITE_BYTES: usize = 256 << 20;
 
 /// [`stage_batches`] over a stream: each batch (a prepared group of them) is
 /// written as it arrives, several at once, and added to `txn` in order.
+///
+/// `carried` maps columns a batch may bring beside the table's own to the
+/// physical columns they are written as (a compaction's row ids and commit
+/// versions, into the materialized row-tracking columns).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_stream(
     txn: &mut Transaction,
     engine: &SharedEngine,
@@ -450,6 +455,7 @@ pub(crate) fn stage_stream(
     batches: impl Iterator<Item = Result<Vec<arrow::array::RecordBatch>>>,
     codec: Compression,
     written: &mut Vec<String>,
+    carried: &[(String, String)],
 ) -> Result<()> {
     let mut inflight: Inflight = Default::default();
     let result = stage_stream_into(
@@ -461,6 +467,7 @@ pub(crate) fn stage_stream(
         codec,
         written,
         &mut inflight,
+        carried,
     );
     if result.is_err() {
         // The writes still running finish (at most WRITE_FILES of them), and
@@ -489,6 +496,7 @@ fn stage_stream_into(
     codec: Compression,
     written: &mut Vec<String>,
     inflight: &mut Inflight,
+    carried: &[(String, String)],
 ) -> Result<()> {
     let write_state = txn.write_state()?;
     let mut inflight_bytes = 0usize;
@@ -522,12 +530,13 @@ fn stage_stream_into(
                     finish(txn, handle)?;
                 }
                 let engine = engine.clone();
+                let carried = carried.to_vec();
                 let handle = runtime::runtime().spawn(async move {
-                    let data = ArrowEngineData::new(data);
                     // The writer that marks the footer with the Spark version,
                     // as every other write here uses: without it Databricks
                     // read a compacted file's early dates shifted.
-                    crate::writer::write_parquet(&engine, &data, &context, codec).await
+                    crate::writer::write_parquet_carrying(&engine, data, &carried, &context, codec)
+                        .await
                 });
                 inflight.push_back((handle, bytes));
                 inflight_bytes += bytes;
@@ -852,17 +861,55 @@ pub struct CommitInfoPatch {
     pub operation_parameters: Option<std::collections::HashMap<String, String>>,
     /// Written as `isBlindAppend`, true or false (kernel writes only true).
     pub blind_append: Option<bool>,
+    /// Actions written after kernel's own: the `remove`s of a row-tracked
+    /// table, which kernel 0.28 refuses to stage (see [`RemovesByHand`]).
+    pub extra_actions: ExtraActions,
+    /// Written as the `tags` of every `add` (kernel writes none).
+    pub add_tags: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Actions a commit writes beside the ones kernel builds, taken by the
+/// committer that writes them (one commit attempt per transaction).
+#[derive(Clone, Default)]
+pub struct ExtraActions(Arc<std::sync::Mutex<Vec<FilteredEngineData>>>);
+
+impl std::fmt::Debug for ExtraActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0.lock().map(|v| v.len()).unwrap_or(0);
+        write!(f, "ExtraActions({n} batches)")
+    }
+}
+
+impl ExtraActions {
+    pub(crate) fn push(&self, data: FilteredEngineData) {
+        if let Ok(mut held) = self.0.lock() {
+            held.push(data);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.lock().map(|v| v.is_empty()).unwrap_or(true)
+    }
+
+    fn take(&self) -> Vec<FilteredEngineData> {
+        self.0
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
+    }
 }
 
 impl CommitInfoPatch {
     fn is_empty(&self) -> bool {
-        self.operation_parameters.is_none() && self.blind_append.is_none()
+        self.operation_parameters.is_none()
+            && self.blind_append.is_none()
+            && self.add_tags.is_none()
+            && self.extra_actions.is_empty()
     }
 
     /// `data` with the patched fields, when it is the `commitInfo` action.
     fn apply(&self, data: FilteredEngineData) -> DeltaResult<FilteredEngineData> {
-        use arrow::array::{Array, ArrayRef, BooleanArray, MapArray, StringArray, StructArray};
-        use arrow::buffer::OffsetBuffer;
+        use arrow::array::{Array, ArrayRef, BooleanArray, StructArray};
         use arrow::datatypes::{DataType, Field};
 
         let (data, selection) = data.into_parts();
@@ -880,6 +927,10 @@ impl CommitInfoPatch {
             .downcast::<ArrowEngineData>()
             .map_err(|_| delta_kernel::Error::generic("action data is not Arrow"))?)
         .into();
+        if let (Some(tags), Ok(index)) = (&self.add_tags, batch.schema().index_of("add")) {
+            let batch = with_add_tags(&batch, index, tags)?;
+            return FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection);
+        }
         let Ok(index) = batch.schema().index_of("commitInfo") else {
             return FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection);
         };
@@ -907,39 +958,7 @@ impl CommitInfoPatch {
             }
         };
         if let Some(parameters) = &self.operation_parameters {
-            let mut entries: Vec<(&String, &String)> = parameters.iter().collect();
-            entries.sort();
-            let keys: Vec<&str> = entries
-                .iter()
-                .cycle()
-                .take(entries.len() * rows)
-                .map(|(k, _)| k.as_str())
-                .collect();
-            let values: Vec<&str> = entries
-                .iter()
-                .cycle()
-                .take(entries.len() * rows)
-                .map(|(_, v)| v.as_str())
-                .collect();
-            let entry_fields = arrow::datatypes::Fields::from(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("value", DataType::Utf8, true),
-            ]);
-            let entry_struct = StructArray::try_new(
-                entry_fields.clone(),
-                vec![
-                    Arc::new(StringArray::from(keys)) as ArrayRef,
-                    Arc::new(StringArray::from(values)) as ArrayRef,
-                ],
-                None,
-            )?;
-            let entries_field = Arc::new(Field::new(
-                "key_value",
-                DataType::Struct(entry_fields),
-                false,
-            ));
-            let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(entries.len(), rows));
-            let map = MapArray::try_new(entries_field.clone(), offsets, entry_struct, None, false)?;
+            let (entries_field, map) = constant_map(parameters, rows)?;
             put(
                 "operationParameters",
                 Field::new(
@@ -978,6 +997,103 @@ impl CommitInfoPatch {
     }
 }
 
+/// A map column holding `entries` (sorted by key) on each of `rows` rows.
+fn constant_map(
+    entries: &std::collections::HashMap<String, String>,
+    rows: usize,
+) -> DeltaResult<(arrow::datatypes::FieldRef, arrow::array::ArrayRef)> {
+    use arrow::array::{ArrayRef, MapArray, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field};
+
+    let mut entries: Vec<(&String, &String)> = entries.iter().collect();
+    entries.sort();
+    let keys: Vec<&str> = entries
+        .iter()
+        .cycle()
+        .take(entries.len() * rows)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    let values: Vec<&str> = entries
+        .iter()
+        .cycle()
+        .take(entries.len() * rows)
+        .map(|(_, v)| v.as_str())
+        .collect();
+    let entry_fields = arrow::datatypes::Fields::from(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, true),
+    ]);
+    let entry_struct = StructArray::try_new(
+        entry_fields.clone(),
+        vec![
+            Arc::new(StringArray::from(keys)) as ArrayRef,
+            Arc::new(StringArray::from(values)) as ArrayRef,
+        ],
+        None,
+    )?;
+    let entries_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(entries.len(), rows));
+    let map = MapArray::try_new(entries_field.clone(), offsets, entry_struct, None, false)?;
+    Ok((entries_field, Arc::new(map)))
+}
+
+/// `batch` with the `add` struct at `index` carrying `tags` on every row.
+fn with_add_tags(
+    batch: &arrow::array::RecordBatch,
+    index: usize,
+    tags: &std::collections::HashMap<String, String>,
+) -> DeltaResult<arrow::array::RecordBatch> {
+    use arrow::array::{Array, StructArray};
+    use arrow::datatypes::{DataType, Field};
+
+    let Some(add) = batch.column(index).as_any().downcast_ref::<StructArray>() else {
+        return Ok(batch.clone());
+    };
+    let DataType::Struct(struct_fields) = add.data_type().clone() else {
+        unreachable!("a StructArray has a struct type");
+    };
+    let (entries_field, map) = constant_map(tags, add.len())?;
+    let field = Arc::new(Field::new(
+        "tags",
+        DataType::Map(entries_field, false),
+        true,
+    ));
+    let mut fields: Vec<arrow::datatypes::FieldRef> = struct_fields.iter().cloned().collect();
+    let mut columns = add.columns().to_vec();
+    match fields.iter().position(|f| f.name() == "tags") {
+        Some(i) => {
+            fields[i] = field;
+            columns[i] = map;
+        }
+        None => {
+            fields.push(field);
+            columns.push(map);
+        }
+    }
+    let patched = StructArray::try_new(fields.into(), columns, add.nulls().cloned())?;
+    let mut outer: Vec<arrow::datatypes::FieldRef> =
+        batch.schema().fields().iter().cloned().collect();
+    outer[index] = Arc::new(Field::new(
+        "add",
+        patched.data_type().clone(),
+        outer[index].is_nullable(),
+    ));
+    let mut outer_columns = batch.columns().to_vec();
+    outer_columns[index] = Arc::new(patched);
+    Ok(arrow::array::RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            outer,
+            batch.schema().metadata().clone(),
+        )),
+        outer_columns,
+    )?)
+}
+
 /// A committer that writes [`CommitInfoPatch`] into the `commitInfo` action,
 /// then hands every action to the real committer unchanged otherwise.
 struct PatchingCommitter {
@@ -993,7 +1109,10 @@ impl Committer for PatchingCommitter {
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
         let info = &self.info;
-        let patched = actions.map(move |item| item.and_then(|data| info.apply(data)));
+        let extra = info.extra_actions.take();
+        let patched = actions
+            .map(move |item| item.and_then(|data| info.apply(data)))
+            .chain(extra.into_iter().map(Ok));
         self.inner
             .commit(engine, Box::new(patched), commit_metadata)
     }
@@ -1009,6 +1128,171 @@ impl Committer for PatchingCommitter {
     ) -> DeltaResult<()> {
         self.inner.publish(engine, publish_metadata)
     }
+}
+
+// ---------------------------------------------------------------- row tracking
+
+/// The `remove` actions of a commit on a row-tracked table, built here.
+///
+/// Kernel 0.28 refuses every remove on a table that supports row tracking
+/// (`validate_feature_support_for_remove`, delta-kernel-rs#2538): it cannot
+/// know whether the rows it removes kept their ids. The Delta protocol asks
+/// nothing of a remove there beyond what kernel's own would say (Spark and
+/// Databricks carry `baseRowId` and `defaultRowCommitVersion` on it); what
+/// row tracking asks of the commit is that rows it moves keep their ids and
+/// commit versions, which a compaction writes into the materialized columns,
+/// and that new rows get fresh ids, which kernel assigns to the adds. So the
+/// removes are staged here, from the same scan rows kernel would build them
+/// from, and written after kernel's actions by the committer.
+///
+/// Kernel's post-commit snapshot and its checksum delta do not count these
+/// removes; nothing here reads either (checkpoints are written from a
+/// snapshot read back from storage).
+pub(crate) struct RemovesByHand {
+    evaluator: Arc<dyn delta_kernel::ExpressionEvaluator>,
+}
+
+impl RemovesByHand {
+    /// Whether `snapshot`'s commits must stage their removes here.
+    pub(crate) fn needed(snapshot: &SnapshotRef) -> bool {
+        use delta_kernel::table_features::TableFeature;
+        let config = snapshot.table_configuration();
+        let suspended = snapshot
+            .metadata_configuration()
+            .get("delta.rowTrackingSuspended")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        config.is_feature_supported(&TableFeature::RowTracking)
+            && !suspended
+            && !config.is_feature_enabled(&TableFeature::IcebergCompatV3)
+    }
+
+    /// An evaluator from kernel's scan rows to `remove` actions stamped
+    /// `deletion_timestamp` and `data_change`.
+    pub(crate) fn new(
+        engine: &SharedEngine,
+        deletion_timestamp: i64,
+        data_change: bool,
+    ) -> Result<Self> {
+        use delta_kernel::expressions::{column_expr_ref, Expression, Predicate};
+        use delta_kernel::schema::{DataType, StructField, StructType};
+        use delta_kernel::Engine;
+
+        let input = delta_kernel::scan::scan_row_schema();
+        let field = |name: &str| -> Result<DataType> {
+            input
+                .field(name)
+                .map(|f| f.data_type().clone())
+                .ok_or_else(|| NativeError::Invalid(format!("scan rows have no {name}")))
+        };
+        let constants = match field("fileConstantValues")? {
+            DataType::Struct(s) => s,
+            _ => {
+                return Err(NativeError::Invalid(
+                    "scan rows' fileConstantValues is not a struct".to_string(),
+                ))
+            }
+        };
+        let constant = |name: &str| -> Result<DataType> {
+            constants
+                .field(name)
+                .map(|f| f.data_type().clone())
+                .ok_or_else(|| NativeError::Invalid(format!("scan rows have no {name}")))
+        };
+        let remove = StructType::try_new([
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("deletionTimestamp", DataType::LONG),
+            StructField::nullable("dataChange", DataType::BOOLEAN),
+            StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
+            StructField::nullable("partitionValues", constant("partitionValues")?),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable("tags", constant("tags")?),
+            StructField::nullable("deletionVector", field("deletionVector")?),
+            StructField::nullable("baseRowId", DataType::LONG),
+            StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+        ])?;
+        let output = StructType::try_new([StructField::nullable(
+            "remove",
+            DataType::Struct(Box::new(remove)),
+        )])?;
+        // As kernel's `build_remove_struct_patch` has it.
+        let extended = Predicate::and_from([
+            Expression::column(["size"]).is_not_null(),
+            Expression::column(["fileConstantValues", "partitionValues"]).is_not_null(),
+        ]);
+        let expression = Expression::struct_from([Arc::new(Expression::struct_from([
+            column_expr_ref!("path"),
+            Arc::new(Expression::literal(deletion_timestamp)),
+            Arc::new(Expression::literal(data_change)),
+            Arc::new(Expression::from(extended)),
+            column_expr_ref!("fileConstantValues.partitionValues"),
+            column_expr_ref!("size"),
+            column_expr_ref!("stats"),
+            column_expr_ref!("fileConstantValues.tags"),
+            column_expr_ref!("deletionVector"),
+            column_expr_ref!("fileConstantValues.baseRowId"),
+            column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+        ]))]);
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            input,
+            Arc::new(expression),
+            DataType::Struct(Box::new(output)),
+        )?;
+        Ok(Self { evaluator })
+    }
+
+    /// The removes of the rows of `scan_files` (kernel scan rows) `selected` marks.
+    pub(crate) fn of(
+        &self,
+        scan_files: &dyn delta_kernel::EngineData,
+        selected: Vec<bool>,
+    ) -> Result<FilteredEngineData> {
+        let removes = self.evaluator.evaluate(scan_files)?;
+        Ok(FilteredEngineData::try_new(removes, selected)?)
+    }
+}
+
+/// The removes of an overwrite: every file `snapshot` can see.
+///
+/// Returned for kernel to stage, or, on a row-tracked table, staged by hand
+/// into `info` (the new rows get fresh ids from kernel, as a replaced
+/// table's rows should) and nothing returned.
+fn overwrite_removes(
+    snapshot: &SnapshotRef,
+    engine: &SharedEngine,
+    info: &CommitInfoPatch,
+) -> Result<Vec<FilteredEngineData>> {
+    let scan = snapshot.clone().scan_builder().build()?;
+    let scan_metadata = runtime::block_on(async { scan.scan_metadata(engine.as_ref()) })?;
+    let builder = if RemovesByHand::needed(snapshot) {
+        Some(RemovesByHand::new(engine, now_millis(), true)?)
+    } else {
+        None
+    };
+    let mut removes = Vec::new();
+    for filtered in Transaction::scan_metadata_to_engine_data(scan_metadata) {
+        let filtered = filtered?;
+        match &builder {
+            Some(builder) => {
+                let selection = filtered.selection_vector();
+                let selected = (0..filtered.data().len())
+                    .map(|i| selection.get(i).copied().unwrap_or(true))
+                    .collect();
+                info.extra_actions
+                    .push(builder.of(filtered.data(), selected)?);
+            }
+            None => removes.push(filtered),
+        }
+    }
+    Ok(removes)
+}
+
+/// Milliseconds since the epoch, for a remove's `deletionTimestamp`.
+pub(crate) fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------- distributed
@@ -1356,6 +1640,11 @@ pub fn commit_files(
     let scan_source = snapshot.clone();
     let table_root = snapshot.table_root().to_string();
     let metadata_id = snapshot.table_configuration().metadata().id().to_string();
+    let removes = if overwrite {
+        overwrite_removes(&scan_source, &engine, &info)?
+    } else {
+        Vec::new()
+    };
     let mut transaction = begin_transaction(
         snapshot,
         &engine,
@@ -1366,13 +1655,8 @@ pub fn commit_files(
         commit_metadata,
         info,
     )?;
-
-    if overwrite {
-        let scan = scan_source.scan_builder().build()?;
-        let scan_metadata = runtime::block_on(async { scan.scan_metadata(engine.as_ref()) })?;
-        for filtered in Transaction::scan_metadata_to_engine_data(scan_metadata) {
-            transaction.remove_files(filtered?);
-        }
+    for filtered in removes {
+        transaction.remove_files(filtered);
     }
 
     // Decode and check every fragment before adding any, so a bad one cannot
@@ -1478,6 +1762,7 @@ mod commit_info_tests {
         let patch = CommitInfoPatch {
             operation_parameters: Some([("mode".to_string(), "Overwrite".to_string())].into()),
             blind_append: Some(false),
+            ..Default::default()
         };
         let data = FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(
             commit_info_batch(),
@@ -1522,10 +1807,69 @@ mod commit_info_tests {
     }
 
     #[test]
+    fn add_tags_are_written_onto_every_add() {
+        use arrow::array::{Int64Array, StructArray};
+        let fields = vec![
+            Arc::new(Field::new("path", DataType::Utf8, true)),
+            Arc::new(Field::new("size", DataType::Int64, true)),
+        ];
+        let add = StructArray::try_new(
+            fields.into(),
+            vec![
+                Arc::new(StringArray::from(vec!["a.parquet", "b.parquet"]))
+                    as arrow::array::ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+            None,
+        )
+        .unwrap();
+        let schema =
+            arrow::datatypes::Schema::new(vec![Field::new("add", add.data_type().clone(), true)]);
+        let batch =
+            arrow::array::RecordBatch::try_new(Arc::new(schema), vec![Arc::new(add)]).unwrap();
+        let patch = CommitInfoPatch {
+            add_tags: Some([("ZCUBE_ID".to_string(), "c1".to_string())].into()),
+            ..Default::default()
+        };
+        let data =
+            FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(batch)));
+        let (data, _) = patch.apply(data).unwrap().into_parts();
+        let out: arrow::array::RecordBatch =
+            (*data.into_any().downcast::<ArrowEngineData>().unwrap()).into();
+        let add = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let tags = add
+            .column_by_name("tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(tags.len(), 2);
+        for row in 0..2 {
+            let entries = tags.value(row);
+            let keys = entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = entries
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!((keys.value(0), values.value(0)), ("ZCUBE_ID", "c1"));
+        }
+    }
+
+    #[test]
     fn other_actions_pass_through_unchanged() {
         let patch = CommitInfoPatch {
             operation_parameters: None,
             blind_append: Some(true),
+            ..Default::default()
         };
         let column = Arc::new(StringArray::from(vec!["x"])) as arrow::array::ArrayRef;
         let schema = arrow::datatypes::Schema::new(vec![Field::new("add", DataType::Utf8, true)]);

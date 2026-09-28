@@ -36,10 +36,13 @@ fn missing(name: &str) -> NativeError {
 }
 
 /// One row per live data file, with optional predicate-based file skipping.
+///
+/// With `tags`, a last column `tags` holds each add's tags as a JSON object.
 pub fn list_files(
     snapshot: SnapshotRef,
     engine: &dyn Engine,
     predicate: Option<Predicate>,
+    tags: bool,
 ) -> Result<RecordBatch> {
     // Struct stats are requested only so the kernel reads a checkpoint's
     // `stats_parsed` and re-serializes it into `stats`. With the default
@@ -62,11 +65,11 @@ pub fn list_files(
             .collect();
         let selected = filter_record_batch(&batch, &mask)?;
         if selected.num_rows() > 0 {
-            batches.push(project(&selected)?);
+            batches.push(project(&selected, tags)?);
         }
     }
 
-    let schema = output_schema();
+    let schema = schema_for(tags);
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -96,8 +99,18 @@ pub fn output_schema() -> Arc<Schema> {
     ]))
 }
 
+fn schema_for(tags: bool) -> Arc<Schema> {
+    let schema = output_schema();
+    if !tags {
+        return schema;
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.push(Field::new("tags", DataType::Utf8, true));
+    Arc::new(Schema::new(fields))
+}
+
 /// Reshape one selected scan-metadata batch into the listing schema.
-fn project(batch: &RecordBatch) -> Result<RecordBatch> {
+fn project(batch: &RecordBatch, with_tags: bool) -> Result<RecordBatch> {
     let column = |name: &str| {
         batch
             .column_by_name(name)
@@ -128,18 +141,56 @@ fn project(batch: &RecordBatch) -> Result<RecordBatch> {
     let stats_strings = stats.as_string::<i32>();
     let num_records = num_records(stats_strings);
 
-    Ok(RecordBatch::try_new(
-        output_schema(),
-        vec![
-            path,
-            size,
-            modification_time,
-            partition_values,
-            stats,
-            Arc::new(deletion_vector),
-            Arc::new(num_records),
-        ],
-    )?)
+    let mut columns: Vec<ArrayRef> = vec![
+        path,
+        size,
+        modification_time,
+        partition_values,
+        stats,
+        Arc::new(deletion_vector),
+        Arc::new(num_records),
+    ];
+    if with_tags {
+        let tags = match constants.column_by_name("tags") {
+            Some(tags) => tags_json(tags)?,
+            None => StringArray::new_null(batch.num_rows()),
+        };
+        columns.push(Arc::new(tags));
+    }
+    Ok(RecordBatch::try_new(schema_for(with_tags), columns)?)
+}
+
+/// Each add's `tags` map as a JSON object (null where it has none): what an
+/// incremental Z-order reads its `ZCUBE_*` tags from.
+fn tags_json(array: &ArrayRef) -> Result<StringArray> {
+    let map = array
+        .as_map_opt()
+        .ok_or_else(|| missing("fileConstantValues.tags (as a map)"))?;
+    let keys = arrow::compute::cast(map.keys(), &DataType::Utf8)?;
+    let values = arrow::compute::cast(map.values(), &DataType::Utf8)?;
+    let (keys, values) = (keys.as_string::<i32>(), values.as_string::<i32>());
+    let mut out = StringBuilder::new();
+    for i in 0..map.len() {
+        if map.is_null(i) {
+            out.append_null();
+            continue;
+        }
+        let (start, end) = (
+            map.value_offsets()[i] as usize,
+            map.value_offsets()[i + 1] as usize,
+        );
+        let mut object = serde_json::Map::new();
+        for j in start..end {
+            let value = if values.is_null(j) {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(values.value(j).to_string())
+            };
+            object.insert(keys.value(j).to_string(), value);
+        }
+        out.append_value(serde_json::Value::Object(object).to_string());
+    }
+    Ok(out.finish())
 }
 
 /// Give the map column our field names, so the output schema is stable no

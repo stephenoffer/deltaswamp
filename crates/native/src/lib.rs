@@ -83,6 +83,13 @@ pub const FEATURES: &[&str] = &[
     "vacuum",
     // `add_actions`/`missing_files`: RESTORE committed from the target's adds.
     "restore",
+    // Compactions and overwrites of row-tracked tables: removes staged by
+    // hand, and `scan(row_tracking=True)` rows written back with their ids
+    // and commit versions in the materialized columns.
+    "row_tracking_compaction",
+    // `commit_dml(add_tags=)`: tags on every add (a Z-order's ZCUBE_* tags),
+    // and files() lists each file's tags.
+    "add_tags",
 ];
 
 #[pyfunction]

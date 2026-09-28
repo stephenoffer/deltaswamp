@@ -13,6 +13,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -441,6 +442,8 @@ class KernelEngine:
     supports_commit_metadata = True
     supports_writer_properties = False
     supports_dynamic_overwrite = False
+    #: OPTIMIZE FULL: every file of a liquid-clustered table reclustered.
+    supports_optimize_full = True
     #: Negative fractional decimal partition values are serialized correctly.
     supports_negative_decimal_partition_values = True
     #: history_manager resolves a timestamp to the latest recreatable version,
@@ -604,7 +607,20 @@ class KernelEngine:
 
         by_dv = operation in _REWRITE_OPS and self._dv_path(table)
         row_tracked = "rowTracking" in table.effective_writer_features
-        if row_tracked and operation in _REMOVE_OPS and not (by_dv and _keeps_row_ids(table)):
+        # A plain overwrite replaces every row, and the new ones get fresh
+        # ids, as the protocol asks: the native commit stages its removes by
+        # hand where kernel will not.
+        replaces_all = (
+            operation is Operation.OVERWRITE
+            and shape.get("predicate") is None
+            and _native_has("row_tracking_compaction")
+        )
+        if (
+            row_tracked
+            and operation in _REMOVE_OPS
+            and not replaces_all
+            and not (by_dv and _keeps_row_ids(table))
+        ):
             # Checked for every remove-staging operation, not just the rewrites:
             # a kernel overwrite removes every visible file in the same commit,
             # and the commit is refused after the data is written. Through
@@ -2239,12 +2255,20 @@ class KernelEngine:
         """
         refusal = (
             _compaction_option_refusal(shape)
+            or _clustering_option_refusal(shape, _clustered(table.effective_writer_features))
             or self._compaction_table_refusal(table)
             or _compaction_feature_refusal(table.effective_writer_features, table.properties)
         )
         if refusal is not None:
             reason, remedy = refusal
             return Capability(operation, ok=False, reason=reason, remedy=remedy or "")
+        if _clustered(table.effective_writer_features):
+            return Capability(
+                operation,
+                ok=True,
+                engine=self.kind,
+                reason=(_FULL_RECLUSTER if shape.get("full") else _INCREMENTAL_RECLUSTER),
+            )
         return Capability(operation, ok=True, engine=self.kind)
 
     def _compaction_table_refusal(self, table: ResolvedTable) -> tuple[str, str | None] | None:
@@ -2314,7 +2338,13 @@ class KernelEngine:
         it; `target_size` (default `delta.targetFileSize`, else 100 MiB) sizes
         the output; `commit_properties` / `commit_metadata` /
         `max_commit_retries` and `post_commithook_properties(create_checkpoint=)`
-        are honoured. delta-rs's executor knobs (`max_concurrent_tasks`,
+        are honoured. `min_file_size` (default: the target) leaves files at
+        least that large out of a bin-packing; `sort_by` sorts each bin's rows
+        by those columns; a Z-order leaves alone the files already Z-ordered
+        by the same columns in cubes of at least `min_cube_size` (default: the
+        target). On a liquid-clustered table OPTIMIZE Z-orders by the
+        clustering keys, incrementally, or every file with `full=True`.
+        delta-rs's executor knobs (`max_concurrent_tasks`,
         `max_spill_size`, `max_temp_directory_size`) have nothing to bound
         here. `writer_properties`, `min_commit_interval`, app transactions and
         log cleanup are refused (see `supports`).
@@ -2343,6 +2373,7 @@ class KernelEngine:
         if target is None:
             target = parse_byte_size(table.properties.get("delta.targetFileSize"))
         hooks = kwargs.get("post_commithook_properties")
+        sort_by = kwargs.get("sort_by")
         return self.compact(
             table,
             zorder_by=list(zorder_by) if zorder_by else None,
@@ -2351,6 +2382,10 @@ class KernelEngine:
             commit_metadata=metadata or None,
             max_commit_retries=retries,
             checkpoint=getattr(hooks, "create_checkpoint", True) is not False,
+            full=full,
+            sort_by=[sort_by] if isinstance(sort_by, str) else sort_by,
+            min_file_size=kwargs.get("min_file_size"),
+            min_cube_size=kwargs.get("min_cube_size"),
         )
 
     def zorder(
@@ -2371,8 +2406,18 @@ class KernelEngine:
         commit_metadata: dict[str, Any] | None = None,
         max_commit_retries: int | None = None,
         checkpoint: bool = True,
+        full: bool = False,
+        sort_by: list[str] | None = None,
+        min_file_size: int | None = None,
+        min_cube_size: int | None = None,
     ) -> dict[str, Any]:
         """OPTIMIZE (bin-packing, or Z-order with `zorder_by`), committed by the kernel.
+
+        On a liquid-clustered table it is a Z-order by the clustering keys
+        (the `delta.clustering` domain), which the commit leaves as it is.
+        A Z-order is incremental: files already Z-ordered by the same columns
+        (their `ZCUBE_ZORDER_BY` tag) in a cube of at least `min_cube_size`
+        stay; `full` rewrites them too.
 
         Plans from one snapshot and commits the rewritten files against it,
         `dataChange=false`. When a concurrent commit wins, the same files are
@@ -2391,6 +2436,15 @@ class KernelEngine:
             else int(max_commit_retries)
         )
         target = int(target_size or _DEFAULT_TARGET_SIZE)
+        if full and not _clustered(table.effective_writer_features):
+            reason, remedy = _clustering_option_refusal({"full": True}, False) or ("", None)
+            raise EngineLimitError("optimize on the kernel", reason, remedy)
+        options = _PlanOptions(
+            full=bool(full),
+            sort_by=list(sort_by) if sort_by else None,
+            min_file_size=int(min_file_size) if min_file_size else target,
+            min_cube_size=int(min_cube_size) if min_cube_size else target,
+        )
         metrics: dict[str, Any] = {
             "numFilesAdded": 0,
             "numFilesRemoved": 0,
@@ -2398,7 +2452,7 @@ class KernelEngine:
             "numBatches": 0,
             "totalConsideredFiles": 0,
             "totalFilesSkipped": 0,
-            "preserveInsertionOrder": not zorder_by,
+            "preserveInsertionOrder": not zorder_by and not sort_by,
         }
         added_sizes: list[int] = []
         removed_sizes: list[int] = []
@@ -2427,11 +2481,19 @@ class KernelEngine:
                         "committed before then stands; nothing else was committed",
                     )
             read = snapshot
-            files = pa.table(snapshot.files())
+            files = pa.table(
+                snapshot.files(tags=True) if _native_has("add_tags") else snapshot.files()
+            )
+            clustering = _clustering_keys(snapshot)
+            if clustering is not None and zorder_by:
+                reason, remedy = _clustering_option_refusal({"zorder_by": 1}, True) or ("", None)
+                raise EngineLimitError("z-order on the kernel", reason, remedy)
+            ordering = zorder_by or clustering or None
             bins, considered, skipped = self._plan_compaction(
-                snapshot, files, zorder_by, target, partition_filters, done
+                snapshot, files, ordering, target, partition_filters, done, options
             )
             if first_plan:
+                metrics["preserveInsertionOrder"] = not ordering and not sort_by
                 metrics["totalConsideredFiles"] = considered
                 metrics["totalFilesSkipped"] = skipped
                 first_plan = False
@@ -2452,11 +2514,13 @@ class KernelEngine:
                         table,
                         snapshot,
                         step,
-                        zorder_by,
+                        ordering,
                         target,
                         commit_metadata,
                         checkpoint,
                         [_filter_text(f) for f in partition_filters or []],
+                        sort_by=options.sort_by,
+                        clustering=clustering,
                     )
                     break
                 except CommitConflictError as exc:
@@ -2513,25 +2577,37 @@ class KernelEngine:
         target: int,
         partition_filters: list[Any] | None,
         exclude: set[str],
+        options: _PlanOptions | None = None,
     ) -> tuple[list[_Bin], int, int]:
         """Bins of files to rewrite together, and the considered and skipped counts.
 
-        As delta-rs plans them: per partition, files below the target size
-        packed greedily up to it, a bin of one file left alone -- unless it
-        carries a deletion vector, whose deleted rows the rewrite drops. A
-        Z-order rewrites every file of each partition as one bin.
+        As delta-rs plans them: per partition, files below `min_file_size`
+        (the target size unless given) packed greedily up to the target, a
+        bin of one file left alone -- unless it carries a deletion vector,
+        whose deleted rows the rewrite drops. A Z-order rewrites each
+        partition's files as one bin, but for the cubes already Z-ordered by
+        the same columns that are at least `min_cube_size` (`_zorder_plan`).
         """
+        options = options or _PlanOptions(min_file_size=target, min_cube_size=target)
         physical = _physical_partition_names(snapshot)
         keep = _partition_filter(snapshot, partition_filters, physical)
         width = _decoded_row_bytes(_arrow_schema(snapshot))
         groups: dict[Any, list[tuple[str, int, bool, int | None]]] = {}
+        cubes: dict[str, str | None] = {}
         considered = skipped = 0
-        for path, size, values, dv, records in zip(
+        tags = (
+            files.column("tags").to_pylist()
+            if "tags" in files.column_names
+            else [None] * files.num_rows
+        )
+        wanted = _zorder_tag(zorder_by) if zorder_by else None
+        for path, size, values, dv, records, tagged in zip(
             files.column("path").to_pylist(),
             files.column("size").to_pylist(),
             files.column("partition_values").to_pylist(),
             files.column("deletion_vector").to_pylist(),
             files.column("num_records").to_pylist(),
+            tags,
             strict=True,
         ):
             values = dict(values or [])
@@ -2543,17 +2619,22 @@ class KernelEngine:
             if records is not None:
                 live = int(records) - (int(json.loads(dv).get("cardinality", 0)) if dv else 0)
             groups.setdefault(key, []).append((path, int(size), dv is not None, live))
+            if wanted is not None:
+                cubes[path] = _zcube_of(tagged, wanted)
         bins: list[_Bin] = []
         for key in sorted(groups, key=lambda k: [(n, v is None, v or "") for n, v in k]):
             members = groups[key]
             if zorder_by:
-                bins.append(_Bin.of(key, members))
+                rewrite = members if options.full else _zorder_plan(members, cubes, options)
+                skipped += len(members) - len(rewrite)
+                if rewrite:
+                    bins.append(_Bin.of(key, rewrite))
                 continue
             current: list[tuple[str, int, bool, int | None]] = []
             total = 0
             packed: list[list[tuple[str, int, bool, int | None]]] = []
             for member in sorted(members, key=lambda m: m[1]):
-                if member[1] >= target and not member[2]:
+                if member[1] >= options.min_file_size and not member[2]:
                     skipped += 1
                     continue
                 if current and total + member[1] > target:
@@ -2593,6 +2674,7 @@ class KernelEngine:
         step: list[_Bin],
         zorder_by: list[str] | None,
         target: int,
+        sort_by: list[str] | None = None,
     ) -> Any:
         """The rows of each bin, as a stream of batches that are one output file each.
 
@@ -2606,18 +2688,23 @@ class KernelEngine:
 
         order = [p for item in step for p in item.paths]
         owner = {p: i for i, item in enumerate(step) for p in item.paths}
+        properties = snapshot.table_properties() or {}
+        # Every row keeps its id and commit version: read here, written back
+        # into the materialized columns by the commit.
+        tracked = str(properties.get("delta.enableRowTracking", "false")).lower() == "true"
         stream = pa.RecordBatchReader.from_stream(
             snapshot.scan(
                 files=order,
                 # Each batch tagged by its file, and a bin's files merged into
                 # few batches rather than one each.
                 file_groups=[len(item.paths) for item in step],
+                **({"row_tracking": True} if tracked else {}),
             )
         )
         positions = [_FILE_COLUMN]
         schema = pa.schema([f for f in stream.schema if f.name not in positions])
         cap = max(1, int(self.compaction_max_file_bytes))
-        codec = _pyarrow_codec((snapshot.table_properties() or {}).get(_CODEC_PROPERTY))
+        codec = _pyarrow_codec(properties.get(_CODEC_PROPERTY))
 
         def files_of(index: int, batches: list[Any], final: bool) -> tuple[list[Any], list[Any]]:
             """Output files cut from `batches` of bin `index`, and the rows left over.
@@ -2636,8 +2723,11 @@ class KernelEngine:
                 out = [_one_batch(rows.slice(i * per_file, per_file)) for i in range(whole)]
                 rest = rows.slice(whole * per_file)
                 return out, rest.to_batches() if rest.num_rows else []
-            if zorder_by:
-                rows = rows.take(_zorder_indices(rows, zorder_by))
+            if zorder_by or sort_by:
+                if zorder_by:
+                    rows = rows.take(_zorder_indices(rows, zorder_by))
+                else:
+                    rows = rows.take(_sort_indices(rows, sort_by or []))
                 # Sorted rows compress worse than the input they came from
                 # (files came out 40% over the target): size them by how the
                 # first file's worth of them (a sample, at most) encodes.
@@ -2690,7 +2780,7 @@ class KernelEngine:
                     out, held = files_of(current, held, final=True)
                     yield from out
                     held_bytes = sum(b.nbytes for b in held)
-                elif not zorder_by and step[current].splits(target):
+                elif not zorder_by and not sort_by and step[current].splits(target):
                     out, held = files_of(current, held, final=False)
                     yield from out
                     held_bytes = sum(b.nbytes for b in held)
@@ -2710,11 +2800,32 @@ class KernelEngine:
         commit_metadata: dict[str, Any] | None,
         checkpoint: bool = True,
         predicate: list[str] | None = None,
+        *,
+        sort_by: list[str] | None = None,
+        clustering: list[str] | None = None,
     ) -> int:
         import pyarrow as pa
 
         removing = [p for item in step for p in item.paths]
-        data = self._compacted_batches(snapshot, step, zorder_by, target)
+        data = self._compacted_batches(snapshot, step, zorder_by, target, sort_by)
+        tags = (
+            {
+                # Databricks' tags for a Z-order cube: an incremental Z-order
+                # (here and there) leaves the files of a large enough cube alone.
+                "ZCUBE_ID": str(uuid.uuid4()),
+                "ZCUBE_ZORDER_BY": _zorder_tag(zorder_by),
+                "ZCUBE_ZORDER_CURVE": "zorder",
+            }
+            if zorder_by and _native_has("add_tags")
+            else None
+        )
+        parameters: dict[str, Any] = {
+            "predicate": predicate or [],
+            "zOrderBy": [] if clustering is not None else list(zorder_by or []),
+        }
+        if clustering is not None:
+            # As Databricks records an OPTIMIZE of a clustered table.
+            parameters["clusterBy"] = list(clustering)
         empty = pa.table({"path": pa.array([], pa.string()), "row_index": pa.array([], pa.int64())})
         with translating(EngineKind.KERNEL, "commit"):
             version, _deleted, _dvs, _removed = snapshot.commit_dml(
@@ -2725,13 +2836,9 @@ class KernelEngine:
                 operation="OPTIMIZE",
                 commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
                 data_change=False,
+                **({"add_tags": tags} if tags else {}),
                 # As Spark records an OPTIMIZE; Databricks' history showed {}.
-                **_commit_info(
-                    blind=False,
-                    predicate=predicate or [],
-                    zOrderBy=list(zorder_by or []),
-                    auto="false",
-                ),
+                **_commit_info(blind=False, **parameters, auto="false"),
             )
         if checkpoint and int(version) != int(snapshot.version):
             self._maybe_checkpoint(table, int(version), snapshot)
@@ -4437,6 +4544,9 @@ _COMPACTION_OPTIONS = frozenset(
         "max_commit_retries",
         "commit_properties",
         "post_commithook_properties",
+        "min_file_size",
+        "sort_by",
+        "min_cube_size",
     }
 )
 
@@ -4448,12 +4558,28 @@ def _compaction_option_refusal(shape: dict[str, Any]) -> tuple[str, str | None] 
     OPTIMIZE commit rebases over a concurrent compaction of the same files
     and leaves their rows in the table twice.
     """
-    if shape.get("full"):
-        return (
-            "OPTIMIZE ... FULL reclusters a liquid-clustered table, which the kernel does "
-            "not implement",
-            SQL_FALLBACK_REMEDY,
-        )
+    for name in ("min_file_size", "min_cube_size"):
+        value = shape.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            return (f"{name} must be a positive integer, got {value!r}", None)
+    sort_by = shape.get("sort_by")
+    if sort_by is not None:
+        if isinstance(sort_by, str):
+            sort_by = [sort_by]
+        if (
+            not isinstance(sort_by, list | tuple)
+            or not sort_by
+            or not all(isinstance(c, str) for c in sort_by)
+        ):
+            return ("sort_by is a column name or a list of them", None)
+        if shape.get("zorder_by"):
+            return (
+                "sort_by orders a bin-packing's rows, and a Z-order orders them along its "
+                "curve: pass one or the other",
+                None,
+            )
     if shape.get("predicate") is not None:
         return (
             "the kernel scopes OPTIMIZE by partition filters, not by a SQL predicate",
@@ -4502,8 +4628,6 @@ def _compaction_feature_refusal(
     writer_features: Any, properties: dict[str, Any]
 ) -> tuple[str, str | None] | None:
     """Why the kernel cannot compact a table with these writer features, or None."""
-    mode = str(properties.get("delta.columnMapping.mode", "none")).strip().lower()
-    mapped = mode not in ("", "none")
     blockers: list[str] = []
     for name in sorted(writer_features):
         feature = feature_from_wire(name)
@@ -4513,32 +4637,207 @@ def _compaction_feature_refusal(
         if feature in _COMPACTION_NEUTRAL:
             continue
         if feature is TableFeature.ROW_TRACKING:
-            return (
-                "the table tracks row ids, and rows a compaction moves to new files would "
-                "get new ids: delta-kernel 0.28 cannot carry them",
-                SQL_FALLBACK_REMEDY,
-            )
-        if feature is TableFeature.COLUMN_MAPPING and mapped:
-            # Protocol-correct files, but not ones every reader takes: DuckDB's
-            # delta reader resolves the Parquet field ids the kernel writes and
-            # reads each partition column of such a file as NULL.
-            return (
-                "the table maps column names (columnMapping), and the files the kernel's "
-                "compaction writes there are not yet read correctly by every reader "
-                "(DuckDB's delta_scan reads their partition columns as NULL)",
-                SQL_FALLBACK_REMEDY,
-            )
-        if feature is TableFeature.CLUSTERING:
-            return (
-                "the table is liquid-clustered, where OPTIMIZE reclusters its files; the "
-                "kernel only bin-packs and Z-orders",
-                SQL_FALLBACK_REMEDY,
-            )
+            if "domainMetadata" not in set(writer_features):
+                # Kernel refuses such a protocol at the commit, after the files.
+                return (
+                    "the table lists rowTracking without domainMetadata, which row tracking "
+                    "requires, so no commit can keep its row ids",
+                    SQL_FALLBACK_REMEDY,
+                )
+            refusal = _row_tracking_compaction_refusal(properties)
+            if refusal is not None:
+                return refusal
+            continue
+        if feature is TableFeature.COLUMN_MAPPING:
+            # Written as every kernel write there is: physical names, Parquet
+            # field ids, and partition values keyed by physical name, as the
+            # protocol asks and Databricks reads. (DuckDB's delta_scan reads
+            # the partition columns of such tables as NULL whoever wrote
+            # them, Databricks and delta-rs included: its bug, not the files'.)
+            continue
         if feature in _METADATA_BLOCKERS or FEATURE_SUPPORT[feature].kernel_write is Support.NO:
             blockers.append(name)
     if blockers:
         return (
             "the kernel cannot compact a table with these features: " + ", ".join(blockers),
+            SQL_FALLBACK_REMEDY,
+        )
+    return None
+
+
+#: What can() says of an OPTIMIZE of a liquid-clustered table.
+_INCREMENTAL_RECLUSTER = (
+    "the kernel clusters a liquid-clustered table by Z-ordering its files over the "
+    "clustering keys: files not yet clustered by the current keys, with the clusters "
+    "smaller than the target file size, are rewritten together, not Databricks' "
+    "incremental clustering tree; full=True reclusters every file"
+)
+_FULL_RECLUSTER = (
+    "the kernel reclusters every file of the liquid-clustered table, Z-ordered over "
+    "the clustering keys (a full, not incremental, clustering)"
+)
+
+
+@dataclass(frozen=True)
+class _PlanOptions:
+    """How an OPTIMIZE picks its files, past the target size."""
+
+    full: bool = False
+    sort_by: list[str] | None = None
+    min_file_size: int = _DEFAULT_TARGET_SIZE
+    min_cube_size: int = _DEFAULT_TARGET_SIZE
+
+
+def _clustered(writer_features: Any) -> bool:
+    return "clustering" in set(writer_features or ())
+
+
+def _clustering_option_refusal(
+    shape: dict[str, Any], clustered: bool
+) -> tuple[str, str | None] | None:
+    """An OPTIMIZE option that does not fit whether the table is clustered."""
+    if clustered and shape.get("zorder_by"):
+        # Databricks refuses it too (DELTA_CLUSTERING_WITH_ZORDER_BY).
+        return (
+            "the table is liquid-clustered, and OPTIMIZE orders it by its clustering keys; "
+            "it takes no Z-ORDER BY",
+            "call optimize() without zorder_by, or change the keys with cluster_by()",
+        )
+    if clustered and shape.get("sort_by"):
+        return (
+            "the table is liquid-clustered, and OPTIMIZE orders it by its clustering keys; "
+            "it takes no sort_by",
+            "call optimize() without sort_by",
+        )
+    if not clustered and shape.get("full"):
+        return (
+            "OPTIMIZE ... FULL reclusters a liquid-clustered table, and this table is not one",
+            "drop full=True",
+        )
+    return None
+
+
+def _clustering_keys(snapshot: Any) -> list[str] | None:
+    """The clustering keys of a liquid-clustered table, as logical (dotted) names.
+
+    None where the table is not clustered; `[]` where it is, by no keys.
+    """
+    _reader, _writer, _readers, writers = snapshot.protocol()
+    if not _clustered(writers):
+        return None
+    try:
+        raw = snapshot.domain_metadata("delta.clustering")
+    except Exception:
+        raw = None
+    if not raw:
+        return []
+    physical = json.loads(raw).get("clusteringColumns") or []
+    schema = json.loads(json.loads(snapshot.metadata_json())["schemaString"])
+    keys = []
+    for path in physical:
+        fields, names = schema.get("fields", []), []
+        for part in path:
+            match = next(
+                (
+                    f
+                    for f in fields
+                    if (f.get("metadata") or {}).get("delta.columnMapping.physicalName", f["name"])
+                    == part
+                ),
+                None,
+            )
+            if match is None:
+                raise EngineLimitError(
+                    "optimize on the kernel",
+                    f"the clustering key {'.'.join(path)} names no column of the table",
+                    SQL_FALLBACK_REMEDY,
+                )
+            names.append(match["name"])
+            kind = match.get("type")
+            fields = kind.get("fields", []) if isinstance(kind, dict) else []
+        keys.append(".".join(names))
+    return keys
+
+
+def _zorder_tag(columns: list[str]) -> str:
+    """`ZCUBE_ZORDER_BY` as Databricks writes it: the columns as a JSON list."""
+    return json.dumps(list(columns))
+
+
+def _zcube_of(tags: str | None, wanted: str) -> str | None:
+    """The Z-order cube a file belongs to, if it was Z-ordered by the `wanted` columns."""
+    if not tags:
+        return None
+    try:
+        parsed = json.loads(tags)
+        order = [str(c).lower() for c in json.loads(parsed.get("ZCUBE_ZORDER_BY") or "null")]
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if order != [str(c).lower() for c in json.loads(wanted)]:
+        return None
+    cube = parsed.get("ZCUBE_ID")
+    return str(cube) if cube else None
+
+
+def _zorder_plan(
+    members: list[tuple[str, int, bool, int | None]],
+    cubes: dict[str, str | None],
+    options: _PlanOptions,
+) -> list[tuple[str, int, bool, int | None]]:
+    """The files of one partition an incremental Z-order rewrites.
+
+    As Databricks' does: files already Z-ordered by the same columns stay,
+    cube by cube, where the cube is at least `min_cube_size` (Databricks
+    defaults to 100 GB; here, the target file size). The rest -- new files,
+    small cubes, files a deletion vector has since touched -- are Z-ordered
+    together. Nothing is rewritten where that would be one small cube alone.
+    """
+    by_cube: dict[str, list[tuple[str, int, bool, int | None]]] = {}
+    loose: list[tuple[str, int, bool, int | None]] = []
+    for member in members:
+        cube = cubes.get(member[0])
+        if cube is None or member[2]:
+            loose.append(member)
+        else:
+            by_cube.setdefault(cube, []).append(member)
+    small = [
+        files for files in by_cube.values() if sum(m[1] for m in files) < options.min_cube_size
+    ]
+    if not loose and len(small) <= 1:
+        return []
+    return loose + [m for files in small for m in files]
+
+
+def _row_tracking_compaction_refusal(
+    properties: dict[str, Any],
+) -> tuple[str, str | None] | None:
+    """Why the kernel cannot compact a row-tracked table with these properties, or None.
+
+    Rows a compaction moves keep their ids and commit versions: each is
+    written into the table's materialized columns in the new files, as
+    Databricks' OPTIMIZE writes them.
+    """
+    if not _native_has("row_tracking_compaction"):
+        return (
+            "the table tracks row ids, and this native build cannot carry the ids of the "
+            "rows a compaction moves to new files",
+            SQL_FALLBACK_REMEDY,
+        )
+    if str(properties.get("delta.enableRowTracking", "false")).lower() != "true":
+        # Supported, not enabled: ids are assigned but not promised stable.
+        return None
+    missing = [
+        key
+        for key in (
+            "delta.rowTracking.materializedRowIdColumnName",
+            "delta.rowTracking.materializedRowCommitVersionColumnName",
+        )
+        if not properties.get(key)
+    ]
+    if missing:
+        return (
+            "the table tracks row ids but names no " + " or ".join(missing) + ", so the "
+            "rows a compaction moves could not keep their ids",
             SQL_FALLBACK_REMEDY,
         )
     return None
@@ -4819,13 +5118,12 @@ def _zorder_indices(rows: Any, columns: list[str]) -> Any:
     np = _require("numpy", "pyarrow", "Z-ORDER")
     import pyarrow.compute as pc
 
-    by_lower = {n.lower(): n for n in rows.column_names}
     bits = max(1, 64 // len(columns))
     keys = []
     for column in columns:
-        name = by_lower.get(column.lower(), column)
-        # Ascending ranks put NULLs last by default.
-        ranks = pc.rank(rows.column(name), tiebreaker="dense")
+        # Ascending ranks put NULLs last by default. A clustering key may
+        # be a nested field (`a.b`).
+        ranks = pc.rank(_key_column(rows, column), tiebreaker="dense")
         r = np.asarray(ranks.to_numpy(zero_copy_only=False), dtype=np.uint64) - np.uint64(1)
         distinct = int(r.max()) + 1 if len(r) else 1
         if bits < 64 and distinct > (1 << bits):
@@ -4836,6 +5134,31 @@ def _zorder_indices(rows: Any, columns: list[str]) -> Any:
         for r in keys:
             z = (z << np.uint64(1)) | ((r >> np.uint64(bit)) & np.uint64(1))
     return np.argsort(z, kind="stable")
+
+
+def _sort_indices(rows: Any, columns: list[str]) -> Any:
+    """The order that sorts `rows` by `columns`, ascending, NULLs last (a sorted bin-packing)."""
+    import pyarrow.compute as pc
+
+    by_lower = {n.lower(): n for n in rows.column_names}
+    keys = [(by_lower.get(c.lower(), c), "ascending") for c in columns]
+    return pc.sort_indices(rows, sort_keys=keys, null_placement="at_end")
+
+
+def _key_column(rows: Any, column: str) -> Any:
+    """The values of `column` in `rows`: a top-level column, or a dotted path into structs."""
+    import pyarrow.compute as pc
+
+    by_lower = {n.lower(): n for n in rows.column_names}
+    if column.lower() in by_lower or "." not in column:
+        return rows.column(by_lower.get(column.lower(), column))
+    head, *rest = column.split(".")
+    values = rows.column(by_lower.get(head.lower(), head))
+    for part in rest:
+        kind = values.type
+        names = {kind.field(i).name.lower(): kind.field(i).name for i in range(kind.num_fields)}
+        values = pc.struct_field(values, names.get(part.lower(), part))
+    return values
 
 
 def _arrow_schema(snapshot: Any) -> Any:

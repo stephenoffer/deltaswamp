@@ -190,6 +190,60 @@ pub async fn write_parquet(
     write_physical(engine, &physical, write_context, codec).await
 }
 
+/// [`write_parquet`] of `batch`, whose columns named in `carried` (by the
+/// first of each pair) are not the table's: they are taken out before the
+/// logical-to-physical transform and written after it under the second name
+/// -- a compaction's row ids and commit versions, into the table's
+/// materialized row-tracking columns. They get no statistics, as in Spark.
+pub async fn write_parquet_carrying(
+    engine: &SharedEngine,
+    batch: RecordBatch,
+    carried: &[(String, String)],
+    write_context: &BoundWriteContext,
+    codec: Compression,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let mut logical = batch;
+    let mut extra = Vec::new();
+    for (name, physical) in carried {
+        if let Ok(index) = logical.schema().index_of(name) {
+            extra.push((physical.clone(), logical.column(index).clone()));
+            logical.remove_column(index);
+        }
+    }
+    if extra.is_empty() {
+        return write_parquet(engine, &ArrowEngineData::new(logical), write_context, codec).await;
+    }
+    let input_schema = StructType::try_from_arrow(logical.schema().as_ref())?;
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        Arc::new(input_schema),
+        write_context.logical_to_physical(),
+        write_context.physical_schema().clone().into(),
+    )?;
+    let physical = evaluator
+        .evaluate(&ArrowEngineData::new(logical))?
+        .try_into_record_batch()?;
+    let mut fields: Vec<arrow::datatypes::FieldRef> =
+        physical.schema().fields().iter().cloned().collect();
+    let mut columns = physical.columns().to_vec();
+    for (name, column) in extra {
+        let column = arrow::compute::cast(&column, &DataType::Int64)?;
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            name,
+            DataType::Int64,
+            column.null_count() > 0,
+        )));
+        columns.push(column);
+    }
+    let physical = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            physical.schema().metadata().clone(),
+        )),
+        columns,
+    )?;
+    write_physical(engine, &physical, write_context, codec).await
+}
+
 /// `DefaultParquetHandler::write_parquet_file`, writing the file here:
 /// `batch` is already in the physical schema.
 pub async fn write_physical(

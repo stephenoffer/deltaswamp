@@ -951,14 +951,14 @@ ENGINE_METHODS: dict[Operation, str] = {
 #:
 #: * delta-rs OPTIMIZE / Z-ORDER / ADD COLUMN raise "Column mapping is not
 #:   supported for write operation ..." on a column-mapped table.
-#: * the kernel's transaction refuses any commit carrying a remove on a table
-#:   whose row tracking is not suspended ("Remove actions are not yet
-#:   supported"), so a kernel OVERWRITE fails after staging the new data.
+#:
+#: (The kernel's transaction refuses every remove on a row-tracked table; its
+#: OVERWRITE there stages them by hand, and the kernel engine refuses it
+#: itself on a native build that cannot.)
 OPERATION_FEATURE_BLOCKERS: dict[tuple[Engine, Operation], frozenset[TableFeature]] = {
     (Engine.DELTARS, Operation.OPTIMIZE): frozenset({TableFeature.COLUMN_MAPPING}),
     (Engine.DELTARS, Operation.ZORDER): frozenset({TableFeature.COLUMN_MAPPING}),
     (Engine.DELTARS, Operation.ADD_COLUMN): frozenset({TableFeature.COLUMN_MAPPING}),
-    (Engine.KERNEL, Operation.OVERWRITE): frozenset({TableFeature.ROW_TRACKING}),
     # A symlink manifest lists whole Parquet files: readers of one would return
     # rows a deletion vector removed, and see physical column names. Spark
     # refuses both; delta-rs writes the manifest regardless.

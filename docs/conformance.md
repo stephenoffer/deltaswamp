@@ -131,7 +131,7 @@ serve.
 | `set_not_null` | kernel, sql | needs every existing row checked for nulls before the commit |
 | `drop_not_null` | deltars, kernel, sql | a metadata-only change |
 | `cluster_by` | kernel, sql | the delta.clustering domain; delta-rs has no domain metadata support |
-| `optimize` | kernel, deltars, sql | the kernel commits a compaction on the snapshot it read, so a concurrent one conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows both compacted, so delta-rs hands it to the kernel. The warehouse runs it on managed and clustered tables |
+| `optimize` | kernel, deltars, sql | the kernel commits a compaction on the snapshot it read, so a concurrent one conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows both compacted, so delta-rs hands it to the kernel. On row-tracked tables rows keep their ids and commit versions; on liquid-clustered ones it Z-orders by the clustering keys (`full=True` every file); column-mapped tables compact too. The warehouse runs it on managed tables |
 | `zorder` | kernel, deltars, sql | as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one |
 | `vacuum` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel's log replay for the rest (clustering, row tracking, in-commit timestamps, type widening, vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files delta-rs cannot tell apart from orphans |
 | `restore` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel re-adds the target version's files as logged (deletion vectors, row ids) on deletion-vector tables, which delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write |
