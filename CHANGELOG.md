@@ -198,6 +198,8 @@ First release.
   reporting such a file missing and committing its removal: the kernel now
   asks the filesystem about a file its store cannot find, and a delta-rs
   repair that names a file still on disk is done by the kernel instead.
+  `generate()` refuses partitions that differ only by case (`p=US`, `p=us`)
+  on such a filesystem, where their manifests overwrote each other.
 
 ### Security
 

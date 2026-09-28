@@ -13,8 +13,10 @@ import contextlib
 import dataclasses
 import importlib
 import json
+import os
 import re
 import time
+import uuid
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -799,6 +801,21 @@ def _protocol_from_properties(resolved: ResolvedTable) -> dict[str, Any]:
 #: How often a read through a catalog handle re-checks that its name still
 #: names the same table (seconds).
 _NAME_RECHECK_SECONDS = 1.0
+
+
+def _case_insensitive_dir(path: str) -> bool:
+    """Whether the filesystem holding directory `path` ignores the case of names."""
+    probe = os.path.join(path, f".deltaswamp-case-{uuid.uuid4().hex}-A")
+    try:
+        with open(probe, "x"):
+            pass
+    except OSError:
+        return False
+    try:
+        return os.path.exists(probe[:-1] + "a")
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(probe)
 
 
 #: A SET value that SQL reads as a column reference.
@@ -4590,7 +4607,40 @@ class Table:
 
     def generate(self) -> None:
         """Write symlink manifests, for engines that read those instead of the log."""
-        self._engine(Operation.GENERATE).generate(self._resolved)
+        engine = self._engine(Operation.GENERATE)
+        self._refuse_colliding_manifests()
+        engine.generate(self._resolved)
+
+    def _refuse_colliding_manifests(self) -> None:
+        """Refuse manifests two partitions would share on a case-insensitive filesystem.
+
+        Partitions `p=US` and `p=us` get one manifest directory each; on a
+        case-insensitive filesystem (macOS and Windows by default) those are
+        one directory, and the second manifest overwrote the first, so a
+        reader of the manifests silently missed a partition's rows.
+        """
+        from .engine.deltars import _local_root
+
+        root = _local_root(self._resolved.location)
+        if root is None or not os.path.isdir(root):
+            return
+        files = self.files()
+        keys = [c for c in files.column_names if c.startswith("partition.")]
+        if not keys or not _case_insensitive_dir(root):
+            return
+        seen: dict[str, str] = {}
+        for row in files.select(keys).to_pylist():
+            spelled = "/".join(f"{k[len('partition.') :]}={row[k]}" for k in keys)
+            first = seen.setdefault(spelled.lower(), spelled)
+            if first != spelled:
+                raise UnreachableTableError(
+                    "generate symlink manifests",
+                    f"partitions {first!r} and {spelled!r} differ only by case, and this "
+                    "filesystem does not tell their manifest directories apart, so one "
+                    "manifest would overwrite the other",
+                    "generate the manifests on case-sensitive storage (S3, ADLS, GCS, "
+                    "or a case-sensitive volume)",
+                )
 
     def reorg(self, **kwargs: Any) -> dict[str, Any]:
         """REORG TABLE. Databricks-only, so it needs the SQL fallback."""

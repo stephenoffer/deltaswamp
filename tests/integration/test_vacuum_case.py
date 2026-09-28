@@ -137,3 +137,19 @@ def test_repair_keeps_a_live_file_listed_in_another_case(
     assert moved in _live_paths(path)
     assert gone not in _live_paths(path)
     assert conn.table(str(path)).to_arrow().num_rows == 7
+
+
+def test_generate_refuses_partitions_that_differ_only_by_case(tmp_path: Any) -> None:
+    from deltaswamp.errors import UnreachableTableError
+
+    if not _case_insensitive(tmp_path):
+        pytest.skip("the filesystem is case-sensitive")
+    path = tmp_path / "t"
+    conn = ds.connect()
+    schema = pa.schema([("id", pa.int64()), ("country", pa.string())])
+    t = conn.create_table(str(path), schema, partition_by=["country"])
+    t.append(pa.table({"id": [1, 2], "country": ["US", "fr"]}))
+    conn.table(str(path)).generate()
+    t.append(pa.table({"id": [3], "country": ["us"]}))
+    with pytest.raises(UnreachableTableError, match="differ only by case"):
+        conn.table(str(path)).generate()
