@@ -198,7 +198,6 @@ class TestDatabricksOnlyOperations:
         [
             Operation.DROP_FEATURE,
             Operation.REORG,
-            Operation.CLONE,
             Operation.ANALYZE,
             Operation.SYNC_ICEBERG,
             Operation.REFRESH,
@@ -207,7 +206,9 @@ class TestDatabricksOnlyOperations:
     def test_expected_members(self, op: Operation) -> None:
         assert op in DATABRICKS_ONLY_OPERATIONS
 
-    @pytest.mark.parametrize("op", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN])
+    @pytest.mark.parametrize(
+        "op", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN, Operation.CLONE]
+    )
     def test_column_mapping_ddl_has_a_direct_path(self, op: Operation) -> None:
         """Rename and drop are metadata-only under column mapping, which the
         kernel path writes itself, so they are not Databricks-only."""

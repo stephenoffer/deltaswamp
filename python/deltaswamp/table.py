@@ -1457,24 +1457,78 @@ class Table:
             )
             if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
                 return stream
-            log = _log_schema(
-                engine, self._resolved, version if version is not None else self._version
-            )
-            if self._enrich().features & _VARIANT_FEATURES:
-                # The warehouse sends VARIANT as JSON text; so does this.
-                from ._variant import json_text_stream, variant_paths
-
-                stream = json_text_stream(stream, None if log is None else variant_paths(log))
-            # And a day-time interval as a duration, not bare microseconds.
-            stream = interval_stream(stream, interval_paths(log))
-            # A file VACUUM (or a manual delete) removed fails only once reading
-            # reaches it, as a bare OSError/ArrowInvalid; name it instead.
-            where = self._resolved.location or str(self._resolved.ref)
-            at = version if version is not None else timestamp
-            context = f"{where}" + (f" at {at}" if at is not None else "")
-            return translating_stream(stream, context, _shredded_variant_error)
+            return self._direct_stream(engine, stream, version, timestamp)
 
         return self._read(request, scan)
+
+    def _direct_stream(self, engine: Any, stream: Any, version: Any, timestamp: Any) -> Any:
+        """A direct engine's read, shown as the warehouse shows it, with errors named."""
+        log = _log_schema(engine, self._resolved, version if version is not None else self._version)
+        if self._enrich().features & _VARIANT_FEATURES:
+            # The warehouse sends VARIANT as JSON text; so does this.
+            from ._variant import json_text_stream, variant_paths
+
+            stream = json_text_stream(stream, None if log is None else variant_paths(log))
+        # And a day-time interval as a duration, not bare microseconds.
+        stream = interval_stream(stream, interval_paths(log))
+        # A file VACUUM (or a manual delete) removed fails only once reading
+        # reaches it, as a bare OSError/ArrowInvalid; name it instead.
+        where = self._resolved.location or str(self._resolved.ref)
+        at = version if version is not None else timestamp
+        context = f"{where}" + (f" at {at}" if at is not None else "")
+        return translating_stream(stream, context, _shredded_variant_error)
+
+    def added_since(
+        self,
+        version: int,
+        *,
+        until: int | None = None,
+        columns: list[str] | None = None,
+        predicate: str | None = None,
+        only_appends: bool = False,
+    ) -> Any:
+        """The rows added after `version`, up to `until`, without the change data feed.
+
+        Returns an Arrow stream of the rows in the data files committed in
+        `(version, until]` (`until` defaults to the handle's version, else the
+        latest) -- an incremental read of an append-only table, which needs no
+        `delta.enableChangeDataFeed` (delta-rs#4554, delta-kernel-rs#1177).
+
+        Only appends make that the rows added. A DELETE, UPDATE, MERGE,
+        OPTIMIZE or overwrite in the range removes files and re-adds rows that
+        were there before, so the call is refused if any file was removed;
+        `only_appends=True` reads every file added anyway, rows a rewrite
+        carried over included (for a consumer that dedupes on a key), and
+        `cdf()` reads exactly what changed on a table with the feed on.
+        """
+        _check_version(version, "version")
+        _check_version(until, "until")
+        columns = _columns_arg(columns)
+        _check_predicate(predicate, "added_since")
+        if not isinstance(only_appends, bool):
+            raise InvalidArgumentError(
+                f"only_appends must be True or False, not {type(only_appends).__name__}"
+            )
+        end = until if until is not None else self._version
+        if end is not None and end < version:
+            raise InvalidArgumentError(f"until {end} is before version {version}")
+        request = self._request(
+            Operation.SCAN,
+            {"incremental": True, "columns": columns, "predicate": predicate, "until": end},
+        )
+
+        def read(engine: Any) -> Any:
+            stream = engine.added_since(
+                self._resolved,
+                version,
+                until=end,
+                columns=columns,
+                predicate=predicate,
+                only_appends=only_appends,
+            )
+            return self._direct_stream(engine, stream, end, None)
+
+        return self._read(request, read)
 
     def _travel_version(self, version: int | None, timestamp: Any) -> int | None:
         """The version a read should use: the call's, else the handle's.
@@ -1687,15 +1741,16 @@ class Table:
             return frozenset({"sql_column_defaults"})
         return frozenset()
 
-    def _check_writable(self, what: str) -> None:
+    def _check_writable(self, what: str, *, pinned: bool = False) -> None:
         """Refuse a write through a handle opened at a past version.
 
         Every engine writes to the latest version, so a delete on
         ``conn.table(path, version=1)`` removed rows from the current table,
         not the version the handle shows. Delta refuses writes to a
-        time-travelled table for the same reason.
+        time-travelled table for the same reason. `pinned=True`: the call
+        serves a pinned handle itself (and refuses through `_check_pinned`).
         """
-        if self._version is not None:
+        if self._version is not None and not pinned:
             raise InvalidArgumentError(
                 f"cannot {what}: this handle is pinned to version {self._version}; "
                 "open the table without version= to write to it"
@@ -1705,6 +1760,44 @@ class Table:
             # captured at resolution was a guaranteed 409 once anyone else had
             # committed -- and stayed one on every retry through this handle.
             self._refresh_commit_tail(before_write=True)
+
+    def _check_pinned(self, request: Request) -> dict[str, Any]:
+        """Refuse a pinned-handle DML `can()` refuses; else the engine's `read_version=`.
+
+        DELETE, UPDATE and MERGE from a handle pinned to a past version read
+        there and commit at the latest after Delta's conflict check against
+        every commit since (delta-rs#4417): what the kernel's deletion-vector
+        DML does when it loses a race to them. Where that cannot be done the
+        call is refused, as before, saying why.
+        """
+        if self._version is None:
+            return {}
+        refused = refusal(self, request)
+        if refused is not None:
+            raise InvalidArgumentError(
+                f"cannot {request.operation.value}: {refused.reason}; {refused.remedy}"
+            )
+        return {"read_version": self._version}
+
+    def _pinned_write(self, write: Callable[[], Any]) -> Any:
+        """`write()`, saying so when a pinned handle's commit lost to a later one.
+
+        "Re-read the table and retry" never helps a handle pinned to the
+        version it read: the same call conflicts again.
+        """
+        from .errors import CommitConflictError
+
+        if self._version is None:
+            return write()
+        try:
+            return write()
+        except CommitConflictError as exc:
+            exc.args = (
+                f"{exc} This handle is pinned to version {self._version}, and a commit "
+                "since then changed what it read: open a later version (or the latest) and "
+                "run it from there.",
+            )
+            raise
 
     def to_arrow(self, **kwargs: Any) -> Any:
         pa = _require("pyarrow", "pyarrow")
@@ -2600,6 +2693,7 @@ class Table:
         columns: list[str] | None = None,
         predicate: str | None = None,
         poll_interval: float | None = None,
+        include_snapshot: bool = False,
     ) -> Any:
         """Follow the change feed, one committed version at a time.
 
@@ -2608,6 +2702,12 @@ class Table:
         waiting for new commits, like a streaming read with a change-feed
         source; without, it stops at the latest version. Record the last
         version you processed and pass the next one to resume.
+
+        `include_snapshot=True` bootstraps a consumer, as a streaming read
+        with an initial snapshot does: the first yield is the whole table as
+        of `starting_version`, every row an ``insert`` of that version, and
+        the feed follows from the version after it. The feed need not have
+        been on before `starting_version`.
         """
         import time
 
@@ -2620,6 +2720,10 @@ class Table:
             )
         if poll_interval is not None and poll_interval < 0:
             raise InvalidArgumentError(f"poll_interval must be >= 0, got {poll_interval}")
+        if not isinstance(include_snapshot, bool):
+            raise InvalidArgumentError(
+                f"include_snapshot must be True or False, not {type(include_snapshot).__name__}"
+            )
         pa = _require("pyarrow", "pyarrow")
         columns = _columns_arg(columns)
         # Splitting by version needs `_commit_version`; a projection without
@@ -2628,6 +2732,12 @@ class Table:
         if columns is not None and "_commit_version" not in columns:
             projection = [*columns, "_commit_version"]
         next_version = starting_version
+        if include_snapshot:
+            yield (
+                starting_version,
+                self._snapshot_as_inserts(pa, starting_version, columns, predicate),
+            )
+            next_version = starting_version + 1
         while True:
             current = self._connection._reresolve(self)
             latest = current.version
@@ -2669,6 +2779,50 @@ class Table:
             if poll_interval is None:
                 return
             time.sleep(poll_interval)
+
+    def _snapshot_as_inserts(
+        self, pa: Any, version: int, columns: list[str] | None, predicate: str | None
+    ) -> Any:
+        """The table at `version` as change-feed rows: each an insert of that version."""
+        current = self._connection._reresolve(self) if self._version is None else self
+        pinned = Table(self._connection, current._resolved, version=version)
+        wanted = None if columns is None else [c for c in columns if c not in _CDF_META]
+        rows = _plain_views(pa.table(pinned.scan(columns=wanted, predicate=predicate)))
+        stamp = pa.scalar(self._commit_timestamp(pinned, version), pa.timestamp("us", tz="UTC"))
+        n = rows.num_rows
+        rows = rows.append_column(
+            pa.field("_change_type", pa.string(), nullable=False),
+            pa.array(["insert"] * n, pa.string()),
+        )
+        rows = rows.append_column(
+            pa.field("_commit_version", pa.int64(), nullable=False),
+            pa.array([version] * n, pa.int64()),
+        )
+        rows = rows.append_column(
+            pa.field("_commit_timestamp", pa.timestamp("us", tz="UTC"), nullable=False),
+            pa.array([stamp.value] * n, pa.timestamp("us", tz="UTC")),
+        )
+        return rows if columns is None else rows.select(columns)
+
+    def _commit_timestamp(self, pinned: Table, version: int) -> Any:
+        """When `version` was committed (the in-commit timestamp where there is one)."""
+        import datetime as dt
+
+        kernel = self._connection.router.engines.get(EngineKind.KERNEL)
+        if kernel is not None and hasattr(kernel, "snapshot"):
+            with contextlib.suppress(Exception):
+                ms = int(kernel.snapshot(pinned._resolved, version=version).timestamp())
+                return dt.datetime.fromtimestamp(ms / 1000, tz=dt.UTC)
+        for entry in pinned._connection._reresolve(pinned).history():
+            if entry.get("version") == version and entry.get("timestamp") is not None:
+                stamp = entry["timestamp"]
+                if isinstance(stamp, (int, float)):
+                    return dt.datetime.fromtimestamp(stamp / 1000, tz=dt.UTC)
+                return stamp
+        raise UnreachableTableError(
+            f"read version {version} as a snapshot",
+            "its commit timestamp could not be read from the history",
+        )
 
     # -------------------------------------------------------------- metadata
 
@@ -3021,8 +3175,9 @@ class Table:
         commit_metadata: dict[str, Any] | None = None,
         txn: tuple[str, int] | None = None,
         max_commit_retries: int | None = None,
-    ) -> None:
-        """Append data.
+    ) -> _results.OperationResult:
+        """Append data. Returns an `OperationResult`: the `version` committed and
+        the `num_files`, `num_rows` and `num_bytes` it added, plus `engine`.
 
         `schema_mode="merge"` widens the table schema to fit the data, and
         routes as MERGE_SCHEMA rather than a plain append.
@@ -3034,6 +3189,19 @@ class Table:
         removes the common replay case; it is not a substitute for engine-level
         enforcement, because a concurrent writer could still commit in between.
         """
+        if self._version is not None and schema_mode is None:
+            # A blind append reads nothing, so it means the same from any
+            # handle: rows added at the latest version. Aligned to the latest
+            # schema, not the pinned one.
+            return Table(self._connection, self._resolved).append(
+                data,
+                partition_by=partition_by,
+                target_file_size=target_file_size,
+                writer_properties=writer_properties,
+                commit_metadata=commit_metadata,
+                txn=txn,
+                max_commit_retries=max_commit_retries,
+            )
         self._check_writable("append")
         _check_write_sizes(target_file_size, max_commit_retries)
         if schema_mode not in (None, "merge"):
@@ -3044,9 +3212,10 @@ class Table:
         _check_txn(txn)
         data = _write_data(data)
         if txn is not None and self._already_committed(txn):
-            return
+            return _results.nothing_written()
         raw = data
         self._check_cdf_columns(data, schema_mode, "append")
+        outcome: dict[str, Any] = {}
         for attempt in range(_REALIGN_ATTEMPTS):
             data = self._align(raw, schema_mode)
             request = self._request(
@@ -3065,7 +3234,8 @@ class Table:
 
             def write(data: Any = data, request: Request = request) -> None:
                 engine = self._route(request)
-                engine.append(
+                outcome["engine"] = getattr(engine, "kind", None)
+                outcome["raw"] = engine.append(
                     self._resolved,
                     self._variant_input(engine, data),
                     schema_mode=schema_mode,
@@ -3093,6 +3263,52 @@ class Table:
                 ):
                     raise
         self._invalidate()
+        return self._write_result(outcome)
+
+    def _write_result(self, outcome: dict[str, Any]) -> _results.OperationResult:
+        """The result of the append or overwrite `outcome` records (see `_results.write`)."""
+        if "raw" not in outcome:
+            return _results.nothing_written()  # a lost race won by this very txn
+        raw = outcome["raw"]
+        version = raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+        if isinstance(raw, dict):
+            version = raw.get("version")
+        engine = outcome.get("engine")
+        totals = None if version is None else self._commit_totals(engine, version)
+        return _results.write(raw, engine, totals)
+
+    def _commit_totals(self, kind: Any, version: int) -> dict[str, Any] | None:
+        """What commit `version` added and removed, read back from its log file.
+
+        Neither engine reports it: delta-rs returns nothing, the kernel the
+        version (delta-rs#3952). None when the commit cannot be read (a
+        catalog's unpublished commit, an engine that cannot read one).
+        """
+        engine = self._connection.router.engines.get(kind) if kind is not None else None
+        read = getattr(engine, "commit_text", None)
+        if read is None or version < 1:
+            return None
+        try:
+            text = read(self._resolved, int(version))
+            actions = [json.loads(line) for line in text.splitlines() if line.strip()]
+        except Exception:
+            return None
+        totals: dict[str, Any] = {"num_files": 0, "num_bytes": 0, "num_removed_files": 0}
+        rows: int | None = 0
+        for action in actions:
+            add, remove = action.get("add"), action.get("remove")
+            if add is not None and add.get("dataChange", True):
+                totals["num_files"] += 1
+                totals["num_bytes"] += int(add.get("size") or 0)
+                try:
+                    records = json.loads(add.get("stats") or "{}").get("numRecords")
+                except (ValueError, AttributeError):
+                    records = None
+                rows = None if rows is None or records is None else rows + int(records)
+            elif remove is not None and remove.get("dataChange", True):
+                totals["num_removed_files"] += 1
+        totals["num_rows"] = rows
+        return totals
 
     def _check_cdf_columns(self, data: Any, schema_mode: str | None, what: str) -> None:
         """Refuse a schema-evolving write that adds a column the change feed reserves.
@@ -3161,8 +3377,9 @@ class Table:
         commit_metadata: dict[str, Any] | None = None,
         txn: tuple[str, int] | None = None,
         max_commit_retries: int | None = None,
-    ) -> None:
-        """Replace data.
+    ) -> _results.OperationResult:
+        """Replace data. Returns an `OperationResult`, as `append` does (with
+        `num_removed_files` too).
 
         With `predicate`, replaces only matching rows (`replaceWhere`). With
         `partition_overwrite="dynamic"`, replaces exactly the partitions present
@@ -3192,7 +3409,7 @@ class Table:
         _check_txn(txn)
         data = _write_data(data)
         if txn is not None and self._already_committed(txn):
-            return
+            return _results.nothing_written()
         if (
             partition_overwrite == "dynamic"
             and predicate is None
@@ -3202,7 +3419,7 @@ class Table:
             # Spark's dynamic mode replaces the partitions present in the
             # data; an empty batch names none, so it changes nothing. It used
             # to raise, failing any pipeline whose batch happened to be empty.
-            return
+            return _results.nothing_written()
         raw = data
         self._check_cdf_columns(data, schema_mode, "overwrite")
         data = self._align(raw, schema_mode)
@@ -3218,6 +3435,7 @@ class Table:
         }
         from .errors import CommitConflictError
 
+        outcome: dict[str, Any] = {}
         for attempt in range(_REALIGN_ATTEMPTS):
             request = self._request(Operation.OVERWRITE, options, data)
             refused = refusal(self, request)
@@ -3229,7 +3447,8 @@ class Table:
 
             def write(data: Any = data, request: Request = request) -> None:
                 engine = self._route(request)
-                engine.overwrite(
+                outcome["engine"] = getattr(engine, "kind", None)
+                outcome["raw"] = engine.overwrite(
                     self._resolved,
                     self._variant_input(engine, data),
                     predicate=predicate,
@@ -3249,6 +3468,7 @@ class Table:
                 # Lost to a writer that committed this very txn: already done.
                 if txn is None or not self._txn_landed(txn):
                     raise
+                outcome.pop("raw", None)
                 break
             except Exception as exc:
                 # A concurrent ADD COLUMN between aligning and writing: nothing
@@ -3259,6 +3479,7 @@ class Table:
                     raise
                 data = self._align(raw, schema_mode)
         self._invalidate()
+        return self._write_result(outcome)
 
     def _backfilled(self, write: Any, data: Any = None) -> Any:
         """Run a commit; on a catalog's backfill demand, publish and retry once.
@@ -3293,10 +3514,10 @@ class Table:
                 ) from exc
             return write()
 
-    def replace(self, data: Any, **kwargs: Any) -> None:
+    def replace(self, data: Any, **kwargs: Any) -> _results.OperationResult:
         """Replace the table's contents and schema. REPLACE TABLE / RTAS."""
         _check_options("replace", kwargs, _REPLACE_OPTIONS)
-        self.overwrite(data, schema_mode="overwrite", **kwargs)
+        return self.overwrite(data, schema_mode="overwrite", **kwargs)
 
     def _already_committed(self, txn: tuple[str, int]) -> bool:
         """True if `txn` was already committed, so the write should be skipped.
@@ -3385,18 +3606,19 @@ class Table:
 
     def delete(self, predicate: str | None = None, **kwargs: Any) -> dict[str, Any]:
         """DELETE rows matching a SQL predicate (every row when None)."""
-        self._check_writable("delete")
+        self._check_writable("delete", pinned=True)
         _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
         request = self._request(Operation.DELETE, {"predicate": predicate, **kwargs})
+        pinned = self._check_pinned(request)
         served: list[Any] = []
 
         def run() -> Any:
             engine = self._route(request)
             served.append(getattr(engine, "kind", None))
-            return engine.delete(self._resolved, predicate, **_given(kwargs))
+            return engine.delete(self._resolved, predicate, **_given(kwargs), **pinned)
 
-        result = self._backfilled(run)
+        result = self._pinned_write(lambda: self._backfilled(run))
         self._invalidate()
         return _results.dml(result, served[-1] if served else None)
 
@@ -3410,7 +3632,7 @@ class Table:
     ) -> dict[str, Any]:
         """UPDATE. `updates` maps columns to SQL expressions; `new_values` to
         plain Python values, which need no quoting."""
-        self._check_writable("update")
+        self._check_writable("update", pinned=True)
         _check_options("update", kwargs, _DML_OPTIONS | {"error_on_type_mismatch"})
         _check_predicate(predicate, "update")
         if updates is not None and new_values is not None:
@@ -3428,6 +3650,7 @@ class Table:
             Operation.UPDATE,
             {"updates": updates, "new_values": new_values, "predicate": predicate, **kwargs},
         )
+        pinned = self._check_pinned(request)
         engine = self._route(request)
         defaults = self._update_defaults(updates)[0]
         if defaults and isinstance(engine, (KernelEngine, DeltaRsEngine)):
@@ -3443,9 +3666,11 @@ class Table:
         if new_values is not None:
             kwargs["new_values"] = self._update_targets(new_values, deltars)
             self._refuse_zoned_ntz(kwargs["new_values"])
-        result: dict[str, Any] = self._backfilled(
-            lambda: engine.update(
-                self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
+        result: dict[str, Any] = self._pinned_write(
+            lambda: self._backfilled(
+                lambda: engine.update(
+                    self._resolved, updates=updates, predicate=predicate, **_given(kwargs), **pinned
+                )
             )
         )
         self._invalidate()
@@ -3583,7 +3808,7 @@ class Table:
     def merge(self, source: Any, predicate: str, **kwargs: Any) -> Any:
         """MERGE INTO. Returns a builder with the delta-rs clause API
         (``when_matched_update_all()`` ... ``execute()``) whichever engine serves it."""
-        self._check_writable("merge")
+        self._check_writable("merge", pinned=True)
         _check_options("merge", kwargs, _MERGE_OPTIONS)
         if predicate is None:
             raise InvalidArgumentError("merge needs a join predicate")
@@ -3591,13 +3816,14 @@ class Table:
         _check_sql_fragment(predicate, "the MERGE ON condition")
         source = _write_data(source)
         request = self._request(Operation.MERGE, {"predicate": predicate, **kwargs}, source)
+        pinned = self._check_pinned(request)
 
         routed = {"request": request}
 
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
             engine = self._route(routed["request"], exclude=exclude)
             builder = engine.merge(
-                self._resolved, self._variant_input(engine, source), predicate, **kwargs
+                self._resolved, self._variant_input(engine, source), predicate, **kwargs, **pinned
             )
             return builder, getattr(engine, "kind", None)
 
@@ -3768,6 +3994,9 @@ class Table:
             Operation.VACUUM,
             {"retention_hours": retention_hours, "dry_run": dry_run, "lite": lite, **kwargs},
         )
+        refused = refusal(self, request)
+        if refused is not None:
+            raise UnreachableTableError("vacuum", refused.reason or "", refused.remedy)
         result = self._route(request).vacuum(
             self._resolved, retention_hours=retention_hours, dry_run=dry_run, lite=lite, **kwargs
         )
@@ -4265,7 +4494,16 @@ class Table:
         return result
 
     def clone(self, target: str, **kwargs: Any) -> dict[str, Any]:
-        """CLONE. Databricks-only, so it needs the SQL fallback."""
+        """CLONE (`shallow=True` by default; `version=`/`timestamp=` clone a past one).
+
+        A path table cloned to a storage path is written here, by the kernel
+        (delta-rs#2456): version 0 of a new table with the source's protocol
+        and metadata and a CLONE commit naming the source and its version. A
+        shallow clone's adds name the source's files by absolute URL; a deep
+        clone copies them first. Anything else -- a catalog name as the
+        target, a source whose storage is reached with catalog-scoped
+        credentials -- is Databricks' CLONE through the SQL fallback.
+        """
         _check_options(
             "clone",
             kwargs,
@@ -4758,6 +4996,8 @@ def _check_can_options(op: Operation, shape: dict[str, Any]) -> None:
     if "distributed" in shape:
         method = "plan_write" if op in (Operation.APPEND, Operation.OVERWRITE) else "plan_scan"
         known = {"distributed"}
+    elif "incremental" in shape:
+        method, known = "added_since", {"incremental"}
     else:
         method = _CALL_METHODS.get(op, op.value)
         known = set(_CALL_OPTIONS.get(op, ()))

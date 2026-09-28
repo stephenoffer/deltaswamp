@@ -283,9 +283,11 @@ def test_writes_through_a_pinned_handle_are_refused(conn: Any, tmp_path: Any) ->
     pinned = conn.table(path, version=1)
     with pytest.raises(InvalidArgumentError, match="pinned"):
         pinned.delete("id = 1")
-    with pytest.raises(InvalidArgumentError, match="pinned"):
-        pinned.append(_data())
     assert conn.table(path).count() == 6
+    # A blind append reads nothing, so from a pinned handle it appends at
+    # the latest version (delta-rs#4417).
+    pinned.append(_data())
+    assert conn.table(path).count() == 9
 
 
 def test_errors_are_library_errors() -> None:

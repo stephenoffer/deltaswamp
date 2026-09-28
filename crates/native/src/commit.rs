@@ -23,8 +23,8 @@ use std::sync::Arc;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
+use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
 use delta_kernel::{DeltaResult, FilteredEngineData};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
@@ -685,7 +685,7 @@ pub fn create_table(
     // with block_in_place, so the commit must run inside the shared
     // multi-threaded runtime rather than on a bare Python thread.
     match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
-        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
+        Ok(CommitResult::CommittedTransaction(committed)) => Ok(checksummed(committed, &engine)),
         Ok(CommitResult::ConflictedTransaction(_)) => Err(NativeError::CommitConflict(
             "another writer created this table first".to_string(),
         )),
@@ -1719,9 +1719,45 @@ fn refuse_duplicate_paths(
 }
 
 /// Run a prepared transaction's commit and classify the outcome.
+/// The committed version, after writing its `.crc` where that is cheap.
+///
+/// Called outside `runtime::block_on`, as a checkpoint is: the engine's
+/// executor bridges its own I/O. See `crate::checksum`.
+///
+/// On a row-tracked table the commit's removes are written into the commit
+/// file past the kernel (it refuses removes there), so the post-commit
+/// snapshot's in-memory checksum never saw them. There the checksum is
+/// counted from a snapshot read back from storage instead, whose tail replay
+/// reads the commit file as written.
+fn checksummed(committed: CommittedTransaction, engine: &SharedEngine) -> u64 {
+    let version = committed.commit_version();
+    if let Some(snapshot) = committed.post_commit_snapshot() {
+        if row_tracked(snapshot) {
+            let reread = Snapshot::builder_for(snapshot.table_root().as_str())
+                .at_version(version)
+                .build(engine.as_ref());
+            if let Ok(reread) = reread {
+                crate::checksum::write_best_effort(&reread, engine.as_ref());
+            }
+        } else {
+            crate::checksum::write_best_effort(snapshot, engine.as_ref());
+        }
+    }
+    version
+}
+
+/// Whether the table supports the rowTracking writer feature.
+fn row_tracked(snapshot: &SnapshotRef) -> bool {
+    serde_json::to_value(snapshot.table_configuration().protocol())
+        .ok()
+        .and_then(|p| p.get("writerFeatures").cloned())
+        .and_then(|f| f.as_array().cloned())
+        .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("rowTracking")))
+}
+
 pub(crate) fn finish_commit(txn: Transaction, engine: &SharedEngine) -> Result<u64> {
     match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
-        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
+        Ok(CommitResult::CommittedTransaction(committed)) => Ok(checksummed(committed, engine)),
         Ok(CommitResult::ConflictedTransaction(conflicted)) => {
             let version = conflicted.conflict_version();
             Err(NativeError::CommitConflict(format!(

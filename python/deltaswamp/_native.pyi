@@ -16,8 +16,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
-"restore", "row_tracking_compaction", "add_tags". Gate on this list, not `hasattr`, so a
-stale build refuses cleanly.
+"restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
+"path_clone". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -152,6 +152,22 @@ def probe_put_if_absent(table_root: str, options: dict[str, str] | None = None) 
     deletes it: False if the second put succeeded (the store ignores the
     condition) or the store has no conditional put at all.
     """
+
+def absolute_deletion_vector(table_root: str, descriptor: str) -> str:
+    """A deletion-vector descriptor (JSON) of a file under `table_root`, made absolute.
+
+    A relative (`u`) vector becomes a `p` one with the vector file's full URL;
+    an inline or absolute one is returned unchanged. For shallow clones.
+    """
+
+def copy_objects(
+    source_root: str,
+    target_root: str,
+    paths: list[str],
+    source_options: dict[str, str] | None = None,
+    target_options: dict[str, str] | None = None,
+) -> int:
+    """Copy `paths` (relative, URL-encoded) from one table root to another; bytes copied."""
 
 def commit_raw(
     table_root: str,
@@ -423,6 +439,25 @@ class Snapshot:
 
         `(version, text)`, each text the newline-delimited actions of that
         commit. Published commits only.
+        """
+
+    def write_checksum(self, always: bool = False) -> bool:
+        """Write `_delta_log/<version>.crc` for this snapshot, best effort.
+
+        Only when cheap (a checksum at most 100 commits back, or a short log
+        with no checkpoint) unless `always`; a commit that changed no file
+        carries the previous checksum forward. True if one was written; never
+        raises.
+        """
+
+    def incremental_files(
+        self, base_version: int
+    ) -> tuple[list[tuple[str, str | None]], list[tuple[str, str | None]]] | None:
+        """The data files added and removed in `(base_version, self.version]`.
+
+        `(live_adds, removes)`, each sorted `(path, dv_unique_id)` pairs with
+        paths as stored in the log; the adds are those still live here. None
+        when the range's commits are no longer all in the log.
         """
 
     def timestamp(self) -> int:

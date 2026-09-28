@@ -60,6 +60,9 @@ def _make_catalog_managed(table_path: str) -> None:
             configuration["delta.enableInCommitTimestamps"] = "true"
 
     first.write_text("\n".join(json.dumps(a) for a in actions) + "\n")
+    # Checksums record the old protocol; readers trust them over the log.
+    for crc in log.glob("*.crc"):
+        crc.unlink()
 
 
 def _metadata_id(table_path: str) -> str:
@@ -86,6 +89,9 @@ def _stage_latest_commit(table_path: str) -> dict[str, Any]:
     staged_dir.mkdir(exist_ok=True)
     staged_name = f"{version:020d}.{uuid.uuid4()}.json"
     shutil.move(str(newest), str(staged_dir / staged_name))
+    # A published-only checksum must not outlive its commit: readers refuse a
+    # .crc newer than the log they can see.
+    (log / f"{version:020d}.crc").unlink(missing_ok=True)
 
     return {
         "version": version,

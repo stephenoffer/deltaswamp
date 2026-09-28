@@ -540,6 +540,41 @@ class DeltaRsEngine:
             dt = DeltaTable(uri, version=version, storage_options=options)
         return dt
 
+    def _checksum(self, table: ResolvedTable, version: int | None = None) -> None:
+        """Write the `.crc` delta-rs leaves out, for the commit just made; best effort.
+
+        See `kernel.write_checksum`. A catalog-managed table is the catalog's
+        writer's to checksum (delta-rs cannot write one anyway).
+        """
+        if table.location is None or table.is_catalog_managed:
+            return
+        from .kernel import write_checksum
+
+        try:
+            options = self._storage_options(table, write=True)
+        except Exception:
+            return
+        write_checksum(table.location, options, version)
+
+    def commit_text(self, table: ResolvedTable, version: int) -> str:
+        """The raw commit file of `version`, read through the native extension.
+
+        delta-rs has no call that returns one commit's actions; the native
+        snapshot reads it with the same storage options.
+        """
+        from .kernel import _enter_native
+
+        _enter_native("read a commit")
+        from deltaswamp._native import Snapshot
+
+        assert table.location is not None
+        snapshot = Snapshot.resolve(
+            table.location,
+            options=self._storage_options(table, write=False) or None,
+            version=int(version),
+        )
+        return "".join(text for _v, text in snapshot.commit_log(int(version) - 1))
+
     # ------------------------------------------------------------------- read
 
     def scan(
@@ -822,8 +857,8 @@ class DeltaRsEngine:
 
     # ------------------------------------------------------------------ write
 
-    def append(self, table: ResolvedTable, data: Any, **kwargs: Any) -> None:
-        self._write(table, data, mode="append", **kwargs)
+    def append(self, table: ResolvedTable, data: Any, **kwargs: Any) -> int | None:
+        return self._write(table, data, mode="append", **kwargs)
 
     def overwrite(
         self,
@@ -833,7 +868,7 @@ class DeltaRsEngine:
         predicate: str | None = None,
         partition_overwrite: str = "static",
         **kwargs: Any,
-    ) -> None:
+    ) -> int | None:
         if partition_overwrite == "dynamic":
             if predicate is not None:
                 raise UnreachableTableError(
@@ -853,7 +888,7 @@ class DeltaRsEngine:
             )
         elif predicate is not None and predicate.strip():
             predicate = _datafusion_predicate(self._open(table), predicate)
-        self._write(table, data, mode="overwrite", predicate=predicate, **kwargs)
+        return self._write(table, data, mode="overwrite", predicate=predicate, **kwargs)
 
     #: Refuse to build a predicate wider than this. A thousand OR-ed partition
     #: clauses is a sign the caller meant a full overwrite.
@@ -962,7 +997,8 @@ class DeltaRsEngine:
         txn: tuple[str, int] | None = None,
         max_commit_retries: int | None = None,
         configuration: dict[str, str] | None = None,
-    ) -> None:
+    ) -> int | None:
+        """Write, and return the version committed (None if it cannot be told)."""
         from deltalake import write_deltalake
 
         if table.location is None:
@@ -1018,16 +1054,29 @@ class DeltaRsEngine:
             retries = 15 if max_commit_retries is None else max(0, int(max_commit_retries))
             attempts = 1 + retries if blind else 1
             for attempt in range(attempts):
+                # Written through an opened table, which delta-rs moves to the
+                # version it committed: that is the version the write returns.
+                # By URI it opens its own and says nothing.
+                target: Any = uri
+                with contextlib.suppress(Exception):
+                    target = self._open(table, write=True)
                 try:
                     with translating(EngineKind.DELTARS, f"{mode} to the table"):
-                        write_deltalake(uri, data, mode=mode, **common, **extra)
+                        if target is uri:
+                            write_deltalake(uri, data, mode=mode, **common, **extra)
+                        else:
+                            options = common.pop("storage_options")
+                            try:
+                                write_deltalake(target, data, mode=mode, **common, **extra)
+                            finally:
+                                common["storage_options"] = options
                 except CommitConflictError as exc:
                     if attempt + 1 >= attempts or "changed since last commit" in str(exc):
                         raise
                     commit_backoff(attempt)
                     continue
-                return
-            return
+                return None if target is uri else int(target.version())
+            return None
         # delta-rs's own commit retry does not look at transaction ids: a writer
         # that lost the race to one committing the same (app_id, version)
         # rebased onto it and committed the batch a second time. So with txn=
@@ -1057,7 +1106,8 @@ class DeltaRsEngine:
                     raise
                 commit_backoff(attempt)
                 continue
-            return
+            return int(dt.version())
+        return None
 
     def txn_version(self, table: ResolvedTable, app_id: str) -> int | None:
         """The last version committed under `app_id`, or None.
@@ -1258,6 +1308,7 @@ class DeltaRsEngine:
         bounded = _bounded_merge_predicate(predicate, data, kwargs, _column_names(dt))
         if bounded is not None:
             checked._bounded = lambda: dt.merge(data, bounded, **kwargs)
+        checked._committed = lambda: self._checksum(table)
         return checked
 
     # ------------------------------------------------------------ maintenance
@@ -1789,6 +1840,44 @@ class DeltaRsEngine:
 
     def execute_scan(self, table: ResolvedTable, splits: list[Any], **kwargs: Any) -> Any:
         raise NotImplementedError("see plan_scan")
+
+
+def _checksummed(method: Callable[..., Any]) -> Callable[..., Any]:
+    """`method`, followed by the `.crc` of the commit it made (see `DeltaRsEngine._checksum`)."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self: DeltaRsEngine, table: ResolvedTable, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, table, *args, **kwargs)
+        version = result if isinstance(result, int) and not isinstance(result, bool) else None
+        self._checksum(table, version)
+        return result
+
+    return wrapper
+
+
+# Every DeltaRsEngine method that commits (MERGE commits at execute(); see
+# _CheckedMerger). A method that committed nothing costs one log listing.
+for _name in (
+    "append",
+    "overwrite",
+    "create",
+    "delete",
+    "update",
+    "restore",
+    "vacuum",
+    "repair",
+    "add_columns",
+    "set_properties",
+    "add_feature",
+    "add_constraint",
+    "drop_constraint",
+    "set_comment",
+    "set_column_comment",
+    "drop_not_null",
+):
+    setattr(DeltaRsEngine, _name, _checksummed(getattr(DeltaRsEngine, _name)))
+del _name
 
 
 _CONVERT_ESCAPED_REASON = (
@@ -2958,6 +3047,8 @@ class _CheckedMerger:
         #: Builds the same merger with the ON clause bounded to the source's
         #: keys (`_bounded_merge_predicate`), when that is known to be safe.
         self._bounded: Any = None
+        #: Called after the MERGE commits (the checksum delta-rs leaves out).
+        self._committed: Any = None
 
     def _apply(self, name: str, *args: Any, **kwargs: Any) -> Any:
         self._calls.append((name, args, kwargs))
@@ -3025,7 +3116,10 @@ class _CheckedMerger:
             merger = self._bounded()
             for name, call_args, call_kwargs in self._calls:
                 getattr(merger, name)(*call_args, **call_kwargs)
-        return merger.execute(*args, **kwargs)
+        result = merger.execute(*args, **kwargs)
+        if self._committed is not None:
+            self._committed()
+        return result
 
     def _recompute(self, updates: dict[str, str]) -> dict[str, str]:
         """`updates` plus SETs recomputing the generated columns they feed.

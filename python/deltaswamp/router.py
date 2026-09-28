@@ -445,6 +445,14 @@ _NEED_REASONS: dict[str, str] = {
         "(months, or microseconds), which a direct engine would compare in place of the "
         "interval; filter after reading (the frames show the interval), or use the warehouse"
     ),
+    "pinned_read": (
+        "a DELETE, UPDATE or MERGE from a handle pinned to a past version, which only the "
+        "kernel's deletion-vector DML commits (conflict-checked against the commits since)"
+    ),
+    "incremental_files": (
+        "reading the files added between two versions (added_since), which only the "
+        "kernel's incremental scan lists"
+    ),
 }
 #: Operations on a directory with no Delta log yet: can("convert") refused a
 #: Parquet directory because its (absent) log could not be read.

@@ -61,7 +61,8 @@ Several values in one cell are a routing chain, tried in order.
 | Views, MVs, metric views, row-filtered tables | DBR | warehouse | vending refuses them; only the warehouse can evaluate them |
 | Shallow clones | DBR, Spark | warehouse | absolute paths into the source defeat credential scoping |
 | Distributed scan | Spark, kernel | kernel | `plan_scan()` / `to_ray_dataset()`; per-file splits pinned to a version |
-| Incremental / streaming read | DBR, Spark | native over CDF | `Table.changes()` follows the change feed version by version; reading added files without CDF needs `incremental_scan`, not yet bound |
+| Incremental / streaming read | DBR, Spark | native over CDF | `Table.changes()` follows the change feed version by version; `changes(..., include_snapshot=True)` first yields the table at the start version as inserts |
+| Incremental read without CDF (rows added since a version) | kernel | kernel | `Table.added_since(version)` reads the files the kernel's incremental scan lists as added; refused when the range removed files, unless `only_appends=True` |
 
 ## Writing and DML
 
@@ -138,12 +139,13 @@ variant; all three are writer-only, so both engines read and neither writes.
 | RESTORE | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | the kernel serves deletion-vector tables (delta-rs leaves DV changes in place, delta-rs#4613), column-mapped tables and the tables delta-rs cannot write; restored files keep their row ids, and the target's schema and properties come back |
 | FSCK REPAIR | DBR, delta-rs | delta-rs, warehouse | |
 | Checkpoint | all | delta-rs, kernel | the kernel checkpoints catalog-managed tables, publishing first |
+| Version checksums (`.crc`) | DBR, Spark, kernel | kernel, delta-rs | written after every commit where the previous one is at most 100 versions back (or the log is short); delta-rs writes none itself (delta-rs#4190) |
 | Log compaction | Spark, delta-rs | delta-rs | kernel's writer is a stub |
 | Expired log cleanup | all | delta-rs | `Table.cleanup_metadata()` |
 | Publish staged commits | kernel | kernel | required on catalog-managed tables |
 | ANALYZE (DELTA) STATISTICS | DBR | warehouse | |
 | REORG PURGE / UPGRADE UNIFORM | DBR, Spark | warehouse | |
-| CLONE (shallow, deep) | DBR, Spark | warehouse | |
+| CLONE (shallow, deep) | DBR, Spark | kernel, warehouse | the kernel clones a path table to a path (delta-rs#2456): shallow with absolute-path adds and vectors, deep by copying; catalog targets and catalog-scoped credentials need the warehouse. A shallow clone is for Spark and Databricks: the direct engines read only files under a table's root |
 | CONVERT TO DELTA | DBR, Spark, delta-rs | delta-rs | |
 | Symlink manifests | Spark, delta-rs | delta-rs | |
 | Predictive optimization | DBR | — | server-side scheduling; `Table.info()` reports whether it is on |
@@ -203,7 +205,6 @@ variant; all three are writer-only, so both engines read and neither writes.
 |---|---|
 | UPDATE, MERGE and replaceWhere on a change-data-feed table the kernel alone can write | the kernel cannot write CDC files, and those commits need them; DELETE through deletion vectors does not |
 | CDF on catalog-managed tables outside Databricks | the kernel's `TableChanges` takes no catalog commit tail |
-| Incremental reads without a change feed | the kernel's `incremental_scan` is not bound yet; `Table.changes()` covers tables with CDF |
 | Databricks server-side behavior (predictive optimization, auto compaction, row-level concurrency, Photon, CLUSTER BY AUTO) | these are things a Databricks cluster does, not table formats; the warehouse fallback is the only way in |
 | UniForm metadata generation outside Databricks | Databricks-only |
 | Managed-table creation and catalog-managed commits on Databricks | Databricks allowlists which connectors may write through the UC Delta API, by User-Agent |

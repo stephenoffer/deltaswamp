@@ -78,6 +78,8 @@ class KernelMerger:
         import pyarrow as pa
 
         passthrough = {k: options.pop(k, None) for k in ("commit_metadata", "engine_info")}
+        #: A pinned handle's version: read there, conflict-checked at commit.
+        self._read_version = options.pop("read_version", None)
         merge_schema = options.pop("merge_schema", False)
         if merge_schema:
             raise UnreachableTableError(
@@ -197,7 +199,7 @@ class KernelMerger:
         if self._refusal is not None:
             raise self._refusal
         engine, table = self._engine, self._table
-        snapshot = engine.snapshot(table, write=True)
+        snapshot = engine.snapshot(table, version=self._read_version, write=True)
         schema = pa.schema(snapshot.schema())
         if table.features & {"variantType", "variantType-preview"}:
             from .._variant import log_variant_columns

@@ -866,7 +866,12 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             Operation.PUBLISH, (_K,), "Snapshot::publish; only kernel implements staged->published"
         ),
         _op(Operation.REORG, (_S,), "Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM)"),
-        _op(Operation.CLONE, (_S,), "Databricks-only (shallow and deep CLONE)"),
+        _op(
+            Operation.CLONE,
+            (_K, _S),
+            "kernel: path table to a path (a raw version 0 over the source's files); "
+            "Databricks for catalog tables",
+        ),
         _op(
             Operation.ANALYZE,
             (_S,),

@@ -54,6 +54,7 @@ METHOD_OPERATIONS: dict[str, tuple[Operation, dict[str, Any]]] = {
     "changes": (Operation.INCREMENTAL, {}),
     "plan_write": (Operation.APPEND, {"distributed": True}),
     "plan_scan": (Operation.SCAN, {"distributed": True}),
+    "added_since": (Operation.SCAN, {"incremental": True}),
     "to_arrow": (Operation.SCAN, {}),
     "create_table": (Operation.CREATE, {}),
     "convert_to_delta": (Operation.CONVERT, {}),
@@ -67,7 +68,18 @@ def derive(table: Table, operation: Operation, args: Mapping[str, Any], data: An
     op, needs = operation, set[str]()
     if rule is not None:
         op, needs = rule(table, operation, shape, data)
+    if table._version is not None and op in PINNED_DML:
+        # Read at the pinned version, committed at the latest after Delta's
+        # conflict check against every commit since (delta-rs#4417): what the
+        # kernel's deletion-vector DML does when it loses a race.
+        needs.add("pinned_read")
     return Request(op, frozenset(needs), shape, operation)
+
+
+#: What a handle pinned to a past version may still change: the rows it read,
+#: conflict-checked against the commits since, as a transaction that started
+#: at that version would be.
+PINNED_DML: frozenset[Operation] = frozenset({Operation.DELETE, Operation.UPDATE, Operation.MERGE})
 
 
 #: What the calls refuse on a handle opened at a past version (see
@@ -75,13 +87,9 @@ def derive(table: Table, operation: Operation, args: Mapping[str, Any], data: An
 #: latest version.
 _PINNED_REFUSED: frozenset[Operation] = frozenset(
     {
-        Operation.APPEND,
         Operation.OVERWRITE,
         Operation.REPLACE_WHERE,
         Operation.MERGE_SCHEMA,
-        Operation.DELETE,
-        Operation.UPDATE,
-        Operation.MERGE,
         Operation.OPTIMIZE,
         Operation.ZORDER,
         Operation.RESTORE,
@@ -109,7 +117,10 @@ def refusal(table: Table, request: Request) -> Capability | None:
     """The refusal the call makes of `request` before any engine is asked, if any.
 
     A handle pinned to a version refuses every write in the method; can()
-    asked only the router, which judged the latest table and said yes.
+    asked only the router, which judged the latest table and said yes. Two
+    are served: a blind append (it reads nothing, so it appends at the latest
+    version as from any handle) and DELETE, UPDATE and MERGE where the kernel
+    commits them from the pinned version (see `PINNED_DML`).
     """
     version = table._version
     if request.operation is Operation.OVERWRITE and request.shape.get("schema_mode") == "overwrite":
@@ -124,7 +135,37 @@ def refusal(table: Table, request: Request) -> Capability | None:
                 remedy="drop the constraints first (drop_constraint()), or write the data as "
                 "a new table (write_table() at another location)",
             )
-    if version is None or request.operation not in _PINNED_REFUSED:
+    if request.operation is Operation.VACUUM and request.shape.get("dry_run") is False:
+        borrowed = _borrowed_files(table)
+        if borrowed:
+            # The catalog says when a table is a shallow clone; a path table's
+            # log is the only witness. VACUUM there would treat the source's
+            # files as the clone's own.
+            return Capability(
+                request.asked,
+                ok=False,
+                reason=f"the table is a shallow clone: {borrowed} of its live files belong to "
+                "another table (referenced by absolute path), and vacuuming it risks deleting "
+                "data the source still owns",
+                remedy="vacuum the source table; a deep clone (clone(..., shallow=False)) "
+                "owns its files",
+            )
+    if version is not None and request.operation in PINNED_DML:
+        verdict = table._connection.router.capability(
+            request.operation, table._enrich(), needs=request.needs, **request.shape
+        )
+        if verdict.ok:
+            return None
+        return Capability(
+            request.asked,
+            ok=False,
+            reason=f"this handle is pinned to version {version}; a {request.operation.value} "
+            "commits from a past version only as deletion vectors on the kernel, "
+            f"conflict-checked against the commits since, and here: {verdict.reason}",
+            remedy="open the table without version= to write to it",
+        )
+    distributed = request.operation is Operation.APPEND and request.shape.get("distributed")
+    if version is None or (request.operation not in _PINNED_REFUSED and not distributed):
         return None
     return Capability(
         request.asked,
@@ -133,6 +174,22 @@ def refusal(table: Table, request: Request) -> Capability | None:
         "latest version",
         remedy="open the table without version= to write to it",
     )
+
+
+def _borrowed_files(table: Table) -> int:
+    """How many of the table's live files are another table's, by absolute path."""
+    from .capability import Engine
+
+    kernel = table._connection.router.engines.get(Engine.KERNEL)
+    if kernel is None or table._resolved.location is None or not hasattr(kernel, "snapshot"):
+        return 0
+    try:
+        import pyarrow as pa
+
+        paths = pa.table(kernel.snapshot(table._resolved).files()).column("path").to_pylist()
+    except Exception:
+        return 0
+    return sum(1 for p in paths if "://" in p)
 
 
 def _replace_keeps(table: Table) -> str:
@@ -164,6 +221,17 @@ def _read(
     needs: set[str] = set()
     if get("distributed"):
         needs.add("distributed_scan")
+    incremental = bool(shape.pop("incremental", False))
+    if incremental:
+        # added_since(): the file diff between two versions, which only the
+        # kernel's incremental scan gives. Its `version` is where the range
+        # starts, not a version to read at; `until` is that.
+        needs.add("incremental_files")
+        shape.pop("version", None)
+        if shape.get("until") is not None:
+            shape["version"] = shape.pop("until")
+        shape.pop("until", None)
+        shape.pop("only_appends", None)
     if predicate is not None:
         needs |= table._predicate_needs(predicate)
         needs |= table._interval_needs(predicate)
@@ -193,6 +261,8 @@ def _feed(
     get = shape.get
     predicate = get("predicate")
     needs: set[str] = set()
+    # The snapshot a bootstrapping changes() yields first is a plain read.
+    shape.pop("include_snapshot", None)
     if predicate is not None:
         needs |= table._predicate_needs(predicate)
         needs |= table._expression_needs(predicate)

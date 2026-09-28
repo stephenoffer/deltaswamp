@@ -200,6 +200,18 @@ looking the name up in its own catalog.
 `dbfs:/` and `/mnt/...` paths are refused with an explanation, since they are
 unreachable from outside Databricks.
 
+A handle opened with `version=` reads that version, and writes as a
+transaction begun there would (delta-rs#4417). `append` is blind -- it reads
+nothing -- so it appends at the latest version, as from any handle. `delete`,
+`update` and `merge` read the pinned version and commit at the latest after
+Delta's conflict check against every commit since: they go through if the
+commits since were blind appends or left the files they read alone, and
+raise `CommitConflictError` otherwise (open a later version and run it
+again). Only the kernel's deletion-vector DML does that, so they need a table
+with `delta.enableDeletionVectors`, not catalog-managed; elsewhere, and for
+every other write (overwrite, schema-merging appends, OPTIMIZE, RESTORE,
+ALTER), a pinned handle refuses, and `can()` says so.
+
 ## Reading
 
 `scan()` is the primitive. It returns an Arrow stream that exports
@@ -356,6 +368,27 @@ not retroactive. A table whose `delta.deletedFileRetentionDuration` is shorter
 than its `delta.logRetentionDuration` is refused too, because files could be
 vacuumed while their commits survive.
 
+An append-only table needs no feed to be read incrementally. `added_since`
+returns the rows of the data files committed after a version, from the
+kernel's incremental scan of the log:
+
+```python
+new_rows = t.added_since(last_seen)  # (last_seen, latest]
+t.added_since(5, until=9, columns=["id"], predicate="id > 100")
+```
+
+Only appends make those the rows added: a DELETE, UPDATE, MERGE, OPTIMIZE or
+overwrite in the range removes files and adds back rows that were there
+before, so such a range is refused. `only_appends=True` reads every file
+added anyway, rows a rewrite carried over included, for a consumer that
+dedupes on a key; `cdf()` is the exact answer. A range whose commits were
+cleaned from the log is refused too.
+
+`changes(start, include_snapshot=True)` bootstraps a consumer of the feed: the
+first yield is the whole table as of `start`, every row an `insert` of that
+version, and the feed follows from `start + 1`. The feed must be on from
+`start + 1`, not before.
+
 ## Writing
 
 ```python
@@ -367,6 +400,12 @@ t.append(df, schema_mode="merge")  # widen the schema to fit
 t.replace(df)  # new contents and schema (RTAS)
 t.append(df, txn=("nightly-load", batch_id))  # idempotent
 ```
+
+Each returns an `OperationResult` (a dict): the `version` it committed and the
+`num_files`, `num_rows` and `num_bytes` it added (`num_removed_files` too),
+read back from the commit, plus `.engine`. A write skipped because its `txn`
+was already committed has `skipped=True` and no `version`. The warehouse
+reports neither, so a write it served carries only `.engine`.
 
 `txn=(app_id, version)` makes an append exactly-once, as Spark's
 `txnAppId`/`txnVersion` do: an append whose version is at or below the last
@@ -667,6 +706,31 @@ t.refresh()  # a materialized view or streaming table
 t.cluster_by("auto")
 ```
 
+A path table cloned to a storage path needs no warehouse: the kernel writes
+the clone's version 0 itself (delta-rs#2456).
+
+```python
+t = conn.table("s3://bucket/orders")
+t.clone("s3://bucket/orders_dev")  # shallow: references orders' files
+t.clone("s3://bucket/orders_copy", shallow=False)  # deep: copies them
+t.clone("s3://bucket/orders_v12", version=12)
+```
+
+The clone carries the source's protocol, metadata (under a new table id) and
+clustering, and its commit is a `CLONE` naming the source and its version, as
+Databricks writes one. A shallow clone's add actions name the source's data
+files and deletion vectors by absolute URL, which Spark and Databricks read;
+this library's own engines read only files under a table's root (a log must
+not reach other data with the connection's credentials), so they refuse to
+read it -- clone deep to read it here. `vacuum(dry_run=False)` on a shallow
+clone is refused, since it would treat the source's files as its own; vacuum
+the source, which keeps the files its live versions reference. A deep clone
+copies every live data file and deletion vector, then keeps their relative
+paths. Refused (and left to Databricks' CLONE): a catalog table name as the
+target, `replace=True`, a source whose storage the catalog reaches with
+credentials scoped to it, and tables with row tracking or catalog-managed
+commits.
+
 ## Maintenance
 
 ```python
@@ -759,8 +823,9 @@ deletes from its adds and removes. A target file VACUUM deleted raises
 
 These refuse rather than misbehave:
 
-- `vacuum` and `restore` on a shallow clone, which borrows the source's files,
-  and on a table carrying a feature nothing here recognizes.
+- `vacuum` and `restore` on a shallow clone, which borrows the source's files
+  (a catalog's shallow clone, or a path table whose live files are another
+  table's), and on a table carrying a feature nothing here recognizes.
 - `restore` across a change of column-mapping mode, of partition columns, or
   of the table id (a replaced table), or to a version whose protocol needed a
   feature since dropped. `can("restore", target=n)` says so up front.
@@ -770,6 +835,17 @@ These refuse rather than misbehave:
 Checkpoints work on catalog-managed tables. The kernel publishes staged commits
 first, since it checkpoints only published versions. Commits made here also
 checkpoint on their own at the table's `delta.checkpointInterval`.
+
+Every commit made here also writes its version checksum,
+`_delta_log/<version>.crc` (the table's size, file count, protocol and
+metadata), which Databricks and Spark read to load a snapshot quickly and to
+check the state they rebuilt. delta-rs writes none, so one is written after
+each of its commits too. It is computed from the previous checksum, so it is
+written only while the chain is intact: the previous checksum at most 100
+versions back, or a log of fewer than 100 commits with no checkpoint. A table
+whose history never had them is left without, and a catalog-managed table's
+are left to the catalog's writer. A checksum that cannot be written never
+fails the commit.
 
 ## Metadata
 

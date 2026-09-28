@@ -116,7 +116,6 @@ def test_writes_through_a_pinned_handle_are_refused_by_can(conn: Any, tmp_path: 
     conn.open_table(path).append(pa.table({"id": [2]}))
     t = conn.open_table(path, version=0)
     cases: list[tuple[str, dict[str, Any]]] = [
-        ("append", {}),
         ("delete", {"predicate": "id = 1"}),
         ("merge", {}),
         ("optimize", {}),
@@ -129,7 +128,9 @@ def test_writes_through_a_pinned_handle_are_refused_by_can(conn: Any, tmp_path: 
         assert "pinned to version 0" in cap.reason
         assert "without version=" in (cap.remedy or "")
     with pytest.raises(InvalidArgumentError, match="pinned"):
-        t.append(pa.table({"id": [9]}))
+        t.delete("id = 1")
+    # A blind append reads nothing: it appends at the latest version.
+    assert t.can("append").ok
     assert t.can("scan").ok and t.can("vacuum").ok
 
 

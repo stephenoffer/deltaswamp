@@ -120,6 +120,9 @@ def _make_catalog_managed(path: str, *, vacuum_protocol_check: bool = True) -> N
             configuration["delta.enableInCommitTimestamps"] = "true"
             configuration["io.unitycatalog.tableId"] = action["metaData"]["id"]
     first.write_text("\n".join(json.dumps(a) for a in actions) + "\n")
+    # Checksums record the old protocol; readers trust them over the log.
+    for crc in first.parent.glob("*.crc"):
+        crc.unlink()
 
 
 @dataclass

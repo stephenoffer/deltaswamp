@@ -65,6 +65,12 @@ First release.
   `num_files_added`, `num_files_removed`, `version`; `num_removed_files` and
   `num_restored_files` for RESTORE), plus `.engine`. Code comparing a result
   for exact equality with a dict needs to compare the keys it cares about.
+- `append`, `overwrite` and `replace` return an `OperationResult` too, where
+  they returned None (delta-rs#3952): `version` committed, `num_files`,
+  `num_rows` and `num_bytes` added, `num_removed_files`, and `.engine`, read
+  back from the commit on the kernel and delta-rs. A write the call skipped
+  (a `txn` already committed, an empty dynamic overwrite) has `skipped=True`,
+  zero counts and no `version`. Through the warehouse only `.engine` is known.
 
 - One error-translation boundary around every engine: nothing but a
   `DeltaSwampError` reaches a caller, from a call or later from the stream or
@@ -87,6 +93,42 @@ First release.
   (`zstd`, `gzip`, `lz4`, `lz4_raw`, `brotli`, `uncompressed`; `lzo`, which
   arrow-rs cannot write, as snappy). They were uncompressed, and an OPTIMIZE
   grew a table 2-4x.
+
+- Every commit writes its version checksum (`_delta_log/<version>.crc`), as
+  Spark and Databricks do (delta-rs#4190, delta-kernel-rs#1781): kernel
+  commits from the post-commit snapshot, delta-rs commits and raw metadata
+  commits afterwards, through the kernel's `Snapshot::write_checksum`. A
+  commit that changes no file (SET TBLPROPERTIES, ADD COLUMNS, VACUUM
+  START/END), which the kernel gives up on, carries the previous checksum
+  forward. Only when cheap -- the previous checksum at most 100 commits back,
+  or a log under 100 commits with no checkpoint -- so a long history that
+  never had one does not start a chain; never on a catalog-managed table (the
+  catalog's writer keeps those); and never at the cost of the write.
+
+- `Table.added_since(version, until=None, ...)` reads the rows added after a
+  version without the change data feed (delta-rs#4554,
+  delta-kernel-rs#1177), from the kernel's incremental scan bound as
+  `Snapshot.incremental_files`. It refuses a range that removed files (DML,
+  OPTIMIZE, overwrite) unless `only_appends=True`; `can("added_since")`
+  says so. `changes(start, include_snapshot=True)` yields the table at
+  `start` as inserts before the feed.
+
+- A handle pinned to a version (`conn.table(..., version=n)`) can write
+  (delta-rs#4417): `append` appends at the latest version (it reads nothing),
+  and `delete`, `update` and `merge` read version n and commit at the latest
+  through the kernel's deletion-vector conflict check against every commit
+  since, raising `CommitConflictError` when one changed what they read.
+  Other writes, tables without deletion vectors and catalog-managed tables
+  still refuse, and `can()` agrees.
+
+- `clone(target)` of a path table to a storage path is written by the kernel,
+  with no warehouse (delta-rs#2456): version 0 with the source's protocol,
+  metadata and clustering, a `CLONE` commit naming the source and its
+  version, and the source's files by absolute URL (deletion vectors made
+  absolute) for a shallow clone, or copies of them for `shallow=False`.
+  VACUUM of a path shallow clone is refused. The direct engines do not read a
+  shallow clone (their reads stay confined to the table root); Spark and
+  Databricks do.
 
 ### Security
 

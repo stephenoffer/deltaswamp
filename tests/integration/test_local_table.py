@@ -187,10 +187,14 @@ class TestCapabilities:
     def test_databricks_only_operations_are_refused_with_a_remedy(
         self, conn: Any, path: str
     ) -> None:
-        cap = conn.open_table(path).can(Operation.CLONE)
+        # CLONE of a path table to a path is the kernel's; to a catalog
+        # name it is Databricks'.
+        cap = conn.open_table(path).can(Operation.REORG)
         assert not cap.ok
         assert "Databricks" in cap.reason
         assert "allow_sql_fallback" in cap.remedy
+        cap = conn.open_table(path).can(Operation.CLONE, target="main.sales.copy")
+        assert not cap.ok and "allow_sql_fallback" in cap.remedy
 
 
 class TestCreate:
