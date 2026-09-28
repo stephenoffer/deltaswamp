@@ -196,14 +196,22 @@ class TestPartitionValues:
 
 class TestWriteShapes:
     def test_merge_schema_on_column_mapped_table(self, conn: Any, tmp_path: Any) -> None:
-        """LW-14: can() said delta-rs would serve it, and delta-rs then failed."""
+        """LW-14: can() said delta-rs would serve it, and delta-rs then failed.
+
+        delta-rs still cannot; the kernel evolves the schema in the write's own
+        commit, with a column-mapping id and physical name for the new column.
+        """
         path = str(tmp_path / "t")
         t = conn.create_table(
             path, pa.schema([("id", pa.int64())]), properties={"delta.columnMapping.mode": "name"}
         )
-        assert not t.can("append", schema_mode="merge")
-        with pytest.raises(UnreachableTableError, match="column mapping"):
-            t.append(pa.table({"id": [1], "w": [2]}), schema_mode="merge")
+        verdict = t.can("append", schema_mode="merge")
+        assert verdict.ok and str(verdict.engine) == "kernel", verdict
+        t.append(pa.table({"id": [1], "w": [2]}), schema_mode="merge")
+        t = conn.open_table(path)
+        assert t.to_arrow().to_pylist() == [{"id": 1, "w": 2}]
+        field = t.schema().field("w")
+        assert field.metadata[b"delta.columnMapping.physicalName"].startswith(b"col-")
 
     def test_zoned_timestamps_create(self, conn: Any, tmp_path: Any) -> None:
         """LW-12: a non-UTC zone raised a bare Exception from delta-rs."""

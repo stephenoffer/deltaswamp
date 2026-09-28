@@ -953,6 +953,9 @@ impl PySnapshot {
         commit_metadata = None,
         operation_parameters = None,
         blind_append = None,
+        metadata = None,
+        protocol = None,
+        constraints_checked = false,
     ))]
     fn append(
         &self,
@@ -966,6 +969,9 @@ impl PySnapshot {
         commit_metadata: Option<HashMap<String, String>>,
         operation_parameters: Option<HashMap<String, String>>,
         blind_append: Option<bool>,
+        metadata: Option<String>,
+        protocol: Option<String>,
+        constraints_checked: bool,
     ) -> PyResult<u64> {
         let reader = data.into_reader()?;
 
@@ -989,6 +995,11 @@ impl PySnapshot {
                     blind_append,
                     ..Default::default()
                 },
+                &crate::restate::Restatement {
+                    metadata,
+                    protocol,
+                    constraints_checked,
+                },
             )
         })?;
         Ok(version)
@@ -1001,18 +1012,26 @@ impl PySnapshot {
     /// coordinator that gives up leaves them as garbage. Decide whether the
     /// commit can succeed *before* the first worker runs -- that is what
     /// `Table.can(...)` is for.
-    #[pyo3(signature = (data, uc = None))]
+    #[pyo3(signature = (data, uc = None, constraints_checked = false))]
     fn write_files(
         &self,
         py: Python<'_>,
         data: PyRecordBatchReader,
         uc: Option<UcCommitConfig>,
+        constraints_checked: bool,
     ) -> PyResult<Vec<u8>> {
         let reader = data.into_reader()?;
         let batches: std::result::Result<Vec<_>, _> = reader.collect();
         let batches = batches.map_err(NativeError::from)?;
-        let result =
-            py.detach(|| commit::write_files(self.inner.clone(), self.engine.clone(), batches, uc));
+        let result = py.detach(|| {
+            commit::write_files(
+                self.inner.clone(),
+                self.engine.clone(),
+                batches,
+                uc,
+                constraints_checked,
+            )
+        });
         match result {
             Ok(bytes) => Ok(bytes),
             Err(failure) => {
@@ -1050,6 +1069,7 @@ impl PySnapshot {
         commit_metadata = None,
         operation_parameters = None,
         blind_append = None,
+        constraints_checked = false,
     ))]
     fn commit_files(
         &self,
@@ -1063,6 +1083,7 @@ impl PySnapshot {
         commit_metadata: Option<HashMap<String, String>>,
         operation_parameters: Option<HashMap<String, String>>,
         blind_append: Option<bool>,
+        constraints_checked: bool,
     ) -> PyResult<u64> {
         let version = py.detach(|| {
             commit::commit_files(
@@ -1080,6 +1101,7 @@ impl PySnapshot {
                     blind_append,
                     ..Default::default()
                 },
+                constraints_checked,
             )
         })?;
         Ok(version)
@@ -1112,6 +1134,7 @@ impl PySnapshot {
         operation_parameters = None,
         blind_append = None,
         add_tags = None,
+        constraints_checked = false,
     ))]
     fn commit_dml(
         &self,
@@ -1128,6 +1151,7 @@ impl PySnapshot {
         operation_parameters: Option<HashMap<String, String>>,
         blind_append: Option<bool>,
         add_tags: Option<HashMap<String, String>>,
+        constraints_checked: bool,
     ) -> PyResult<(u64, u64, usize, usize)> {
         let deletions = deletions.into_reader()?;
         let data = data.map(|d| d.into_reader()).transpose()?;
@@ -1158,6 +1182,7 @@ impl PySnapshot {
                 txn,
                 commit_metadata,
                 data_change,
+                constraints_checked,
                 commit::CommitInfoPatch {
                     operation_parameters,
                     blind_append,

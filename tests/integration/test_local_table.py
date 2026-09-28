@@ -915,11 +915,12 @@ class TestEnforcementIsNotBypassed:
         replace.commit([replace.write(pa.table({"id": [9]}))])
         assert conn.open_table(location).to_arrow().to_pydict()["id"] == [9]
 
-    def test_a_check_constraint_keeps_writes_on_delta_rs(self, conn: Any, amounts: str) -> None:
+    def test_a_check_constraint_is_enforced_by_either_engine(self, conn: Any, amounts: str) -> None:
         """A legacy protocol names no features, so only the version reveals this.
 
         Reading just the named list made the table look featureless: the kernel
-        would have accepted the write and skipped the constraint entirely.
+        would have accepted the write and skipped the constraint entirely. It
+        now evaluates the constraint over every row it writes, as delta-rs does.
         """
         conn.open_table(amounts).add_constraint({"amt_positive": "amt > 0"})
         table = conn.open_table(amounts)
@@ -928,20 +929,24 @@ class TestEnforcementIsNotBypassed:
         assert "checkConstraints" in table.resolved.effective_writer_features
         assert table.can(Operation.APPEND).engine is Engine.DELTARS
 
-        with pytest.raises(UnreachableTableError, match="checkConstraints"):
-            conn.open_table(amounts).plan_write()
+        plan = conn.open_table(amounts).plan_write()
+        with pytest.raises(InvalidArgumentError, match="amt_positive"):
+            plan.write(pa.table({"id": [3], "amt": [-5]}))
+        plan.commit([plan.write(pa.table({"id": [3], "amt": [5]}))])
         with pytest.raises(Exception, match=r"(?i)invalid data|constraint"):
-            conn.open_table(amounts).append(pa.table({"id": [3], "amt": [-5]}))
+            conn.open_table(amounts).append(pa.table({"id": [4], "amt": [-5]}))
+        assert sorted(conn.open_table(amounts).to_arrow().column("amt").to_pylist()) == [5, 10]
 
 
 class TestTheKernelWritePathIsVersionBound:
-    """What rules a table out of a kernel write is its protocol *version*.
+    """What ruled a table out of a kernel write was its protocol *version*.
 
     A legacy writer version implies a whole feature set. Version 3 and above
     imply `checkConstraints`, which the kernel refuses whether or not a single
-    constraint exists -- so enabling change data feed, which alone puts a table
-    at version 4, takes it off the kernel write path entirely. The same features
-    are fine on a version 7 table, where only what is *named* applies.
+    constraint exists, and 4 and above `generatedColumns` -- so enabling change
+    data feed, which alone puts a table at version 4, took it off the kernel
+    write path entirely. A checked write (every constraint evaluated here, no
+    column generated) now commits past both; a build without it still refuses.
     """
 
     @staticmethod
@@ -957,8 +962,8 @@ class TestTheKernelWritePathIsVersionBound:
         ("properties", "writable"),
         [
             ({}, True),
-            ({"delta.enableChangeDataFeed": "true"}, False),
-            ({"delta.columnMapping.mode": "name"}, False),
+            ({"delta.enableChangeDataFeed": "true"}, True),
+            ({"delta.columnMapping.mode": "name"}, True),
             ({"delta.enableChangeDataFeed": "true", "delta.enableRowTracking": "true"}, True),
             ({"delta.columnMapping.mode": "name", "delta.enableDeletionVectors": "true"}, True),
         ],
@@ -976,17 +981,33 @@ class TestTheKernelWritePathIsVersionBound:
             with pytest.raises(UnreachableTableError):
                 conn.open_table(location).plan_write()
 
-    def test_a_refusal_says_when_the_feature_is_only_implied(self, conn: Any) -> None:
+    @staticmethod
+    def _unchecked(monkeypatch: Any) -> None:
+        """A native build that cannot commit a checked write."""
+        from deltaswamp.engine import kernel
+
+        real = kernel._native_has
+        monkeypatch.setattr(
+            kernel, "_native_has", lambda *f: "check_constraints" not in f and real(*f)
+        )
+
+    def test_a_refusal_says_when_the_feature_is_only_implied(
+        self, conn: Any, monkeypatch: Any
+    ) -> None:
         """A CDF table with no constraints must not send its owner hunting."""
+        self._unchecked(monkeypatch)
         location = self._table(conn, {"delta.enableChangeDataFeed": "true"})
         with pytest.raises(UnreachableTableError, match="neither names nor uses") as caught:
             conn.open_table(location).plan_write()
         assert "writer version 4 implies" in str(caught.value)
 
-    def test_the_note_omits_a_feature_the_table_really_uses(self, conn: Any) -> None:
+    def test_the_note_omits_a_feature_the_table_really_uses(
+        self, conn: Any, monkeypatch: Any
+    ) -> None:
         location = self._table(conn, {"delta.enableChangeDataFeed": "true"})
         conn.open_table(location).append(pa.table({"id": [1]}))
         conn.open_table(location).add_constraint({"positive": "id > 0"})
+        self._unchecked(monkeypatch)
 
         with pytest.raises(UnreachableTableError) as caught:
             conn.open_table(location).plan_write()

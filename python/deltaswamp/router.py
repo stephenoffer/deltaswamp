@@ -247,11 +247,15 @@ def _operation_blocker(
                 f"the table uses the legacy writer protocol version {writer}, which implies "
                 "checkConstraints, and the kernel refuses to write its log"
             )
+        # checkConstraints binds a checkpoint too: the kernel's data writes
+        # commit past it (constraints evaluated here), its checkpoint writer
+        # does not.
         unwritable = sorted(
             name
             for name in table.writer_features
             if (feature := feature_from_wire(name)) is None
             or FEATURE_SUPPORT[feature].kernel_write is Support.NO
+            or feature is TableFeature.CHECK_CONSTRAINTS
         )
         if unwritable:
             return f"the kernel cannot write the log of a table with {', '.join(unwritable)}"
@@ -283,6 +287,8 @@ def _features_added(operation: Operation, shape: dict[str, object]) -> set[str]:
     names: set[str] = set()
     if operation is Operation.CLUSTER_BY:
         names.add("clustering")
+    elif operation is Operation.ADD_CONSTRAINT:
+        names.add("checkConstraints")
     elif operation is Operation.ADD_FEATURE:
         features = shape.get("features")
         items = [features] if isinstance(features, str) else features
@@ -334,6 +340,10 @@ def _strands_legacy_table(
 
     implied = set(_LEGACY_WRITER.get(writer, ()))
     added = _features_added(operation, shape) - implied
+    if added and _writes(implied | added, "kernel"):
+        # Writer 3 implies no more than the kernel writes (checkConstraints
+        # included, enforced here), so it goes on writing the table.
+        return None
     unwritable = sorted(
         name
         for name in added
@@ -342,7 +352,7 @@ def _strands_legacy_table(
     )
     if not unwritable:
         return None
-    kept = ", ".join(n for n in ("checkConstraints", "generatedColumns") if n in implied)
+    kept = ", ".join(n for n in sorted(implied) if not _writes({n}, "kernel"))
     return (
         f"the table is at the legacy writer version {writer}, and turning on "
         f"{', '.join(unwritable)} moves it to table features that must keep listing {kept} "

@@ -46,6 +46,7 @@ __all__ = [
     "Change",
     "TableState",
     "add_columns",
+    "add_constraints",
     "add_feature",
     "alter_column_type",
     "arrow_to_delta_schema",
@@ -53,6 +54,7 @@ __all__ = [
     "cluster_by",
     "drop_column",
     "drop_constraint",
+    "merge_schema",
     "rename_column",
     "set_column_comment",
     "set_comment",
@@ -848,6 +850,162 @@ def add_columns(state: TableState, new_fields: list[dict[str, Any]]) -> Change:
     )
 
 
+def merge_schema(state: TableState, arrow_schema: Any) -> Change:
+    """schema_mode='merge': the table's schema widened to take a write's columns.
+
+    What Spark's mergeSchema does: a column the data has and the table does
+    not is added (nullable, at the end), at the top level and inside structs,
+    arrays of structs and maps of them; a column the data leaves out stays,
+    NULL in the new rows. Under column mapping every new field gets the next
+    id and a fresh physical name, and `delta.columnMapping.maxColumnId` moves
+    past them. A column whose data type is wider than the table's is widened
+    only where the table enables type widening (and the widening is one the
+    protocol allows), and recorded in the field's `delta.typeChanges`, as
+    Databricks does; elsewhere it is refused. A narrower type is the table's
+    own, cast losslessly by the write. Returns a Change whose metadata is None
+    when the table already takes the data as it is.
+    """
+    schema = state.schema
+    configuration = state.configuration
+    column_mapping = state.column_mapping_mode in ("name", "id")
+    widening = configuration.get("delta.enableTypeWidening", "false").lower() == "true"
+    partitions = {p.lower() for p in state.metadata.get("partitionColumns") or []}
+    operation = "write with schema_mode='merge'"
+    added: list[dict[str, Any]] = []
+    widened: list[str] = []
+
+    def new_field(f: Any, path: str) -> dict[str, Any]:
+        try:
+            out = arrow_to_delta_field(f)
+        except UnreachableTableError as exc:
+            raise _refuse(f"add column {path}", str(exc.reason)) from None
+        comment = (out.get("metadata") or {}).get("comment")
+        # Only a comment is carried: a generation expression, an identity or
+        # a default declared in the data's schema would need its feature and
+        # its values computed, which Spark refuses on schema evolution too.
+        out["metadata"] = {"comment": comment} if comment is not None else {}
+        out["nullable"] = True
+        top = "." not in path
+        if top and path.lower() in _CDF_RESERVED and _cdf_enabled(configuration):
+            raise cdf_clash_error(operation, [path])
+        added.append(out)
+        return out
+
+    def merge_fields(
+        fields: list[dict[str, Any]], data_type: Any, path: str, *, nested: bool = False
+    ) -> None:
+        by_name = {f["name"].lower(): f for f in fields}
+        # A pyarrow Schema or StructType: both iterate their fields.
+        for f in data_type:
+            where = f"{path}.{f.name}" if path else f.name
+            current = by_name.get(f.name.lower())
+            if current is None:
+                fields.append(new_field(f, where))
+                by_name[f.name.lower()] = fields[-1]
+                continue
+            old = current["type"]
+            merged = merge_type(old, f.type, where, nested=nested)
+            if merged is not None:
+                current["type"] = merged
+                meta = current.setdefault("metadata", {})
+                history = list(meta.get(_TYPE_CHANGES) or [])
+                history.append({"fromType": old, "toType": merged})
+                meta[_TYPE_CHANGES] = history
+                widened.append(merged)
+
+    def merge_type(table_type: Any, data_type: Any, where: str, *, nested: bool) -> Any:
+        """The table's primitive type widened to take `data_type`, or None if it takes
+        it as it is. Structs (anywhere) are merged in place; `nested` is True inside
+        an array or a map, where a type is not widened."""
+        import pyarrow as pa
+
+        if isinstance(table_type, dict):
+            kind = table_type.get("type")
+            if kind == "struct" and pa.types.is_struct(data_type):
+                merge_fields(_fields(table_type), data_type, where, nested=nested)
+            elif kind == "array" and (
+                pa.types.is_list(data_type) or pa.types.is_large_list(data_type)
+            ):
+                merge_type(
+                    table_type["elementType"], data_type.value_type, f"{where}.element", nested=True
+                )
+            elif kind == "map" and pa.types.is_map(data_type):
+                merge_type(table_type["keyType"], data_type.key_type, f"{where}.key", nested=True)
+                merge_type(
+                    table_type["valueType"], data_type.item_type, f"{where}.value", nested=True
+                )
+            # A type of another kind is the write's to refuse: nothing changes here.
+            return None
+        if not isinstance(table_type, str):
+            return None
+        try:
+            data_name = arrow_to_delta_type(data_type)
+        except UnreachableTableError:
+            return None  # e.g. an unsigned integer, which the write widens itself
+        if not isinstance(data_name, str):
+            return None
+        data_name = data_name.replace(" ", "")
+        old = table_type.replace(" ", "")
+        if data_name == old or not _widening_allowed(old, data_name):
+            return None
+        if not widening:
+            raise _refuse(
+                f"write {data_name} values into column {where} ({old})",
+                "the data's type is wider than the column's, and widening a column's type "
+                "needs type widening, which the table does not enable",
+                "set_properties({'delta.enableTypeWidening': 'true'}) first, or cast the "
+                f"data to {old}",
+            )
+        if nested:
+            raise _refuse(
+                f"widen {where} from {old} to {data_name}",
+                "widening an array element or a map key or value is not supported on write",
+                f"cast the data to {old}",
+            )
+        if where.lower() in partitions:
+            raise _refuse(
+                f"widen partition column {where} from {old} to {data_name}",
+                "its stored values (strings in the log) are parsed with the column's type",
+                f"cast the data to {old}",
+            )
+        dependents = [
+            d
+            for d in _dependents(state, where.split(".")[-1])
+            if d != "delta.dataSkippingStatsColumns"
+        ]
+        if dependents:
+            raise _refuse(
+                f"widen {where} from {old} to {data_name}",
+                f"it is referenced by {', '.join(dependents)}",
+                f"cast the data to {old}",
+            )
+        return data_name
+
+    merge_fields(_fields(schema), arrow_schema, "")
+    if not added and not widened:
+        return Change("WRITE", {})
+    for f in added:
+        # Each one on its own: new fields of different structs are no siblings,
+        # and a sibling the struct already had was matched, not added.
+        _check_names([f], operation, column_mapping=column_mapping)
+    if column_mapping:
+        next_id = _assign_ids(
+            added, _max_column_id(state) + 1, physical=lambda _f: f"col-{uuid.uuid4()}"
+        )
+        configuration[_CM_MAX] = str(next_id - 1)
+    features: set[str] = {"typeWidening"} if widened else set()
+    for datatype in [f["type"] for f in added] + widened:
+        features |= _type_features(datatype)
+    metadata = _new_metadata(state, schema)
+    metadata["configuration"] = configuration
+    return Change(
+        "WRITE",
+        {"mergeSchema": "true"},
+        protocol=with_features(state.protocol, features) if features else None,
+        metadata=metadata,
+    )
+
+
 def drop_column(state: TableState, column: str) -> Change:
     _require_column_mapping(state, f"drop column {column}")
     schema = state.schema
@@ -1213,6 +1371,50 @@ def alter_column_type(state: TableState, column: str, new_type: str) -> Change:
         {"column": column, "type": new_type},
         protocol=with_features(state.protocol, features),
         metadata=_new_metadata(state, schema),
+    )
+
+
+def add_constraints(state: TableState, constraints: Mapping[str, str]) -> Change:
+    """ADD CONSTRAINT ... CHECK. The caller must have checked every existing row.
+
+    Names are stored lower-cased, as Spark stores them (`delta.constraints.<name>`),
+    and one the table already has is refused, as Spark refuses it. The
+    protocol gains `checkConstraints`: a table on table features lists it, and
+    a legacy one below writer version 3 moves to 3, which implies it, as
+    Spark upgrades one.
+    """
+    configuration = state.configuration
+    existing = {k.lower() for k in configuration}
+    added: dict[str, str] = {}
+    for name, expression in constraints.items():
+        if not isinstance(name, str) or not name.strip():
+            raise InvalidArgumentError(f"constraint names must be non-empty, not {name!r}")
+        key = f"delta.constraints.{name.lower()}"
+        if key in existing or key in added:
+            raise InvalidArgumentError(
+                f"cannot add constraint {name}: the table already has a constraint with "
+                f"that name; drop_constraint({name!r}) first"
+            )
+        added[key] = str(expression)
+    if not added:
+        return Change("ADD CONSTRAINT", {})
+    configuration.update(added)
+    metadata = _new_metadata(state)
+    metadata["configuration"] = configuration
+    protocol: dict[str, Any] | None
+    writer = int(state.protocol.get("minWriterVersion", 1))
+    if writer >= 7:
+        protocol = with_features(state.protocol, {"checkConstraints"})
+    elif writer < 3:
+        protocol = {**state.protocol, "minWriterVersion": 3}
+    else:
+        protocol = None
+    (name, expression), *_ = constraints.items()
+    return Change(
+        "ADD CONSTRAINT",
+        {"name": name, "expr": expression} if len(constraints) == 1 else {},
+        protocol=protocol,
+        metadata=metadata,
     )
 
 

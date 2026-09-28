@@ -193,16 +193,36 @@ class TestSupports:
         assert not verdict.ok
         assert "unpartitioned" in verdict.reason
 
-    @pytest.mark.parametrize("writer", [3, 4, 6])
-    def test_legacy_writer_protocol_refuses_data_writes(self, tmp_path: Any, writer: int) -> None:
+    @pytest.mark.parametrize("writer", [3, 4])
+    def test_legacy_writer_protocol_takes_checked_data_writes(
+        self, tmp_path: Any, writer: int
+    ) -> None:
+        """Writer 3 and 4 imply checkConstraints (4 generatedColumns too), which
+        the kernel refuses; a checked write commits past both where no
+        constraint fails and no column is generated."""
         path = write(
             str(tmp_path / "legacy"),
             pa.table({"id": [1]}),
             configuration={"delta.minWriterVersion": str(writer)},
         )
+        engine = KernelEngine()
+        assert engine.supports(Operation.APPEND, resolved(path)).ok
+        engine.append(resolved(path), pa.table({"id": [2]}))
+        from deltalake import DeltaTable
+
+        table = DeltaTable(path)
+        assert table.protocol().min_writer_version == writer
+        assert sorted(table.to_pyarrow_table().column("id").to_pylist()) == [1, 2]
+
+    def test_legacy_writer_6_refuses_data_writes(self, tmp_path: Any) -> None:
+        path = write(
+            str(tmp_path / "legacy"),
+            pa.table({"id": [1]}),
+            configuration={"delta.minWriterVersion": "6"},
+        )
         verdict = KernelEngine().supports(Operation.APPEND, resolved(path))
         assert not verdict.ok
-        assert "checkConstraints" in verdict.reason
+        assert "identityColumns" in verdict.reason
 
     @pytest.mark.parametrize(
         "op", [Operation.DELETE, Operation.UPDATE, Operation.OVERWRITE, Operation.REPLACE_WHERE]

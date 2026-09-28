@@ -155,27 +155,6 @@ const VALUE_CONSTRAINTS: &[&str] = &[
     "invariants",
 ];
 
-/// The writer features a legacy writer version implies, in protocol order.
-fn legacy_writer_features(version: i32) -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if version >= 2 {
-        features.extend(["appendOnly", "invariants"]);
-    }
-    if version >= 3 {
-        features.push("checkConstraints");
-    }
-    if version >= 4 {
-        features.extend(["changeDataFeed", "generatedColumns"]);
-    }
-    if version >= 5 {
-        features.push("columnMapping");
-    }
-    if version >= 6 {
-        features.push("identityColumns");
-    }
-    features
-}
-
 /// `snapshot` as a compaction's transaction sees it: the same log segment,
 /// metadata and version, with [`VALUE_CONSTRAINTS`] left out of the protocol
 /// kernel checks the write against.
@@ -187,57 +166,7 @@ fn legacy_writer_features(version: i32) -> Vec<&'static str> {
 /// commit snapshot kernel builds from it is dropped: checkpoints are written
 /// from a snapshot read back from storage.
 pub(crate) fn compaction_snapshot(snapshot: &SnapshotRef) -> Result<SnapshotRef> {
-    use delta_kernel::actions::Protocol;
-    use delta_kernel::snapshot::Snapshot;
-    use delta_kernel::table_configuration::TableConfiguration;
-
-    let config = snapshot.table_configuration();
-    let protocol = config.protocol();
-    let writer = protocol.min_writer_version();
-    let listed: Vec<String> = match protocol.writer_features() {
-        Some(features) => features.iter().map(|f| f.to_string()).collect(),
-        None => legacy_writer_features(writer)
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    };
-    if !listed
-        .iter()
-        .any(|f| VALUE_CONSTRAINTS.contains(&f.as_str()))
-    {
-        return Ok(snapshot.clone());
-    }
-    let kept: Vec<&String> = listed
-        .iter()
-        .filter(|f| !VALUE_CONSTRAINTS.contains(&f.as_str()))
-        .collect();
-    let reader = protocol.min_reader_version();
-    let reader_features: Option<Vec<String>> = protocol
-        .reader_features()
-        .map(|features| features.iter().map(|f| f.to_string()).collect());
-    // A legacy writer version becomes the same features listed explicitly
-    // (writer version 7), the only form in which some can be left out.
-    let protocol: Protocol = serde_json::from_value(serde_json::json!({
-        "minReaderVersion": reader,
-        "minWriterVersion": 7,
-        "readerFeatures": reader_features,
-        "writerFeatures": kept,
-    }))
-    .map_err(|e| {
-        NativeError::Invalid(format!(
-            "could not restate the table's protocol for its compaction: {e}"
-        ))
-    })?;
-    let config = TableConfiguration::try_new(
-        config.metadata().clone(),
-        protocol,
-        snapshot.table_root().clone(),
-        snapshot.version(),
-    )?;
-    Ok(Arc::new(Snapshot::new(
-        snapshot.log_segment().clone(),
-        config,
-    )?))
+    crate::restate::restated_snapshot(snapshot, VALUE_CONSTRAINTS, None, None)
 }
 
 /// Commit a DELETE (and, with `batches`, an UPDATE's new rows) as deletion vectors.
@@ -266,6 +195,7 @@ pub fn commit_dml(
     txn: Option<(String, i64)>,
     commit_metadata: Option<HashMap<String, String>>,
     data_change: bool,
+    constraints_checked: bool,
     info: commit::CommitInfoPatch,
 ) -> Result<DmlOutcome> {
     let deletions: HashMap<String, RoaringTreemap> = deletions
@@ -526,12 +456,21 @@ pub fn commit_dml(
 
     // A compaction commits on the table's own snapshot with the features
     // that only constrain the values a commit writes set aside; see
-    // `compaction_snapshot`.
-    let committing = if data_change {
-        snapshot.clone()
-    } else {
+    // `compaction_snapshot`. A DML whose caller checked the table's CHECK
+    // constraints over the rows it writes sets those aside alike; see
+    // `crate::restate`.
+    let committing = if !data_change {
         compaction_snapshot(&snapshot)?
+    } else if constraints_checked {
+        let checked = crate::restate::Restatement {
+            constraints_checked: true,
+            ..Default::default()
+        };
+        crate::restate::writing_snapshot(&snapshot, &engine, &checked, &info)?
+    } else {
+        snapshot.clone()
     };
+    let restated = !Arc::ptr_eq(&committing, &snapshot);
     let mut transaction = commit::begin_transaction(
         committing,
         &engine,
@@ -656,7 +595,7 @@ pub fn commit_dml(
         ),
     };
     let staging_failed = staged.is_err();
-    let result = staged.and_then(|()| commit::finish_commit(transaction, &engine));
+    let result = staged.and_then(|()| commit::finish_commit_as(transaction, &engine, restated));
     if let Err(err) = &result {
         if staging_failed || commit::never_committed(err) {
             // Rows a lost race or a failed step wrote, which no commit names:
@@ -1164,22 +1103,6 @@ pub fn deletions_from_batches(batches: &[RecordBatch]) -> Result<HashMap<String,
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn legacy_writer_versions_imply_their_features() {
-        assert_eq!(super::legacy_writer_features(1), Vec::<&str>::new());
-        assert_eq!(
-            super::legacy_writer_features(4),
-            [
-                "appendOnly",
-                "invariants",
-                "checkConstraints",
-                "changeDataFeed",
-                "generatedColumns"
-            ]
-        );
-        assert!(super::legacy_writer_features(6).contains(&"identityColumns"));
-    }
 
     use super::*;
 

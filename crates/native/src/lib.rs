@@ -16,6 +16,7 @@ mod functions;
 mod partition;
 mod predicate;
 mod rebase;
+mod restate;
 mod runtime;
 mod scan;
 mod snapshot;
@@ -99,6 +100,13 @@ pub const FEATURES: &[&str] = &[
     // `absolute_deletion_vector` and `copy_objects`: shallow and deep clones
     // of path tables.
     "path_clone",
+    // `constraints_checked=` on every data write: CHECK constraints evaluated
+    // by the caller over the rows written, and the write committed past the
+    // kernel's refusal of the checkConstraints feature.
+    "check_constraints",
+    // `append(metadata=, protocol=)`: a schema-evolving write, its rows and
+    // the table's new metaData in one commit.
+    "schema_evolution",
 ];
 
 #[pyfunction]
