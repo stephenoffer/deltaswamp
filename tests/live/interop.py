@@ -1219,10 +1219,6 @@ class Case:
         return f"{self.shape}-{self.history}"
 
 
-NAN_STATS = (
-    "NaN in a DOUBLE column: arrow-rs leaves NaN out of the Parquet footer min/max and "
-    "delta-rs out of the Delta stats, so Databricks prunes the files holding NaN"
-)
 CDF_SCHEMA = (
     "table_changes() over a range that ends before a later ADD COLUMN returns the "
     "current schema on Databricks; deltaswamp cdf() returns the end version's"
@@ -1302,7 +1298,7 @@ CASES: list[Case] = [
     ),
     Case("constraints", "violations", h_constraints, groups(), known=_nan()),
     Case("v2_checkpoints", "full", h_v2_checkpoints, groups(), known=_nan()),
-    Case("liquid", "recluster", h_liquid, groups(), known={"stats-nan": NAN_STATS}),
+    Case("liquid", "recluster", h_liquid, groups(), known=_nan()),
     Case("checkpoint_interval", "log_compaction", h_log_compaction, groups(), known=_nan()),
     Case("legacy_deltalake", "upgrade", h_legacy_upgrade, groups(), known=_nan()),
     Case(
