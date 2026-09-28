@@ -143,6 +143,54 @@ pub(crate) fn restated_snapshot(
     )?))
 }
 
+/// Features that constrain only the values a commit writes.
+///
+/// A compaction writes back exactly the values it read (`dataChange=false`),
+/// already checked when they were first written: a CHECK constraint, an
+/// invariant or a generation expression holds for them as it did, and an
+/// identity column's values and high-water mark are untouched. A checkpoint
+/// or a checksum writes no row at all. delta-kernel refuses any of these
+/// on a table carrying one of the features -- a writer version 3 or 4 table
+/// implies two of them, so every table delta-rs gave a change data feed was
+/// refused -- which left those tables to delta-rs, or, where delta-rs lacks
+/// another of the table's features (in-commit timestamps, row tracking,
+/// clustering), to nothing.
+pub(crate) const VALUE_CONSTRAINTS: &[&str] = &[
+    "checkConstraints",
+    "generatedColumns",
+    "identityColumns",
+    "invariants",
+];
+
+/// `snapshot` as a checkpoint or checksum writer sees it: the same log
+/// segment, metadata and version, with [`VALUE_CONSTRAINTS`] left out of the
+/// protocol the kernel checks the table against -- and `snapshot` itself
+/// where the kernel writes the table as it is.
+///
+/// Both writers take the protocol and metadata they write from the log
+/// (`LogSegment::read_actions` for a checkpoint, the log replay rooted at a
+/// checkpoint or version 0 for a checksum), never from the snapshot's table
+/// configuration, so what they write is the table's own protocol, the
+/// features set aside here included. The restated configuration decides only
+/// the kernel's refusal; the checkpoint's shape (classic or v2, stats as JSON
+/// or struct) comes from features and properties it keeps.
+///
+/// A restated snapshot holds no checksum in memory (the kernel builds it from
+/// the log segment alone), so the kernel resolves a checksum from it by
+/// replay: see `crate::checksum::write`.
+pub(crate) fn log_writing_snapshot(snapshot: &SnapshotRef) -> Result<SnapshotRef> {
+    use delta_kernel::table_features::Operation;
+
+    if snapshot
+        .table_configuration()
+        .ensure_operation_supported(Operation::Write)
+        .is_ok()
+    {
+        return Ok(snapshot.clone());
+    }
+    restated_snapshot(snapshot, VALUE_CONSTRAINTS, None, None)
+}
+
 /// The features a caller's own evaluation stands in for.
 const CHECKED: &[&str] = &["checkConstraints"];
 
@@ -313,6 +361,141 @@ mod tests {
 
         let plain = protocol(serde_json::json!({"minReaderVersion": 1, "minWriterVersion": 2}));
         assert!(without_features(&plain, CHECKED).unwrap().is_none());
+    }
+
+    /// A table carrying every value-constraint feature: CHECK constraints, a
+    /// generated column, an identity column and an invariant, over two commits.
+    fn value_constrained_table() -> (crate::commit::SharedEngine, SnapshotRef, serde_json::Value) {
+        use delta_kernel::object_store::memory::InMemory;
+        use delta_kernel::object_store::path::Path;
+        use delta_kernel::object_store::ObjectStoreExt;
+        use delta_kernel::snapshot::Snapshot;
+
+        let protocol = serde_json::json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 7,
+            "writerFeatures": [
+                "appendOnly", "invariants", "checkConstraints", "generatedColumns",
+                "identityColumns"
+            ],
+        });
+        let schema = serde_json::json!({"type": "struct", "fields": [
+            {"name": "id", "type": "long", "nullable": true,
+             "metadata": {"delta.identity.start": 1, "delta.identity.step": 1,
+                          "delta.identity.allowExplicitInsert": false,
+                          "delta.identity.highWaterMark": 4}},
+            {"name": "g", "type": "long", "nullable": true,
+             "metadata": {"delta.generationExpression": "id * 2"}},
+            {"name": "v", "type": "long", "nullable": true,
+             "metadata": {"delta.invariants": "{\"expression\":{\"expression\":\"v > 0\"}}"}},
+        ]});
+        let metadata = serde_json::json!({
+            "id": "5b3c0a1e-0000-4000-8000-000000000001",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema.to_string(),
+            "partitionColumns": [],
+            "configuration": {"delta.constraints.pos": "id > 0"},
+            "createdTime": 1,
+        });
+        let add = |name: &str, size: i64| {
+            serde_json::json!({"add": {"path": name, "partitionValues": {}, "size": size,
+                "modificationTime": 1, "dataChange": true}})
+            .to_string()
+        };
+        let info = |op: &str| {
+            serde_json::json!({"commitInfo": {"timestamp": 1, "operation": op}}).to_string()
+        };
+        let commits = [
+            [
+                info("CREATE TABLE"),
+                serde_json::json!({"protocol": protocol}).to_string(),
+                serde_json::json!({"metaData": metadata}).to_string(),
+                add("a.parquet", 100),
+            ]
+            .join("\n"),
+            [info("WRITE"), add("b.parquet", 200)].join("\n"),
+        ];
+        let store = Arc::new(InMemory::new());
+        for (version, body) in commits.iter().enumerate() {
+            let key = Path::from(format!("t/_delta_log/{version:020}.json"));
+            crate::runtime::block_on(store.put(&key, body.clone().into())).unwrap();
+        }
+        let engine = crate::commit::new_engine(store);
+        let snapshot = Snapshot::builder_for("memory:///t/")
+            .build(engine.as_ref())
+            .unwrap();
+        (engine, snapshot, protocol)
+    }
+
+    #[test]
+    fn a_checkpoint_of_a_value_constrained_table_keeps_its_protocol() {
+        use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot};
+
+        let (engine, snapshot, protocol) = value_constrained_table();
+        // The kernel refuses the table as it is ...
+        assert!(snapshot.checkpoint(engine.as_ref(), None).is_err());
+        // ... and checkpoints it restated.
+        let restated = log_writing_snapshot(&snapshot).unwrap();
+        assert!(!Arc::ptr_eq(&restated, &snapshot));
+        let (result, checkpointed) = restated.checkpoint(engine.as_ref(), None).unwrap();
+        assert!(matches!(result, CheckpointWriteResult::Written));
+        assert!(crate::checksum::write_at_checkpoint(
+            &checkpointed,
+            engine.as_ref()
+        ));
+
+        // A fresh snapshot, loaded from the checkpoint, has the table's own
+        // protocol and metadata.
+        let fresh = Snapshot::builder_for("memory:///t/")
+            .build(engine.as_ref())
+            .unwrap();
+        assert_eq!(fresh.log_segment().checkpoint_version, Some(1));
+        assert_eq!(
+            serde_json::to_value(fresh.table_configuration().protocol()).unwrap(),
+            serde_json::to_value(snapshot.table_configuration().protocol()).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(fresh.table_configuration().protocol()).unwrap()["writerFeatures"],
+            protocol["writerFeatures"],
+        );
+        assert_eq!(
+            fresh.table_configuration().metadata(),
+            snapshot.table_configuration().metadata()
+        );
+        assert_eq!(
+            fresh
+                .get_file_stats_if_present()
+                .map(|s| (s.num_files(), s.table_size_bytes())),
+            Some((2, 300))
+        );
+    }
+
+    #[test]
+    fn a_writable_table_is_checkpointed_as_it_is() {
+        use delta_kernel::object_store::memory::InMemory;
+        use delta_kernel::object_store::path::Path;
+        use delta_kernel::object_store::ObjectStoreExt;
+        use delta_kernel::snapshot::Snapshot;
+
+        let body = [
+            r#"{"commitInfo":{"timestamp":1,"operation":"CREATE TABLE"}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"5b3c0a1e-0000-4000-8000-000000000002","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1}}"#,
+        ]
+        .join("\n");
+        let store = Arc::new(InMemory::new());
+        let key = Path::from(format!("t/_delta_log/{:020}.json", 0));
+        crate::runtime::block_on(store.put(&key, body.into())).unwrap();
+        let engine = crate::commit::new_engine(store);
+        let snapshot = Snapshot::builder_for("memory:///t/")
+            .build(engine.as_ref())
+            .unwrap();
+        // Writer version 2 implies invariants, but the schema declares none:
+        // the kernel writes the table, and the snapshot (checksum and all) is kept.
+        assert!(Arc::ptr_eq(
+            &log_writing_snapshot(&snapshot).unwrap(),
+            &snapshot
+        ));
     }
 
     #[test]

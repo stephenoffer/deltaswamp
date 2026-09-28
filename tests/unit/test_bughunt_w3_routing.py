@@ -271,21 +271,36 @@ def _legacy(path: Path, writer: int) -> str:
     return p
 
 
+def _checkpoint_protocol(path: str, version: int) -> dict[str, Any]:
+    import pyarrow.parquet as pq
+
+    rows = pq.read_table(f"{path}/_delta_log/{version:020d}.checkpoint.parquet").to_pylist()
+    (protocol,) = [row["protocol"] for row in rows if row["protocol"] is not None]
+    return dict(protocol)
+
+
 @needs_native
 @pytest.mark.parametrize("writer", [3, 4])
-def test_kernel_checkpoint_refuses_a_legacy_writer_protocol(
+def test_kernel_checkpoints_a_legacy_writer_protocol(
     kernel_only: Any, tmp_path: Path, writer: int
 ) -> None:
-    """The kernel's checkpoint writer fails "Feature 'checkConstraints' is not
-    supported" on writer 3-6; supports() never checked, so it was claimed."""
+    """The kernel's checkpoint writer failed "Feature 'checkConstraints' is not
+    supported" on writer 3-6; supports() then refused it. A checkpoint writes
+    no row, so the build now writes it past the implied value-constraint
+    features, with the table's own legacy protocol in it."""
     p = _legacy(tmp_path, writer)
-    verdict = kernel_only.table(p).can("checkpoint")
-    assert not verdict.ok
-    assert "legacy writer protocol" in verdict.reason
+    t = kernel_only.table(p)
+    verdict = t.can("checkpoint")
+    assert verdict.ok, verdict
+    t.checkpoint()
+    version = deltalake.DeltaTable(p).version()
+    protocol = _checkpoint_protocol(p, version)
+    assert (protocol["minReaderVersion"], protocol["minWriterVersion"]) == (1, writer)
+    assert not protocol.get("writerFeatures")
 
 
 @needs_native
-def test_kernel_checkpoint_refuses_invariants(kernel_only: Any, tmp_path: Path) -> None:
+def test_kernel_checkpoints_past_invariants(kernel_only: Any, tmp_path: Path) -> None:
     from deltalake import DeltaTable, Field, Schema, write_deltalake
     from deltalake.schema import PrimitiveType
 
@@ -304,8 +319,14 @@ def test_kernel_checkpoint_refuses_invariants(kernel_only: Any, tmp_path: Path) 
         ),
     )
     write_deltalake(p, _data(), mode="append")
-    verdict = kernel_only.table(p).can("checkpoint")
-    assert not verdict.ok and "invariants" in verdict.reason
+    t = kernel_only.table(p)
+    verdict = t.can("checkpoint")
+    assert verdict.ok, verdict
+    t.checkpoint()
+    protocol = _checkpoint_protocol(p, 1)
+    assert (protocol["minReaderVersion"], protocol["minWriterVersion"]) == (1, 2)
+    # A write is still refused: the kernel would not enforce the invariant.
+    assert not t.can("append").ok
 
 
 def test_kernel_checkpoint_refuses_unwritable_writer_features() -> None:
@@ -319,10 +340,12 @@ def test_kernel_checkpoint_refuses_unwritable_writer_features() -> None:
         location="/tmp/t",
         min_reader_version=3,
         min_writer_version=7,
-        writer_features=frozenset({"identityColumns"}),
+        writer_features=frozenset({"identityColumns", "icebergCompatV1"}),
     )
     verdict = router.capability(Operation.CHECKPOINT, table)
-    assert not verdict.ok and "identityColumns" in verdict.reason
+    # identityColumns binds only the values written, which a checkpoint has none of.
+    assert not verdict.ok and "icebergCompatV1" in verdict.reason
+    assert "identityColumns" not in verdict.reason
 
 
 @needs_native

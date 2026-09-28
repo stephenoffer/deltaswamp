@@ -1010,12 +1010,25 @@ impl PySnapshot {
     /// On a catalog-managed table every commit up to this version must be
     /// published first; the kernel refuses otherwise, because a checkpoint over
     /// unpublished commits would leave a gap in the log for older readers.
+    ///
+    /// A table carrying a feature that binds only the values of rows written
+    /// (CHECK constraints, generated or identity columns, invariants) is
+    /// checkpointed from a restated snapshot (`restate::log_writing_snapshot`):
+    /// a checkpoint writes no row, and holds the protocol and metadata from
+    /// the log, those features included. Its checksum is written with it --
+    /// past a table's first checkpoint the commits' own often cannot be.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<bool> {
         let written = py.detach(|| -> Result<bool> {
+            let engine = self.engine.as_ref();
+            let snapshot = crate::restate::log_writing_snapshot(&self.inner)?;
             // Called directly, not inside runtime::block_on: the engine's
             // executor does its own bridging (see commit::SharedEngine).
-            let (result, _) = self.inner.checkpoint(self.engine.as_ref(), None)?;
-            Ok(matches!(result, CheckpointWriteResult::Written))
+            let (result, checkpointed) = snapshot.checkpoint(engine, None)?;
+            let written = matches!(result, CheckpointWriteResult::Written);
+            if written && !Arc::ptr_eq(&snapshot, &self.inner) {
+                crate::checksum::write_at_checkpoint(&checkpointed, engine);
+            }
+            Ok(written)
         })?;
         Ok(written)
     }

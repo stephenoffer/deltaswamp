@@ -121,6 +121,11 @@ pub const FEATURES: &[&str] = &[
     "symlink_manifest",
     // `missing_data_files`: FSCK REPAIR from the kernel's file listing.
     "fsck",
+    // `checkpoint()` and `write_checksum()` on a table carrying CHECK
+    // constraints, generated or identity columns, or invariants: written from
+    // a snapshot whose checked protocol sets those aside, with the table's own
+    // protocol and metadata in the files.
+    "value_constrained_checkpoint",
 ];
 
 #[pyfunction]
