@@ -506,6 +506,43 @@ def write_checksum(
         return False
 
 
+def vacuum_garbage(
+    location: str | None, options: dict[str, str] | None, retention_hours: float | None
+) -> set[str] | None:
+    """The files the kernel's VACUUM plan would delete, lowercased; None if it cannot plan.
+
+    Another engine's VACUUM deletes only what this agrees is garbage. The
+    kernel matches the files it lists against the ones the log references
+    regardless of case, which an exact match gets wrong on a case-insensitive
+    filesystem (see `crate::vacuum::Referenced`).
+    """
+    if location is None or not _native_has("vacuum"):
+        return None
+    try:
+        _enter_native("plan a vacuum")
+        import time
+
+        from deltaswamp._native import Snapshot
+
+        snapshot = Snapshot.resolve(location, options=options or None)
+        configured = snapshot.deleted_file_retention_ms
+        configured = (
+            KernelEngine.default_file_retention_ms if configured is None else int(configured)
+        )
+        retention_ms = (
+            configured if retention_hours is None else int(float(retention_hours) * 3_600_000)
+        )
+        names = _physical_partition_names(snapshot)
+        plan = snapshot.vacuum_plan(
+            int(time.time() * 1000) - retention_ms,
+            lite=False,
+            partition_columns=sorted({*names, *names.values()}),
+        )
+    except Exception:
+        return None
+    return {path.lower() for _, path, _, _ in plan}
+
+
 def _implemented() -> frozenset[Operation]:
     ops = set(_IMPLEMENTED)
     if _native_has("commit_raw", "metadata_json"):

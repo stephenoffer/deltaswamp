@@ -99,7 +99,9 @@ fn random_prefix(snapshot: &SnapshotRef) -> String {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| (1..=16).contains(n))
         .unwrap_or(2);
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    // Lowercase only: on a case-insensitive filesystem `nT/` and `nt/` are
+    // one directory, listed under whichever spelling came first.
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let bytes = uuid::Uuid::new_v4().into_bytes();
     (0..len)
         .map(|i| CHARSET[bytes[i % bytes.len()] as usize % CHARSET.len()] as char)

@@ -70,6 +70,13 @@ pub struct Candidate {
 /// plain decoded key (what S3 lists). A listed file is referenced if either
 /// spelling matches, so a key with `%` in it is never deleted for being
 /// spelled differently -- the error that way is keeping an orphan.
+///
+/// Keys also match regardless of case. On a case-insensitive filesystem
+/// (macOS and Windows by default) `nt/` and `nT/` are one directory, which
+/// lists under the spelling that created it; Spark and the kernel pick
+/// random mixed-case prefixes, so a live `nt/x.parquet` can list as
+/// `nT/x.parquet`, and an exact match deleted it. On a case-sensitive store
+/// the cost is keeping an orphan that differs from a live file only by case.
 #[derive(Default)]
 struct Referenced {
     keys: HashSet<String>,
@@ -81,15 +88,15 @@ impl Referenced {
             return;
         }
         if let Some(key) = store_key(root_path, url) {
-            self.keys.insert(key);
+            self.keys.insert(key.to_lowercase());
         }
         if let Some(key) = decoded_key(root, url) {
-            self.keys.insert(key);
+            self.keys.insert(key.to_lowercase());
         }
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.keys.contains(key) || self.keys.contains(decode(key).as_str())
+        self.keys.contains(&key.to_lowercase()) || self.keys.contains(&decode(key).to_lowercase())
     }
 }
 
@@ -659,6 +666,20 @@ mod tests {
         assert!(referenced.contains("p=a%253Ab/part-0.parquet"));
         assert!(referenced.contains("p=a%3Ab/part-0.parquet"));
         assert!(!referenced.contains("p=a/part-0.parquet"));
+    }
+
+    #[test]
+    fn a_key_listed_in_another_case_is_referenced() {
+        // A case-insensitive filesystem lists `nt/` as `nT/` once another
+        // file created the directory under that spelling.
+        let root = Url::parse("file:///t/").unwrap();
+        let root_path = Path::from_url_path(root.path()).unwrap();
+        let mut referenced = Referenced::default();
+        let url = resolve(&root, "nt/9eb12f17.parquet").unwrap();
+        referenced.insert(&root, &root_path, &url);
+        assert!(referenced.contains("nT/9eb12f17.parquet"));
+        assert!(referenced.contains("NT/9EB12F17.parquet"));
+        assert!(!referenced.contains("nt/other.parquet"));
     }
 
     #[test]

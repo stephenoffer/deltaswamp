@@ -39,6 +39,7 @@ use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::collect_stats;
 
 use crate::commit::SharedEngine;
+use url::Url;
 
 /// The footer key Spark reads its writer's version from.
 pub const SPARK_VERSION_KEY: &str = "org.apache.spark.version";
@@ -261,7 +262,7 @@ pub async fn write_physical(
     let size = u64::try_from(buffer.len())
         .map_err(|_| Error::generic("unable to convert usize to u64"))?;
 
-    let dir = write_context.write_dir();
+    let dir = lowercase_prefix(write_context.write_dir(), write_context.table_root_dir());
     if !dir.path().ends_with('/') {
         return Err(Error::generic(format!(
             "Path must end with a trailing slash: {dir}"
@@ -294,6 +295,31 @@ pub async fn write_physical(
         DataFileMetadata::new(file_meta, stats),
         write_context,
     )
+}
+
+/// `dir` with the kernel's random directory prefix lowercased.
+///
+/// The kernel draws the prefix from mixed-case letters, as Spark does. On a
+/// case-insensitive filesystem (macOS and Windows by default) `nT/` and `nt/`
+/// are one directory that lists under whichever spelling created it, so a
+/// file the log names `nt/x.parquet` lists as `nT/x.parquet` and looks like
+/// an orphan to an exact-match VACUUM. Only a single alphanumeric segment
+/// under the root is a prefix; Hive partition directories are left alone.
+fn lowercase_prefix(dir: Url, root: &Url) -> Url {
+    let Some(rest) = dir.path().strip_prefix(root.path()) else {
+        return dir;
+    };
+    let segment = rest.strip_suffix('/').unwrap_or(rest);
+    if segment.is_empty()
+        || segment.contains('/')
+        || !segment.bytes().all(|b| b.is_ascii_alphanumeric())
+        || !segment.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        return dir;
+    }
+    let mut lowered = dir.clone();
+    lowered.set_path(&format!("{}{}/", root.path(), segment.to_ascii_lowercase()));
+    lowered
 }
 
 #[cfg(test)]
@@ -422,5 +448,15 @@ mod tests {
             let written = reader.metadata().row_group(0).column(0).compression();
             assert_eq!(written, codec);
         }
+    }
+    #[test]
+    fn random_prefixes_are_lowercased_and_partitions_kept() {
+        let root = Url::parse("file:///t/tbl/").unwrap();
+        let at = |p: &str| lowercase_prefix(Url::parse(p).unwrap(), &root).to_string();
+        assert_eq!(at("file:///t/tbl/nT/"), "file:///t/tbl/nt/");
+        assert_eq!(at("file:///t/tbl/ab/"), "file:///t/tbl/ab/");
+        assert_eq!(at("file:///t/tbl/"), "file:///t/tbl/");
+        assert_eq!(at("file:///t/tbl/P=Ab/"), "file:///t/tbl/P=Ab/");
+        assert_eq!(at("file:///t/tbl/A=1/B=2/"), "file:///t/tbl/A=1/B=2/");
     }
 }

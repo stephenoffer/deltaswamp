@@ -169,6 +169,14 @@ First release.
   value-constraint features, or one of the writes above) counts its version
   checksum from storage, where it recorded the protocol the write was checked
   against instead of the table's.
+- VACUUM no longer deletes live files on a case-insensitive filesystem (macOS
+  and Windows by default). Spark and the kernel write under random mixed-case
+  directory prefixes, and `nt/` and `nT/` are one directory there, listed
+  under whichever spelling came first: both engines matched the listing
+  against the log exactly and deleted a live `nt/x.parquet` listed as
+  `nT/x.parquet`. The kernel now matches regardless of case, a delta-rs
+  VACUUM deletes only what the kernel's plan also deletes, and new files get
+  lowercase prefixes.
 
 ### Security
 

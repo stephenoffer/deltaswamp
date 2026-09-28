@@ -1438,6 +1438,8 @@ class DeltaRsEngine:
                 candidates: list[str] = dt.vacuum(
                     retention_hours=retention_hours, dry_run=True, full=True, **kwargs
                 )
+                listed = len(candidates)
+                candidates = self._case_safe(table, dt, candidates, retention_hours)
                 foreign = [p for p in candidates if not _delta_file_name(p)]
                 if foreign:
                     warnings.warn(
@@ -1448,7 +1450,7 @@ class DeltaRsEngine:
                         DeltaSwampWarning,
                         stacklevel=4,
                     )
-                if dv_table or foreign:
+                if dv_table or foreign or len(candidates) < listed:
                     return self._vacuum_keeping_vectors(
                         dt, candidates, dry_run, keep_vectors=dv_table
                     )
@@ -1467,6 +1469,36 @@ class DeltaRsEngine:
             ) from exc
         # Only a full vacuum that deletes reports bucket-relative paths.
         return _table_relative(result, table.location or "", full=not lite and not dry_run)
+
+    def _case_safe(
+        self, table: ResolvedTable, dt: Any, candidates: list[str], retention_hours: Any
+    ) -> list[str]:
+        """The VACUUM candidates that are garbage in any spelling of their path.
+
+        delta-rs matches the files it lists against the log's paths exactly.
+        On a case-insensitive filesystem (macOS and Windows by default) a
+        directory lists under the spelling that created it, and Spark and the
+        kernel pick random mixed-case prefixes: a live `nt/x.parquet` listed
+        as `nT/x.parquet`, and delta-rs deleted it. A candidate is kept unless
+        the kernel's own plan, which matches regardless of case, deletes it
+        too; without the kernel, unless no live file shares its lowercased path.
+        """
+        from urllib.parse import unquote
+
+        from .kernel import vacuum_garbage
+
+        garbage = vacuum_garbage(
+            table.location, self._storage_options(table, write=False) or None, retention_hours
+        )
+        if garbage is not None:
+            return [p for p in candidates if p.lower() in garbage or unquote(p).lower() in garbage]
+        # Every trailing run of a live file's path segments: a candidate is
+        # relative to the root, however the root itself is spelled.
+        live: set[str] = set()
+        for uri in dt.file_uris():
+            parts = unquote(uri).lower().split("/")
+            live.update("/".join(parts[i:]) for i in range(len(parts)))
+        return [p for p in candidates if unquote(p).lower() not in live]
 
     @staticmethod
     def _vacuum_keeping_vectors(
