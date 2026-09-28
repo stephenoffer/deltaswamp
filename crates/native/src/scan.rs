@@ -101,6 +101,72 @@ pub const FILE_PATH_COLUMN: &str = "__deltaswamp_file";
 /// row id, on a table with row tracking enabled.
 pub const ROW_ID_COLUMN: &str = "__deltaswamp_row_id";
 
+/// Name of the column a compaction's scan adds on a row-tracked table: each
+/// row's commit version, as Databricks' `_metadata.row_commit_version` reads
+/// it -- the file's materialized value, else its `defaultRowCommitVersion`.
+pub const ROW_COMMIT_VERSION_COLUMN: &str = "__deltaswamp_row_commit_version";
+
+/// How a scan reads each row's commit version (kernel 0.28 refuses the
+/// `RowCommitVersion` metadata column): the table's materialized column,
+/// read by its physical name beside the data, falling back to each file's
+/// `defaultRowCommitVersion` from the log.
+#[derive(Clone, Debug)]
+pub struct CommitVersions {
+    /// `delta.rowTracking.materializedRowCommitVersionColumnName`.
+    pub column: String,
+    /// Each planned file's `defaultRowCommitVersion`, by log path.
+    defaults: HashMap<String, Option<i64>>,
+}
+
+impl CommitVersions {
+    pub fn new(column: String) -> Self {
+        Self {
+            column,
+            defaults: HashMap::new(),
+        }
+    }
+
+    /// Record the `defaultRowCommitVersion` of every selected file in `metadata`.
+    fn learn(&mut self, metadata: &ScanMetadata) -> DeltaResult<()> {
+        use arrow::array::{Array, AsArray, StringArray};
+        use arrow::datatypes::Int64Type;
+
+        let data = metadata.scan_files.data();
+        let Some(batch) = data.any_ref().downcast_ref::<ArrowEngineData>() else {
+            return Err(Error::generic("the kernel's scan files are not Arrow"));
+        };
+        let batch = batch.record_batch();
+        let selection = metadata.scan_files.selection_vector();
+        let (Some(paths), Some(constants)) = (
+            batch.column_by_name("path"),
+            batch.column_by_name("fileConstantValues"),
+        ) else {
+            return Err(Error::generic(
+                "the kernel's scan files have no path or constants",
+            ));
+        };
+        let paths = arrow::compute::cast(paths, &arrow::datatypes::DataType::Utf8)?;
+        let paths = paths
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::generic("scan-file paths are not strings"))?;
+        let constants = constants.as_struct();
+        let versions = constants
+            .column_by_name("defaultRowCommitVersion")
+            .ok_or_else(|| Error::generic("the scan files carry no defaultRowCommitVersion"))?
+            .as_primitive::<Int64Type>();
+        for i in 0..batch.num_rows() {
+            if !selection.get(i).copied().unwrap_or(true) || paths.is_null(i) {
+                continue;
+            }
+            let version =
+                (constants.is_valid(i) && versions.is_valid(i)).then(|| versions.value(i));
+            self.defaults.insert(paths.value(i).to_string(), version);
+        }
+        Ok(())
+    }
+}
+
 impl KernelBatchReader {
     /// This reader with the top-level column `name` removed from its schema
     /// and from every batch (row counts are kept).
@@ -142,7 +208,7 @@ impl KernelBatchReader {
         engine: Arc<dyn Engine>,
         paths: Vec<String>,
     ) -> Result<Self> {
-        let iter = RestrictedScan::new(scan, engine, Some(paths), false, false)?;
+        let iter = RestrictedScan::new(scan, engine, Some(paths), false, false, None)?;
         Self::from_parts(scan.logical_schema().as_ref(), iter)
     }
 
@@ -157,7 +223,7 @@ impl KernelBatchReader {
         engine: Arc<dyn Engine>,
         paths: Option<Vec<String>>,
     ) -> Result<Self> {
-        let iter = RestrictedScan::new(scan, engine, paths, true, false)?;
+        let iter = RestrictedScan::new(scan, engine, paths, true, false, None)?;
         let mut reader = Self::from_parts(scan.logical_schema().as_ref(), iter)?;
         let mut fields: Vec<arrow::datatypes::FieldRef> =
             reader.schema.fields().iter().cloned().collect();
@@ -177,11 +243,15 @@ impl KernelBatchReader {
     /// compaction's bins), every row tagged by its file
     /// ([`FILE_PATH_COLUMN`], dictionary-encoded) and the batches of a run
     /// merged into fewer, larger ones; see [`Coalesced`].
+    ///
+    /// With `commit_versions`, each row's commit version comes too, as
+    /// [`ROW_COMMIT_VERSION_COLUMN`] just before the file column.
     pub fn try_new_grouped(
         scan: &Scan,
         engine: Arc<dyn Engine>,
         paths: Vec<String>,
         groups: Vec<usize>,
+        commit_versions: Option<CommitVersions>,
     ) -> Result<Self> {
         if groups.iter().sum::<usize>() != paths.len() {
             return Err(crate::error::NativeError::Invalid(format!(
@@ -197,7 +267,14 @@ impl KernelBatchReader {
                 group_of.insert(path.clone(), group);
             }
         }
-        let iter = RestrictedScan::new(scan, engine, Some(paths), true, true)?;
+        let iter = RestrictedScan::new(
+            scan,
+            engine,
+            Some(paths),
+            true,
+            true,
+            commit_versions.clone(),
+        )?;
         let mut reader = Self::from_parts(
             scan.logical_schema().as_ref(),
             Coalesced {
@@ -212,6 +289,13 @@ impl KernelBatchReader {
         )?;
         let mut fields: Vec<arrow::datatypes::FieldRef> =
             reader.schema.fields().iter().cloned().collect();
+        if commit_versions.is_some() {
+            fields.push(Arc::new(arrow::datatypes::Field::new(
+                ROW_COMMIT_VERSION_COLUMN,
+                arrow::datatypes::DataType::Int64,
+                true,
+            )));
+        }
         fields.push(Arc::new(arrow::datatypes::Field::new(
             FILE_PATH_COLUMN,
             arrow::datatypes::DataType::Dictionary(
@@ -342,6 +426,9 @@ struct OpenFile {
     batches: DataIter,
     selection: Option<Vec<bool>>,
     transform: Option<delta_kernel::ExpressionRef>,
+    /// The materialized commit-version column to take out of each physical
+    /// batch, and the file's `defaultRowCommitVersion` for rows without one.
+    commit_version: Option<(String, Option<i64>)>,
 }
 
 /// `Scan::execute`, restricted to a set of file paths. See the module docs.
@@ -373,6 +460,11 @@ struct RestrictedScan {
     decoded_ratio: f64,
     /// A prefetched file's batches, finished, not yet handed on.
     ready: VecDeque<Box<dyn EngineData>>,
+    /// Read each row's commit version too ([`ROW_COMMIT_VERSION_COLUMN`]).
+    commit_versions: Option<CommitVersions>,
+    /// `physical_schema`, plus the materialized commit-version column when
+    /// `commit_versions` asks for it: what the Parquet reader is asked for.
+    read_schema: SchemaRef,
 }
 
 /// Files read ahead at most, and their estimated decoded bytes at most (one
@@ -398,6 +490,7 @@ fn open_file(
     table_root: &Url,
     physical_schema: &SchemaRef,
     file: ScanFile,
+    commit_versions: Option<&CommitVersions>,
 ) -> DeltaResult<OpenFile> {
     let location = table_root.join(&file.path)?;
     let selection = file.dv_info.get_selection_vector(engine, table_root)?;
@@ -422,11 +515,16 @@ fn open_file(
             file.path
         )));
     }
+    let commit_version = commit_versions.map(|versions| {
+        let default = versions.defaults.get(&file.path).copied().flatten();
+        (versions.column.clone(), default)
+    });
     Ok(OpenFile {
         path: file.path,
         batches: Box::new(batches),
         selection,
         transform: file.transform,
+        commit_version,
     })
 }
 
@@ -437,14 +535,31 @@ impl RestrictedScan {
         order: Option<Vec<String>>,
         tag_path: bool,
         dictionary: bool,
+        commit_versions: Option<CommitVersions>,
     ) -> Result<Self> {
         let paths = order.as_ref().map(|o| o.iter().cloned().collect());
         let prefetch = order.is_some();
+        let physical_schema = scan.physical_schema().clone();
+        let read_schema = match &commit_versions {
+            // Read by name, as the kernel reads the materialized row-id
+            // column: a file without it reads it as null.
+            Some(versions) => Arc::new(delta_kernel::schema::StructType::try_new(
+                physical_schema.fields().cloned().chain([
+                    delta_kernel::schema::StructField::nullable(
+                        versions.column.clone(),
+                        delta_kernel::schema::DataType::LONG,
+                    ),
+                ]),
+            )?),
+            None => physical_schema.clone(),
+        };
         Ok(Self {
             metadata: Box::new(scan.scan_metadata(engine.as_ref())?),
             engine,
             table_root: scan.snapshot().table_root().clone(),
-            physical_schema: scan.physical_schema().clone(),
+            physical_schema,
+            read_schema,
+            commit_versions,
             logical_schema: scan.logical_schema().clone(),
             paths,
             order,
@@ -475,7 +590,11 @@ impl RestrictedScan {
             // the data and vectors are still read only as each is opened.
             let mut found: HashMap<String, ScanFile> = HashMap::new();
             for metadata in self.metadata.by_ref() {
-                for file in metadata?.visit_scan_files(Vec::new(), collect)? {
+                let metadata = metadata?;
+                if let Some(versions) = self.commit_versions.as_mut() {
+                    versions.learn(&metadata)?;
+                }
+                for file in metadata.visit_scan_files(Vec::new(), collect)? {
                     if paths.contains(&file.path) {
                         found.insert(file.path.clone(), file);
                     }
@@ -490,7 +609,11 @@ impl RestrictedScan {
         };
         // Visiting only decodes the scan rows; the DV is not read until the
         // file is opened, so dropping a file here costs no I/O.
-        let files = metadata?.visit_scan_files(Vec::new(), collect)?;
+        let metadata = metadata?;
+        if let Some(versions) = self.commit_versions.as_mut() {
+            versions.learn(&metadata)?;
+        }
+        let files = metadata.visit_scan_files(Vec::new(), collect)?;
         let paths = &self.paths;
         self.pending.extend(
             files
@@ -505,8 +628,9 @@ impl RestrictedScan {
         open_file(
             self.engine.as_ref(),
             &self.table_root,
-            &self.physical_schema,
+            &self.read_schema,
             file,
+            self.commit_versions.as_ref(),
         )
     }
 
@@ -532,6 +656,8 @@ impl RestrictedScan {
             let engine = self.engine.clone();
             let root = self.table_root.clone();
             let physical = self.physical_schema.clone();
+            let read = self.read_schema.clone();
+            let versions = self.commit_versions.clone();
             let logical = self.logical_schema.clone();
             let tag_path = self.tag_path;
             let dictionary = self.dictionary;
@@ -539,7 +665,7 @@ impl RestrictedScan {
             // runs on a worker, so files are finished concurrently and
             // handed on in order.
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let mut open = open_file(engine.as_ref(), &root, &physical, file)?;
+                let mut open = open_file(engine.as_ref(), &root, &read, file, versions.as_ref())?;
                 let mut batches = Vec::new();
                 let mut decoded = 0usize;
                 while let Some(item) = open.batches.next() {
@@ -650,6 +776,14 @@ impl RestrictedScan {
         open: &mut OpenFile,
         physical: Box<dyn EngineData>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        let (physical, versions) = match &open.commit_version {
+            Some((column, default)) => {
+                let (rest, versions) =
+                    take_commit_versions(physical, column, *default, &open.path)?;
+                (rest, Some(versions))
+            }
+            None => (physical, None),
+        };
         let logical = transform_to_logical(
             engine,
             physical,
@@ -657,6 +791,23 @@ impl RestrictedScan {
             logical_schema,
             open.transform.clone(),
         )?;
+        let logical = match versions {
+            Some(versions) => {
+                let batch = logical.try_into_record_batch()?;
+                let mut fields: Vec<arrow::datatypes::FieldRef> =
+                    batch.schema().fields().iter().cloned().collect();
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    ROW_COMMIT_VERSION_COLUMN,
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )));
+                let mut columns = batch.columns().to_vec();
+                columns.push(versions);
+                let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?;
+                Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
+            }
+            None => logical,
+        };
         let len = logical.len();
         // The mask may be shorter than the file (trailing rows are kept); it
         // is consumed front to back as batches arrive in file order.
@@ -670,6 +821,43 @@ impl RestrictedScan {
             None => Ok(logical),
         }
     }
+}
+
+/// `physical` without the materialized commit-version column `column`, and
+/// each row's commit version: the materialized value, else `default`.
+fn take_commit_versions(
+    physical: Box<dyn EngineData>,
+    column: &str,
+    default: Option<i64>,
+    path: &str,
+) -> DeltaResult<(Box<dyn EngineData>, arrow::array::ArrayRef)> {
+    use arrow::array::{Array, AsArray, Int64Array};
+    use arrow::datatypes::Int64Type;
+
+    let mut batch = physical.try_into_record_batch()?;
+    let index = batch.schema().index_of(column)?;
+    let materialized =
+        arrow::compute::cast(batch.column(index), &arrow::datatypes::DataType::Int64)?;
+    batch.remove_column(index);
+    let materialized = materialized.as_primitive::<Int64Type>();
+    let versions: Int64Array = if materialized.null_count() == 0 {
+        materialized.clone()
+    } else {
+        let Some(default) = default else {
+            // Row tracking assigns every file a default; without one a
+            // row's version is unknown, and writing null would give it the
+            // compaction's own.
+            return Err(Error::generic(format!(
+                "data file {path:?} has rows without a materialized row commit version and \
+                 no defaultRowCommitVersion, so their commit versions are unknown"
+            )));
+        };
+        materialized
+            .iter()
+            .map(|v| Some(v.unwrap_or(default)))
+            .collect()
+    };
+    Ok((Box::new(ArrowEngineData::new(batch)), Arc::new(versions)))
 }
 
 impl RestrictedScan {

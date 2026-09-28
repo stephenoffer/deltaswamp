@@ -72,7 +72,7 @@ fn removes_allowed(snapshot: &SnapshotRef) -> bool {
     let config = snapshot.table_configuration();
     let suspended = snapshot
         .metadata_configuration()
-        .get("delta.rowTracking.suspended")
+        .get("delta.rowTrackingSuspended")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     let row_tracking = config.is_feature_supported(&TableFeature::RowTracking) && !suspended;
     !row_tracking && !config.is_feature_enabled(&TableFeature::IcebergCompatV3)
@@ -308,7 +308,13 @@ pub fn commit_dml(
     }
 
     // Decide every file's fate before any I/O, so bad input writes nothing.
-    let allow_remove = removes_allowed(&snapshot);
+    //
+    // A compaction of a row-tracked table removes the files it rewrites
+    // like any other: kernel refuses to stage those removes, so they are
+    // staged by hand (`commit::RemovesByHand`), and the rows keep their ids
+    // and commit versions in the materialized columns of the new files.
+    let by_hand = !data_change && commit::RemovesByHand::needed(&snapshot);
+    let allow_remove = removes_allowed(&snapshot) || by_hand;
     // Files whose add carries no `numRecords` in its JSON stats, with the row
     // count read from their Parquet footer instead. Databricks writes such
     // adds as a matter of course: its tables default to
@@ -489,6 +495,34 @@ pub fn commit_dml(
         .filter(|(_, t)| t.remove)
         .map(|(p, _)| p.as_str())
         .collect();
+    let carried = carried_columns(&snapshot, by_hand)?;
+    if by_hand && !removals.is_empty() {
+        let builder = commit::RemovesByHand::new(&engine, commit::now_millis(), data_change)?;
+        for item in &metadata {
+            let data = item.scan_files.data();
+            let batch = data
+                .any_ref()
+                .downcast_ref::<ArrowEngineData>()
+                .ok_or_else(|| {
+                    NativeError::Invalid(
+                        "the kernel returned scan files that are not Arrow".to_string(),
+                    )
+                })?
+                .record_batch();
+            let paths = scan_file_paths(batch)?;
+            let selection = item.scan_files.selection_vector();
+            let remove: Vec<bool> = (0..batch.num_rows())
+                .map(|i| {
+                    selection.get(i).copied().unwrap_or(true)
+                        && !paths.is_null(i)
+                        && removals.contains(paths.value(i))
+                })
+                .collect();
+            if remove.iter().any(|r| *r) {
+                info.extra_actions.push(builder.of(data, remove)?);
+            }
+        }
+    }
 
     // A compaction commits on the table's own snapshot with the features
     // that only constrain the values a commit writes set aside; see
@@ -528,7 +562,7 @@ pub fn commit_dml(
             .into();
         let paths = scan_file_paths(&batch)?;
         let selected = |i: usize| selection.get(i).copied().unwrap_or(true);
-        if !removals.is_empty() {
+        if !removals.is_empty() && !by_hand {
             let remove: Vec<bool> = (0..batch.num_rows())
                 .map(|i| selected(i) && !paths.is_null(i) && removals.contains(paths.value(i)))
                 .collect();
@@ -595,10 +629,11 @@ pub fn commit_dml(
                 // One batch is one file: each is conformed on its own and
                 // written as it arrives, so the rows of a whole compaction
                 // step are never in memory at once.
-                batch.and_then(|b| commit::prepare_batches(&snapshot, vec![b]))
+                batch.and_then(|b| prepare_carrying(&snapshot, b, &carried))
             }),
             codec,
             &mut written,
+            &carried,
         ),
         (None, None) => commit::stage_batches(
             &mut transaction,
@@ -643,6 +678,80 @@ pub fn commit_dml(
             Err(err)
         }
     }
+}
+
+/// The columns a compaction's rows carry beside the table's own, and the
+/// materialized row-tracking columns they are written to.
+///
+/// Where row tracking is enabled every row a compaction moves keeps its row
+/// id and its commit version (Databricks' `_metadata.row_id` and
+/// `_metadata.row_commit_version`): a new file's own `baseRowId` and
+/// `defaultRowCommitVersion` would give it new ones. Where the feature is
+/// only supported, ids are not promised stable and nothing is carried.
+fn carried_columns(snapshot: &SnapshotRef, by_hand: bool) -> Result<Vec<(String, String)>> {
+    let config = snapshot.metadata_configuration();
+    let enabled = config
+        .get("delta.enableRowTracking")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    if !by_hand || !enabled {
+        return Ok(Vec::new());
+    }
+    let named = |key: &str| {
+        config.get(key).cloned().ok_or_else(|| {
+            NativeError::Invalid(format!(
+                "the table tracks row ids but names no {key}, so a compaction cannot keep \
+                 its rows' ids"
+            ))
+        })
+    };
+    Ok(vec![
+        (
+            crate::scan::ROW_ID_COLUMN.to_string(),
+            named("delta.rowTracking.materializedRowIdColumnName")?,
+        ),
+        (
+            crate::scan::ROW_COMMIT_VERSION_COLUMN.to_string(),
+            named("delta.rowTracking.materializedRowCommitVersionColumnName")?,
+        ),
+    ])
+}
+
+/// `prepare_batches` of one compaction batch, the `carried` columns set
+/// aside and put back after; refused if they are not all there.
+fn prepare_carrying(
+    snapshot: &SnapshotRef,
+    batch: RecordBatch,
+    carried: &[(String, String)],
+) -> Result<Vec<RecordBatch>> {
+    if carried.is_empty() {
+        return commit::prepare_batches(snapshot, vec![batch]);
+    }
+    let mut rest = batch;
+    let mut set_aside = Vec::new();
+    for (name, _) in carried {
+        let index = rest.schema().index_of(name).map_err(|_| {
+            NativeError::Invalid(format!(
+                "a compaction of a table with row tracking enabled must bring each row's \
+                 id and commit version ({name} is missing), or the rows it moves would \
+                 get new ones"
+            ))
+        })?;
+        set_aside.push((name.clone(), rest.column(index).clone()));
+        rest.remove_column(index);
+    }
+    let conformed = commit::prepare_batches(snapshot, vec![rest])?;
+    if conformed.is_empty() {
+        return Ok(conformed);
+    }
+    let [conformed] = <[RecordBatch; 1]>::try_from(conformed).map_err(|_| {
+        NativeError::Invalid("a compaction batch did not conform to one batch".to_string())
+    })?;
+    let mut out = conformed;
+    for (name, column) in set_aside {
+        let column = arrow::compute::cast(&column, &arrow::datatypes::DataType::Int64)?;
+        out = with_column(&out, &name, column)?;
+    }
+    Ok(vec![out])
 }
 
 /// The physical column that carries materialized row ids, when `batches` bring them.

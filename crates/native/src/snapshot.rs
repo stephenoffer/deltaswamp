@@ -500,6 +500,11 @@ impl PySnapshot {
     /// before any deletion vector). Rows already deleted are not returned.
     /// `row_ids` (with `row_positions`, on a table with row tracking enabled)
     /// adds `__deltaswamp_row_id`, each row's stable row id.
+    ///
+    /// `row_tracking` (with `file_groups`, on a table with row tracking
+    /// enabled) adds `__deltaswamp_row_id` and `__deltaswamp_row_commit_version`,
+    /// each row's id and commit version as Databricks' `_metadata` reads them:
+    /// what a compaction writes back into the materialized columns.
     #[pyo3(signature = (
         columns = None,
         predicate = None,
@@ -507,6 +512,7 @@ impl PySnapshot {
         row_positions = false,
         row_ids = false,
         file_groups = None,
+        row_tracking = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn scan(
@@ -518,7 +524,14 @@ impl PySnapshot {
         row_positions: bool,
         row_ids: bool,
         file_groups: Option<Vec<usize>>,
+        row_tracking: bool,
     ) -> PyResult<PyRecordBatchReader> {
+        if row_tracking && file_groups.is_none() {
+            return Err(NativeError::Invalid(
+                "row_tracking=True takes file_groups=...".to_string(),
+            )
+            .into());
+        }
         if file_groups.is_some() && (row_positions || files.is_none()) {
             return Err(NativeError::Invalid(
                 "file_groups=... takes files=... and not row_positions=True".to_string(),
@@ -568,12 +581,30 @@ impl PySnapshot {
                     delta_kernel::schema::MetadataColumnSpec::RowIndex,
                 )?);
             }
-            if row_ids {
+            if row_ids || row_tracking {
                 schema = Arc::new(schema.add_metadata_column(
                     crate::scan::ROW_ID_COLUMN,
                     delta_kernel::schema::MetadataColumnSpec::RowId,
                 )?);
             }
+            let commit_versions = if row_tracking {
+                let column = self
+                    .inner
+                    .metadata_configuration()
+                    .get("delta.rowTracking.materializedRowCommitVersionColumnName")
+                    .cloned()
+                    .ok_or_else(|| {
+                        NativeError::Invalid(
+                            "the table names no \
+                             delta.rowTracking.materializedRowCommitVersionColumnName, so its \
+                             rows' commit versions cannot be read"
+                                .to_string(),
+                        )
+                    })?;
+                Some(crate::scan::CommitVersions::new(column))
+            } else {
+                None
+            };
             builder = builder.with_schema(schema);
 
             let scan = builder.build()?;
@@ -589,8 +620,13 @@ impl PySnapshot {
                 return KernelBatchReader::try_new_positional(&scan, engine, paths);
             }
             if let (Some(files), Some(groups)) = (&files, file_groups) {
-                let reader =
-                    KernelBatchReader::try_new_grouped(&scan, engine, files.clone(), groups)?;
+                let reader = KernelBatchReader::try_new_grouped(
+                    &scan,
+                    engine,
+                    files.clone(),
+                    groups,
+                    commit_versions,
+                )?;
                 return Ok(if only_partitions {
                     reader.without_column(crate::scan::ROW_COUNT_COLUMN)
                 } else {
@@ -621,11 +657,12 @@ impl PySnapshot {
     /// root, URL-encoded), `size`, `modification_time`, `partition_values`
     /// (map, keyed by *physical* name under column mapping), `stats` (raw JSON),
     /// `deletion_vector` (JSON descriptor or null) and `num_records`.
-    #[pyo3(signature = (predicate = None))]
-    fn files(&self, py: Python<'_>, predicate: Option<String>) -> PyResult<PyTable> {
+    /// `tags=True` adds `tags`, each add's tags as a JSON object.
+    #[pyo3(signature = (predicate = None, tags = false))]
+    fn files(&self, py: Python<'_>, predicate: Option<String>, tags: bool) -> PyResult<PyTable> {
         let batch = py.detach(|| -> Result<arrow::array::RecordBatch> {
             let predicate = parse_predicate(predicate.as_deref(), self.inner.schema().as_ref())?;
-            files::list_files(self.inner.clone(), self.engine.as_ref(), predicate)
+            files::list_files(self.inner.clone(), self.engine.as_ref(), predicate, tags)
         })?;
         let schema = batch.schema();
         PyTable::try_new(vec![batch], schema)
@@ -813,6 +850,7 @@ impl PySnapshot {
                 commit::CommitInfoPatch {
                     operation_parameters,
                     blind_append,
+                    ..Default::default()
                 },
             )
         })?;
@@ -903,6 +941,7 @@ impl PySnapshot {
                 commit::CommitInfoPatch {
                     operation_parameters,
                     blind_append,
+                    ..Default::default()
                 },
             )
         })?;
@@ -919,7 +958,9 @@ impl PySnapshot {
     /// it as a compaction (OPTIMIZE): every add and remove says the rows did
     /// not change, only the files holding them. Returns `(version, deleted_rows,
     /// deletion_vectors_added, files_removed)`; a DML that changes nothing
-    /// commits nothing and returns this snapshot's version.
+    /// commits nothing and returns this snapshot's version. `add_tags` are
+    /// written as the `tags` of every add the commit makes (a Z-order's
+    /// `ZCUBE_*` tags).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         deletions,
@@ -933,6 +974,7 @@ impl PySnapshot {
         data_change = true,
         operation_parameters = None,
         blind_append = None,
+        add_tags = None,
     ))]
     fn commit_dml(
         &self,
@@ -948,6 +990,7 @@ impl PySnapshot {
         data_change: bool,
         operation_parameters: Option<HashMap<String, String>>,
         blind_append: Option<bool>,
+        add_tags: Option<HashMap<String, String>>,
     ) -> PyResult<(u64, u64, usize, usize)> {
         let deletions = deletions.into_reader()?;
         let data = data.map(|d| d.into_reader()).transpose()?;
@@ -981,6 +1024,8 @@ impl PySnapshot {
                 commit::CommitInfoPatch {
                     operation_parameters,
                     blind_append,
+                    add_tags,
+                    ..Default::default()
                 },
             )
         })?;
