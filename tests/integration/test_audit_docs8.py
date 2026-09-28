@@ -72,3 +72,20 @@ def test_merge_without_a_clause_is_refused_and_commits_nothing(tmp_path: Any) ->
     with pytest.raises(InvalidArgumentError, match="at least one clause"):
         t.merge(pa.table({"id": [2]}), "t.id = s.id", source_alias="s", target_alias="t").execute()
     assert conn.table(str(tmp_path / "t")).version == before
+
+
+def test_update_to_a_bare_word_says_to_quote_it(tmp_path: Any) -> None:
+    import pyarrow as pa
+
+    conn = ds.connect()
+    path = str(tmp_path / "t")
+    t = conn.create_table(path, pa.schema([("id", pa.int64()), ("city", pa.string())]))
+    t.append(pa.table({"id": [1, 2], "city": ["oslo", "lima"]}))
+    with pytest.raises(InvalidArgumentError, match="quote a string"):
+        t.update({"city": "archived"}, predicate="id = 1")
+    # A column, a niladic function and a quoted string still work.
+    t.update({"city": "CITY"}, predicate="id = 1")
+    t.update({"city": "'archived'"}, predicate="id = 2")
+    t.update({"city": "null"}, predicate="id = 1")
+    rows = sorted(conn.table(path).to_arrow().to_pylist(), key=lambda r: r["id"])
+    assert rows == [{"id": 1, "city": None}, {"id": 2, "city": "archived"}]

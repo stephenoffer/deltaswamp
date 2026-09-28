@@ -801,6 +801,29 @@ def _protocol_from_properties(resolved: ResolvedTable) -> dict[str, Any]:
 _NAME_RECHECK_SECONDS = 1.0
 
 
+#: A SET value that SQL reads as a column reference.
+_BARE_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+#: Spark words that need no parentheses and name no column.
+_NILADIC = frozenset(
+    {
+        "null",
+        "true",
+        "false",
+        "default",
+        "current_date",
+        "current_timestamp",
+        "current_user",
+        "current_catalog",
+        "current_database",
+        "current_schema",
+        "current_timezone",
+        "localtimestamp",
+        "session_user",
+        "user",
+    }
+)
+
+
 class Table:
     """One table: reads, writes, DDL and maintenance, routed per operation."""
 
@@ -3677,6 +3700,8 @@ class Table:
         if not updates and not new_values:
             raise InvalidArgumentError("update needs at least one column to set")
         updates, new_values = _dotted_keys(updates), _dotted_keys(new_values)
+        if updates:
+            self._refuse_bare_words(updates)
         request = self._request(
             Operation.UPDATE,
             {"updates": updates, "new_values": new_values, "predicate": predicate, **kwargs},
@@ -3779,6 +3804,28 @@ class Table:
                     f"and {value.isoformat()} carries one; pass a naive datetime (for "
                     "example value.replace(tzinfo=None), or the value converted to the zone "
                     "you mean first)"
+                )
+
+    def _refuse_bare_words(self, updates: dict[str, Any]) -> None:
+        """Refuse a SET value that is a bare word naming no column.
+
+        `{"city": "archived"}` is SQL for "the column archived", which Spark
+        refuses as unresolved; the engines failed with a raw "No field named
+        archived" that did not say the value wanted quotes.
+        """
+        columns = {name.lower() for name in self.schema().names}
+        for key, value in updates.items():
+            if (
+                isinstance(value, str)
+                and _BARE_WORD.fullmatch(value.strip())
+                and value.strip().lower() not in columns
+                and value.strip().lower() not in _NILADIC
+            ):
+                word = value.strip()
+                raise InvalidArgumentError(
+                    f"update sets {key!r} to {word!r}, which SQL reads as a column, and the "
+                    f"table has no column {word!r}; quote a string (\"'{word}'\") or pass "
+                    f"new_values={{{key!r}: {word!r}}}"
                 )
 
     def _update_targets(self, targets: dict[str, Any], deltars: bool) -> dict[str, Any]:
