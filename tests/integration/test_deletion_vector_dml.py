@@ -207,11 +207,18 @@ class TestRowTracking:
         conn.open_table(tracked).delete("id IN (2, 5, 6)")
         after = self._row_ids(conn, tracked)
         assert after == {k: v for k, v in before.items() if k not in (2, 5, 6)}
-        # Row tracking forbids removes here, so an emptied file keeps a full vector.
+        # Kernel will not stage a remove here, so an emptied file's is staged
+        # by hand; every remove, and every re-add under a new vector, keeps
+        # the file's baseRowId and defaultRowCommitVersion.
         actions = _last_commit(tracked)
-        removed = {a["remove"]["path"] for a in actions if "remove" in a}
-        added = {a["add"]["path"] for a in actions if "add" in a}
-        assert removed and removed <= added
+        removes = [a["remove"] for a in actions if "remove" in a]
+        assert removes
+        assert all(r.get("baseRowId") is not None for r in removes)
+        assert all(r.get("defaultRowCommitVersion") is not None for r in removes)
+        removed = {r["path"] for r in removes}
+        for add in (a["add"] for a in actions if "add" in a):
+            assert add["path"] in removed and add.get("deletionVector") is not None
+            assert add.get("baseRowId") is not None
 
     def test_update_keeps_the_updated_row_id(self, conn: Any, tracked: str) -> None:
         properties = conn.open_table(tracked).properties()
@@ -472,7 +479,9 @@ class TestExistingVectorsAndFiles:
         assert conn.open_table(path).delete()["num_deleted_rows"] == 6
         assert conn.open_table(path).to_arrow().num_rows == 0
         assert _deltars_rows(path, "id") == []
-        adds = [a["add"] for a in _last_commit(path) if "add" in a]
-        assert adds and all(
-            a["deletionVector"]["cardinality"] == json.loads(a["stats"])["numRecords"] for a in adds
-        )
+        # Every file removed (the removes staged by hand, as kernel will not
+        # stage them on a row-tracked table), with its row-tracking fields.
+        actions = _last_commit(path)
+        assert not any("add" in a for a in actions)
+        removes = [a["remove"] for a in actions if "remove" in a]
+        assert removes and all(r.get("baseRowId") is not None for r in removes)

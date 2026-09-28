@@ -99,6 +99,11 @@ pub const FEATURES: &[&str] = &[
     // `absolute_deletion_vector` and `copy_objects`: shallow and deep clones
     // of path tables.
     "path_clone",
+    // Copy-on-write DML of row-tracked tables: `commit_dml` stages the
+    // removes by hand and writes the rows' ids and commit versions it is
+    // given into the materialized columns, and `scan(row_positions=True,
+    // row_tracking=True)` reads both beside each row's position.
+    "row_tracking_dml",
 ];
 
 #[pyfunction]

@@ -510,8 +510,8 @@ impl PySnapshot {
     /// `row_ids` (with `row_positions`, on a table with row tracking enabled)
     /// adds `__deltaswamp_row_id`, each row's stable row id.
     ///
-    /// `row_tracking` (with `file_groups`, on a table with row tracking
-    /// enabled) adds `__deltaswamp_row_id` and `__deltaswamp_row_commit_version`,
+    /// `row_tracking` (with `file_groups` or `row_positions`, on a table with
+    /// row tracking enabled) adds `__deltaswamp_row_id` and `__deltaswamp_row_commit_version`,
     /// each row's id and commit version as Databricks' `_metadata` reads them:
     /// what a compaction writes back into the materialized columns.
     #[pyo3(signature = (
@@ -535,9 +535,9 @@ impl PySnapshot {
         file_groups: Option<Vec<usize>>,
         row_tracking: bool,
     ) -> PyResult<PyRecordBatchReader> {
-        if row_tracking && file_groups.is_none() {
+        if row_tracking && file_groups.is_none() && !row_positions {
             return Err(NativeError::Invalid(
-                "row_tracking=True takes file_groups=...".to_string(),
+                "row_tracking=True takes file_groups=... or row_positions=True".to_string(),
             )
             .into());
         }
@@ -626,7 +626,12 @@ impl PySnapshot {
             );
             if row_positions {
                 let paths = files.map(|f| f.into_iter().collect());
-                return KernelBatchReader::try_new_positional(&scan, engine, paths);
+                return KernelBatchReader::try_new_positional(
+                    &scan,
+                    engine,
+                    paths,
+                    commit_versions,
+                );
             }
             if let (Some(files), Some(groups)) = (&files, file_groups) {
                 let reader = KernelBatchReader::try_new_grouped(

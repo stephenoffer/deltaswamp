@@ -12,9 +12,15 @@
 //!
 //! * The new deletions are unioned with the file's existing vector, so a
 //!   second DELETE never resurrects the rows the first one removed.
-//! * A file whose every row is now deleted is removed outright, as Spark does,
-//!   unless the table tracks row ids (the kernel cannot stage removes there),
-//!   in which case it keeps a vector covering every row -- equally valid.
+//! * A file whose every row is now deleted is removed outright, as Spark does.
+//!   On a row-tracked table kernel will not stage that remove, so it is
+//!   staged by hand ([`commit::RemovesByHand`]) with the file's `baseRowId`
+//!   and `defaultRowCommitVersion`; only icebergCompatV3, which forbids
+//!   removes, keeps a vector covering every row instead -- equally valid.
+//! * A copy-on-write DML (a table without deletion vectors) names the files
+//!   it rewrites as `whole_files` and brings their surviving rows as data;
+//!   on a row-tracked table those rows bring their ids and commit versions,
+//!   written into the materialized columns ([`dml_carried_columns`]).
 //! * All vectors go into one `deletion_vector_<uuid>.bin` at the table root,
 //!   in the on-disk format the Delta protocol specifies, referenced by
 //!   relative (`u`) descriptors. The file is written before the commit and
@@ -250,8 +256,8 @@ pub(crate) fn compaction_snapshot(snapshot: &SnapshotRef) -> Result<SnapshotRef>
 /// `whole_files` names files every live row of which is deleted, without
 /// listing the rows: a DELETE with no predicate, or a file the caller is
 /// rewriting (its surviving rows are in `batches`). Such a file is removed; a
-/// full-file vector stands in where row tracking forbids removes, which needs
-/// the file's `numRecords`. Where an add carries no such statistic, the row
+/// full-file vector stands in where icebergCompatV3 forbids removes, which
+/// needs the file's `numRecords`. Where an add carries no such statistic, the row
 /// count comes from the file's Parquet footer.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_dml(
@@ -309,11 +315,13 @@ pub fn commit_dml(
 
     // Decide every file's fate before any I/O, so bad input writes nothing.
     //
-    // A compaction of a row-tracked table removes the files it rewrites
-    // like any other: kernel refuses to stage those removes, so they are
-    // staged by hand (`commit::RemovesByHand`), and the rows keep their ids
-    // and commit versions in the materialized columns of the new files.
-    let by_hand = !data_change && commit::RemovesByHand::needed(&snapshot);
+    // A compaction or a copy-on-write DML of a row-tracked table removes the
+    // files it rewrites like any other: kernel refuses to stage those
+    // removes, so they are staged by hand (`commit::RemovesByHand`, carrying
+    // each file's `baseRowId` and `defaultRowCommitVersion`), and the rows
+    // keep their ids (and, where unchanged, their commit versions) in the
+    // materialized columns of the new files.
+    let by_hand = commit::RemovesByHand::needed(&snapshot);
     let allow_remove = removes_allowed(&snapshot) || by_hand;
     // Files whose add carries no `numRecords` in its JSON stats, with the row
     // count read from their Parquet footer instead. Databricks writes such
@@ -452,9 +460,13 @@ pub fn commit_dml(
         .logical_partition_columns()
         .to_vec();
     let table_schema = snapshot.schema();
-    let materialized_row_ids = materialized_row_id_column(&snapshot, &batches)?;
+    let dml_carried = if data_change {
+        dml_carried_columns(&snapshot, &batches)?
+    } else {
+        Vec::new()
+    };
     let batches = if data_change {
-        prepare_with_row_ids(&snapshot, batches)?
+        prepare_dml_carrying(&snapshot, batches, &dml_carried)?
     } else {
         // A compaction sized each batch as one output file; coalescing them
         // would ignore the table's target file size.
@@ -495,7 +507,7 @@ pub fn commit_dml(
         .filter(|(_, t)| t.remove)
         .map(|(p, _)| p.as_str())
         .collect();
-    let carried = carried_columns(&snapshot, by_hand)?;
+    let carried = carried_columns(&snapshot, by_hand && !data_change)?;
     if by_hand && !removals.is_empty() {
         let builder = commit::RemovesByHand::new(&engine, commit::now_millis(), data_change)?;
         for item in &metadata {
@@ -619,8 +631,8 @@ pub fn commit_dml(
         None => None,
     };
     let mut written = Vec::new();
-    let staged = match (&materialized_row_ids, stream) {
-        (_, Some(stream)) => commit::stage_stream(
+    let staged = match stream {
+        Some(stream) => commit::stage_stream(
             &mut transaction,
             &engine,
             &partition_columns,
@@ -635,7 +647,7 @@ pub fn commit_dml(
             &mut written,
             &carried,
         ),
-        (None, None) => commit::stage_batches(
+        None if dml_carried.is_empty() => commit::stage_batches(
             &mut transaction,
             &engine,
             &partition_columns,
@@ -644,15 +656,17 @@ pub fn commit_dml(
             codec,
             &mut written,
         ),
-        (Some(column), None) => stage_with_row_ids(
+        // Rows that bring their ids (and commit versions) along: written
+        // with them in the materialized columns, as a compaction's are.
+        None => commit::stage_stream(
             &mut transaction,
             &engine,
             &partition_columns,
             &table_schema,
-            batches,
-            column,
+            batches.into_iter().map(|batch| Ok(vec![batch])),
             codec,
             &mut written,
+            &dml_carried,
         ),
     };
     let staging_failed = staged.is_err();
@@ -754,65 +768,87 @@ fn prepare_carrying(
     Ok(vec![out])
 }
 
-/// The physical column that carries materialized row ids, when `batches` bring them.
+/// The row-tracking columns `batches` bring beside the table's own, and the
+/// materialized columns they are written to.
 ///
-/// Rows an UPDATE rewrites must keep their row ids on a table with row
-/// tracking enabled. A new file's rows would otherwise get fresh ids from its
-/// `baseRowId`, so the old ids are written into the column the table names in
-/// `delta.rowTracking.materializedRowIdColumnName`, which readers prefer over
-/// the computed id. Their commit version is left unmaterialized, which reads
-/// as this commit's -- correct for a row this commit changed.
-fn materialized_row_id_column(
+/// On a table with row tracking enabled a DML must keep the row id of every
+/// row it rewrites, and the commit version of every row it keeps unchanged.
+/// A new file's rows would otherwise get fresh ids from its `baseRowId` and
+/// this commit's version from its `defaultRowCommitVersion`, so the old
+/// values are written into the columns the table names in
+/// `delta.rowTracking.materializedRowIdColumnName` and
+/// `...materializedRowCommitVersionColumnName`, which readers prefer. A null
+/// there is the file's default: a fresh id for an inserted row, and this
+/// commit's version for an updated one -- correct for a row this commit made.
+fn dml_carried_columns(
     snapshot: &SnapshotRef,
     batches: &[RecordBatch],
-) -> Result<Option<String>> {
-    let carries = batches
-        .iter()
-        .any(|b| b.schema().index_of(crate::scan::ROW_ID_COLUMN).is_ok());
-    if !carries {
-        return Ok(None);
+) -> Result<Vec<(String, String)>> {
+    let config = snapshot.metadata_configuration();
+    let mut carried = Vec::new();
+    for (name, key) in [
+        (
+            crate::scan::ROW_ID_COLUMN,
+            "delta.rowTracking.materializedRowIdColumnName",
+        ),
+        (
+            crate::scan::ROW_COMMIT_VERSION_COLUMN,
+            "delta.rowTracking.materializedRowCommitVersionColumnName",
+        ),
+    ] {
+        if !batches.iter().any(|b| b.schema().index_of(name).is_ok()) {
+            continue;
+        }
+        let physical = config.get(key).cloned().ok_or_else(|| {
+            NativeError::Invalid(format!(
+                "the data carries {name}, but the table names no {key} to write it to"
+            ))
+        })?;
+        carried.push((name.to_string(), physical));
     }
-    snapshot
-        .metadata_configuration()
-        .get("delta.rowTracking.materializedRowIdColumnName")
-        .cloned()
-        .map(Some)
-        .ok_or_else(|| {
-            NativeError::Invalid(
-                "the data carries row ids, but the table names no \
-                 delta.rowTracking.materializedRowIdColumnName to write them to"
-                    .to_string(),
-            )
-        })
+    Ok(carried)
 }
 
-/// `prepare_batches`, carrying a row-id column through untouched.
+/// `prepare_batches`, carrying the `carried` columns through untouched.
 ///
-/// Conforming to the table schema refuses unknown columns, so the row ids are
-/// set aside and put back afterwards; conforming keeps rows in order.
-fn prepare_with_row_ids(
+/// Conforming to the table schema refuses unknown columns, so they are set
+/// aside and put back afterwards (conforming keeps rows in order). A batch
+/// without one of them gets it as nulls -- fresh values -- so every batch
+/// has one schema and they coalesce into as few files as before.
+fn prepare_dml_carrying(
     snapshot: &SnapshotRef,
     batches: Vec<RecordBatch>,
+    carried: &[(String, String)],
 ) -> Result<Vec<RecordBatch>> {
+    if carried.is_empty() {
+        return commit::prepare_batches(snapshot, batches);
+    }
     let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
-        let Ok(index) = batch.schema().index_of(crate::scan::ROW_ID_COLUMN) else {
-            out.extend(commit::prepare_batches(snapshot, vec![batch])?);
+        let rows = batch.num_rows();
+        let mut rest = batch;
+        let mut set_aside = Vec::new();
+        for (name, _) in carried {
+            let column = match rest.schema().index_of(name) {
+                Ok(index) => {
+                    let column = rest.column(index).clone();
+                    rest.remove_column(index);
+                    arrow::compute::cast(&column, &arrow::datatypes::DataType::Int64)?
+                }
+                Err(_) => arrow::array::new_null_array(&arrow::datatypes::DataType::Int64, rows),
+            };
+            set_aside.push((name.clone(), column));
+        }
+        let Some(mut conformed) = commit::prepare_batches(snapshot, vec![rest])?
+            .into_iter()
+            .next()
+        else {
             continue;
         };
-        let row_ids = batch.column(index).clone();
-        let mut rest = batch.clone();
-        rest.remove_column(index);
-        let conformed = commit::prepare_batches(snapshot, vec![rest])?;
-        let Some(conformed) = conformed.into_iter().next() else {
-            continue;
-        };
-        let row_ids = arrow::compute::cast(&row_ids, &arrow::datatypes::DataType::Int64)?;
-        out.push(with_column(
-            &conformed,
-            crate::scan::ROW_ID_COLUMN,
-            row_ids,
-        )?);
+        for (name, column) in set_aside {
+            conformed = with_column(&conformed, &name, column)?;
+        }
+        out.push(conformed);
     }
     commit::coalesce(out)
 }
@@ -839,89 +875,6 @@ fn with_column(
         )),
         columns,
     )?)
-}
-
-/// `commit::stage_batches`, writing each batch's row ids to `column`.
-///
-/// Mirrors `writer::write_parquet` -- the logical-to-physical transform, then
-/// the Parquet write -- with the materialized row-id column appended to
-/// the physical data in between. Batches without row ids are written normally.
-#[allow(clippy::too_many_arguments)]
-fn stage_with_row_ids(
-    txn: &mut delta_kernel::transaction::Transaction,
-    engine: &SharedEngine,
-    partition_columns: &[String],
-    table_schema: &delta_kernel::schema::SchemaRef,
-    batches: Vec<RecordBatch>,
-    column: &str,
-    codec: delta_kernel::parquet::basic::Compression,
-    written: &mut Vec<String>,
-) -> Result<()> {
-    use delta_kernel::engine::arrow_conversion::TryFromArrow;
-    use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-    use delta_kernel::schema::StructType;
-    use delta_kernel::Engine;
-
-    let write_state = txn.write_state()?;
-    let mut groups: Vec<(
-        RecordBatch,
-        Option<HashMap<String, delta_kernel::expressions::Scalar>>,
-    )> = Vec::new();
-    for batch in batches {
-        if partition_columns.is_empty() {
-            groups.push((batch, None));
-        } else {
-            for group in crate::partition::split_by_partition(
-                &batch,
-                partition_columns,
-                table_schema.as_ref(),
-            )? {
-                groups.push((group.data, Some(group.values)));
-            }
-        }
-    }
-    let mut staged = Vec::new();
-    for (batch, values) in groups {
-        let write_context = match values {
-            None => write_state.unpartitioned_write_context()?,
-            Some(values) => write_state.partitioned_write_context(values)?,
-        };
-        let Ok(index) = batch.schema().index_of(crate::scan::ROW_ID_COLUMN) else {
-            let data = ArrowEngineData::new(batch);
-            let metadata = runtime::block_on(crate::writer::write_parquet(
-                engine,
-                &data,
-                &write_context,
-                codec,
-            ))?;
-            staged.push(commit::track_written(metadata, written)?);
-            continue;
-        };
-        let row_ids = batch.column(index).clone();
-        let mut logical = batch;
-        logical.remove_column(index);
-        let input_schema = StructType::try_from_arrow(logical.schema().as_ref())?;
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            Arc::new(input_schema),
-            write_context.logical_to_physical(),
-            write_context.physical_schema().clone().into(),
-        )?;
-        let physical = evaluator
-            .evaluate(&ArrowEngineData::new(logical))?
-            .try_into_record_batch()?;
-        let physical = with_column(&physical, column, row_ids)?;
-        let metadata = runtime::block_on(crate::writer::write_physical(
-            engine,
-            &physical,
-            &write_context,
-            codec,
-        ))?;
-        staged.push(commit::track_written(metadata, written)?);
-    }
-    for metadata in staged {
-        txn.add_files(metadata);
-    }
-    Ok(())
 }
 
 /// The `path` column of a scan-file batch.

@@ -218,15 +218,28 @@ impl KernelBatchReader {
     /// it, each row is addressed by `(file, physical row index)`, which is what
     /// a deletion vector records. Rows a deletion vector already removed are
     /// not returned, but the survivors keep their physical indexes.
+    ///
+    /// With `commit_versions`, each row's commit version comes too, as
+    /// [`ROW_COMMIT_VERSION_COLUMN`] just before the file column: what a
+    /// copy-on-write DML writes back for the rows it keeps.
     pub fn try_new_positional(
         scan: &Scan,
         engine: Arc<dyn Engine>,
         paths: Option<Vec<String>>,
+        commit_versions: Option<CommitVersions>,
     ) -> Result<Self> {
-        let iter = RestrictedScan::new(scan, engine, paths, true, false, None)?;
+        let versioned = commit_versions.is_some();
+        let iter = RestrictedScan::new(scan, engine, paths, true, false, commit_versions)?;
         let mut reader = Self::from_parts(scan.logical_schema().as_ref(), iter)?;
         let mut fields: Vec<arrow::datatypes::FieldRef> =
             reader.schema.fields().iter().cloned().collect();
+        if versioned {
+            fields.push(Arc::new(arrow::datatypes::Field::new(
+                ROW_COMMIT_VERSION_COLUMN,
+                arrow::datatypes::DataType::Int64,
+                true,
+            )));
+        }
         fields.push(Arc::new(arrow::datatypes::Field::new(
             FILE_PATH_COLUMN,
             arrow::datatypes::DataType::Utf8,

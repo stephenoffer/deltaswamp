@@ -17,7 +17,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
-"path_clone". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
+"path_clone", "row_tracking_dml". Gate on this list, not `hasattr`, so a stale build
+refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -304,7 +305,7 @@ class Snapshot:
         position in that file): the address a deletion vector uses. `row_ids`
         (which needs `row_positions`, and row tracking enabled) also appends
         `__deltaswamp_row_id`, each row's stable row id. `row_tracking` (with
-        `file_groups`, row tracking enabled) appends `__deltaswamp_row_id` and
+        `file_groups` or `row_positions`, row tracking enabled) appends `__deltaswamp_row_id` and
         `__deltaswamp_row_commit_version`: each row's id and commit version as
         Databricks' `_metadata` reads them, for a compaction to write back.
 
@@ -569,20 +570,18 @@ class Snapshot:
         one file as it arrives, and the table's CHECK constraints, generated
         and identity columns and invariants do not stop it (they constrain
         new values, and a compaction writes the ones it read). On a row-tracked
-        table a compaction's removes are staged here (kernel refuses them), and
-        its `__deltaswamp_row_id` / `__deltaswamp_row_commit_version` columns
-        are written to the materialized row-tracking columns. `add_tags` are
-        written as the `tags` of every add.
+        table every commit's removes are staged here (kernel refuses them),
+        and `__deltaswamp_row_id` / `__deltaswamp_row_commit_version` columns
+        in `data` are written to the materialized row-tracking columns (a null
+        is a fresh value). `add_tags` are written as the `tags` of every add.
 
         `deletions` is an Arrow stream of `path` and `row_index` columns, as a
         positional scan reports them. Each touched file's new deletions are
-        unioned with its existing vector; a file left with no rows is removed
-        (or, where row tracking forbids removes, keeps a full vector). `data`,
-        if given, is appended in the same commit; a `__deltaswamp_row_id`
-        column in it is written to the table's materialized row-id column, so
-        updated rows keep their ids. Returns `(version, deleted_rows,
-        deletion_vectors_added, files_removed)`; nothing to change commits
-        nothing and returns this snapshot's version.
+        unioned with its existing vector; a file left with no rows is removed.
+        `data`, if given, is appended in the same commit, so a copy-on-write
+        rewrite is `whole_files` plus their surviving rows in `data`. Returns
+        `(version, deleted_rows, deletion_vectors_added, files_removed)`;
+        nothing to change commits nothing and returns this snapshot's version.
         """
 
     @property
