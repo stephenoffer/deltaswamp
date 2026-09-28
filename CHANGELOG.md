@@ -105,6 +105,14 @@ First release.
   never had one does not start a chain; never on a catalog-managed table (the
   catalog's writer keeps those); and never at the cost of the write.
 
+- `Table.added_since(version, until=None, ...)` reads the rows added after a
+  version without the change data feed (delta-rs#4554,
+  delta-kernel-rs#1177), from the kernel's incremental scan bound as
+  `Snapshot.incremental_files`. It refuses a range that removed files (DML,
+  OPTIMIZE, overwrite) unless `only_appends=True`; `can("added_since")`
+  says so. `changes(start, include_snapshot=True)` yields the table at
+  `start` as inserts before the feed.
+
 ### Security
 
 See docs/usage.md, "Security notes".

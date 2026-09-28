@@ -54,6 +54,7 @@ METHOD_OPERATIONS: dict[str, tuple[Operation, dict[str, Any]]] = {
     "changes": (Operation.INCREMENTAL, {}),
     "plan_write": (Operation.APPEND, {"distributed": True}),
     "plan_scan": (Operation.SCAN, {"distributed": True}),
+    "added_since": (Operation.SCAN, {"incremental": True}),
     "to_arrow": (Operation.SCAN, {}),
     "create_table": (Operation.CREATE, {}),
     "convert_to_delta": (Operation.CONVERT, {}),
@@ -164,6 +165,17 @@ def _read(
     needs: set[str] = set()
     if get("distributed"):
         needs.add("distributed_scan")
+    incremental = bool(shape.pop("incremental", False))
+    if incremental:
+        # added_since(): the file diff between two versions, which only the
+        # kernel's incremental scan gives. Its `version` is where the range
+        # starts, not a version to read at; `until` is that.
+        needs.add("incremental_files")
+        shape.pop("version", None)
+        if shape.get("until") is not None:
+            shape["version"] = shape.pop("until")
+        shape.pop("until", None)
+        shape.pop("only_appends", None)
     if predicate is not None:
         needs |= table._predicate_needs(predicate)
         needs |= table._interval_needs(predicate)
@@ -193,6 +205,8 @@ def _feed(
     get = shape.get
     predicate = get("predicate")
     needs: set[str] = set()
+    # The snapshot a bootstrapping changes() yields first is a plain read.
+    shape.pop("include_snapshot", None)
     if predicate is not None:
         needs |= table._predicate_needs(predicate)
         needs |= table._expression_needs(predicate)

@@ -139,3 +139,78 @@ def test_a_skipped_write_says_so(conn: Any, tmp_path: Any) -> None:
     again = t.append(pa.table({"a": [2]}), txn=("job", 1))
     assert first["num_rows"] == 1 and "skipped" not in first
     assert again["skipped"] and again["num_rows"] == 0 and "version" not in again
+
+
+# --------------------------------------------------- #10 incremental reads
+
+
+def _appended(conn: Any, path: str) -> tuple[Any, int]:
+    conn.write_table(path, pa.table({"id": [1, 2]}))
+    t = conn.table(path)
+    base = t.version
+    t.append(pa.table({"id": [3, 4]}))
+    t.append(pa.table({"id": [5]}))
+    return conn.table(path), base
+
+
+def test_added_since_reads_the_appended_rows_without_the_feed(conn: Any, tmp_path: Any) -> None:
+    """delta-rs#4554, delta-kernel-rs#1177: an incremental read needed CDF on."""
+    t, base = _appended(conn, str(tmp_path / "t"))
+    cap = t.can("added_since", version=base)
+    assert cap.ok and cap.engine is Engine.KERNEL
+    assert pa.table(t.added_since(base)).column("id").to_pylist() == [3, 4, 5]
+    assert pa.table(t.added_since(base, until=base + 1)).column("id").to_pylist() == [3, 4]
+    got = pa.table(t.added_since(base, columns=["id"], predicate="id > 3"))
+    assert got.column("id").to_pylist() == [4, 5]
+    assert pa.table(t.added_since(t.version)).num_rows == 0
+    pinned = conn.table(t.location, version=base + 1)
+    assert pa.table(pinned.added_since(base)).column("id").to_pylist() == [3, 4]
+
+
+def test_added_since_refuses_a_range_that_rewrote_files(conn: Any, tmp_path: Any) -> None:
+    from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
+
+    t, base = _appended(conn, str(tmp_path / "t"))
+    t.delete("id = 3")
+    with pytest.raises(UnreachableTableError, match="removed or rewritten"):
+        t.added_since(base)
+    assert sorted(pa.table(t.added_since(base, only_appends=True)).column("id").to_pylist()) == [
+        4,
+        5,
+    ]
+    with pytest.raises(InvalidArgumentError, match="after the table's version"):
+        t.added_since(t.version + 5)
+    with pytest.raises(InvalidArgumentError, match="before version"):
+        t.added_since(3, until=2)
+
+
+def test_added_since_needs_the_kernel(tmp_path: Any) -> None:
+    conn = _only(Engine.DELTARS)
+    t, base = _appended(conn, str(tmp_path / "t"))
+    cap = t.can("added_since", version=base)
+    assert not cap.ok and "incremental scan" in (cap.reason or "")
+
+
+def test_changes_can_start_from_a_snapshot(conn: Any, tmp_path: Any) -> None:
+    """The feed was on only from version N: a consumer bootstraps from the table at N."""
+    path = str(tmp_path / "t")
+    conn.write_table(path, pa.table({"id": [1, 2]}))
+    t = conn.table(path)
+    t.set_properties({"delta.enableChangeDataFeed": "true"})
+    start = conn.table(path).version
+    t.append(pa.table({"id": [3]}))
+    t.delete("id = 1")
+    got = list(conn.table(path).changes(start, include_snapshot=True))
+    assert [v for v, _ in got] == [start, start + 1, start + 2]
+    snap = got[0][1]
+    assert sorted(snap.column("id").to_pylist()) == [1, 2]
+    assert set(snap.column("_change_type").to_pylist()) == {"insert"}
+    assert set(snap.column("_commit_version").to_pylist()) == {start}
+    assert snap.schema.names == got[1][1].schema.names
+    assert (
+        snap.schema.field("_commit_timestamp").type
+        == got[1][1].schema.field("_commit_timestamp").type
+    )
+    assert got[2][1].column("_change_type").to_pylist() == ["delete"]
+    projected = next(iter(conn.table(path).changes(start, include_snapshot=True, columns=["id"])))
+    assert projected[1].column_names == ["id"]

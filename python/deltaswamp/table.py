@@ -1457,24 +1457,78 @@ class Table:
             )
             if not isinstance(engine, (KernelEngine, DeltaRsEngine)):
                 return stream
-            log = _log_schema(
-                engine, self._resolved, version if version is not None else self._version
-            )
-            if self._enrich().features & _VARIANT_FEATURES:
-                # The warehouse sends VARIANT as JSON text; so does this.
-                from ._variant import json_text_stream, variant_paths
-
-                stream = json_text_stream(stream, None if log is None else variant_paths(log))
-            # And a day-time interval as a duration, not bare microseconds.
-            stream = interval_stream(stream, interval_paths(log))
-            # A file VACUUM (or a manual delete) removed fails only once reading
-            # reaches it, as a bare OSError/ArrowInvalid; name it instead.
-            where = self._resolved.location or str(self._resolved.ref)
-            at = version if version is not None else timestamp
-            context = f"{where}" + (f" at {at}" if at is not None else "")
-            return translating_stream(stream, context, _shredded_variant_error)
+            return self._direct_stream(engine, stream, version, timestamp)
 
         return self._read(request, scan)
+
+    def _direct_stream(self, engine: Any, stream: Any, version: Any, timestamp: Any) -> Any:
+        """A direct engine's read, shown as the warehouse shows it, with errors named."""
+        log = _log_schema(engine, self._resolved, version if version is not None else self._version)
+        if self._enrich().features & _VARIANT_FEATURES:
+            # The warehouse sends VARIANT as JSON text; so does this.
+            from ._variant import json_text_stream, variant_paths
+
+            stream = json_text_stream(stream, None if log is None else variant_paths(log))
+        # And a day-time interval as a duration, not bare microseconds.
+        stream = interval_stream(stream, interval_paths(log))
+        # A file VACUUM (or a manual delete) removed fails only once reading
+        # reaches it, as a bare OSError/ArrowInvalid; name it instead.
+        where = self._resolved.location or str(self._resolved.ref)
+        at = version if version is not None else timestamp
+        context = f"{where}" + (f" at {at}" if at is not None else "")
+        return translating_stream(stream, context, _shredded_variant_error)
+
+    def added_since(
+        self,
+        version: int,
+        *,
+        until: int | None = None,
+        columns: list[str] | None = None,
+        predicate: str | None = None,
+        only_appends: bool = False,
+    ) -> Any:
+        """The rows added after `version`, up to `until`, without the change data feed.
+
+        Returns an Arrow stream of the rows in the data files committed in
+        `(version, until]` (`until` defaults to the handle's version, else the
+        latest) -- an incremental read of an append-only table, which needs no
+        `delta.enableChangeDataFeed` (delta-rs#4554, delta-kernel-rs#1177).
+
+        Only appends make that the rows added. A DELETE, UPDATE, MERGE,
+        OPTIMIZE or overwrite in the range removes files and re-adds rows that
+        were there before, so the call is refused if any file was removed;
+        `only_appends=True` reads every file added anyway, rows a rewrite
+        carried over included (for a consumer that dedupes on a key), and
+        `cdf()` reads exactly what changed on a table with the feed on.
+        """
+        _check_version(version, "version")
+        _check_version(until, "until")
+        columns = _columns_arg(columns)
+        _check_predicate(predicate, "added_since")
+        if not isinstance(only_appends, bool):
+            raise InvalidArgumentError(
+                f"only_appends must be True or False, not {type(only_appends).__name__}"
+            )
+        end = until if until is not None else self._version
+        if end is not None and end < version:
+            raise InvalidArgumentError(f"until {end} is before version {version}")
+        request = self._request(
+            Operation.SCAN,
+            {"incremental": True, "columns": columns, "predicate": predicate, "until": end},
+        )
+
+        def read(engine: Any) -> Any:
+            stream = engine.added_since(
+                self._resolved,
+                version,
+                until=end,
+                columns=columns,
+                predicate=predicate,
+                only_appends=only_appends,
+            )
+            return self._direct_stream(engine, stream, end, None)
+
+        return self._read(request, read)
 
     def _travel_version(self, version: int | None, timestamp: Any) -> int | None:
         """The version a read should use: the call's, else the handle's.
@@ -2600,6 +2654,7 @@ class Table:
         columns: list[str] | None = None,
         predicate: str | None = None,
         poll_interval: float | None = None,
+        include_snapshot: bool = False,
     ) -> Any:
         """Follow the change feed, one committed version at a time.
 
@@ -2608,6 +2663,12 @@ class Table:
         waiting for new commits, like a streaming read with a change-feed
         source; without, it stops at the latest version. Record the last
         version you processed and pass the next one to resume.
+
+        `include_snapshot=True` bootstraps a consumer, as a streaming read
+        with an initial snapshot does: the first yield is the whole table as
+        of `starting_version`, every row an ``insert`` of that version, and
+        the feed follows from the version after it. The feed need not have
+        been on before `starting_version`.
         """
         import time
 
@@ -2620,6 +2681,10 @@ class Table:
             )
         if poll_interval is not None and poll_interval < 0:
             raise InvalidArgumentError(f"poll_interval must be >= 0, got {poll_interval}")
+        if not isinstance(include_snapshot, bool):
+            raise InvalidArgumentError(
+                f"include_snapshot must be True or False, not {type(include_snapshot).__name__}"
+            )
         pa = _require("pyarrow", "pyarrow")
         columns = _columns_arg(columns)
         # Splitting by version needs `_commit_version`; a projection without
@@ -2628,6 +2693,12 @@ class Table:
         if columns is not None and "_commit_version" not in columns:
             projection = [*columns, "_commit_version"]
         next_version = starting_version
+        if include_snapshot:
+            yield (
+                starting_version,
+                self._snapshot_as_inserts(pa, starting_version, columns, predicate),
+            )
+            next_version = starting_version + 1
         while True:
             current = self._connection._reresolve(self)
             latest = current.version
@@ -2669,6 +2740,50 @@ class Table:
             if poll_interval is None:
                 return
             time.sleep(poll_interval)
+
+    def _snapshot_as_inserts(
+        self, pa: Any, version: int, columns: list[str] | None, predicate: str | None
+    ) -> Any:
+        """The table at `version` as change-feed rows: each an insert of that version."""
+        current = self._connection._reresolve(self) if self._version is None else self
+        pinned = Table(self._connection, current._resolved, version=version)
+        wanted = None if columns is None else [c for c in columns if c not in _CDF_META]
+        rows = _plain_views(pa.table(pinned.scan(columns=wanted, predicate=predicate)))
+        stamp = pa.scalar(self._commit_timestamp(pinned, version), pa.timestamp("us", tz="UTC"))
+        n = rows.num_rows
+        rows = rows.append_column(
+            pa.field("_change_type", pa.string(), nullable=False),
+            pa.array(["insert"] * n, pa.string()),
+        )
+        rows = rows.append_column(
+            pa.field("_commit_version", pa.int64(), nullable=False),
+            pa.array([version] * n, pa.int64()),
+        )
+        rows = rows.append_column(
+            pa.field("_commit_timestamp", pa.timestamp("us", tz="UTC"), nullable=False),
+            pa.array([stamp.value] * n, pa.timestamp("us", tz="UTC")),
+        )
+        return rows if columns is None else rows.select(columns)
+
+    def _commit_timestamp(self, pinned: Table, version: int) -> Any:
+        """When `version` was committed (the in-commit timestamp where there is one)."""
+        import datetime as dt
+
+        kernel = self._connection.router.engines.get(EngineKind.KERNEL)
+        if kernel is not None and hasattr(kernel, "snapshot"):
+            with contextlib.suppress(Exception):
+                ms = int(kernel.snapshot(pinned._resolved, version=version).timestamp())
+                return dt.datetime.fromtimestamp(ms / 1000, tz=dt.UTC)
+        for entry in pinned._connection._reresolve(pinned).history():
+            if entry.get("version") == version and entry.get("timestamp") is not None:
+                stamp = entry["timestamp"]
+                if isinstance(stamp, (int, float)):
+                    return dt.datetime.fromtimestamp(stamp / 1000, tz=dt.UTC)
+                return stamp
+        raise UnreachableTableError(
+            f"read version {version} as a snapshot",
+            "its commit timestamp could not be read from the history",
+        )
 
     # -------------------------------------------------------------- metadata
 
@@ -4804,6 +4919,8 @@ def _check_can_options(op: Operation, shape: dict[str, Any]) -> None:
     if "distributed" in shape:
         method = "plan_write" if op in (Operation.APPEND, Operation.OVERWRITE) else "plan_scan"
         known = {"distributed"}
+    elif "incremental" in shape:
+        method, known = "added_since", {"incremental"}
     else:
         method = _CALL_METHODS.get(op, op.value)
         known = set(_CALL_OPTIONS.get(op, ()))

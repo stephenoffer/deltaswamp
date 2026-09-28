@@ -474,6 +474,11 @@ class KernelEngine:
     #: and function calls go to an engine that evaluates SQL.
     supports_sql_expressions = False
 
+    @property
+    def supports_incremental_files(self) -> bool:
+        """`added_since()`: the file diff between two versions (the incremental scan)."""
+        return _native_has("incremental_files")
+
     #: Resolved snapshots kept per (location, version, store) for reuse.
     snapshot_cache_size = 16
     # Every metadata call and every routing decision resolved the log from
@@ -1024,6 +1029,61 @@ class KernelEngine:
                     "allow_sql_fallback=True) to read through a SQL warehouse",
                 ) from exc
         return stream
+
+    def added_since(
+        self,
+        table: ResolvedTable,
+        version: int,
+        *,
+        until: int | None = None,
+        columns: list[str] | None = None,
+        predicate: str | None = None,
+        only_appends: bool = False,
+    ) -> Any:
+        """The rows of the data files added in `(version, until]`; see `Table.added_since`.
+
+        The kernel's incremental scan walks the snapshot's own commit list (a
+        catalog-managed table's ratified tail included) for the files added
+        and removed in the range; the added ones still live at `until` are
+        read as a scan restricted to them, deletion vectors applied.
+        """
+        snapshot = self.snapshot(table, version=until)
+        end = int(snapshot.version)
+        if version > end:
+            raise InvalidArgumentError(
+                f"version {version} is after the table's version {end}; nothing can have "
+                "been added since"
+            )
+        diff = snapshot.incremental_files(int(version))
+        if diff is None:
+            raise UnreachableTableError(
+                f"read the rows added after version {version}",
+                f"the commits after version {version} are no longer all in the log "
+                "(cleaned up past a checkpoint), so the files they added cannot be told apart",
+                "read a later range, or the change data feed (cdf()) if the table has it on",
+            )
+        added, removed = diff
+        if removed and not only_appends:
+            raise UnreachableTableError(
+                f"read the rows added after version {version}",
+                f"{len(removed)} data file(s) were removed or rewritten in versions "
+                f"{version + 1} to {end} (a DELETE, UPDATE, MERGE, OPTIMIZE or overwrite), so "
+                "the files added there hold rows that were in the table before, and rows "
+                "deleted there are not seen",
+                "read the change data feed (cdf()), which says what changed, or pass "
+                "only_appends=True to read the rows of the added files anyway",
+            )
+        import pyarrow as pa
+
+        # In commit order, as they were appended (a file-restricted scan reads
+        # the files in the order given); the diff itself is a set.
+        wanted = {path for path, _dv in added}
+        live = pa.table(snapshot.files()).select(["path", "modification_time"]).to_pylist()
+        order = sorted(
+            (row for row in live if row["path"] in wanted),
+            key=lambda row: (row["modification_time"] or 0, row["path"]),
+        )
+        return _planned_read(snapshot, columns, predicate, files=[row["path"] for row in order])
 
     def _scan(
         self,

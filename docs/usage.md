@@ -356,6 +356,27 @@ not retroactive. A table whose `delta.deletedFileRetentionDuration` is shorter
 than its `delta.logRetentionDuration` is refused too, because files could be
 vacuumed while their commits survive.
 
+An append-only table needs no feed to be read incrementally. `added_since`
+returns the rows of the data files committed after a version, from the
+kernel's incremental scan of the log:
+
+```python
+new_rows = t.added_since(last_seen)  # (last_seen, latest]
+t.added_since(5, until=9, columns=["id"], predicate="id > 100")
+```
+
+Only appends make those the rows added: a DELETE, UPDATE, MERGE, OPTIMIZE or
+overwrite in the range removes files and adds back rows that were there
+before, so such a range is refused. `only_appends=True` reads every file
+added anyway, rows a rewrite carried over included, for a consumer that
+dedupes on a key; `cdf()` is the exact answer. A range whose commits were
+cleaned from the log is refused too.
+
+`changes(start, include_snapshot=True)` bootstraps a consumer of the feed: the
+first yield is the whole table as of `start`, every row an `insert` of that
+version, and the feed follows from `start + 1`. The feed must be on from
+`start + 1`, not before.
+
 ## Writing
 
 ```python
