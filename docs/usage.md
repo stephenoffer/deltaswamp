@@ -251,6 +251,17 @@ refuses it (`DELTA_TIMESTAMP_GREATER_THAN_COMMIT`): no version exists at that
 time yet, and the same read would return other data once the next commit
 lands. Read the latest version without a timestamp.
 
+A commit's time is its in-commit timestamp, and before those are enabled its
+commit file's modification time made monotonic: a commit whose file looks no
+newer than the one before it is taken to be a millisecond after it, as Spark
+and Databricks take it. File times go out of order when a log is copied or
+rewritten, or written from machines whose clocks disagree; every engine
+resolves a timestamp against the same times (`restore()` and the change
+feed's bounds included), and `history()` and `_commit_timestamp` report them.
+A feed's `starting_timestamp` names the first commit at or after it and
+`ending_timestamp` the latest at or before it; either after the latest commit
+is refused unless `allow_out_of_range=True`.
+
 A predicate on a `CHAR(n)` column is evaluated by the warehouse: Spark pads a
 CHAR value with spaces to `n` before comparing (`c = 'a  '` matches `'a'` in a
 CHAR(3) column), which the direct engines, comparing bytes, do not. Without the

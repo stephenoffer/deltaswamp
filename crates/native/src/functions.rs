@@ -61,6 +61,50 @@ pub fn table_changes(
     Ok(PyRecordBatchReader::new(Box::new(reader)))
 }
 
+/// The version range a change feed's bounds name, as `table_changes` reads it.
+///
+/// A start timestamp is the first commit at or after it, an end timestamp the
+/// latest at or before it, both by commit times as Delta assigns them; either
+/// after the latest commit raises ValueError, as Databricks refuses it
+/// (DELTA_TIMESTAMP_GREATER_THAN_COMMIT). For an engine that reads the feed
+/// itself but resolves timestamps by raw file times.
+#[pyfunction]
+#[pyo3(signature = (
+    table_root,
+    options = None,
+    start_version = None,
+    end_version = None,
+    start_timestamp_ms = None,
+    end_timestamp_ms = None,
+))]
+pub fn feed_versions(
+    py: Python<'_>,
+    table_root: &str,
+    options: Option<HashMap<String, String>>,
+    start_version: Option<u64>,
+    end_version: Option<u64>,
+    start_timestamp_ms: Option<i64>,
+    end_timestamp_ms: Option<i64>,
+) -> PyResult<(u64, Option<u64>)> {
+    let url = PySnapshot::table_root_url(table_root)?;
+    let options = options.unwrap_or_default();
+    let range = py.detach(|| {
+        let store = store::build_store(&url, &options)?;
+        let engine = commit::new_engine(store);
+        changes::resolve_range(
+            &url,
+            &engine,
+            Range {
+                start_version,
+                end_version,
+                start_timestamp_ms,
+                end_timestamp_ms,
+            },
+        )
+    })?;
+    Ok(range)
+}
+
 /// Write `actions` verbatim as commit `version`, put-if-absent.
 #[pyfunction]
 #[pyo3(signature = (table_root, version, actions, options = None))]

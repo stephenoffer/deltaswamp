@@ -8,6 +8,7 @@
 mod changes;
 mod checksum;
 mod commit;
+mod commit_time;
 mod confine;
 mod dml;
 mod error;
@@ -126,6 +127,11 @@ pub const FEATURES: &[&str] = &[
     // a snapshot whose checked protocol sets those aside, with the table's own
     // protocol and metadata in the files.
     "value_constrained_checkpoint",
+    // `commit_timestamp`/`file_commit_timestamps`/`version_at` and
+    // `feed_versions`: commit times as Delta assigns them (file times made
+    // monotonic before in-commit timestamps), which every timestamp lookup
+    // resolves against.
+    "commit_timestamps",
 ];
 
 #[pyfunction]
@@ -178,6 +184,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_function(wrap_pyfunction!(create_table, m)?)?;
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::feed_versions, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;
     m.add_function(wrap_pyfunction!(functions::absolute_deletion_vector, m)?)?;
     m.add_function(wrap_pyfunction!(functions::copy_objects, m)?)?;

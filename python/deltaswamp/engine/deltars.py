@@ -18,7 +18,7 @@ import os
 import re
 import threading
 import warnings
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from numbers import Integral
@@ -620,13 +620,9 @@ class DeltaRsEngine:
         both direct engines give one answer. Without the extension, delta-rs
         resolves it (None).
         """
-        from .kernel import KernelEngine
-
-        if not KernelEngine.available():
+        kernel = self._kernel()
+        if kernel is None:
             return None
-        # Behind the boundary like any routed engine, so a refusal of the
-        # request arrives as this library's error and is told apart below.
-        kernel = guard(EngineKind.KERNEL, KernelEngine(storage_options=self._base_options))
         try:
             snapshot = kernel.snapshot(table, timestamp=timestamp)
         except DeltaSwampError:
@@ -636,6 +632,102 @@ class DeltaRsEngine:
             # The kernel cannot open this table at all; delta-rs may.
             return None
         return int(snapshot.version)
+
+    def _kernel(self) -> Any:
+        """The kernel engine behind the boundary, or None without the extension.
+
+        Behind the boundary like any routed engine, so a refusal of the request
+        arrives as this library's error and can be told apart.
+        """
+        from .kernel import KernelEngine
+
+        if not KernelEngine.available():
+            return None
+        return guard(EngineKind.KERNEL, KernelEngine(storage_options=self._base_options))
+
+    def _commit_times(self, table: ResolvedTable) -> dict[int, int] | None:
+        """version -> Delta's commit time of each commit timed by its file, via the kernel.
+
+        delta-rs reports a commit file's raw modification time; Delta makes
+        those monotonic (a commit is at least a millisecond after the one
+        before it), and so do Databricks' history and change feed. None
+        without the kernel, and the callers fall back to the raw times.
+        """
+        kernel = self._kernel()
+        if kernel is None:
+            return None
+        try:
+            times: dict[int, int] | None = kernel.file_commit_times(table)
+        except Exception:
+            return None
+        return times
+
+    def _feed_versions(
+        self,
+        table: ResolvedTable,
+        starting_version: int | None,
+        ending_version: int | None,
+        starting_timestamp: Any,
+        ending_timestamp: Any,
+        allow_out_of_range: bool,
+    ) -> tuple[int | None, int | None] | None:
+        """The feed's timestamp bounds as versions, resolved as the kernel resolves them.
+
+        delta-rs matches a timestamp against raw file modification times, so a
+        log whose files are out of order (copied, rewritten, clocks apart)
+        started or ended the feed at the wrong commit. A bound after the
+        latest commit is refused, as Databricks refuses it, unless
+        `allow_out_of_range` (then the feed runs to the latest, or is empty).
+        None when the kernel cannot resolve them; delta-rs then does.
+        """
+        kernel = self._kernel()
+        if kernel is None:
+            return None
+        start, end = starting_version, ending_version
+        try:
+            if not allow_out_of_range:
+                bounds = kernel.feed_versions(
+                    table,
+                    starting_timestamp,
+                    ending_timestamp,
+                    starting_version=starting_version,
+                    ending_version=ending_version,
+                )
+                if bounds is None:
+                    return None
+                if starting_timestamp is not None:
+                    start = bounds[0]
+                if ending_timestamp is not None:
+                    end = bounds[1]
+                return start, end
+            for which, stamp in (("start", starting_timestamp), ("end", ending_timestamp)):
+                if stamp is None:
+                    continue
+                try:
+                    bounds = kernel.feed_versions(
+                        table,
+                        stamp if which == "start" else None,
+                        stamp if which == "end" else None,
+                    )
+                except InvalidArgumentError as exc:
+                    if "after the latest commit" not in str(exc):
+                        raise
+                    if which == "start":
+                        start = int(kernel.snapshot(table).version) + 1
+                    else:
+                        end = None
+                    continue
+                if bounds is None:
+                    return None
+                if which == "start":
+                    start = bounds[0]
+                else:
+                    end = bounds[1]
+            return start, end
+        except DeltaSwampError:
+            raise
+        except Exception:
+            return None
 
     def history(self, table: ResolvedTable, *, limit: int | None = None) -> list[dict[str, Any]]:
         if limit is not None and limit < 0:
@@ -647,7 +739,7 @@ class DeltaRsEngine:
             failure: Exception | None = None
         except Exception as exc:
             result, failure = None, exc
-        rebuilt = _history_from_log(dt, limit, result)
+        rebuilt = _history_from_log(dt, limit, result, self._commit_times(table))
         if rebuilt is not None:
             return rebuilt
         if failure is not None:
@@ -700,6 +792,19 @@ class DeltaRsEngine:
                     "read the change data feed",
                     f"both a {bound} version and a {bound} timestamp were given; pass one",
                 )
+        if starting_timestamp is not None or ending_timestamp is not None:
+            bounds = self._feed_versions(
+                table,
+                starting_version,
+                ending_version,
+                starting_timestamp,
+                ending_timestamp,
+                allow_out_of_range,
+            )
+            if bounds is not None:
+                starting_version, ending_version = bounds
+                starting_timestamp = ending_timestamp = None
+        times = self._commit_times(table)
         dt = self._open(table)
 
         def load(start: int) -> Any:
@@ -707,6 +812,7 @@ class DeltaRsEngine:
                 try:
                     return _cdf_commit_times(
                         dt,
+                        times,
                         _without_view_types(
                             dt.load_cdf(
                                 starting_version=start,
@@ -2322,42 +2428,29 @@ def _without_view_types(stream: Any, *, keep: list[str] | None = None) -> Any:
     return pa.RecordBatchReader.from_batches(target, (b.cast(target) for b in reader))
 
 
-def _cdf_commit_times(dt: Any, reader: Any) -> Any:
-    """`reader` with `_commit_timestamp` taken from each commit file's mtime.
+def _cdf_commit_times(dt: Any, times: dict[int, int] | None, reader: Any) -> Any:
+    """`reader` with `_commit_timestamp` as Delta assigns it.
 
-    delta-rs fills it from commitInfo.timestamp, the writer's clock; the
-    kernel -- and time travel on both engines -- use the commit file's
-    modification time when in-commit timestamps are off. The two straddle a
-    millisecond often enough that the same feed disagreed across engines, and
-    a `_commit_timestamp` fed back to `starting_timestamp=` could miss its
-    own commit. With in-commit timestamps on, delta-rs is left alone.
+    delta-rs fills it from commitInfo.timestamp, the writer's clock; Delta's
+    commit time -- what the kernel, time travel and Databricks' feed use -- is
+    the commit file's modification time made monotonic when in-commit
+    timestamps are off. The two straddle a millisecond often enough that the
+    same feed disagreed across engines, and a `_commit_timestamp` fed back to
+    `starting_timestamp=` could miss its own commit. `times` are the kernel's
+    (only the commits timed by their files); without it the raw modification
+    times are used, and a table with in-commit timestamps is left alone.
     """
-    import pyarrow as pa
+    from .kernel import with_commit_times
 
-    config = dict(getattr(dt.metadata(), "configuration", {}) or {})
-    if str(config.get("delta.enableInCommitTimestamps", "")).lower() == "true":
-        return reader
-    names = reader.schema.names
-    if "_commit_timestamp" not in names or "_commit_version" not in names:
-        return reader
-    log = _DeltaLog.open(dt)
-    if log is None or not log.mtimes:
-        return reader
-    ts_index = names.index("_commit_timestamp")
-    ts_type = reader.schema.field(ts_index).type
-    mtimes = log.mtimes
-
-    def fixed() -> Iterator[Any]:
-        for batch in reader:
-            versions = batch.column(names.index("_commit_version")).to_pylist()
-            if not all(v in mtimes for v in versions if v is not None):
-                yield batch
-                continue
-            millis = pa.array([None if v is None else mtimes[v] for v in versions], type=pa.int64())
-            column = millis.cast(pa.timestamp("ms", tz=getattr(ts_type, "tz", None))).cast(ts_type)
-            yield batch.set_column(ts_index, reader.schema.field(ts_index), column)
-
-    return pa.RecordBatchReader.from_batches(reader.schema, fixed())
+    if times is None:
+        config = dict(getattr(dt.metadata(), "configuration", {}) or {})
+        if str(config.get("delta.enableInCommitTimestamps", "")).lower() == "true":
+            return reader
+        log = _DeltaLog.open(dt)
+        if log is None or not log.mtimes:
+            return reader
+        times = log.mtimes
+    return with_commit_times(reader, times)
 
 
 def _datafusion_predicate(
@@ -3737,7 +3830,10 @@ def _rows_removed(dt: Any, result: dict[str, Any]) -> int | None:
 
 
 def _history_from_log(
-    dt: Any, limit: int | None, reported: list[dict[str, Any]] | None = None
+    dt: Any,
+    limit: int | None,
+    reported: list[dict[str, Any]] | None = None,
+    times: dict[int, int] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Commit history with each entry's version taken from its commit file.
 
@@ -3749,6 +3845,8 @@ def _history_from_log(
     log = _DeltaLog.open(dt)
     if log is None or not log.commits:
         return None
+    # Delta's commit times (file times made monotonic), else the raw ones.
+    stamps = {**log.mtimes, **(times or {})}
     newest_first = list(reversed(log.commits))
     if limit is not None:
         newest_first = newest_first[:limit]
@@ -3760,7 +3858,7 @@ def _history_from_log(
         # Every commit in the window has a commitInfo, so delta-rs numbered
         # them correctly: no need to re-read each commit file.
         return [
-            _travel_timestamp(dict(h), log.mtimes.get(v))
+            _travel_timestamp(dict(h), stamps.get(v))
             for h, (v, _) in zip(reported, newest_first, strict=True)
         ]
     from concurrent.futures import ThreadPoolExecutor
@@ -3768,7 +3866,7 @@ def _history_from_log(
     def entry(item: tuple[int, str]) -> dict[str, Any]:
         version, path = item
         info = next((a["commitInfo"] for a in log.actions(path) if "commitInfo" in a), None)
-        return _travel_timestamp({**(info or {}), "version": version}, log.mtimes.get(version))
+        return _travel_timestamp({**(info or {}), "version": version}, stamps.get(version))
 
     try:
         # Concurrently: one GET per commit, which on object storage is slow

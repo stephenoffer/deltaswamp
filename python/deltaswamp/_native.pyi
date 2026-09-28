@@ -18,8 +18,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
 "path_clone", "row_tracking_dml", "check_constraints", "schema_evolution", "log_cleanup",
-"symlink_manifest", "fsck", "value_constrained_checkpoint". Gate on this list, not
-`hasattr`, so a stale build refuses cleanly.
+"symlink_manifest", "fsck", "value_constrained_checkpoint", "commit_timestamps". Gate on
+this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -139,6 +139,22 @@ def table_changes(
     `predicate` is the same JSON AST as `Snapshot.scan` and only skips files.
     Path-based tables only (no catalog log tail). Raises ValueError if CDF was
     not enabled at the range's endpoints or the schema changed across it.
+    """
+
+def feed_versions(
+    table_root: str,
+    options: dict[str, str] | None = None,
+    start_version: int | None = None,
+    end_version: int | None = None,
+    start_timestamp_ms: int | None = None,
+    end_timestamp_ms: int | None = None,
+) -> tuple[int, int | None]:
+    """The `(start, end)` versions a change feed's bounds name, as `table_changes` reads them.
+
+    A start timestamp is the first commit at or after it, an end timestamp the
+    latest at or before it, by commit times as Delta assigns them (file times
+    made monotonic before in-commit timestamps). ValueError when either is
+    after the latest commit, an end is before the first, or the range is empty.
     """
 
 def validate_retry_options(options: dict[str, str]) -> None:
@@ -502,6 +518,29 @@ class Snapshot:
 
         The in-commit timestamp when ICT is enabled, else the commit file's
         modification time.
+        """
+
+    def commit_timestamp(self) -> int:
+        """This version's commit timestamp as Delta assigns it, in epoch ms.
+
+        The in-commit timestamp when ICT is enabled, else the commit file's
+        modification time made monotonic: no earlier than a millisecond after
+        the commit before it, as Spark reports it and time travel compares it.
+        """
+
+    def file_commit_timestamps(self) -> list[tuple[int, int]]:
+        """`(version, ms)` of each published commit timed by its file.
+
+        Every commit when in-commit timestamps are off, those before their
+        enablement when they were turned on later; the times made monotonic.
+        """
+
+    def version_at(self, timestamp_ms: int, at_or_after: bool = False) -> tuple[int, int]:
+        """`(version, commit ms)` of the published commit a timestamp names.
+
+        The latest at or before it, or with `at_or_after` the first at or
+        after it. Raises ValueError ("timestamp out of range") when there is
+        none.
         """
 
     def checkpoint(self) -> bool:

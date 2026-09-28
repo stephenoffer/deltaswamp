@@ -205,7 +205,11 @@ class TestTimeTravel:
         write_deltalake(path, pa.table({"id": [2]}), mode="append")
 
         assert helpers.snapshot(path, timestamp_ms=between).version == 0
-        assert helpers.snapshot(path, timestamp_ms=int(time.time() * 1000) + 10_000).version == 1
+        latest = helpers.snapshot(path)
+        assert helpers.snapshot(path, timestamp_ms=latest.commit_timestamp()).version == 1
+        # After the latest commit no version exists yet (Databricks refuses it).
+        with pytest.raises(ValueError, match="after the latest commit"):
+            helpers.snapshot(path, timestamp_ms=int(time.time() * 1000) + 10_000)
 
     def test_timestamp_before_history_is_a_clear_error(self, two_file_table: str) -> None:
         with pytest.raises(ValueError, match="earliest recreatable commit"):

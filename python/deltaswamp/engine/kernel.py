@@ -480,6 +480,55 @@ def _native_has(*features: str) -> bool:
     return set(features) <= set(getattr(_native, "FEATURES", ()))
 
 
+def commit_timestamp(snapshot: Any) -> int:
+    """`snapshot`'s commit time as Delta assigns it, in epoch milliseconds.
+
+    The in-commit timestamp, else the commit file's modification time made
+    monotonic -- no earlier than a millisecond after the commit before it, as
+    Spark's history reports it and time travel compares it. The raw file time
+    of a copied or rewritten log's last commit can be older than the commit
+    before it; comparing against that refused times Databricks reads at.
+    """
+    if _native_has("commit_timestamps"):
+        return int(snapshot.commit_timestamp())
+    return int(snapshot.timestamp())
+
+
+def with_commit_times(reader: Any, times: dict[int, int]) -> Any:
+    """`reader` (a change feed) with `_commit_timestamp` taken from `times`.
+
+    `times` maps a version to its commit time in epoch ms; rows of versions it
+    lacks (in-commit timestamps, which the engines already report) are left
+    alone. The feed's own column type is kept.
+    """
+    import pyarrow as pa
+
+    reader = pa.RecordBatchReader.from_stream(reader)
+    names = reader.schema.names
+    if not times or "_commit_timestamp" not in names or "_commit_version" not in names:
+        return reader
+    ts_index = names.index("_commit_timestamp")
+    field = reader.schema.field(ts_index)
+    unit = getattr(field.type, "unit", None)
+    per_ms = {"s": None, "ms": 1, "us": 1_000, "ns": 1_000_000}.get(str(unit))
+    if per_ms is None:
+        return reader
+    ticks = {v: t * per_ms for v, t in times.items()}
+    storage = pa.int64()
+
+    def fixed() -> Any:
+        for batch in reader:
+            versions = batch.column(names.index("_commit_version")).to_pylist()
+            if not any(v in ticks for v in versions):
+                yield batch
+                continue
+            old = batch.column(ts_index).view(storage).to_pylist()
+            new = [ticks.get(v, o) for v, o in zip(versions, old, strict=True)]
+            yield batch.set_column(ts_index, field, pa.array(new, storage).view(field.type))
+
+    return pa.RecordBatchReader.from_batches(reader.schema, fixed())
+
+
 def write_checksum(
     location: str | None, options: dict[str, str] | None, version: int | None = None
 ) -> bool:
@@ -1199,6 +1248,11 @@ class KernelEngine:
         except ValueError as exc:
             if "earliest recreatable" in str(exc):
                 raise UnreachableTableError(f"read the table as of {timestamp}", str(exc)) from exc
+            if timestamp is not None and "DELTA_TIMESTAMP_GREATER_THAN_COMMIT" in str(exc):
+                raise InvalidArgumentError(
+                    f"cannot time travel to {timestamp}: {exc}; read the latest version "
+                    "without a timestamp"
+                ) from exc
             if version is not None and (
                 "not the same as the specified end version" in str(exc)
                 # A catalog-managed table past its ratified version: this
@@ -1559,6 +1613,9 @@ class KernelEngine:
                         f"pass starting_version={earliest} or later",
                     ) from exc
                 raise
+        # The kernel stamps a commit with its file's raw modification time;
+        # Delta's commit time is that made monotonic, as history reports it.
+        stream = with_commit_times(stream, self.file_commit_times(table) or {})
         if node is not None:
             stream = sqlpred.filter_stream(stream, node)
         if keep is not None:
@@ -1569,6 +1626,58 @@ class KernelEngine:
                 return have
             return _project(have, keep)
         return stream
+
+    def file_commit_times(self, table: ResolvedTable) -> dict[int, int] | None:
+        """version -> commit time (epoch ms) of each commit timed by its file.
+
+        Every commit when in-commit timestamps are off, those before their
+        enablement otherwise, the modification times made monotonic as Delta
+        assigns them. None when the extension or the table cannot say.
+        """
+        if not _native_has("commit_timestamps") or table.location is None:
+            return None
+        try:
+            return dict(self.snapshot(table).file_commit_timestamps())
+        except Exception:
+            return None
+
+    def feed_versions(
+        self,
+        table: ResolvedTable,
+        starting_timestamp: Any,
+        ending_timestamp: Any,
+        *,
+        starting_version: int | None = None,
+        ending_version: int | None = None,
+    ) -> tuple[int, int | None] | None:
+        """The versions a change feed's timestamp bounds name, as the kernel reads them.
+
+        The first commit at or after the start, the latest at or before the
+        end, by Delta's commit times; a bound after the latest commit is
+        refused (InvalidArgumentError), as Databricks refuses it. None when
+        the extension cannot resolve them here.
+        """
+        if not _native_has("commit_timestamps") or table.location is None:
+            return None
+        from deltaswamp._native import feed_versions
+
+        _enter_native("resolve the change feed's timestamps")
+        try:
+            start, end = feed_versions(
+                table.location,
+                options=self._options(table, write=False) or None,
+                start_version=starting_version,
+                end_version=ending_version,
+                start_timestamp_ms=(
+                    timestamp_ms(starting_timestamp) if starting_timestamp is not None else None
+                ),
+                end_timestamp_ms=(
+                    timestamp_ms(ending_timestamp) if ending_timestamp is not None else None
+                ),
+            )
+        except ValueError as exc:
+            raise InvalidArgumentError(f"read the change data feed: {exc}") from exc
+        return int(start), None if end is None else int(end)
 
     def _feed_gap(self, table: ResolvedTable, start: int, end: int | None) -> int | None:
         """The first version in `start..end` with the change feed off, or None.

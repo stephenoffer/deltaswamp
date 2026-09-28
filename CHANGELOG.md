@@ -200,6 +200,19 @@ First release.
   repair that names a file still on disk is done by the kernel instead.
   `generate()` refuses partitions that differ only by case (`p=US`, `p=us`)
   on such a filesystem, where their manifests overwrote each other.
+- One timestamp -> version resolver for every engine and call (`scan`,
+  `to_arrow`, `restore`, `cdf` bounds, `cleanup_metadata`), by commit times as
+  Delta assigns them: the in-commit timestamp, and before those are enabled
+  the commit file's modification time made monotonic (a commit is at least a
+  millisecond after the one before it, as Spark's history manager has it).
+  The kernel's history manager compared a timestamp with the latest commit's
+  raw file time first, so on a log whose files are out of time order (copied,
+  rewritten, clocks apart) any time after that read the latest version and a
+  feed "found no commit at or after" it; delta-rs compared raw file times
+  throughout. `history()` timestamps and the feed's `_commit_timestamp` are
+  those times too, and a feed bound after the latest commit is refused
+  (`DELTA_TIMESTAMP_GREATER_THAN_COMMIT`) unless `allow_out_of_range=True`.
+  All agree with Databricks for the same file times, checked live.
 
 ### Security
 
@@ -536,9 +549,9 @@ See docs/usage.md, "Security notes".
   if the schema changed. A pinned hand-off of a version whose files were
   vacuumed fails in Polars as a `ComputeError` naming `MissingDataFileError`
   (Polars wraps every error an IO source raises).
-- A time-travel timestamp after the latest commit reads the latest version on
-  the direct engines; the warehouse refuses it. A RESTORE to one is refused
-  everywhere, as Spark refuses it.
+- A time-travel or RESTORE timestamp after the latest commit is refused on
+  every engine, as Spark refuses it; "latest" is the monotonic commit time,
+  not the last commit file's own modification time.
 - A table URI (`file://`, `s3://`, ...) containing `?` or `#` is refused at
   create: a URL reads them as a query or fragment. Percent-encode them.
 - delta-rs writes no statistics at all (null counts included) for decimal

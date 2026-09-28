@@ -51,7 +51,7 @@ Several values in one cell are a routing chain, tried in order.
 | Column projection | all | kernel, delta-rs, warehouse | |
 | Predicate filtering | all | kernel (native), delta-rs, warehouse | kernel skips files; the exact row filter is applied here, from one parsed predicate |
 | Time travel by version | all | kernel, delta-rs, warehouse | |
-| Time travel by timestamp | all | kernel, delta-rs, warehouse | kernel honors in-commit timestamps |
+| Time travel by timestamp | all | kernel, delta-rs, warehouse | one resolver for both direct engines: in-commit timestamps, else file times made monotonic, as Databricks resolves them |
 | Change data feed | DBR, Spark, delta-rs, kernel | kernel, delta-rs, sharing, warehouse | kernel first; delta-rs reads past the last version and predicates the kernel cannot parse; by version or timestamp |
 | CDF on catalog-managed tables | DBR | warehouse | the kernel's TableChanges takes no catalog tail |
 | History | all | delta-rs, iceberg, warehouse | |
