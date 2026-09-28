@@ -42,3 +42,21 @@ def test_an_extra_column_says_to_merge_the_schema(table: Any) -> None:
     # delta-rs said only "number of fields does not match: 3 vs 2".
     with pytest.raises(InvalidArgumentError, match="schema_mode='merge'"):
         table.append(pa.table({"id": [3], "city": ["c"], "extra": [1]}))
+
+
+def test_base_install_appends_and_merges_arro3(tmp_path: Any, monkeypatch: Any) -> None:
+    # The NaN check before a delta-rs write, and the MERGE key bound,
+    # imported pyarrow unconditionally, so the base install's append of
+    # arro3 data failed with EngineError[ImportError].
+    import sys
+
+    arro3 = pytest.importorskip("arro3.core")
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    schema = arro3.Schema([arro3.Field("id", arro3.DataType.int64())])
+    data = arro3.Table.from_pydict({"id": arro3.Array([1, 2], arro3.DataType.int64())})
+    t = ds.connect("file://").create_table(str(tmp_path / "t"), schema)
+    assert t.append(data)["num_rows"] == 2
+    merged = t.merge(data, "target.id = source.id").when_matched_update_all().execute()
+    assert merged["num_updated_rows"] == 2
+    with pytest.raises(ImportError, match=r"deltaswamp\[pyarrow\]"):
+        t.optimize()
