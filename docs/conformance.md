@@ -64,7 +64,14 @@ change data feeds.
 
 Two features run the other way. `checkConstraints` and `generatedColumns` are
 cases where delta-rs is the more capable engine, so routing must never assume
-kernel wins by default.
+kernel wins by default. delta-kernel refuses every write to a table carrying
+either, used or not (legacy writer versions 3 to 6 imply both). The kernel
+paths here evaluate every CHECK constraint in DuckDB over the rows they write
+(a NULL result passes, a FALSE one fails the write before anything is
+committed), and commit past the kernel's refusal of `checkConstraints`, and of
+`generatedColumns` where no column is generated; a constraint DuckDB cannot
+evaluate as Databricks does is refused up front. The kernel's checkpoint
+writer and its version checksums still refuse a table with the feature.
 
 Unknown feature names must not raise. The kernel tolerates unknown writer-only
 features when reading, and so must deltaswamp, or the first table to adopt a
@@ -112,7 +119,7 @@ serve.
 | `overwrite` | deltars, kernel, iceberg, sql | delta-rs first; the kernel replaces a catalog-managed table in one commit |
 | `replace_where` | deltars, iceberg, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs, PyIceberg for Iceberg tables, the warehouse, and last a bounded whole-table rewrite through the kernel |
 | `create` | deltars, kernel | delta-rs creates path and external tables; the kernel takes over when the properties or clustering exceed what delta-rs accepts, and for managed tables, whose storage the catalog allocates through its staging-table API |
-| `merge_schema` | deltars, sql | kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH SCHEMA EVOLUTION |
+| `merge_schema` | deltars, kernel, sql | delta-rs first; the kernel for tables it cannot write or whose column mapping it cannot extend, committing the rows and the widened schema together; the warehouse uses INSERT WITH SCHEMA EVOLUTION |
 | `delete` | deltars, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs copy-on-write, then the warehouse, and last a bounded whole-table rewrite through the kernel |
 | `update` | deltars, sql, kernel | deletion vectors plus new files through the kernel when the table enables them (row ids kept under row tracking); otherwise delta-rs, the warehouse, and last a bounded whole-table rewrite, with literal or column assignments |
 | `merge` | deltars, sql, kernel | deletion vectors through the kernel, with clauses evaluated in DuckDB, when the table enables them; otherwise delta-rs, then the warehouse, which merges from a source staged in a volume |
@@ -122,7 +129,7 @@ serve.
 | `set_properties` | deltars, kernel, sql | delta-rs takes the keys it handles at create, probed against deltalake 1.6.5; it rejects column mapping, row tracking, in-commit timestamps and type widening, and enabling deletion vectors through it stamps a bogus variantType feature, so those go to the kernel |
 | `add_feature` | deltars, kernel, sql | delta-rs only for features it can then write, with their dependencies present; otherwise the kernel, which adds dependencies alongside |
 | `drop_feature` | sql | Databricks-only (DROP FEATURE ... TRUNCATE HISTORY) |
-| `add_constraint` | deltars, sql | kernel marks checkConstraints NotSupported for writes, and adding one means validating every existing row |
+| `add_constraint` | deltars, kernel, sql | delta-rs first; the kernel path for tables delta-rs cannot write, after checking every existing row in DuckDB |
 | `drop_constraint` | deltars, kernel, sql | a metadata-only change |
 | `unset_properties` | kernel, sql | delta-rs has no way to remove a property |
 | `set_comment` | deltars, kernel, sql | the table description in the Metadata action |

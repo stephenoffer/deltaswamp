@@ -73,7 +73,7 @@ Several values in one cell are a routing chain, tried in order.
 | Overwrite | all | delta-rs, kernel, iceberg, warehouse | kernel replaces a catalog-managed table in one commit |
 | replaceWhere | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, iceberg, warehouse | kernel: replaced rows marked deleted, new rows appended, in one commit; a bounded whole-table rewrite on tables without deletion vectors |
 | Dynamic partition overwrite | DBR, Spark | native over delta-rs | predicate derived from the data |
-| Schema merge on write | DBR, Spark, delta-rs | delta-rs | |
+| Schema merge on write | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | the kernel for tables delta-rs cannot write and for column-mapped tables: new columns and nested fields (ids and physical names assigned) in the same commit as the rows; a wider type only under type widening |
 | Save modes | DBR, Spark, delta-rs | native | `Connection.write_table` |
 | Idempotent writes (txnAppId) | DBR, Spark | native | checked here; delta-rs records but does not enforce |
 | DELETE / UPDATE | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, warehouse | deletion vectors on tables that enable them; otherwise delta-rs copy-on-write, and last a bounded whole-table rewrite through the kernel |
@@ -105,7 +105,7 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 | SET / DROP NOT NULL | DBR, Spark, delta-rs (drop) | native, delta-rs, warehouse | SET checks the data first |
 | Table and column comments | all | delta-rs, native, warehouse | |
 | SET / UNSET TBLPROPERTIES | all | delta-rs, native, warehouse | native validates keys and raises the protocol when a value implies a feature |
-| ADD / DROP CHECK constraint | DBR, Spark, delta-rs | delta-rs, native (drop), warehouse | adding validates existing rows, which delta-rs does |
+| ADD / DROP CHECK constraint | DBR, Spark, delta-rs | delta-rs, native, warehouse | adding validates every existing row (delta-rs, or DuckDB on the native path); kernel writes then evaluate every constraint over the rows they write |
 | ADD FEATURE | DBR, Spark, delta-rs | delta-rs (features it can write), native, warehouse | native adds dependencies alongside and refuses features that need a backfill (row tracking) |
 | DROP FEATURE | DBR, Spark | warehouse | needs history truncation and checkpoint protection |
 | CLUSTER BY (change keys) | DBR, Spark | native, warehouse | writes the `delta.clustering` domain |

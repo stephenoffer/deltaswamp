@@ -130,6 +130,32 @@ First release.
   shallow clone (their reads stay confined to the table root); Spark and
   Databricks do.
 
+- CHECK constraints on the tables only the kernel writes (in-commit
+  timestamps, clustering, row tracking, type widening, column defaults):
+  `add_constraint` checks every existing row in a sandboxed DuckDB, then
+  commits `delta.constraints.<name>` with the `checkConstraints` feature
+  (writer version 3 for a legacy protocol below it), and every kernel write
+  (append, overwrite, replaceWhere, DELETE, UPDATE, MERGE, distributed
+  writes) evaluates each constraint over the rows it writes, as Spark does: a
+  NULL result passes, a FALSE one raises `InvalidArgumentError` and commits
+  nothing. delta-kernel refuses any write to a table with the feature; these
+  commit past that refusal, and past its refusal of `generatedColumns` where
+  no column is generated, so legacy writer 3 to 5 tables (every change-feed
+  and column-mapped table delta-rs created) take kernel writes too. A
+  constraint DuckDB cannot evaluate as Databricks does is refused up front.
+- `append` and `overwrite` with `schema_mode="merge"` through the kernel, on
+  the tables delta-rs cannot write and on column-mapped ones (delta-rs cannot
+  change their schema on write): new columns and nested fields (inside
+  structs, arrays and maps) are added with column-mapping ids and physical
+  names, `delta.columnMapping.maxColumnId` moves past them, and the new
+  metaData is committed with the rows in one commit, never marked a blind
+  append. A wider type widens the column only where the table enables type
+  widening (recorded in `delta.typeChanges`), and is refused elsewhere.
+- A kernel commit on a restated protocol (a compaction past the
+  value-constraint features, or one of the writes above) counts its version
+  checksum from storage, where it recorded the protocol the write was checked
+  against instead of the table's.
+
 ### Security
 
 See docs/usage.md, "Security notes".
