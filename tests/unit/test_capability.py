@@ -171,9 +171,10 @@ class TestEasilyMissedFacts:
 
     def test_checkconstraints_deltars_ahead_of_kernel(self) -> None:
         """A case where delta-rs is the more capable engine, so routing must not
-        assume kernel is always better."""
+        assume kernel is always better: the kernel refuses the feature, and only
+        the write paths here, evaluating each constraint themselves, get past it."""
         row = FEATURE_SUPPORT[TableFeature.CHECK_CONSTRAINTS]
-        assert row.kernel_write is Support.NO
+        assert row.kernel_write is Support.PARTIAL
         assert row.deltars_write is Support.YES
 
 

@@ -99,6 +99,7 @@ def _as_record_batch_reader(data: Any) -> Any:
 _WRITE_OPS: frozenset[Operation] = frozenset(
     {
         Operation.APPEND,
+        Operation.MERGE_SCHEMA,
         Operation.CREATE,
         Operation.OVERWRITE,
         Operation.REPLACE_WHERE,
@@ -107,6 +108,10 @@ _WRITE_OPS: frozenset[Operation] = frozenset(
         Operation.MERGE,
     }
 )
+
+#: Writes that only add rows: what an append-only table or a change feed
+#: (whose change rows the adds are) lets the kernel commit.
+_ADDING_OPS: frozenset[Operation] = frozenset({Operation.APPEND, Operation.MERGE_SCHEMA})
 
 #: Served by rewriting the whole table in one commit: correct on any table the
 #: kernel can write, and bounded by `KernelEngine.rewrite_max_bytes`.
@@ -121,7 +126,10 @@ _REWRITE_OPS: frozenset[Operation] = frozenset(
 #: inside the write, can() named the kernel and the call then failed.
 _UNIMPLEMENTED_OPTIONS: dict[Operation, frozenset[str]] = {
     Operation.APPEND: frozenset({"target_file_size", "writer_properties", "partition_by"}),
-    Operation.OVERWRITE: frozenset({"target_file_size", "writer_properties", "schema_mode"}),
+    Operation.MERGE_SCHEMA: frozenset({"target_file_size", "writer_properties", "partition_by"}),
+    # schema_mode="merge" is implemented; "overwrite" is refused on its own
+    # (see `_schema_mode_refusal`).
+    Operation.OVERWRITE: frozenset({"target_file_size", "writer_properties"}),
     Operation.REPLACE_WHERE: frozenset(
         {"target_file_size", "writer_properties", "schema_mode", "max_commit_retries"}
     ),
@@ -131,7 +139,27 @@ _UNIMPLEMENTED_OPTIONS: dict[Operation, frozenset[str]] = {
     Operation.UPDATE: frozenset(
         {"writer_properties", "max_commit_retries", "error_on_type_mismatch"}
     ),
+    # The commit is written here, whose commitInfo carries no caller metadata.
+    Operation.ADD_CONSTRAINT: frozenset(
+        {"commit_metadata", "commit_properties", "post_commithook_properties"}
+    ),
 }
+
+
+def _schema_mode_refusal(operation: Operation, shape: dict[str, Any]) -> str | None:
+    """Why the kernel cannot take the write's `schema_mode` (or MERGE's merge_schema)."""
+    mode = shape.get("schema_mode")
+    if operation is Operation.MERGE and shape.get("merge_schema"):
+        return "the kernel MERGE cannot evolve the table schema (merge_schema)"
+    if mode is None:
+        return None
+    if mode == "overwrite":
+        return "the kernel write path cannot replace the table schema (schema_mode='overwrite')"
+    if mode == "merge" and operation in (Operation.MERGE_SCHEMA, Operation.OVERWRITE):
+        if not _native_has("schema_evolution"):
+            return "the installed native extension cannot evolve a schema on write"
+        return None
+    return f"the kernel {operation.value} path does not implement schema_mode={mode!r}"
 
 
 def _options_refusal(operation: Operation, shape: dict[str, Any]) -> str | None:
@@ -405,6 +433,39 @@ def _dml_info(operation: str, predicate: str | None, snapshot: Any) -> dict[str,
     return _commit_info(blind=False, predicate=[predicate] if predicate is not None else [])
 
 
+#: What a checked kernel write commits past (`crate::restate`): CHECK
+#: constraints, which the write evaluates, and generatedColumns where no
+#: column is generated (legacy writer versions 4 to 6 imply it regardless).
+_CHECKED_FEATURES = frozenset({"checkConstraints", "generatedColumns"})
+
+
+def _carries_check_constraints(snapshot: Any) -> bool:
+    """Whether the snapshot's protocol supports a feature a checked write sets aside."""
+    _reader, writer, _readers, writers = snapshot.protocol()
+    if int(writer) >= 7:
+        return bool(_CHECKED_FEATURES & set(writers or ()))
+    return int(writer) >= 3
+
+
+def _constraint_check(snapshot: Any, what: str) -> tuple[Any, dict[str, Any]]:
+    """The CHECK constraint check a kernel write on `snapshot` runs over its rows,
+    and the native argument that says it ran.
+
+    (None, {}) where the protocol has no checkConstraints: the kernel then
+    writes the table as it is. Where it has the feature but no constraint,
+    there is nothing to check and the flag alone lets the kernel write.
+    """
+    if not _native_has("check_constraints") or not _carries_check_constraints(snapshot):
+        return None, {}
+    from .constraints import ConstraintCheck, table_constraints
+
+    constraints = table_constraints(snapshot.table_properties())
+    check = None
+    if constraints:
+        check = ConstraintCheck(constraints, _arrow_schema(snapshot), what=what)
+    return check, {"constraints_checked": True}
+
+
 def _native_has(*features: str) -> bool:
     """Whether the compiled extension advertises every one of `features`.
 
@@ -449,6 +510,12 @@ def _implemented() -> frozenset[Operation]:
     ops = set(_IMPLEMENTED)
     if _native_has("commit_raw", "metadata_json"):
         ops |= METADATA_OPERATIONS
+        if not _native_has("check_constraints"):
+            # A constraint added here would leave a table no kernel write
+            # could take: the build cannot commit past checkConstraints.
+            ops.discard(Operation.ADD_CONSTRAINT)
+    if _native_has("schema_evolution", "metadata_json"):
+        ops.add(Operation.MERGE_SCHEMA)
     if _native_has("table_changes"):
         ops.add(Operation.CDF)
     if _native_has("files"):
@@ -493,6 +560,11 @@ class KernelEngine:
         return _native_has("file_restricted_scan", "files")
 
     @property
+    def supports_schema_merge(self) -> bool:
+        """schema_mode='merge': the rows and the widened schema in one commit."""
+        return _native_has("schema_evolution")
+
+    @property
     def supports_distributed_write(self) -> bool:
         """Workers can write data files that a coordinator commits together."""
         return _native_has("distributed_write")
@@ -502,7 +574,6 @@ class KernelEngine:
     supports_predicates = True
     #: None of these are bound in the native extension yet. Declaring them false
     #: makes the router divert the call rather than letting it be dropped.
-    supports_schema_merge = False
     supports_schema_overwrite = False
     supports_idempotent_txn = True
     supports_commit_metadata = True
@@ -686,9 +757,31 @@ class KernelEngine:
             if refusal is not None:
                 return refusal
 
-        unimplemented = _options_refusal(operation, shape)
+        unimplemented = _options_refusal(operation, shape) or _schema_mode_refusal(operation, shape)
         if unimplemented is not None:
             return Capability(operation, ok=False, reason=unimplemented)
+        if shape.get("schema_mode") == "merge" and table.is_catalog_managed:
+            return Capability(
+                operation,
+                ok=False,
+                reason="evolving the schema changes the table's metadata, which a "
+                "catalog-managed table takes only through the catalog",
+                remedy=SQL_FALLBACK_REMEDY,
+            )
+
+        if operation is Operation.ADD_CONSTRAINT:
+            from .constraints import enforcement_refusal
+
+            constraints = shape.get("constraints")
+            unenforceable = enforcement_refusal(
+                constraints if isinstance(constraints, dict) else {}
+            )
+            if unenforceable is not None:
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason=unenforceable.replace("the table's CHECK", "the CHECK", 1),
+                )
 
         if (
             (operation in _WRITE_OPS or operation in METADATA_OPERATIONS)
@@ -777,6 +870,28 @@ class KernelEngine:
                     flag, why = _USAGE_GATED[feature]
                     if getattr(table, flag, False):
                         usage_blockers.append(why)
+                elif (
+                    feature is TableFeature.GENERATED_COLUMNS
+                    and not table.has_generated_columns
+                    and _native_has("check_constraints")
+                ):
+                    # Implied by a legacy writer version (4 to 6: every
+                    # column-mapped table at (2, 5)) or merely listed, with no
+                    # column generated: a checked write commits past the
+                    # kernel's refusal, with nothing for it to compute.
+                    continue
+                elif feature is TableFeature.CHECK_CONSTRAINTS:
+                    # The kernel refuses the feature; the write paths here
+                    # evaluate every constraint over the rows they write and
+                    # commit past the refusal, where the build can.
+                    if not _native_has("check_constraints"):
+                        write_blockers.append(name)
+                    else:
+                        from .constraints import enforcement_refusal, table_constraints
+
+                        unenforceable = enforcement_refusal(table_constraints(table.properties))
+                        if unenforceable is not None:
+                            usage_blockers.append(unenforceable)
                 elif FEATURE_SUPPORT[feature].kernel_write is Support.NO:
                     write_blockers.append(name)
             if write_blockers:
@@ -807,7 +922,7 @@ class KernelEngine:
             if (
                 table.partition_columns
                 and (
-                    operation in (Operation.APPEND, Operation.OVERWRITE)
+                    operation in (Operation.APPEND, Operation.MERGE_SCHEMA, Operation.OVERWRITE)
                     or operation in _REWRITE_OPS
                 )
                 and not _native_has("partitioned_append")
@@ -1507,9 +1622,29 @@ class KernelEngine:
         overwrite: bool = False,
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, str] | None = None,
+        schema_mode: str | None = None,
         **unsupported: Any,
     ) -> int:
-        """Append data and commit. Returns the committed version."""
+        """Append data and commit. Returns the committed version.
+
+        `schema_mode="merge"` widens the table's schema to take the data's
+        columns (`metadata.merge_schema`) and commits the new metaData with
+        the rows, in one commit; on a lost race the change is computed again
+        against the schema the winner left.
+        """
+        if schema_mode not in (None, "merge"):
+            raise UnreachableTableError(
+                f"write with schema_mode={schema_mode!r} through the kernel",
+                "the kernel write path cannot replace the table schema",
+            )
+        evolve = schema_mode == "merge"
+        if evolve and table.is_catalog_managed:
+            raise UnreachableTableError(
+                "evolve the schema of a catalog-managed table on write",
+                "its metadata changes go through the catalog, which refuses them from "
+                "external writers after version 0",
+                SQL_FALLBACK_REMEDY,
+            )
         # Refuse options this path would otherwise ignore.
         retries = unsupported.pop("max_commit_retries", None)
         # The binding extracts only a tuple; txn=["job", 1] passed every check
@@ -1551,7 +1686,25 @@ class KernelEngine:
                             f"concurrent writer (the table records version {last}); "
                             "this batch is already in the table",
                         )
-                reader = recorded(_as_record_batch_reader(data))
+                check, checked = _constraint_check(snapshot, "the data")
+                reader = _as_record_batch_reader(data)
+                info = _write_info(snapshot, overwrite=overwrite)
+                evolution: dict[str, Any] = {}
+                if evolve:
+                    change = meta.merge_schema(self._state_of(snapshot), reader.schema)
+                    if change.metadata is not None:
+                        evolution["metadata"] = json.dumps(change.metadata, separators=(",", ":"))
+                    if change.protocol is not None:
+                        evolution["protocol"] = json.dumps(change.protocol, separators=(",", ":"))
+                    if evolution:
+                        # A commit that changes the schema is no blind append:
+                        # a concurrent writer must not rebase over it unseen.
+                        info = {**info, "blind_append": False}
+                if check is not None:
+                    # Read (and checked) by the native write as it collects the
+                    # batches, before it writes a file.
+                    reader = check.checked(reader)
+                reader = recorded(reader)
                 try:
                     version: int = snapshot.append(
                         reader,
@@ -1562,7 +1715,9 @@ class KernelEngine:
                         txn=txn,
                         commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
                         or None,
-                        **_write_info(snapshot, overwrite=overwrite),
+                        **info,
+                        **evolution,
+                        **checked,
                     )
                 except _native.CommitConflictError:
                     if attempt + 1 >= attempts or self._txn_won_race(snapshot, table, txn):
@@ -2113,9 +2268,11 @@ class KernelEngine:
         staged, with no way for the router to divert the call.
         """
         writer = table.min_writer_version or 0
-        if 3 <= writer <= 6:
+        if 3 <= writer <= 6 and not _native_has("check_constraints"):
             # A legacy protocol implies checkConstraints (and, from 4, CDF and
             # generated columns), which the kernel writer does not support.
+            # Where the build commits past it, the implied features are judged
+            # one by one with the table's own.
             return Capability(
                 operation,
                 ok=False,
@@ -2123,7 +2280,7 @@ class KernelEngine:
                 "implies checkConstraints; the kernel writer does not support it",
             )
         append_only = str(table.properties.get("delta.appendOnly", "false")).lower() == "true"
-        if append_only and operation is not Operation.APPEND:
+        if append_only and operation not in _ADDING_OPS:
             return Capability(
                 operation,
                 ok=False,
@@ -2132,7 +2289,7 @@ class KernelEngine:
             )
         cdf = str(table.properties.get("delta.enableChangeDataFeed", "false")).lower() == "true"
         dv_delete = operation is Operation.DELETE and self._dv_path(table)
-        if cdf and operation is not Operation.APPEND and not dv_delete:
+        if cdf and operation not in _ADDING_OPS and not dv_delete:
             # A DELETE through deletion vectors is exempt: its commit adds no
             # data, and change-feed readers derive the deleted rows from the
             # difference between each file's old and new vector.
@@ -2232,6 +2389,9 @@ class KernelEngine:
             touched = int(pc.sum(matched).as_py() or 0)
             if touched == 0 and replacement.num_rows == current.num_rows:
                 return {"version": int(snapshot.version), "num_affected_rows": 0}
+            check, checked = _constraint_check(snapshot, "the rewritten table")
+            if check is not None:
+                check.check_table(replacement)
             try:
                 with translating(EngineKind.KERNEL, "commit"):
                     version = snapshot.append(
@@ -2244,6 +2404,7 @@ class KernelEngine:
                         commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
                         or None,
                         **_dml_info(operation, predicate, snapshot),
+                        **checked,
                     )
                 break
             except CommitConflictError:
@@ -2451,6 +2612,14 @@ class KernelEngine:
             )
         touched = set(deletions.column("path").to_pylist()) | set(whole_files or ())
         attempt = 0
+        # Checked once: a rebase is refused over a commit that changed the
+        # metadata, so every snapshot the commit is tried on has these
+        # constraints.
+        check, checked = _constraint_check(snapshot, f"the {operation}")
+        if check is not None and data is not None:
+            check.check_table(data)
+        elif check is not None:
+            check.close()
         try:
             while True:
                 try:
@@ -2466,6 +2635,7 @@ class KernelEngine:
                             commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()}
                             or None,
                             **_dml_info(operation, predicate, snapshot),
+                            **checked,
                         )
                     break
                 except CommitConflictError:
@@ -3575,15 +3745,19 @@ class KernelEngine:
     def _state(self, table: ResolvedTable) -> tuple[Any, Any]:
         """(snapshot, TableState) for the latest version."""
         snapshot = self.snapshot(table, write=True)
+        return snapshot, self._state_of(snapshot)
+
+    @staticmethod
+    def _state_of(snapshot: Any) -> Any:
+        """The TableState a metadata change is computed against, of `snapshot`."""
         clustering_raw = snapshot.domain_metadata(CLUSTERING_DOMAIN)
-        state = TableState(
+        return TableState(
             version=snapshot.version,
             protocol=json.loads(snapshot.protocol_json()),
             metadata=json.loads(snapshot.metadata_json()),
             timestamp=snapshot.timestamp(),
             clustering=json.loads(clustering_raw) if clustering_raw else None,
         )
-        return snapshot, state
 
     #: Attempts before a metadata change gives up on a busy table. Each retry
     #: recomputes the change against the state another writer just committed.
@@ -3595,6 +3769,7 @@ class KernelEngine:
         mutate: Any,
         *,
         precheck: Any = None,
+        attempts: int | None = None,
     ) -> int:
         """Compute a metadata change against the latest state and commit it.
 
@@ -3606,7 +3781,8 @@ class KernelEngine:
         from deltaswamp import _native
 
         last_error: Exception | None = None
-        for _ in range(self.metadata_commit_attempts):
+        attempts = self.metadata_commit_attempts if attempts is None else max(1, attempts)
+        for _ in range(attempts):
             snapshot, state = self._state(table)
             if precheck is not None:
                 precheck(snapshot, state)
@@ -3633,7 +3809,7 @@ class KernelEngine:
         raise CommitConflictError(
             conflict_version(str(last_error)),
             f"cannot commit a metadata change: another writer committed first on each "
-            f"of {self.metadata_commit_attempts} attempts ({last_error}); retry when the "
+            f"of {attempts} attempts ({last_error}); retry when the "
             "table is less busy",
         )
 
@@ -3750,6 +3926,53 @@ class KernelEngine:
             return meta.set_properties(state, props)
 
         return self._commit_metadata(table, mutate)
+
+    def add_constraint(
+        self,
+        table: ResolvedTable,
+        constraints: dict[str, str],
+        *,
+        max_commit_retries: int | None = None,
+        **unsupported: Any,
+    ) -> int:
+        """ADD CONSTRAINT ... CHECK, after proving every existing row satisfies it.
+
+        The rows are read from the same snapshot the commit is computed
+        from, and the put-if-absent commit fails if anything was written
+        since -- so a violating row cannot slip in between the check and the
+        change. A row passes where the expression is TRUE or NULL, as in Spark.
+        """
+        _refuse_options("add a constraint", unsupported)
+
+        def precheck(snapshot: Any, state: Any) -> None:
+            import pyarrow as pa
+
+            from .constraints import ConstraintCheck
+
+            # The change's own refusals (a name the table has) come first.
+            meta.add_constraints(state, constraints)
+            reader = pa.RecordBatchReader.from_stream(snapshot.scan())
+            check = ConstraintCheck(
+                constraints,
+                reader.schema,
+                what="the table's existing rows",
+                violation="the table's existing rows violate the new constraint, so it was "
+                "not added",
+            )
+            try:
+                check.bind()
+                for batch in reader:
+                    check.check(batch)
+            finally:
+                check.close()
+
+        attempts = None if max_commit_retries is None else 1 + max(0, int(max_commit_retries))
+        return self._commit_metadata(
+            table,
+            lambda s: meta.add_constraints(s, constraints),
+            precheck=precheck,
+            attempts=attempts,
+        )
 
     def drop_constraint(self, table: ResolvedTable, name: str, *, if_exists: bool = False) -> int:
         return self._commit_metadata(
@@ -4503,9 +4726,18 @@ class KernelEngine:
         # table the write was planned for.
         snapshot = self.snapshot(table, version=version, write=True, fresh=False)
         _refuse_other_table(snapshot, table_identity, "write files for this plan")
-        result: bytes = snapshot.write_files(
-            _as_record_batch_reader(data), uc=self._uc_commit_config(table, staging=True)
-        )
+        # The commit refuses fragments written under constraints the table no
+        # longer has (they are part of the layout stamped below).
+        check, checked = _constraint_check(snapshot, "the data")
+        uc = self._uc_commit_config(table, staging=True)
+        if check is None:
+            result: bytes = snapshot.write_files(_as_record_batch_reader(data), uc=uc, **checked)
+        else:
+            # Translated here so that a violation, raised inside the stream
+            # the native write pulls, comes back as itself.
+            with translating(EngineKind.KERNEL, "write files"):
+                reader = recorded(check.checked(_as_record_batch_reader(data)))
+                result = snapshot.write_files(reader, uc=uc, **checked)
         # Record the layout these files were written under, from the very
         # snapshot that wrote them, so the commit can tell whether the table
         # still has it.
@@ -4568,6 +4800,10 @@ class KernelEngine:
                 txn=txn,
                 commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
                 **_write_info(snapshot, overwrite=overwrite),
+                # Every worker checked its rows against the constraints of the
+                # layout the fragments carry, which `_refuse_changed_layout`
+                # held to this snapshot's.
+                **_constraint_check(snapshot, "the data")[1],
             )
         self._maybe_checkpoint(table, committed, snapshot)
         return committed

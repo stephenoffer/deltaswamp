@@ -192,11 +192,6 @@ def kernel_only(conn: Any, tmp_path: Any) -> Any:
     ("operation", "shape", "call"),
     [
         (
-            "append",
-            {"schema_mode": "merge"},
-            lambda t: t.append(pa.table({"id": [2], "r": ["b"], "x": [1]}), schema_mode="merge"),
-        ),
-        (
             "overwrite",
             {"partition_overwrite": "dynamic"},
             lambda t: t.overwrite(pa.table({"id": [2], "r": ["a"]}), partition_overwrite="dynamic"),
@@ -228,6 +223,9 @@ def test_can_still_says_yes_where_the_call_succeeds(kernel_only: Any) -> None:
     assert kernel_only.can("append", txn=("job", 1))
     kernel_only.append({"id": [5], "r": ["a"]}, txn=("job", 1))
     assert kernel_only.can("scan", predicate="id > 1")
+    # The kernel evolves the schema in the write's own commit.
+    assert kernel_only.can("append", schema_mode="merge")
+    kernel_only.append(pa.table({"id": [2], "r": ["b"], "x": [1]}), schema_mode="merge")
 
 
 # ----------------------------------------------------------------- cdf()

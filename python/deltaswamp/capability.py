@@ -286,10 +286,12 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             TableFeature.CHECK_CONSTRAINTS,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _Y,
-            "delta-rs is ahead of kernel here: add_constraint/drop_constraint exist",
+            "delta-kernel refuses every write to a table with the feature; the kernel "
+            "paths here evaluate each constraint in DuckDB over the rows they write and "
+            "commit past the refusal. Its checkpoint writer still refuses the table",
         ),
         _row(TableFeature.CHANGE_DATA_FEED, _W, _Y, _Y, _Y, _Y),
         _row(
@@ -719,9 +721,10 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(
             Operation.MERGE_SCHEMA,
-            (_D, _S),
-            "kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH "
-            "SCHEMA EVOLUTION",
+            (_D, _K, _S),
+            "delta-rs first; the kernel for tables it cannot write or whose column mapping "
+            "it cannot extend, committing the rows and the widened schema together; the "
+            "warehouse uses INSERT WITH SCHEMA EVOLUTION",
         ),
         # --- dml: delta-rs (copy-on-write) or the kernel with deletion vectors.
         # On a table with deletion vectors enabled the router asks the kernel
@@ -772,9 +775,9 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(
             Operation.ADD_CONSTRAINT,
-            (_D, _S),
-            "kernel marks checkConstraints NotSupported for writes, and adding one means "
-            "validating every existing row",
+            (_D, _K, _S),
+            "delta-rs first; the kernel path for tables delta-rs cannot write, after "
+            "checking every existing row in DuckDB",
         ),
         _op(Operation.DROP_CONSTRAINT, (_D, _K, _S), "a metadata-only change"),
         _op(
@@ -1096,6 +1099,7 @@ METADATA_OPERATIONS: frozenset[Operation] = frozenset(
         Operation.SET_PROPERTIES,
         Operation.UNSET_PROPERTIES,
         Operation.ADD_FEATURE,
+        Operation.ADD_CONSTRAINT,
         Operation.DROP_CONSTRAINT,
         Operation.SET_COMMENT,
         Operation.SET_COLUMN_COMMENT,

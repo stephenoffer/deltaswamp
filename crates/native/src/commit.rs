@@ -255,10 +255,15 @@ pub fn write(
     txn: Option<(String, i64)>,
     commit_metadata: Option<std::collections::HashMap<String, String>>,
     info: CommitInfoPatch,
+    restatement: &crate::restate::Restatement,
 ) -> Result<u64> {
     // Clone before the transaction consumes it; the overwrite path needs to
     // scan the same snapshot to learn which files to remove.
     let scan_source = snapshot.clone();
+    // The rows are conformed to, and written under, the schema the commit
+    // leaves the table with; see `crate::restate`.
+    let snapshot = crate::restate::writing_snapshot(&snapshot, &engine, restatement, &info)?;
+    let restated = !Arc::ptr_eq(&snapshot, &scan_source);
     let codec = crate::writer::codec_for(&snapshot);
     let root = snapshot.table_root().clone();
     let partition_columns = snapshot
@@ -294,7 +299,7 @@ pub fn write(
     // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
     // with block_in_place, so the commit must run inside the shared
     // multi-threaded runtime rather than on a bare Python thread.
-    stage_and_commit(transaction, &engine, &root, |txn, written| {
+    stage_and_commit(transaction, &engine, &root, restated, |txn, written| {
         stage_batches(
             txn,
             &engine,
@@ -415,6 +420,7 @@ pub(crate) fn stage_and_commit(
     mut txn: Transaction,
     engine: &SharedEngine,
     root: &url::Url,
+    restated: bool,
     stage: impl FnOnce(&mut Transaction, &mut Vec<String>) -> Result<()>,
 ) -> Result<u64> {
     let mut written = Vec::new();
@@ -422,7 +428,7 @@ pub(crate) fn stage_and_commit(
         let _ = remove_written(engine, root, &written);
         return Err(err);
     }
-    match finish_commit(txn, engine) {
+    match finish_commit_as(txn, engine, restated) {
         Err(err) if never_committed(&err) => {
             let _ = remove_written(engine, root, &written);
             Err(err)
@@ -685,7 +691,9 @@ pub fn create_table(
     // with block_in_place, so the commit must run inside the shared
     // multi-threaded runtime rather than on a bare Python thread.
     match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
-        Ok(CommitResult::CommittedTransaction(committed)) => Ok(checksummed(committed, &engine)),
+        Ok(CommitResult::CommittedTransaction(committed)) => {
+            Ok(checksummed(committed, &engine, false))
+        }
         Ok(CommitResult::ConflictedTransaction(_)) => Err(NativeError::CommitConflict(
             "another writer created this table first".to_string(),
         )),
@@ -1467,9 +1475,26 @@ pub fn write_files(
     engine: SharedEngine,
     batches: Vec<arrow::array::RecordBatch>,
     uc: Option<UcCommitConfig>,
+    constraints_checked: bool,
 ) -> std::result::Result<Vec<u8>, Box<WriteFilesError>> {
     let root = snapshot.table_root().clone();
     let mut written = Vec::new();
+    let restatement = crate::restate::Restatement {
+        constraints_checked,
+        ..Default::default()
+    };
+    let snapshot = crate::restate::writing_snapshot(
+        &snapshot,
+        &engine,
+        &restatement,
+        &CommitInfoPatch::default(),
+    )
+    .map_err(|error| {
+        Box::new(WriteFilesError {
+            error,
+            not_removed: Vec::new(),
+        })
+    })?;
     match write_files_tracked(snapshot, &engine, batches, uc, &mut written) {
         Ok(bytes) => Ok(bytes),
         Err(error) => {
@@ -1636,8 +1661,15 @@ pub fn commit_files(
     txn: Option<(String, i64)>,
     commit_metadata: Option<std::collections::HashMap<String, String>>,
     info: CommitInfoPatch,
+    constraints_checked: bool,
 ) -> Result<u64> {
     let scan_source = snapshot.clone();
+    let restatement = crate::restate::Restatement {
+        constraints_checked,
+        ..Default::default()
+    };
+    let snapshot = crate::restate::writing_snapshot(&snapshot, &engine, &restatement, &info)?;
+    let restated = !Arc::ptr_eq(&snapshot, &scan_source);
     let table_root = snapshot.table_root().to_string();
     let metadata_id = snapshot.table_configuration().metadata().id().to_string();
     let removes = if overwrite {
@@ -1673,7 +1705,7 @@ pub fn commit_files(
         transaction.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
-    finish_commit(transaction, &engine)
+    finish_commit_as(transaction, &engine, restated)
 }
 
 /// Refuse a data file that is added twice in one commit.
@@ -1728,11 +1760,14 @@ fn refuse_duplicate_paths(
 /// file past the kernel (it refuses removes there), so the post-commit
 /// snapshot's in-memory checksum never saw them. There the checksum is
 /// counted from a snapshot read back from storage instead, whose tail replay
-/// reads the commit file as written.
-fn checksummed(committed: CommittedTransaction, engine: &SharedEngine) -> u64 {
+/// reads the commit file as written. So it is after a commit on a restated
+/// snapshot (`restated`, see `crate::restate` and `dml::compaction_snapshot`):
+/// the post-commit snapshot holds the protocol the write was checked against,
+/// not the one the table has.
+fn checksummed(committed: CommittedTransaction, engine: &SharedEngine, restated: bool) -> u64 {
     let version = committed.commit_version();
     if let Some(snapshot) = committed.post_commit_snapshot() {
-        if row_tracked(snapshot) {
+        if restated || row_tracked(snapshot) {
             let reread = Snapshot::builder_for(snapshot.table_root().as_str())
                 .at_version(version)
                 .build(engine.as_ref());
@@ -1755,9 +1790,19 @@ fn row_tracked(snapshot: &SnapshotRef) -> bool {
         .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("rowTracking")))
 }
 
-pub(crate) fn finish_commit(txn: Transaction, engine: &SharedEngine) -> Result<u64> {
+/// Commit `txn` and classify the outcome; the committed version.
+///
+/// `restated`: the transaction was begun on a restated snapshot, and its
+/// checksum is counted from storage (see [`checksummed`]).
+pub(crate) fn finish_commit_as(
+    txn: Transaction,
+    engine: &SharedEngine,
+    restated: bool,
+) -> Result<u64> {
     match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
-        Ok(CommitResult::CommittedTransaction(committed)) => Ok(checksummed(committed, engine)),
+        Ok(CommitResult::CommittedTransaction(committed)) => {
+            Ok(checksummed(committed, engine, restated))
+        }
         Ok(CommitResult::ConflictedTransaction(conflicted)) => {
             let version = conflicted.conflict_version();
             Err(NativeError::CommitConflict(format!(

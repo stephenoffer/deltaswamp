@@ -185,7 +185,11 @@ class TestKernelRefusesWhatItCannotHonor:
 
         with pytest.raises(DeltaSwampError, match="does not implement"):
             KernelEngine().append(
-                plain.resolved, pa.table({"id": [3], "city": ["x"]}), schema_mode="merge"
+                plain.resolved, pa.table({"id": [3], "city": ["x"]}), target_file_size=1
+            )
+        with pytest.raises(DeltaSwampError, match="cannot replace the table schema"):
+            KernelEngine().append(
+                plain.resolved, pa.table({"id": [3], "city": ["x"]}), schema_mode="overwrite"
             )
 
 

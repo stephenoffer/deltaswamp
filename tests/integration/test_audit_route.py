@@ -153,7 +153,11 @@ def test_property_values_are_spelled_before_routing(table: Any) -> None:
 
 
 def test_no_alter_leaves_a_feature_table_unwritable(conn: Any, tmp_path: Any) -> None:
-    """r5rg H3: a (3,7) table listing checkConstraints gains a feature delta-rs cannot write."""
+    """r5rg H3: a (3,7) table listing checkConstraints gains a feature delta-rs cannot write.
+
+    The kernel writes such a table now (it checks the constraints itself, and
+    no column is generated), so the change is taken and it goes on writing.
+    """
     path = str(tmp_path / "v7")
     t = conn.create_table(path, pa.schema([("id", pa.int64()), ("city", pa.string())]))
     t.append(pa.table({"id": [1], "city": ["a"]}))
@@ -162,15 +166,14 @@ def test_no_alter_leaves_a_feature_table_unwritable(conn: Any, tmp_path: Any) ->
     t = conn.open_table(path)
     assert "checkConstraints" in t.features()
     change = {"delta.enableTypeWidening": "true"}
-    cap = t.can("set_properties", properties=change)
-    assert not cap.ok and "no local engine" in cap.reason
-    with pytest.raises(ds.UnreachableTableError, match="no local engine"):
-        t.set_properties(change)
-    with pytest.raises(ds.UnreachableTableError, match="no local engine"):
-        t.cluster_by(["city"])
+    assert t.can("set_properties", properties=change).ok
+    t.set_properties(change)
+    conn.open_table(path).cluster_by(["city"])
     t = conn.open_table(path)
-    assert "typeWidening" not in t.features()
+    assert {"typeWidening", "clustering"} <= set(t.features())
+    assert t.can("append").engine is Engine.KERNEL
     t.append(pa.table({"id": [2], "city": ["b"]}))
+    assert conn.open_table(path).count() == 2
 
 
 # ------------------------------------------------------------------ the boundary
