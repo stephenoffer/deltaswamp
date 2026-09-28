@@ -201,13 +201,17 @@ See docs/usage.md, "Security notes".
   kernel-only connections and tables delta-rs cannot open (in-commit
   timestamps, type widening, `vacuumProtocolCheck`) compact too. Refused, typed
   and before any work, rather than run unsafely: `writer_properties`,
-  `min_commit_interval`, app transactions, `cleanup_expired_logs=True`,
-  row-tracked, liquid-clustered and name/id column-mapped tables (DuckDB's
-  delta reader reads the partition columns of kernel-written column-mapped
-  files as NULL), and files holding legacy-calendar or out-of-range INT96
-  values (the kernel writer does not yet mark its files proleptic, so
-  Databricks would read the rewritten values shifted). An OPTIMIZE that loses
-  to a protocol change it cannot write raises `CommitConflictError`.
+  `min_commit_interval`, app transactions and `cleanup_expired_logs=True`.
+  Row-tracked tables compact with every row's id and commit version kept
+  (written into the materialized columns, as Databricks' OPTIMIZE writes
+  them), and overwrite with fresh ids for the new rows; liquid-clustered
+  tables are Z-ordered over their clustering keys (`full=True` rewrites every
+  file); name/id column-mapped tables compact too (DuckDB's delta reader reads
+  the partition columns of every column-mapped table as NULL, Databricks'
+  own included). Z-order is incremental through Databricks' `ZCUBE_*` tags
+  (`min_cube_size`), and bin-packing takes `min_file_size` and `sort_by`. An
+  OPTIMIZE that loses to a protocol change it cannot write raises
+  `CommitConflictError`.
 - OPTIMIZE reads each step's files with one scan, in bin order and several at
   a time, and writes several output files at once (20,000 files: 16 s before,
   3 s now, delta-rs 2.2 s; 5,000 commits without a checkpoint: 173 s, now
@@ -256,6 +260,11 @@ See docs/usage.md, "Security notes".
 - On a kernel-only table without deletion vectors, DML is a whole-table
   rewrite bounded by `KernelEngine.rewrite_max_bytes` and refused on
   row-tracked tables, and MERGE needs the SQL fallback.
+- OPTIMIZE of a liquid-clustered table is a Z-order over its keys, not
+  Databricks' incremental clustering tree (whose state Databricks keeps in its
+  own domain); Databricks reclusters such files on its next OPTIMIZE. On a
+  row-tracked table the kernel's post-commit snapshot and checksum delta do
+  not count the removes the native commit stages itself; nothing reads them.
 - The kernel cannot write CDC files, so UPDATE and MERGE on a change-data-feed
   table it alone can write need the SQL fallback. DELETE through deletion
   vectors needs none.

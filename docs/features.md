@@ -129,9 +129,10 @@ variant; all three are writer-only, so both engines read and neither writes.
 
 | Feature | Where it exists | deltaswamp | Notes |
 |---|---|---|---|
-| OPTIMIZE (compaction) | all | kernel, warehouse | committed by the kernel on the snapshot it planned from, so concurrent runs never compact a file twice (delta-rs's own commit duplicates their rows; a delta-rs connection hands it to the kernel). Legacy-calendar and INT96 files are rewritten with correct values and a Spark footer. Refused on row-tracked and column-mapped tables and with `writer_properties`/`min_commit_interval` |
-| OPTIMIZE ZORDER BY | DBR, Spark, delta-rs | kernel, warehouse | as above; top-level columns with statistics only (not STRUCT/ARRAY/MAP) |
-| OPTIMIZE on clustered / managed tables, OPTIMIZE FULL | DBR | warehouse | delta-rs cannot write clustered tables |
+| OPTIMIZE (compaction) | all | kernel, warehouse | committed by the kernel on the snapshot it planned from, so concurrent runs never compact a file twice (delta-rs's own commit duplicates their rows; a delta-rs connection hands it to the kernel). Legacy-calendar and INT96 files are rewritten with correct values and a Spark footer. Row-tracked tables keep every row's `_metadata.row_id` and `row_commit_version` (written into the materialized columns, as Databricks does); column-mapped tables (name and id) get physical names and field ids. `min_file_size` and `sort_by` shape a bin-packing. Refused with `writer_properties`/`min_commit_interval` |
+| OPTIMIZE ZORDER BY | DBR, Spark, delta-rs | kernel, warehouse | as above; top-level columns with statistics only (not STRUCT/ARRAY/MAP). Incremental: files tagged `ZCUBE_*` by an earlier Z-order of the same columns, in cubes of at least `min_cube_size` (default the target size), are left alone; the tags are Databricks', which takes the kernel's cubes as its own |
+| OPTIMIZE on liquid-clustered tables, OPTIMIZE FULL | DBR | kernel, warehouse | the kernel Z-orders over the `delta.clustering` keys, incrementally as above (`full=True` rewrites every file); the domain is left as it is. Not Databricks' clustering tree, which Databricks keeps to itself |
+| OPTIMIZE on managed tables | DBR | warehouse | Databricks forbids external writes to managed tables |
 | VACUUM (standard and LITE) | DBR, Spark, delta-rs | delta-rs, warehouse | dry run by default here |
 | VACUUM on managed tables | DBR | warehouse | Databricks forbids external VACUUM on managed tables |
 | RESTORE | DBR, Spark, delta-rs | delta-rs, warehouse | refused on DV tables through delta-rs (delta-rs#4613) |

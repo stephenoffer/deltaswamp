@@ -131,7 +131,7 @@ serve.
 | `set_not_null` | kernel, sql | needs every existing row checked for nulls before the commit |
 | `drop_not_null` | deltars, kernel, sql | a metadata-only change |
 | `cluster_by` | kernel, sql | the delta.clustering domain; delta-rs has no domain metadata support |
-| `optimize` | kernel, deltars, sql | the kernel commits a compaction on the snapshot it read, so a concurrent one conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows both compacted, so delta-rs hands it to the kernel. The warehouse runs it on managed and clustered tables |
+| `optimize` | kernel, deltars, sql | the kernel commits a compaction on the snapshot it read, so a concurrent one conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows both compacted, so delta-rs hands it to the kernel. On row-tracked tables rows keep their ids and commit versions; on liquid-clustered ones it Z-orders by the clustering keys (`full=True` every file); column-mapped tables compact too. The warehouse runs it on managed tables |
 | `zorder` | kernel, deltars, sql | as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one |
 | `vacuum` | deltars, sql | kernel has no VACUUM |
 | `restore` | deltars, sql | kernel has no RESTORE |
