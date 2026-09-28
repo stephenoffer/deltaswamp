@@ -172,8 +172,12 @@ def test_scan_beyond_the_kernel_grammar_routes_to_delta_rs(conn: Any, tmp_path: 
     rows = pa.table(t.scan(predicate="id % 7 = 1"))
     assert served == [verdict.engine.value] == ["deltars"]
     assert sorted(rows.column("id").to_pylist()) == [1, 8]
-    # Malformed in any SQL: still the kernel's parser that names it.
-    assert t.can("scan", predicate="id ===").engine.value == "kernel"
+    # Malformed in any SQL: the kernel's parser names it before routing, so
+    # no engine reads a prefix of it (round-7 INJ-2).
+    from deltaswamp.predicate import PredicateError
+
+    with pytest.raises(PredicateError, match="==="):
+        t.can("scan", predicate="id ===")
 
 
 def test_can_convert_a_parquet_directory(conn: Any, tmp_path: Any) -> None:

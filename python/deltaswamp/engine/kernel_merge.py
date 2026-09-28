@@ -117,6 +117,11 @@ class KernelMerger:
         self._by_source_conditions: list[str | None] = []
 
     def _translate(self, text: str) -> str:
+        from .dialect import check_expression
+
+        # Malformed text is the caller's mistake for every engine: a
+        # PredicateError, never an EngineLimitError another engine retries.
+        check_expression(text, "the MERGE clause text")
         try:
             return _spark_sql(text)
         except EngineLimitError as exc:
@@ -213,11 +218,24 @@ class KernelMerger:
 
         from .dialect import install_duckdb_macros
 
-        con = duckdb.connect()
+        # The clause text is the caller's SQL, spliced into the statements
+        # below. It evaluates in the same sandbox as the library's other DuckDB
+        # expressions (`duckfilter`): no file or network access, no extension
+        # loading, the configuration locked -- read_text() or COPY in a SET
+        # value otherwise read or wrote local files.
+        con = duckdb.connect(
+            ":memory:",
+            config={
+                "enable_external_access": False,
+                "autoinstall_known_extensions": False,
+                "autoload_known_extensions": False,
+            },
+        )
         try:
             install_duckdb_macros(con)
             con.register("__target", target)
             con.register("__source", source)
+            con.execute("SET lock_configuration = true")
             result = self._evaluate(con, schema, target, row_ids)
         except (
             duckdb.ParserException,
@@ -408,10 +426,11 @@ class KernelMerger:
                 if any(c is None for c in conditions)
                 else " OR ".join(f"COALESCE(({c}), FALSE)" for c in conditions)
             )
-            dup = con.execute(
+            dup = _one_statement(
+                con,
                 f"SELECT count(*) FROM (SELECT {t}.{_quote(_FILE)}, {t}.{_quote(_INDEX)} "
                 f"FROM __target AS {t} JOIN __source AS {s} ON {on} WHERE {acting} "
-                f"GROUP BY 1, 2 HAVING count(*) > 1)"
+                f"GROUP BY 1, 2 HAVING count(*) > 1)",
             ).fetchone()[0]
             if dup:
                 raise InvalidArgumentError(
@@ -589,7 +608,20 @@ def _fetch(con: Any, sql: str) -> Any:
     """
     import pyarrow as pa
 
-    return pa.table(con.execute(sql).arrow())
+    return pa.table(_one_statement(con, sql).arrow())
+
+
+def _one_statement(con: Any, sql: str) -> Any:
+    """`con.execute(sql)`, refused unless `sql` is exactly one statement.
+
+    The clauses are validated as single expressions before they get here;
+    this is the last line should one still end the SELECT around it.
+    """
+    if len(con.extract_statements(sql)) != 1:
+        raise InvalidArgumentError(
+            "the MERGE clause text does not stay inside one expression; refused"
+        )
+    return con.execute(sql)
 
 
 def _row_tracking_enabled(table: Any) -> bool:

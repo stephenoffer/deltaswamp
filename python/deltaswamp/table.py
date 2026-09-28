@@ -377,6 +377,39 @@ def _check_predicate(predicate: Any, what: str) -> None:
         raise InvalidArgumentError(f"{what}: the predicate is blank; pass None to mean every row")
 
 
+def _check_sql_fragment(text: Any, what: str) -> None:
+    """Refuse SQL text that is not exactly one expression, for every engine.
+
+    One check (`dialect.check_expression`) for each fragment the API forwards:
+    predicates, SET/INSERT values, MERGE ON and clause conditions,
+    replaceWhere, CHECK constraints. Raised before routing, so no engine --
+    delta-rs reading a prefix, DuckDB or the warehouse splicing it into a
+    statement -- sees text that would mean something other than one
+    expression.
+    """
+    from .engine.dialect import check_expression
+
+    check_expression(text, what)
+
+
+def _parses_as_spark(text: Any) -> bool:
+    """Whether `text` is absent, or one expression of Spark's grammar in `dialect`."""
+    from .engine.dialect import parses
+
+    return not isinstance(text, str) or not text.strip() or parses(text)
+
+
+def _check_merge_clause(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """`_check_sql_fragment` for a MERGE clause's condition and values."""
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, str):
+            _check_sql_fragment(value, "the MERGE clause condition")
+        elif isinstance(value, dict):
+            for item in value.values():
+                if isinstance(item, str):
+                    _check_sql_fragment(item, "the MERGE value")
+
+
 def _check_write_sizes(target_file_size: Any, max_commit_retries: Any) -> None:
     """Refuse negative sizes here: delta-rs raised a bare OverflowError for them."""
     _check_count(target_file_size, "target_file_size")
@@ -2778,9 +2811,9 @@ class Table:
         texts = [predicate, *(updates.values() if isinstance(updates, dict) else ())]
         for text in texts:
             # Refused before any engine sees it: DataFusion reads up to a ';'
-            # and ignores the rest, so "id = 1; id = 2" deleted id = 1 and
-            # reported success.
-            sqlpred.refuse_statement_separator(text)
+            # or a stray ')' and ignores the rest, so "id = 1) AND (s = 'x'"
+            # deleted every id = 1 row and reported success.
+            _check_sql_fragment(text, "the predicate" if text is predicate else "the SET value")
         if any(warehouse_reason(t) is not None for t in texts):
             # Spark SQL neither direct engine can be made to compute as
             # Databricks does (a 0-based array subscript, `split`).
@@ -2799,10 +2832,14 @@ class Table:
                         # named the kernel. delta-rs evaluates it.
                         return frozenset({"sql_expressions"})
         except sqlpred.PredicateError as exc:
-            # Malformed in any SQL (`id ===`): no engine serves it, and the
-            # kernel's parser names the mistake where delta-rs's raises a raw
-            # parser error.
-            return frozenset({"sql_expressions"}) if exc.beyond_grammar else frozenset()
+            if exc.beyond_grammar or all(_parses_as_spark(t) for t in texts):
+                # Spark's grammar (`dialect`) reads it: SQL an engine that
+                # evaluates SQL serves, though the kernel's parser does not.
+                return frozenset({"sql_expressions"})
+            # Malformed in any SQL (`id ===`): no engine serves it. Handing it
+            # on as "no needs" let delta-rs read a prefix of it and act on
+            # more rows; the kernel's parser names the mistake here instead.
+            raise
         return frozenset()
 
     def _update_needs(self, targets: Any, literal: bool) -> frozenset[str]:
@@ -3418,6 +3455,7 @@ class Table:
         if predicate is None:
             raise InvalidArgumentError("merge needs a join predicate")
         _check_predicate(predicate, "merge")
+        _check_sql_fragment(predicate, "the MERGE ON condition")
         source = _write_data(source)
         request = self._request(Operation.MERGE, {"predicate": predicate, **kwargs}, source)
 
@@ -3906,6 +3944,7 @@ class Table:
             if not isinstance(cname, str) or not cname.strip():
                 raise InvalidArgumentError(f"constraint names must be non-empty, got {cname!r}")
             _check_predicate(expression, f"add constraint {cname}")
+            _check_sql_fragment(expression, f"constraint {cname!r}")
             if expression is None:
                 raise InvalidArgumentError(f"constraint {cname!r} has no expression")
         request = self._request(Operation.ADD_CONSTRAINT, {"constraints": constraints, **kwargs})
@@ -4860,6 +4899,7 @@ class _InvalidatingMerger:
                 kwargs["updates"] = kwargs.pop("values")
             clause = merge_clause(name, args, kwargs)
             if clause is not None:
+                _check_merge_clause(args, kwargs)
                 kind, conditional = clause
                 if kind in self._unconditional:
                     # Spark refuses this when it parses the MERGE; the engines

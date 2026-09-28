@@ -44,9 +44,11 @@ from ..errors import EngineLimitError
 
 __all__ = [
     "DUCKDB_MACROS",
+    "check_expression",
     "install_duckdb_macros",
     "numeric_kinds",
     "parse_json_literal",
+    "parses",
     "to_datafusion",
     "to_duckdb",
     "warehouse_reason",
@@ -656,6 +658,91 @@ def _parse(text: str) -> _Node:
         return _Parser(_tokenize(text)).parse()
     except RecursionError:
         raise _Unparsed("too deep") from None
+
+
+def parses(text: str) -> bool:
+    """Whether `text` is exactly one expression of the grammar parsed here."""
+    try:
+        _parse(text)
+    except _Unparsed:
+        return False
+    return True
+
+
+#: Words Spark allows right after a complete operand (`s COLLATE UTF8_LCASE`,
+#: a window or aggregate suffix); any other token there starts a second
+#: expression.
+_POSTFIX_WORDS = frozenset({"COLLATE", "OVER", "FILTER", "WITHIN", "IGNORE", "RESPECT", "NULLS"})
+_CLOSING = {")": "(", "]": "["}
+
+
+def check_expression(text: Any, what: str = "the SQL expression") -> None:
+    """Refuse `text` unless it is structurally one Spark SQL expression.
+
+    Every SQL fragment the API forwards to an engine -- a predicate, a SET or
+    INSERT value, a MERGE ON or clause condition, a replaceWhere, a CHECK
+    constraint, a generation expression -- goes through this before routing.
+    DataFusion parses a prefix and ignores the rest, so ``id = 1) AND (...``
+    or ``id = 1 extra`` acted on every ``id = 1`` row; DuckDB and the
+    warehouse splice the text into a statement, where a stray ``)``, a ``;``
+    or a comment would change the statement around it. So: literals and
+    quoted names are closed, parentheses and brackets balance and never close
+    early, there is no ``;``, no comment and no top-level ``,``, and when a
+    complete expression parses from the start nothing but a postfix keyword
+    follows it. Raises `PredicateError` (malformed in any SQL: no engine
+    serves it). Legitimate Spark SQL beyond this module's grammar (a
+    subquery, a lambda, a variant path) passes the structural checks.
+    """
+    from ..predicate import PredicateError
+
+    if not isinstance(text, str):
+        return
+
+    def refuse(why: str) -> PredicateError:
+        return PredicateError(f"{what} {text!r} is not a single SQL expression: {why}")
+
+    tokens = _tokenize(text)
+    stack: list[str] = []
+    for i, t in enumerate(tokens):
+        if t.kind == "other":
+            if t.text == ";":
+                raise refuse("';' outside a string literal ends a statement")
+            if t.text in ("'", '"', "`"):
+                raise refuse(f"an unterminated {t.text} literal or name")
+            continue
+        if t.kind != "op":
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if nxt is not None and nxt.kind == "op" and (t.text, nxt.text) in (("-", "-"), ("/", "*")):
+            raise refuse("it holds a SQL comment")
+        if t.text in ("(", "["):
+            stack.append(t.text)
+        elif t.text in _CLOSING:
+            if not stack or stack.pop() != _CLOSING[t.text]:
+                raise refuse(f"an unbalanced {t.text!r}")
+        elif t.text == "," and not stack:
+            raise refuse("a ',' outside parentheses separates two expressions")
+    if stack:
+        raise refuse(f"an unclosed {stack[-1]!r}")
+    if not text.strip():
+        return
+    try:
+        _Parser(tokens).parse()
+        return
+    except (_Unparsed, RecursionError):
+        pass
+    parser = _Parser(tokens)
+    try:
+        parser.expr()
+    except (_Unparsed, RecursionError):
+        return  # beyond the grammar here; the structure above is sound
+    tail = parser.peek()
+    if tail is None:
+        return
+    if tail.kind == "word" and tail.text.upper() in _POSTFIX_WORDS:
+        return
+    if tail.kind in ("word", "num", "str", "dstr", "bq"):
+        raise refuse(f"{tail.text!r} follows a complete expression")
 
 
 # ------------------------------------------------------------ warehouse-only
