@@ -937,6 +937,12 @@ class KernelEngine:
                 ) from exc
             raise
 
+    def forget(self, location: str) -> None:
+        """Drop every snapshot cached for the table at `location`."""
+        with self._snapshots_lock:
+            for key in [k for k in self._snapshots if k[0] == location]:
+                self._snapshots.pop(key, None)
+
     def _remember(self, key: tuple[Any, ...], snapshot: Any) -> None:
         if getattr(snapshot, "commit_identity", None) is None:
             # Nothing to revalidate it against (no commit file at its version,

@@ -358,3 +358,50 @@ def test_a_feed_ending_before_add_column_has_the_column(
         conn.open_table(path).cdf(starting_version=1, ending_version=1, columns=["id"])
     )
     assert "newc" not in projected.column_names
+
+
+# ----------------------------------- 6: stale _last_checkpoint, can("vacuum")
+
+
+def test_a_stale_checkpoint_hint_is_a_typed_refusal_can_then_agrees(
+    conn: Any, tmp_path: Any
+) -> None:
+    from deltaswamp.errors import CorruptTableError, DeltaSwampError
+
+    path = str(tmp_path / "stale")
+    ids = lambda *v: pa.table({"id": pa.array(v, pa.int64())})  # noqa: E731
+    t = conn.create_table(path, pa.schema([("id", pa.int64())]))
+    t.append(ids(1, 2))
+    t.checkpoint()
+    t.append(ids(3))
+    t.checkpoint()
+    os.remove(os.path.join(path, "_delta_log", f"{2:020}.checkpoint.parquet"))
+    t = conn.open_table(path)
+    with pytest.raises(CorruptTableError, match="_last_checkpoint"):
+        t.append(ids(4))
+    assert not t.can("append").ok and not conn.open_table(path).can("append").ok
+    with pytest.raises(DeltaSwampError, match="_last_checkpoint"):
+        t.delete("id = 1")
+    os.remove(os.path.join(path, "_delta_log", "_last_checkpoint"))
+    conn.open_table(path).append(ids(4))
+    assert conn.open_table(path).count() == 4
+
+
+@pytest.mark.parametrize(
+    "props", [{"delta.enableInCommitTimestamps": "true"}, {}], ids=["ict", "plain"]
+)
+def test_can_vacuum_answers_for_the_call_with_the_same_arguments(
+    conn: Any, tmp_path: Any, props: dict[str, str]
+) -> None:
+    path = str(tmp_path / "v")
+    t = conn.create_table(path, pa.schema([("id", pa.int64())]), properties=props)
+    t.append(pa.table({"id": pa.array([1], pa.int64())}))
+    t = conn.open_table(path)
+    for kwargs in ({}, {"dry_run": True}, {"dry_run": False}):
+        answer = t.can("vacuum", **kwargs)
+        try:
+            t.vacuum(**kwargs)
+            ran = True
+        except ds.errors.UnreachableTableError:
+            ran = False
+        assert answer.ok == ran, (kwargs, answer)

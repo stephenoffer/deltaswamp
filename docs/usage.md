@@ -685,6 +685,19 @@ t.publish()  # staged catalog commits -> _delta_log
 conn.convert_to_delta("s3://bucket/parquet-dir")
 ```
 
+`can("vacuum")` answers for the call `vacuum()` makes with no arguments, a dry
+run, which lists files and deletes nothing. A table some engine can list but
+none can vacuum for real (in-commit timestamps or type widening on a
+delta-rs-only path, for example) answers yes there and no to
+`can("vacuum", dry_run=False)`, as the two calls behave. Ask with the
+arguments you will pass.
+
+A `_delta_log/_last_checkpoint` naming a checkpoint that is gone is refused
+by both direct engines with `CorruptTableError` (listing the log from version
+0 cannot tell a damaged log from a whole one); after that error the handle's
+cached snapshot is dropped, so `can()` refuses too. Restore the checkpoint, or
+remove the stale `_last_checkpoint` if every commit is still present.
+
 OPTIMIZE and Z-ORDER are committed by the kernel on the snapshot they were
 planned from, so concurrent runs never compact a file twice; delta-rs's own
 OPTIMIZE commit does, and is never used. They take delta-rs's options except

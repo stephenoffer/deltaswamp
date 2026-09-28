@@ -401,6 +401,33 @@ def _deltars_fork(exc: BaseException, what: str) -> BaseException | None:
     )
 
 
+#: Both engines' failure on a `_last_checkpoint` naming a missing checkpoint.
+STALE_CHECKPOINT_HINT = "Had a _last_checkpoint hint but didn't find any checkpoints"
+
+
+def _stale_checkpoint_hint(exc: BaseException, what: str) -> BaseException | None:
+    """A `_last_checkpoint` that names a checkpoint no longer in the log.
+
+    The kernel refuses to list the log from version 0 instead (a deleted log
+    prefix or a table re-created at the path would replay as a plausible,
+    wrong history), and delta-rs reads the log through it. A handle whose
+    kernel snapshot was cached before the damage still routed a write to
+    either engine, which then failed with a raw EngineError; the table
+    handle forgets that snapshot when this is raised (`Table._backfilled`).
+    """
+    if STALE_CHECKPOINT_HINT not in str(exc):
+        return None
+    error = CorruptTableError(
+        f"cannot {what}: the table's _delta_log/_last_checkpoint names a checkpoint that is "
+        "not in the log, and neither direct engine reads a log past such a hint (listing "
+        "from version 0 cannot tell a damaged log from a whole one)"
+        "\n  remedy: restore the missing checkpoint, or remove _delta_log/_last_checkpoint "
+        "if the log's commits are all present"
+    )
+    error.stale_checkpoint_hint = True  # type: ignore[attr-defined]
+    return error
+
+
 def _deltars_constraint(exc: BaseException, what: str) -> BaseException | None:
     """NOT NULL, CHECK, invariants and generated columns refusing bad rows.
 
@@ -553,8 +580,15 @@ _NATIVE: tuple[Rule, ...] = (_kernel_commit, _kernel_catalog, _kernel_input)
 
 #: Each engine's rules, tried in order; the first to answer wins.
 RULES: dict[EngineKind, tuple[Rule, ...]] = {
-    EngineKind.KERNEL: (*_NATIVE, _panic(EngineKind.KERNEL), _damaged_file, _storage),
+    EngineKind.KERNEL: (
+        _stale_checkpoint_hint,
+        *_NATIVE,
+        _panic(EngineKind.KERNEL),
+        _damaged_file,
+        _storage,
+    ),
     EngineKind.DELTARS: (
+        _stale_checkpoint_hint,
         _deltars_conflict,
         _deltars_fork,
         _panic(EngineKind.DELTARS),

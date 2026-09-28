@@ -898,6 +898,20 @@ class Table:
         ):
             self._refresh_commit_tail()
 
+    def _forget_snapshots(self) -> None:
+        """Drop the kernel snapshots cached for this table and the enrichment.
+
+        A snapshot cached before the log was damaged refreshes without
+        re-reading `_last_checkpoint`, so routing kept answering from it
+        (can("append") said delta-rs) while every engine failed the call.
+        Resolved afresh, the log's damage reaches can() as it reaches the call.
+        """
+        kernel = self._connection.router.engines.get(EngineKind.KERNEL)
+        forget = getattr(kernel, "forget", None)
+        if forget is not None and self._resolved.location is not None:
+            forget(self._resolved.location)
+        self._invalidate()
+
     def _check_still_named(self) -> None:
         """Refuse a read through a handle whose catalog name no longer names its table.
 
@@ -3260,6 +3274,10 @@ class Table:
 
         try:
             return write()
+        except CorruptTableError as exc:
+            if getattr(exc, "stale_checkpoint_hint", False):
+                self._forget_snapshots()
+            raise
         except BackfillRequiredError as exc:
             if not self._resolved.is_catalog_managed:
                 raise
