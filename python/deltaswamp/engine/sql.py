@@ -2451,12 +2451,21 @@ def _column_ddl(table: str, name: str, type_text: str, field: Any) -> tuple[str,
         metadata[k] = value.decode() if isinstance(value, bytes) else str(value)
 
     def expression(key: str) -> str:
+        from ..predicate import PredicateError
+        from .dialect import check_expression
+
         text = metadata[key].strip()
-        # Spliced into the statement, so it must not be able to end it.
-        if not text or ";" in text or "--" in text or "/*" in text:
+        # Spliced into the statement, and it comes from another table's log:
+        # a stray ')' closed GENERATED ALWAYS AS (...) and declared columns of
+        # its own. So it must be exactly one expression (dialect's check).
+        if not text:
             raise InvalidArgumentError(
                 f"column {name!r}: {key} {metadata[key]!r} is not a single SQL expression"
             )
+        try:
+            check_expression(text, f"column {name!r}: {key}")
+        except PredicateError as exc:
+            raise InvalidArgumentError(str(exc)) from None
         return text
 
     clause = f"{sq.quote(name)} {sq.sql_type(type_text)}"

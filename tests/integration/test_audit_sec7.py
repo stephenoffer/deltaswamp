@@ -525,3 +525,37 @@ class TestSdkDebugRedaction:
         for secret in ("dapiPAT123", "CHILDTOKEN", "SASSIG", "AMZSIG"):
             assert secret not in out, secret
         assert "Content-Length: 2" in out and "se=2" in out
+
+
+class TestDdlFromTableMetadata:
+    """INJ-3: generation / DEFAULT expressions from a log were spliced into CREATE TABLE."""
+
+    @pytest.mark.parametrize(
+        "key, text",
+        [
+            ("delta.generationExpression", "id + 1), `smuggled` STRING COMMENT 'x', `g2` BIGINT"),
+            ("delta.generationExpression", "id + 1) GENERATED ALWAYS AS (id"),
+            ("CURRENT_DEFAULT", "1 COMMENT 'smuggled'"),
+            ("CURRENT_DEFAULT", "1, `smuggled` STRING"),
+        ],
+    )
+    def test_a_column_expression_that_is_not_one_expression_is_refused(
+        self, key: str, text: str
+    ) -> None:
+        from deltaswamp.engine.sql import _column_ddl
+
+        field = pa.field("g", pa.int64(), metadata={key: text})
+        with pytest.raises(InvalidArgumentError, match="single SQL expression"):
+            _column_ddl("c.s.t", "g", "BIGINT", field)
+
+    def test_legitimate_expressions_render(self) -> None:
+        from deltaswamp.engine.sql import _column_ddl
+
+        gen = pa.field(
+            "g", pa.int64(), metadata={"delta.generationExpression": "CAST(id + 1 AS BIGINT)"}
+        )
+        clause, _ = _column_ddl("c.s.t", "g", "BIGINT", gen)
+        assert clause.endswith("GENERATED ALWAYS AS (CAST(id + 1 AS BIGINT))")
+        default = pa.field("d", pa.string(), metadata={"CURRENT_DEFAULT": "'a, b'"})
+        clause, has_default = _column_ddl("c.s.t", "d", "STRING", default)
+        assert has_default and clause.endswith("DEFAULT 'a, b'")
