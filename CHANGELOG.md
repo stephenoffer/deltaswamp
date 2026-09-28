@@ -31,6 +31,18 @@ First release.
   are kept). MERGE through the kernel evaluates its clauses with DuckDB. Tables
   without deletion vectors get copy-on-write, with a bounded whole-table rewrite
   for tables only the kernel can write.
+- Kernel copy-on-write MERGE on tables without deletion vectors that delta-rs
+  cannot write (in-commit timestamps, liquid clustering, type widening, column
+  defaults, legacy-calendar files): each touched file is removed and its other
+  rows written again beside the new ones.
+- DELETE, UPDATE, MERGE and replaceWhere on row-tracked tables without deletion
+  vectors, through the kernel: only touched files are rewritten, kept rows keep
+  their row ids and commit versions (written to the materialized columns),
+  updated rows their ids, and inserted rows get fresh ids. Removes on row-tracked
+  tables, staged by hand since kernel 0.28 refuses them, carry each file's
+  `baseRowId` and `defaultRowCommitVersion`, as do deletion-vector re-adds; a
+  deletion-vector DELETE that empties a file now removes it rather than leaving
+  a full vector. CLONE of a row-tracked table stays refused, with the reason.
 - Metadata-only ALTER commits for what delta-rs cannot do: column rename and
   drop under column mapping, type widening, SET NOT NULL, clustering keys and
   unset properties.

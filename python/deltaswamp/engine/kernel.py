@@ -193,6 +193,28 @@ def _keeps_row_ids(table: ResolvedTable) -> bool:
     ) and _native_has("materialized_row_ids")
 
 
+def _row_tracking_dml(table: ResolvedTable) -> bool:
+    """Whether a copy-on-write DML here keeps a row-tracked table's row ids.
+
+    The rewritten files' removes are staged by hand (kernel refuses them),
+    and every row the DML keeps or updates is written back with its id --
+    and, where kept unchanged, its commit version -- in the table's
+    materialized columns. Where the feature is merely supported, ids are not
+    promised stable and none are carried; where it is enabled, both columns
+    must be named.
+    """
+    if "rowTracking" not in table.effective_writer_features:
+        return False
+    if not _native_has("row_tracking_dml", "deletion_vector_dml"):
+        return False
+    if not _row_tracking_enabled(table):
+        return True
+    return all(
+        table.properties.get(f"delta.rowTracking.materialized{kind}ColumnName")
+        for kind in ("RowId", "RowCommitVersion")
+    )
+
+
 def deletion_vectors_writable(table: ResolvedTable) -> bool:
     """Whether DML on `table` may be written as deletion vectors.
 
@@ -692,18 +714,23 @@ class KernelEngine:
             and shape.get("predicate") is None
             and _native_has("row_tracking_compaction")
         )
+        # A copy-on-write DELETE, UPDATE or replaceWhere of a row-tracked
+        # table rewrites only the files it touches, through `commit_dml`.
+        by_file = operation in _REWRITE_OPS and not by_dv and self._file_rewrite_path(table)
         if (
             row_tracked
             and operation in _REMOVE_OPS
             and not replaces_all
             and not (by_dv and _keeps_row_ids(table))
+            and not by_file
         ):
             # Checked for every remove-staging operation, not just the rewrites:
             # a kernel overwrite removes every visible file in the same commit,
             # and the commit is refused after the data is written. Through
-            # deletion vectors no file is removed and every surviving row keeps
-            # its baseRowId; an UPDATE also writes each rewritten row's old id
-            # into the materialized row-id column, so ids stay stable.
+            # deletion vectors every surviving row keeps its baseRowId; an
+            # UPDATE also writes each rewritten row's old id into the
+            # materialized row-id column, so ids stay stable. A file rewrite
+            # writes the kept rows' ids and commit versions the same way.
             return Capability(
                 operation,
                 ok=False,
@@ -715,7 +742,7 @@ class KernelEngine:
             )
 
         if operation in _REWRITE_OPS:
-            refusal = self._rewrite_refusal(operation, table, by_dv=by_dv)
+            refusal = self._rewrite_refusal(operation, table, by_dv=by_dv or by_file)
             if refusal is not None:
                 return refusal
 
@@ -1570,6 +1597,13 @@ class KernelEngine:
         blockers = sorted(_CLONE_BLOCKERS & (table.features | table.effective_writer_features))
         if table.is_catalog_managed and "catalogManaged" not in blockers:
             blockers.append("catalogManaged")
+        if blockers == ["rowTracking"]:
+            return (
+                "the table tracks row ids, and a clone written here would have to carry "
+                "each file's baseRowId and the row-id high-water mark, and give its rows "
+                "commit versions in a history that starts at the clone's version 0 (the "
+                "source's versions mean nothing there); only Databricks writes that clone"
+            )
         if blockers:
             return f"the table has {', '.join(blockers)}, which a clone written here cannot carry"
         if shape.get("shallow", True) and (
@@ -1917,7 +1951,7 @@ class KernelEngine:
             }
             _refuse_options("overwrite with a predicate", kwargs)
             incoming = pa.table(_as_record_batch_reader(data))
-            if self._dv_path(table):
+            if self._dv_path(table) or self._file_rewrite_path(table):
                 result = self._dv_dml(
                     table,
                     predicate,
@@ -1962,13 +1996,30 @@ class KernelEngine:
     rewrite_max_bytes = 1 << 30
 
     def _merge_refusal(self, table: ResolvedTable) -> Capability | None:
-        """Why the kernel cannot MERGE into `table`, or None if it can."""
-        if not self._dv_path(table):
+        """Why the kernel cannot MERGE into `table`, or None if it can.
+
+        With deletion vectors enabled the touched rows are marked deleted;
+        otherwise the files holding them are rewritten (copy-on-write), which
+        on a row-tracked table needs `_row_tracking_dml`.
+        """
+        if not _native_has("deletion_vector_dml"):
             return Capability(
                 Operation.MERGE,
                 ok=False,
-                reason="the kernel serves MERGE only by writing deletion vectors, and this "
-                "table does not enable them (delta.enableDeletionVectors)",
+                reason="this build of the native extension has no kernel DML",
+                remedy=SQL_FALLBACK_REMEDY,
+            )
+        if (
+            not self._dv_path(table)
+            and "rowTracking" in table.effective_writer_features
+            and not _row_tracking_dml(table)
+        ):
+            return Capability(
+                Operation.MERGE,
+                ok=False,
+                reason="the table tracks row ids but names no materialized row-id and "
+                "row-commit-version columns, so the rows a copy-on-write MERGE rewrites "
+                "could not keep theirs",
                 remedy=SQL_FALLBACK_REMEDY,
             )
         if (
@@ -1989,7 +2040,11 @@ class KernelEngine:
                 "by absolute path), which cannot be credential-scoped reliably",
                 remedy=SQL_FALLBACK_REMEDY,
             )
-        if "rowTracking" in table.effective_writer_features and not _keeps_row_ids(table):
+        if (
+            self._dv_path(table)
+            and "rowTracking" in table.effective_writer_features
+            and not _keeps_row_ids(table)
+        ):
             return Capability(
                 Operation.MERGE,
                 ok=False,
@@ -2002,6 +2057,15 @@ class KernelEngine:
     def _dv_path(self, table: ResolvedTable) -> bool:
         """Whether DELETE/UPDATE/replaceWhere go through deletion vectors here."""
         return deletion_vectors_writable(table) and _native_has("deletion_vector_dml")
+
+    def _file_rewrite_path(self, table: ResolvedTable) -> bool:
+        """Whether DELETE/UPDATE/replaceWhere rewrite only the files they touch.
+
+        That is how a row-tracked table without deletion vectors is served:
+        a whole-table rewrite would give every row a fresh id. Elsewhere the
+        whole-table rewrite (`_rewrite`) still serves those tables.
+        """
+        return not self._dv_path(table) and _row_tracking_dml(table)
 
     def _rewrite_refusal(
         self, operation: Operation, table: ResolvedTable, *, by_dv: bool = False
@@ -2376,7 +2440,15 @@ class KernelEngine:
         file's Parquet footer. `read_predicate` is the kernel skipping
         predicate the rows were read with (None: every file was read), which
         decides which concurrently added files this commit must conflict with.
+
+        On a table without deletion vectors enabled the same change is written
+        copy-on-write instead (`_as_file_rewrites`): every touched file is
+        removed, and its surviving rows are written again with `data`.
         """
+        if deletions.num_rows and not self._dv_path(table):
+            deletions, data, whole_files = self._as_file_rewrites(
+                table, snapshot, deletions, data, whole_files
+            )
         touched = set(deletions.column("path").to_pylist()) | set(whole_files or ())
         attempt = 0
         try:
@@ -2416,6 +2488,69 @@ class KernelEngine:
         if int(version) != int(snapshot.version):
             self._maybe_checkpoint(table, version, snapshot)
         return int(version)
+
+    def _as_file_rewrites(
+        self,
+        table: ResolvedTable,
+        snapshot: Any,
+        deletions: Any,
+        data: Any,
+        whole_files: list[str] | None,
+    ) -> tuple[Any, Any, list[str]]:
+        """`deletions` and `data` as a copy-on-write commit: `(no deletions, data, files)`.
+
+        Each file a deletion touches is removed whole, and the rows of it
+        the DML keeps are read back (by position, so a duplicate row is told
+        from its twin) and written again beside `data`. On a table with row
+        tracking enabled the kept rows bring their row ids and commit
+        versions, which `commit_dml` writes into the materialized columns, and
+        rows of `data` without an id (inserted ones) get a fresh one, as the
+        protocol asks; an updated row brings its id, and its commit version is
+        this commit's.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        paths = sorted(set(deletions.column("path").to_pylist()))
+        tracked = _row_tracking_enabled(table) and "rowTracking" in table.effective_writer_features
+        extra = {"row_tracking": True} if tracked else {}
+        read = pa.table(snapshot.scan(files=paths, row_positions=True, **extra))
+        catalog = pa.array(paths, pa.string())
+
+        def keys(files: Any, rows: Any) -> Any:
+            # (file, physical row index) as one integer: the file's place in
+            # `paths` above the 40 bits a Parquet file's row count fits in.
+            ids = pc.cast(pc.index_in(pc.cast(files, pa.string()), value_set=catalog), pa.int64())
+            return pc.add(pc.shift_left(ids, 40), pc.cast(rows, pa.int64()))
+
+        gone = keys(deletions.column("path"), deletions.column("row_index"))
+        kept = read.filter(
+            pc.invert(
+                pc.is_in(
+                    keys(read.column(_FILE_COLUMN), read.column(_ROW_INDEX_COLUMN)),
+                    value_set=pc.unique(gone),
+                )
+            )
+        ).drop_columns([_FILE_COLUMN, _ROW_INDEX_COLUMN])
+        carried = [_ROW_ID_COLUMN, _ROW_COMMIT_VERSION_COLUMN] if tracked else []
+        schema = pa.schema(
+            [*_arrow_schema(snapshot), *(pa.field(name, pa.int64()) for name in carried)]
+        )
+
+        def conformed(part: Any) -> Any:
+            columns = []
+            for field in schema:
+                if field.name in part.column_names:
+                    column = part.column(field.name)
+                    columns.append(column if column.type == field.type else column.cast(field.type))
+                else:
+                    columns.append(pa.nulls(part.num_rows, field.type))
+            return pa.Table.from_arrays(columns, schema=schema)
+
+        parts = [conformed(kept)] + ([conformed(data)] if data is not None else [])
+        rewritten = pa.concat_tables(parts)
+        files = sorted(set(paths) | set(whole_files or ()))
+        return deletions.slice(0, 0), rewritten if rewritten.num_rows else None, files
 
     #: Re-commits of a DELETE/UPDATE/MERGE that lost to writers which left
     #: every file it touched alone and added nothing it should have read.
@@ -3200,7 +3335,7 @@ class KernelEngine:
         handle), deletion vectors only.
         """
         _refuse_options("delete", unsupported)
-        if self._dv_path(table):
+        if self._dv_path(table) or (read_version is None and self._file_rewrite_path(table)):
             result = self._dv_dml(
                 table,
                 predicate,
@@ -3307,7 +3442,7 @@ class KernelEngine:
                 out = out.set_column(index, field, new)
             return out
 
-        if self._dv_path(table):
+        if self._dv_path(table) or (read_version is None and self._file_rewrite_path(table)):
             result = self._dv_dml(
                 table,
                 predicate,
@@ -4746,6 +4881,9 @@ def _refuse_changed_layout(snapshot: Any, fragments: list[bytes]) -> None:
 #: The columns a positional scan (`row_positions=True`) adds to each row.
 _FILE_COLUMN = "__deltaswamp_file"
 _ROW_INDEX_COLUMN = "__deltaswamp_row_index"
+#: ... and, with `row_ids` / `row_tracking`, each row's id and commit version.
+_ROW_ID_COLUMN = "__deltaswamp_row_id"
+_ROW_COMMIT_VERSION_COLUMN = "__deltaswamp_row_commit_version"
 
 
 def _canonical_path(schema: Any, path: tuple[str, ...]) -> tuple[str, ...]:

@@ -370,15 +370,25 @@ class TestMerge:
         skipping = merger._skipping(schema)
         assert skipping is not None and '"id"' in skipping
 
-    def test_tables_without_deletion_vectors_are_not_merged_here(
+    def test_tables_without_deletion_vectors_are_merged_copy_on_write(
         self, conn: Any, tmp_path: Any
     ) -> None:
         path = str(tmp_path / "plain")
         conn.create_table(path, pa.schema([("id", pa.int64())]))
-        verdict = conn.router.engines[Engine.KERNEL].supports(
-            Operation.MERGE, conn.open_table(path).resolved
+        conn.open_table(path).append(pa.table({"id": pa.array([1, 2], pa.int64())}))
+        kernel = conn.router.engines[Engine.KERNEL]
+        assert kernel.supports(Operation.MERGE, conn.open_table(path).resolved).ok
+        merger = kernel.merge(
+            conn.open_table(path).resolved,
+            pa.table({"id": pa.array([2, 3], pa.int64())}),
+            "t.id = s.id",
+            source_alias="s",
+            target_alias="t",
         )
-        assert not verdict.ok and "deletion vectors" in verdict.reason
+        merger.when_matched_delete().when_not_matched_insert_all().execute()
+        assert _values(conn, path, "id") == [1, 3]
+        assert _deltars_rows(path, "id") == [1, 3]
+        assert not _dv_files(path)
 
 
 def _z85(data: bytes) -> str:

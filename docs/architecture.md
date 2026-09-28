@@ -238,10 +238,18 @@ its existing vector, writes every vector into one file in the protocol's
 format, and commits through the kernel's `update_deletion_vectors`, with any
 rewritten or inserted rows added in the same transaction.
 
-Three cases follow Spark. A file left with no rows is removed, unless row
-tracking forbids removes, in which case it keeps a vector covering every row.
-A rewritten row on a row-tracked table has its old id written to the table's
-materialized row-id column, so its id survives the UPDATE. A DELETE commit adds
+Three cases follow Spark. A file left with no rows is removed; on a row-tracked
+table, where kernel 0.28 refuses removes, the remove is staged by hand with the
+file's `baseRowId` and `defaultRowCommitVersion`. A rewritten row on a
+row-tracked table has its old id written to the table's materialized row-id
+column, so its id survives the UPDATE.
+
+A table without deletion vectors enabled takes the same change copy-on-write:
+every file holding a touched row is removed (`whole_files`), and its other rows
+are read back by position and written again beside the new ones. That is how
+the kernel serves MERGE on tables delta-rs cannot write, and every DML on a
+row-tracked table: the kept rows bring their row ids and commit versions, which
+go to the materialized columns, so a file rewrite changes neither. A DELETE commit adds
 no data, so it needs no CDC files on a change-data-feed table: readers derive
 the deleted rows from the old and new vectors.
 

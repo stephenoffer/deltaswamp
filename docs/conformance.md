@@ -89,7 +89,7 @@ deduplicates, and save modes come from `Connection.write_table`.
 | idempotent write | `t.append(data, txn=(app_id, version))` | enforced here | neither engine deduplicates; verified against delta-rs 1.6.5 |
 | commit metadata | `t.append(data, commit_metadata={...})` | delta-rs | shows up in `history()` |
 | distributed write | `t.plan_write()` / `plan.write()` / `plan.commit()` | kernel | workers write files, the driver commits them as one version; refused at plan time, before any file is written |
-| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | kernel (deletion vectors), delta-rs, sql | on a table with deletion vectors enabled the kernel writes them, as Databricks does, catalog-managed and row-tracked tables included; elsewhere delta-rs is copy-on-write and the kernel's last resort is a bounded whole-table rewrite (no MERGE) |
+| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | kernel (deletion vectors), delta-rs, sql | on a table with deletion vectors enabled the kernel writes them, as Databricks does, catalog-managed and row-tracked tables included; elsewhere delta-rs is copy-on-write, and the kernel's last resort is a bounded whole-table rewrite (DELETE, UPDATE) or a rewrite of the touched files (MERGE, and all DML on row-tracked tables, whose row ids it keeps) |
 
 ## Where every operation routes
 
@@ -113,9 +113,9 @@ serve.
 | `replace_where` | deltars, iceberg, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs, PyIceberg for Iceberg tables, the warehouse, and last a bounded whole-table rewrite through the kernel |
 | `create` | deltars, kernel | delta-rs creates path and external tables; the kernel takes over when the properties or clustering exceed what delta-rs accepts, and for managed tables, whose storage the catalog allocates through its staging-table API |
 | `merge_schema` | deltars, sql | kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH SCHEMA EVOLUTION |
-| `delete` | deltars, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs copy-on-write, then the warehouse, and last a bounded whole-table rewrite through the kernel |
-| `update` | deltars, sql, kernel | deletion vectors plus new files through the kernel when the table enables them (row ids kept under row tracking); otherwise delta-rs, the warehouse, and last a bounded whole-table rewrite, with literal or column assignments |
-| `merge` | deltars, sql, kernel | deletion vectors through the kernel, with clauses evaluated in DuckDB, when the table enables them; otherwise delta-rs, then the warehouse, which merges from a source staged in a volume |
+| `delete` | deltars, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs copy-on-write, then the warehouse, and last a bounded whole-table rewrite through the kernel (on a row-tracked table, a rewrite of the touched files that keeps every row id) |
+| `update` | deltars, sql, kernel | deletion vectors plus new files through the kernel when the table enables them (row ids kept under row tracking); otherwise delta-rs, the warehouse, and last a bounded whole-table rewrite (on a row-tracked table, a rewrite of the touched files that keeps every row id), with literal or column assignments |
+| `merge` | deltars, sql, kernel | deletion vectors through the kernel, with clauses evaluated in DuckDB, when the table enables them; otherwise delta-rs, then the warehouse, which merges from a source staged in a volume, and last the kernel copy-on-write (touched files rewritten; row ids kept under row tracking) |
 | `add_column` | deltars, kernel, sql | delta-rs first; kernel for tables it cannot write |
 | `drop_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no DROP COLUMN |
 | `rename_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no RENAME COLUMN |

@@ -109,27 +109,26 @@ class TestEarlyValuesSetByDml:
         t.update(new_values=early, predicate="id = 1")
         assert _footers(t.location) == [b"3.5.0"]
 
-    def test_merge_set_and_insert_refused_without_a_footer_writer(
-        self, tmp_path: pathlib.Path
-    ) -> None:
+    def test_merge_set_and_insert_go_to_the_footer_writer(self, tmp_path: pathlib.Path) -> None:
+        # delta-rs would write the early date unmarked; the kernel's
+        # copy-on-write MERGE marks every file it writes.
         t = _table(tmp_path)
-        before = deltalake.DeltaTable(t.location).version()
         src = pa.table({"id": pa.array([1, 9], pa.int64())})
         for clause in (
             ("when_matched_update", None, {"d": "DATE '1000-01-01'"}),
             ("when_not_matched_insert", None, {"id": "source.id", "d": "DATE '1000-01-01'"}),
         ):
             cap = t.can("merge", source=src, predicate="target.id = source.id", clauses=[clause])
-            assert not cap.ok and "1582" in cap.reason, cap
-        with pytest.raises(UnreachableTableError, match="1582"):
-            t.merge(src, "target.id = source.id").when_matched_update(
-                {"d": "DATE '1000-01-01'"}
-            ).execute()
-        with pytest.raises(UnreachableTableError, match="1582"):
-            t.merge(src, "target.id = source.id").when_not_matched_insert(
-                {"id": "source.id", "d": "DATE '1000-01-01'"}
-            ).execute()
-        assert deltalake.DeltaTable(t.location).version() == before
+            assert cap.ok and cap.engine is ds.Engine.KERNEL, cap
+        t.merge(src, "target.id = source.id").when_matched_update(
+            {"d": "DATE '1000-01-01'"}
+        ).execute()
+        t.merge(src, "target.id = source.id").when_not_matched_insert(
+            {"id": "source.id", "d": "DATE '1000-01-01'"}
+        ).execute()
+        assert all(v == b"3.5.0" for v in _footers(t.location)), _footers(t.location)
+        rows = {r["id"]: r["d"] for r in t.to_arrow().to_pylist()}
+        assert rows[1] == rows[9] == dt.date(1000, 1, 1)
 
     def test_merge_copy_of_a_bounded_source_column_goes_to_deltars(
         self, tmp_path: pathlib.Path

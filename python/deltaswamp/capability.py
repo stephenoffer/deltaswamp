@@ -731,21 +731,24 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             (_D, _S, _K),
             "deletion vectors through the kernel when the table enables them; otherwise "
             "delta-rs copy-on-write, then the warehouse, and last a bounded whole-table "
-            "rewrite through the kernel",
+            "rewrite through the kernel (on a row-tracked table, a rewrite of the touched "
+            "files that keeps every row id)",
         ),
         _op(
             Operation.UPDATE,
             (_D, _S, _K),
             "deletion vectors plus new files through the kernel when the table enables "
             "them (row ids kept under row tracking); otherwise delta-rs, the warehouse, "
-            "and last a bounded whole-table rewrite, with literal or column assignments",
+            "and last a bounded whole-table rewrite (on a row-tracked table, a rewrite of "
+            "the touched files that keeps every row id), with literal or column assignments",
         ),
         _op(
             Operation.MERGE,
             (_D, _S, _K),
             "deletion vectors through the kernel, with clauses evaluated in DuckDB, when the "
             "table enables them; otherwise delta-rs, then the warehouse, which merges from "
-            "a source staged in a volume",
+            "a source staged in a volume, and last the kernel copy-on-write (touched files "
+            "rewritten; row ids kept under row tracking)",
         ),
         # --- ddl. The kernel rows are metadata-only commits this library writes
         # itself, for path tables delta-rs cannot alter or cannot express.

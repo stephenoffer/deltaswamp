@@ -142,12 +142,20 @@ class TestRowTracking:
         assert [rid for rid, _ in _row_tracking(path).values()] == [40, 41, 42]
         assert len(_live_adds(path)) == 1
 
-    def test_replace_where_on_a_row_tracked_table_is_still_refused(
+    def test_replace_where_on_a_row_tracked_table_keeps_the_other_rows_ids(
         self, conn: Any, tmp_path: Any
     ) -> None:
         path = str(tmp_path / "rtrw")
         table = _table(conn, path, properties={"delta.enableRowTracking": "true"})
-        assert not table.can("overwrite", predicate="id < 5").ok
+        before = _row_tracking(path)
+        verdict = table.can("overwrite", predicate="id < 5")
+        assert verdict.ok and verdict.engine is Engine.KERNEL
+        table.overwrite(_rows(0, 5), predicate="id < 5")
+        after = _row_tracking(path)
+        # Only the first file is rewritten: its other rows keep id and version;
+        # the replaced rows are new rows, with fresh ids.
+        assert {i: after[i] for i in range(5, 40)} == {i: before[i] for i in range(5, 40)}
+        assert min(after[i][0] for i in range(5)) >= 40
 
 
 class TestLiquidClustering:

@@ -122,28 +122,35 @@ def _ts(conn: Any, path: str, column: str = "ts") -> list[int | None]:
 class TestRewritesKeepTheCalendar:
     """delta-rs rewrote legacy files from their raw Julian values: 0001-01-01 became 0000-12-30."""
 
-    @pytest.mark.parametrize("operation", ["update", "merge"])
-    def test_delta_rs_is_refused_and_can_agrees(
-        self, conn: Any, tmp_path: Any, operation: str
-    ) -> None:
+    def test_delta_rs_is_refused_and_can_agrees(self, conn: Any, tmp_path: Any) -> None:
         path = _spark_table(tmp_path / "t")
         t = conn.open_table(path)
-        shape = {"updates": {"rid": "rid + 10"}} if operation == "update" else {}
-        verdict = t.can(operation, **shape)
+        verdict = t.can("update", updates={"rid": "rid + 10"})
         assert not verdict.ok
         assert "legacy hybrid calendar" in verdict.reason, verdict
         assert verdict.engine is not ds.Engine.DELTARS
         with pytest.raises(UnreachableTableError, match="legacy hybrid calendar"):
-            if operation == "update":
-                t.update({"rid": "rid + 10"}, predicate="rid = 2")
-            elif operation == "merge":
-                source = pa.table({"rid": pa.array([2], pa.int64())})
-                t.merge(source, "target.rid = source.rid").when_matched_update(
-                    {"rid": "target.rid + 100"}
-                ).execute()
+            t.update({"rid": "rid + 10"}, predicate="rid = 2")
         # Nothing was rewritten.
         assert [d for _, d in _rows(conn, path)] == EXPECTED_DATES
         assert _raw_days(path) == [-719164, -171489, 19723]  # the Julian day numbers
+
+    def test_kernel_merge_keeps_the_values(self, conn: Any, tmp_path: Any) -> None:
+        # delta-rs is refused this MERGE; the kernel's copy-on-write one
+        # reads the legacy file rebased and writes what it read.
+        path = _spark_table(tmp_path / "t")
+        t = conn.open_table(path)
+        assert t.can("merge").engine is ds.Engine.KERNEL
+        source = pa.table({"rid": pa.array([2], pa.int64())})
+        t.merge(source, "target.rid = source.rid").when_matched_update(
+            {"rid": "target.rid + 100"}
+        ).execute()
+        assert _rows(conn, path) == [
+            (1, dt.date(1, 1, 1)),
+            (3, dt.date(2024, 1, 1)),
+            (102, dt.date(1500, 6, 15)),
+        ]
+        assert sorted(_raw_days(path)) == sorted(_days(*EXPECTED_DATES))
 
     def test_kernel_rewrites_keep_the_values(self, conn: Any, tmp_path: Any) -> None:
         path = _spark_table(tmp_path / "t")

@@ -1,11 +1,14 @@
-"""MERGE through the kernel, written as deletion vectors.
+"""MERGE through the kernel, written as deletion vectors or copy-on-write.
 
 The kernel has no MERGE, so it is assembled here from the pieces DELETE and
 UPDATE already use: a positional read of the target, the clauses evaluated in
 DuckDB (so clause conditions and SET expressions are real SQL, with the source
 and target aliases), and one `commit_dml` that marks every touched target row
 deleted and appends the rewritten and inserted rows. That is how Databricks
-writes a MERGE on a table with deletion vectors enabled.
+writes a MERGE on a table with deletion vectors enabled. On a table without
+them, the same commit removes every touched file instead and writes its
+untouched rows again beside the new ones (`KernelEngine._as_file_rewrites`),
+as Spark's copy-on-write MERGE does.
 
 Semantics follow Spark's MERGE:
 
@@ -17,7 +20,9 @@ Semantics follow Spark's MERGE:
 * a source row that matches no target row is offered to the NOT MATCHED
   clauses, a target row that matches no source row to the NOT MATCHED BY
   SOURCE clauses;
-* on a table with row tracking enabled, updated rows keep their row ids.
+* on a table with row tracking enabled, updated rows keep their row ids (and
+  a copy-on-write rewrite's untouched rows their commit versions too), and
+  inserted rows get fresh ones.
 
 Clause text is Spark SQL, as everywhere else in the API (and on the
 warehouse, which runs the same text). DuckDB evaluates it, so `_spark_sql`

@@ -92,16 +92,25 @@ def test_positive_decimal_partitions_still_route_to_deltars(tmp_path: Path) -> N
     )
 
 
-def test_merge_negative_decimal_partition_refused_before_commit(tmp_path: Path) -> None:
+def test_merge_negative_decimal_partition_goes_to_the_kernel(tmp_path: Path) -> None:
+    # delta-rs would serialize -1.50 as "-1.-50"; the kernel's copy-on-write
+    # MERGE writes the partition value right.
+    _need_native()
     path = str(tmp_path / "t")
     conn = ds.connect()
     t = conn.write_table(path, pa.table({"p": _dec("2.25"), "v": [1]}), partition_by=["p"])
     source = pa.table({"p": _dec("-1.50"), "v": [2]})
-    with pytest.raises(errors.DeltaSwampError, match="negative_decimal_partition_values"):
+    result = (
         t.merge(source, "s.v = t.v", source_alias="s", target_alias="t")
-    # Nothing was committed, and the table still reads.
-    assert conn.table(path).version == 1
-    assert conn.table(path).count() == 1
+        .when_not_matched_insert_all()
+        .execute()
+    )
+    assert result.engine == "kernel"
+    assert "-1.-50" not in {pv["p"] for pv in _partition_values(path)}
+    assert sorted(conn.table(path).to_arrow().column("p").to_pylist()) == [
+        Decimal("-1.50"),
+        Decimal("2.25"),
+    ]
 
 
 def test_update_to_negative_decimal_partition_is_not_corrupted(tmp_path: Path) -> None:

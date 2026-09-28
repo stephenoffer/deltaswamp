@@ -76,11 +76,11 @@ Several values in one cell are a routing chain, tried in order.
 | Schema merge on write | DBR, Spark, delta-rs | delta-rs | |
 | Save modes | DBR, Spark, delta-rs | native | `Connection.write_table` |
 | Idempotent writes (txnAppId) | DBR, Spark | native | checked here; delta-rs records but does not enforce |
-| DELETE / UPDATE | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, warehouse | deletion vectors on tables that enable them; otherwise delta-rs copy-on-write, and last a bounded whole-table rewrite through the kernel |
-| MERGE | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, warehouse | one clause API for all three; the kernel evaluates clauses with DuckDB (`deltaswamp[duckdb]`), the warehouse merges from a staged source |
-| DML on catalog-managed tables | DBR | kernel (deletion vectors), warehouse | DELETE/UPDATE/replaceWhere/MERGE as deletion vectors through UCCommitter; row ids kept on row-tracked tables. Without deletion vectors, DELETE/UPDATE/replaceWhere are a bounded rewrite and MERGE needs the warehouse |
+| DELETE / UPDATE | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, warehouse | deletion vectors on tables that enable them; otherwise delta-rs copy-on-write, and last a bounded whole-table rewrite through the kernel. A row-tracked table without deletion vectors gets a kernel rewrite of only the touched files, which keeps every row id |
+| MERGE | DBR, Spark, delta-rs | kernel (deletion vectors or copy-on-write), delta-rs, warehouse | one clause API for all three; the kernel evaluates clauses with DuckDB (`deltaswamp[duckdb]`), the warehouse merges from a staged source. On tables delta-rs cannot write (in-commit timestamps, clustering, type widening, column defaults, row tracking, legacy-calendar files) and that do not enable deletion vectors, the kernel removes each touched file and writes its other rows again beside the new ones |
+| DML on catalog-managed tables | DBR | kernel (deletion vectors), warehouse | DELETE/UPDATE/replaceWhere/MERGE as deletion vectors through UCCommitter; row ids kept on row-tracked tables. Without deletion vectors, DELETE/UPDATE/replaceWhere are a bounded rewrite and MERGE a copy-on-write of the touched files |
 | Deletion-vector authoring | DBR, Spark | kernel | bitmaps computed here, written in the protocol's file format, committed through the kernel's DV update; a second DELETE unions with the existing vector; files left empty are removed |
-| Row-id preservation on UPDATE / MERGE | DBR, Spark | kernel | updated rows' ids are written to the table's materialized row-id column |
+| Row-id preservation on DELETE / UPDATE / MERGE / replaceWhere | DBR, Spark | kernel | updated rows' ids are written to the table's materialized row-id column; a copy-on-write rewrite also writes the kept rows' ids and commit versions to the materialized columns, and inserted rows get fresh ids above the high-water mark. Removes (staged by hand, as kernel 0.28 refuses them there) and re-adds carry each file's `baseRowId` and `defaultRowCommitVersion` |
 | DML + CDF | DBR, Spark | kernel (DELETE), delta-rs, warehouse | a deletion-vector DELETE needs no CDC files; UPDATE and MERGE on a CDF table need CDC files the kernel cannot write |
 | Row-level concurrency | DBR | — | a Databricks conflict-detection feature |
 | Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction. Catalog-managed tables included |
@@ -145,7 +145,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | Publish staged commits | kernel | kernel | required on catalog-managed tables |
 | ANALYZE (DELTA) STATISTICS | DBR | warehouse | |
 | REORG PURGE / UPGRADE UNIFORM | DBR, Spark | warehouse | |
-| CLONE (shallow, deep) | DBR, Spark | kernel, warehouse | the kernel clones a path table to a path (delta-rs#2456): shallow with absolute-path adds and vectors, deep by copying; catalog targets and catalog-scoped credentials need the warehouse. A shallow clone is for Spark and Databricks: the direct engines read only files under a table's root |
+| CLONE (shallow, deep) | DBR, Spark | kernel, warehouse | the kernel clones a path table to a path (delta-rs#2456): shallow with absolute-path adds and vectors, deep by copying; catalog targets and catalog-scoped credentials need the warehouse. A shallow clone is for Spark and Databricks: the direct engines read only files under a table's root. Row-tracked tables are refused: the clone would have to carry every file's `baseRowId` and the high-water mark, and its rows' commit versions have no meaning in the new table's history |
 | CONVERT TO DELTA | DBR, Spark, delta-rs | delta-rs | |
 | Symlink manifests | Spark, delta-rs | delta-rs | |
 | Predictive optimization | DBR | — | server-side scheduling; `Table.info()` reports whether it is on |

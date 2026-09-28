@@ -157,26 +157,28 @@ class TestDeltaRsIsNotHandedEarlyValues:
         _assert_footers(path)
         assert _values(path) == before
 
-    def test_a_merge_that_delta_rs_would_write_is_refused(self, early_table: Any) -> None:
+    def test_a_merge_that_delta_rs_would_write_goes_to_the_kernel(self, early_table: Any) -> None:
+        # delta-rs would write the early values unmarked; the kernel's
+        # copy-on-write MERGE writes every file, kept rows' too, marked.
         t = early_table()
         verdict = t.can("merge", data=_rows(EARLY))
-        assert not verdict.ok
-        assert "legacy calendar rebase" in verdict.reason
-        with pytest.raises(UnreachableTableError, match="legacy calendar"):
-            (
-                t.merge(_rows(EARLY), "target.rid = source.rid")
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute()
-            )
+        assert verdict.ok and verdict.engine is ds.Engine.KERNEL, verdict.reason
+        result = (
+            t.merge(_rows(EARLY, base=2), "target.rid = source.rid")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute()
+        )
+        assert result.engine == "kernel"
+        _assert_footers(t.location)
+        assert _values(t.location) == _raw_values(t.location)
 
-    def test_a_delta_rs_rewrite_of_early_files_is_refused(self, early_table: Any) -> None:
+    def test_a_rewrite_of_early_files_goes_to_the_kernel(self, early_table: Any) -> None:
         # Even with late source rows: a MERGE copies the target rows it does
-        # not change into delta-rs files.
+        # not change, which delta-rs would write unmarked.
         t = early_table()
         verdict = t.can("merge", data=_rows(LATE, base=100))
-        assert not verdict.ok
-        assert "may hold dates before 1582-10-15" in verdict.reason
+        assert verdict.ok and verdict.engine is ds.Engine.KERNEL, verdict.reason
 
     def test_an_optimize_only_delta_rs_runs_is_refused(self, early_table: Any) -> None:
         t = early_table()
