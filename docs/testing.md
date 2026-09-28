@@ -94,6 +94,65 @@ It is opt-in on top of the live suite, because it creates around thirty tables
 DELTASWAMP_TEST_MATRIX=1 pytest tests/live/test_live_matrix.py -v
 ```
 
+### The interop suite
+
+The matrix starts from tables Databricks wrote. `tests/live/test_live_interop.py`
+goes the other way: it builds a table locally through a deltaswamp operation
+history, uploads the table directory to a Unity Catalog volume, and asks the
+warehouse what it makes of it. Each case is one table shape under one
+history (the machinery and the histories are in `tests/live/interop.py`):
+plain, pre-1582 data, partitioned (NULL, `''`, `x/y=z`, unicode and early
+dates in partition values), deletion vectors, change data feed, column mapping
+by name and id after renames and drops, row tracking, in-commit timestamps,
+type widening, TIMESTAMP_NTZ, decimal extremes and long strings, generated
+columns, constraints, v2 checkpoints, liquid clustering, interval-2
+checkpoints with log compaction, a legacy table plain delta-rs created, a
+(1,4) change-feed table, all of those features together, a VARIANT table
+Databricks created, kernel deletion-vector DML on 38-digit decimals, nested
+ARRAY<TIMESTAMP>, and early dates through every write path. A history writes
+through the kernel and delta-rs, transactionally and distributed, runs DML
+through each engine, DDL, OPTIMIZE, Z-ORDER, RESTORE, checkpoints, log
+compaction, VACUUM and metadata cleanup. For every case it asserts:
+
+- every step commits, or is refused with a typed error that writes nothing;
+- (a) the rows agree with the warehouse (`EXCEPT ALL` both ways) at the
+  latest version, at three earlier ones through `VERSION AS OF`, and after
+  VACUUM and cleanup;
+- (b) `DESCRIBE DETAIL` agrees on features, properties, protocol, partition
+  columns and file count;
+- (c) Databricks UPDATE, DELETE, MERGE, INSERT, OPTIMIZE, VACUUM DRY RUN and
+  (on deletion-vector tables) REORG PURGE succeed; deltaswamp reads every
+  version Databricks committed as Databricks does, and appends on top in a way
+  Databricks reads back;
+- (d) `table_changes()` equals `cdf()` on change-data-feed tables, over the
+  whole feed, the last few commits, and Databricks' own writes;
+- (e) selective predicates (`=`, `<`, `>`, `>=`, `IS NULL` on the smallest,
+  median and largest value of every leaf column, struct fields included)
+  return the same rows on Databricks as deltaswamp reads, grouped by type:
+  integers, decimals, floats, NaN, strings, long strings, binary and boolean,
+  dates, timestamps, nested. This is data skipping on the log statistics and
+  the Parquet footers;
+- (f) every data file a kernel commit added names `org.apache.spark.version`
+  in its footer, and no file without it (delta-rs cannot write the key) holds
+  a date before 1582-10-15 or a timestamp before 1900.
+
+It needs `DELTASWAMP_TEST_WAREHOUSE_ID` on top of the live suite's variables:
+
+```bash
+DELTASWAMP_TEST_INTEROP=1 pytest tests/live/test_live_interop.py -v
+DELTASWAMP_TEST_INTEROP=1 DELTASWAMP_TEST_INTEROP_SHAPES=plain,dv,cdf \
+  pytest tests/live/test_live_interop.py -v      # a subset, by shape or case id
+```
+
+Cases run in the background, six at a time (`DELTASWAMP_TEST_INTEROP_WORKERS`),
+and each test waits for its case; the whole suite takes about RUNTIME. It
+creates no tables: everything lives on one volume with a random name
+(`dsi_...`), dropped at the end of the session even when tests fail.
+
+Open bugs are marked `xfail(strict=True)` on the one check they break
+(`Case.known` in `tests/live/interop.py`), so a fix turns the test into an
+unexpected pass, and the suite fails until the mark comes off.
+
 A PAT cannot be refreshed, so anything that outlives it stops with what looks
 like an authentication error. Use OAuth M2M in production.
 
