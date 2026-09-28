@@ -320,3 +320,79 @@ class TestKernelCompression:
         version = deltalake.DeltaTable(path).version()
         t.append(self._early_rows(10, 10))
         assert self._codecs(path, version) == {"ZSTD"}
+
+
+class TestIntervalColumns:
+    """D5-D7: SQL on interval columns, and year-month text validation."""
+
+    @pytest.fixture
+    def table(self, tmp_path: pathlib.Path) -> Any:
+        from tests.integration.test_audit_live5 import _interval_table
+
+        return _interval_table(ds.connect("file://"), tmp_path)
+
+    @pytest.mark.parametrize("predicate", ["ym = -14", "i > 0", "y = 36", "`ym` IS NULL"])
+    def test_dml_on_an_interval_column_is_refused_up_front(
+        self, table: Any, predicate: str
+    ) -> None:
+        # can() named delta-rs, which then failed "No such field: ym".
+        for op, kw in (("delete", {}), ("update", {"updates": {"id": "id + 1"}})):
+            cap = table.can(op, predicate=predicate, **kw)
+            assert not cap.ok and "interval" in cap.reason, cap
+        with pytest.raises(UnreachableTableError, match="interval"):
+            table.delete(predicate)
+        assert table.count() == 2
+
+    def test_setting_an_interval_column_is_refused(self, table: Any) -> None:
+        # ym + 1 added a month to the stored integer; Spark refuses the types.
+        assert not table.can("update", updates={"ym": "ym + 1"}, predicate="id = 1").ok
+        with pytest.raises(UnreachableTableError, match="interval"):
+            table.update({"ym": "ym + 1"}, predicate="id = 1")
+
+    def test_other_columns_still_go_direct(self, table: Any) -> None:
+        assert table.can("delete", predicate="id = 1").ok
+        assert table.can("scan", predicate="id = 1").ok
+        # A string literal that happens to spell a column name is no reference.
+        assert table.can("scan", predicate="'ym' = 'ym'").ok
+
+    def test_reads_never_compare_the_stored_integers(self, table: Any) -> None:
+        # ym = -14 matched INTERVAL '-1-2' YEAR TO MONTH.
+        assert not table.can("scan", predicate="ym = -14").ok
+        with pytest.raises(UnreachableTableError, match="interval"):
+            table.to_arrow(predicate="ym = -14")
+
+    def test_lazy_hand_offs_filter_the_shown_values(self, table: Any) -> None:
+        text = "INTERVAL '-1-2' YEAR TO MONTH"
+        rel = table.to_duckdb().filter(f"ym = '{text.replace(chr(39), chr(39) * 2)}'")
+        assert rel.project("id").fetchall() == [(1,)]
+        assert table.to_duckdb().filter("i > INTERVAL 1 DAY").project("id").fetchall() == [(1,)]
+        got = table.to_pyarrow_dataset().to_table(filter=pa.compute.field("ym") == text)
+        assert got.column("id").to_pylist() == [1]
+        pl = pytest.importorskip("polars")
+        frame = table.to_polars(lazy=True).filter(pl.col("i") > dt.timedelta(days=1))
+        assert frame.select("id").collect().to_series().to_list() == [1]
+
+    @pytest.mark.parametrize(
+        "column, text, message",
+        [
+            ("ym", "INTERVAL '1-13' YEAR TO MONTH", "0 to 11"),
+            ("ym", "INTERVAL '999999999' YEAR", "out of range"),
+        ],
+    )
+    def test_year_month_text_is_validated(
+        self, table: Any, column: str, text: str, message: str
+    ) -> None:
+        from deltaswamp.errors import InvalidArgumentError
+
+        with pytest.raises(InvalidArgumentError, match=message):
+            table.append(pa.table({"id": pa.array([9], pa.int64()), column: pa.array([text])}))
+
+    def test_year_to_month_text_into_a_year_column_drops_the_months(self, table: Any) -> None:
+        table.append(
+            pa.table(
+                {"id": pa.array([9], pa.int64()), "y": pa.array(["INTERVAL '1-2' YEAR TO MONTH"])}
+            )
+        )
+        path = table.location
+        raw = deltalake.DeltaTable(path).to_pyarrow_table(filters=[("id", "=", 9)])
+        assert raw.column("y").to_pylist() == [12]

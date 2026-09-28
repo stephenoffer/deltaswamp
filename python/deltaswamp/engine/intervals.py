@@ -32,6 +32,7 @@ __all__ = [
     "interval_schema",
     "interval_stream",
     "month_interval_text",
+    "sql_identifiers",
     "storage_columns",
     "year_month_text",
 ]
@@ -230,10 +231,28 @@ def _months(text: str, qualifier: str) -> int:
     sign, first, second, given = match.groups()
     unit = " ".join((given or qualifier).upper().split())
     if second is not None:
+        if given is not None and unit != "YEAR TO MONTH":
+            raise InvalidArgumentError(f"{text!r}: a 'years-months' value is YEAR TO MONTH")
+        if int(second) > 11:
+            # Spark: "month 13 outside range [0, 11]"; 1-13 is not 2-1.
+            raise InvalidArgumentError(
+                f"{text!r}: the month of a YEAR TO MONTH interval is 0 to 11, not {int(second)}"
+            )
         value = int(first) * 12 + int(second)
     else:
         value = int(first) * (12 if unit == "YEAR" else 1)
-    return -value if sign == "-" else value
+    if qualifier == "YEAR":
+        # An INTERVAL YEAR column holds whole years, as months. Spark casts a
+        # YEAR TO MONTH value into one by dropping the months; stored as
+        # given, '1-2' read back as '1' YEAR while arithmetic saw 14 months.
+        value -= value % 12
+    value = -value if sign == "-" else value
+    if not -(2**31) <= value < 2**31:
+        raise InvalidArgumentError(
+            f"{text!r} is out of range for a year-month interval (at most 178956970 years "
+            "7 months either way)"
+        )
+    return value
 
 
 def _storage_leaf_type(pa: Any, group: str) -> Any:
@@ -284,3 +303,25 @@ def storage_columns(pa: Any, table: Any, groups: IntervalPaths) -> Any:
         if column is not table.column(index):
             table = table.set_column(index, field.with_type(column.type), column)
     return table
+
+
+#: A string literal (skipped), a backquoted identifier, or a bare word.
+_SQL_TOKEN = re.compile(
+    r"""'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.)*"|`((?:[^`]|``)+)`|([A-Za-z_][A-Za-z0-9_]*)"""
+)
+
+
+def sql_identifiers(text: str) -> set[str]:
+    """Every identifier SQL `text` may name, lower-cased, string literals left out.
+
+    Keywords and function names come along; the caller matches the result
+    against column names, so a stray word can only make it cautious.
+    """
+    out = set()
+    for match in _SQL_TOKEN.finditer(text):
+        quoted, bare = match.groups()
+        if quoted is not None:
+            out.add(quoted.replace("``", "`").lower())
+        elif bare is not None:
+            out.add(bare.lower())
+    return out

@@ -166,6 +166,7 @@ def _read(
         needs.add("distributed_scan")
     if predicate is not None:
         needs |= table._predicate_needs(predicate)
+        needs |= table._interval_needs(predicate)
         # A predicate the kernel's grammar does not read (`id % 7 = 1`) goes
         # to an engine that evaluates SQL, as for DELETE: the kernel scan
         # raised PredicateError after can() had named it.
@@ -195,6 +196,7 @@ def _feed(
     if predicate is not None:
         needs |= table._predicate_needs(predicate)
         needs |= table._expression_needs(predicate)
+        needs |= table._interval_needs(predicate)
     needs |= table._variant_needs(get("columns"), predicate)
     if get("allow_out_of_range"):
         # Only delta-rs reads past the table's last version; the kernel
@@ -235,6 +237,7 @@ def _write(
         op = Operation.REPLACE_WHERE
     if op is Operation.REPLACE_WHERE:
         needs |= table._expression_needs(get("predicate"))
+        needs |= table._interval_needs(get("predicate"))
     if data is not NO_DATA:
         needs |= table._data_needs(data, get("partition_by"))
         if schema_mode != "overwrite":
@@ -406,7 +409,9 @@ def _delete(
     table: Table, op: Operation, shape: dict[str, Any], data: Any
 ) -> tuple[Operation, set[str]]:
     return Operation.DELETE, set(table._expression_needs(shape.get("predicate"))) | (
-        _commit_options(table, shape) | table._char_needs(shape.get("predicate"))
+        _commit_options(table, shape)
+        | table._char_needs(shape.get("predicate"))
+        | table._interval_needs(shape.get("predicate"))
     )
 
 
@@ -423,6 +428,11 @@ def _update(
     needs |= table._expression_needs(shape.get("predicate"), spelled)
     needs |= table._char_needs(shape.get("predicate"))
     needs |= _assignment_needs(table, [(spelled or {}, True), (new_values, False)])
+    needs |= table._interval_needs(
+        shape.get("predicate"),
+        updates if isinstance(updates, dict) else None,
+        {k: None for k in new_values} if isinstance(new_values, dict) else None,
+    )
     return Operation.UPDATE, needs | _commit_options(table, shape)
 
 
@@ -460,6 +470,7 @@ def _merge(
     assigned = [
         c[2] for c in clauses if isinstance(c, (list, tuple)) and len(c) > 2 and c[2] is not None
     ]
+    needs |= table._interval_needs(shape.get("predicate"), *assigned)
     if assigned:
         aliases = (
             str(shape.get("source_alias") or "source"),

@@ -831,6 +831,9 @@ class SqlEngine:
     supports_spark_sql = True
     #: Spark's CHAR(n) comparisons, which pad with spaces (`Table._char_needs`).
     supports_char_padding = True
+    #: SQL on an ANSI interval column, which the warehouse types as one
+    #: (`Table._interval_needs`).
+    supports_interval_columns = True
     supports_timestamp_travel = True
     #: `INSERT WITH SCHEMA EVOLUTION` / `MERGE WITH SCHEMA EVOLUTION`.
     supports_schema_merge = True

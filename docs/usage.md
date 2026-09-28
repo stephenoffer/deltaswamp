@@ -393,7 +393,19 @@ staged for the warehouse as microseconds and multiplied back into an interval
 (Databricks casts a bare BIGINT to an interval as *seconds*), and the kernel and
 delta-rs store the integers Databricks stores. A plain integer bound for a
 day-time interval column is refused. A duration nested in a struct, list or map
-cannot be staged for the warehouse.
+cannot be staged for the warehouse. Year-month text is checked as Spark checks
+it: the month of `'1-13'` is out of range, and a value past the INT32 of months
+is refused; `YEAR TO MONTH` text written to an `INTERVAL YEAR` column keeps the
+whole years, as Spark's cast does.
+
+SQL that names an interval column -- a read or DML predicate, an UPDATE or
+MERGE value -- needs the warehouse (`allow_sql_fallback=True`) and is refused
+without it: the files hold the bare integers, and a direct engine would compare
+those (`ym = -14` matched `INTERVAL '-1-2' YEAR TO MONTH`) where Spark compares
+intervals. The lazy hand-offs (`to_duckdb`, `to_polars(lazy=True)`,
+`to_pyarrow_dataset`) push no filter on such a column into the scan, so
+`rel.filter("i > INTERVAL 1 DAY")` or `pl.col("ym") == "INTERVAL '-1-2' YEAR TO
+MONTH"` is evaluated on the values they show.
 
 A Delta timestamp holds microseconds. A nanosecond timestamp (pandas'
 `datetime64[ns]`, `pa.timestamp("ns")`) creates a microsecond column, as Spark

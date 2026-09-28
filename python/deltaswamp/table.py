@@ -1146,6 +1146,44 @@ class Table:
             return set()
         return {"char_padding"} if any(p[0].lower() in chars for p in paths) else set()
 
+    def _interval_columns(self) -> frozenset[str]:
+        """The top-level columns (lower-cased) that are, or hold, an ANSI interval."""
+        try:
+            groups = interval_paths(self._raw_schema(with_log=True)[1])
+        except Exception:
+            return frozenset()
+        return frozenset(p[0].lower() for paths in groups.values() for p in paths if p)
+
+    def _interval_needs(self, *texts: Any) -> set[str]:
+        """``interval_columns`` when SQL names a column Databricks stores an interval in.
+
+        The log spells the interval; the files hold its INT32 months or INT64
+        microseconds, and the direct engines see only those. delta-rs does not
+        even resolve the column ("Schema error: No such field: ym") after
+        can() had named it, and a kernel read compared the raw integers
+        (``ym = -14`` matched ``INTERVAL '-1-2' YEAR TO MONTH``) where Spark
+        compares intervals. Only the warehouse evaluates SQL on an interval
+        as Spark does. `texts` are SQL strings, or mappings whose keys (the
+        columns set) and values count.
+        """
+        names = self._interval_columns()
+        if not names:
+            return set()
+        from .engine.intervals import sql_identifiers
+
+        for text in texts:
+            if isinstance(text, dict):
+                keys = {str(k).strip("`").split(".")[-1].lower() for k in text}
+                if keys & names:
+                    return {"interval_columns"}
+                values = [v for v in text.values() if isinstance(v, str)]
+            else:
+                values = [text] if isinstance(text, str) else []
+            for value in values:
+                if sql_identifiers(value) & names:
+                    return {"interval_columns"}
+        return set()
+
     def _variant_needs(self, columns: Any, predicate: Any) -> set[str]:
         """``variant_free`` when a read on a variant-shredding table skips every VARIANT column.
 
@@ -1690,6 +1728,11 @@ class Table:
         # the binary value: a pushed `v = '"x"'` compared a struct with a
         # string and failed. Nothing on such a column is pushed.
         opaque = frozenset(p[0] for p in self._variant_paths() if len(p) == 1)
+        # An interval column is shown as a duration or Spark's text, but the
+        # scan filters the stored integers (and refuses a predicate on them,
+        # `_interval_needs`): a filter on one is evaluated on the frame.
+        intervals = self._interval_columns()
+        opaque |= frozenset(f.name for f in schema if f.name.lower() in intervals)
         return TableDataset(
             source,
             schema,

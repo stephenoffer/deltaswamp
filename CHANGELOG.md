@@ -93,7 +93,9 @@ First release.
 - `INTERVAL DAY TO SECOND` columns read as `duration[us]` and year-month
   intervals as Spark's text (`INTERVAL '1-2' YEAR TO MONTH`) on every engine,
   warehouse included; both append back unchanged. A duration nested in a
-  struct, list or map cannot be staged for the warehouse.
+  struct, list or map cannot be staged for the warehouse. SQL naming an
+  interval column (a predicate, an UPDATE or MERGE value) needs the
+  warehouse; the lazy hand-offs filter such columns on the values they show.
 - A predicate on a `CHAR(n)` column needs the SQL fallback: Spark compares
   CHAR values padded to `n`, the direct engines compare bytes.
 - Time travel to a timestamp after the latest commit is refused
