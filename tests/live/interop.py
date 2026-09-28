@@ -1204,6 +1204,8 @@ class Case:
     #: How the expected side of a comparison rebuilds a VARIANT column: a
     #: SQL template over `{c}`, the column as JSON text.
     variant: Mapping[str, str] = field(default_factory=dict)
+    #: VARIANT leaves (read back as JSON text), which SQL cannot order or compare.
+    unordered: frozenset[tuple[str, ...]] = frozenset()
     #: Columns Databricks computes, left out of its INSERT statements.
     generated: frozenset[str] = frozenset()
     #: check key -> reason: open bugs, marked xfail(strict=True) so the
@@ -1253,9 +1255,11 @@ def _nan(**more: str) -> dict[str, str]:
 CASES: list[Case] = [
     Case("plain", "full", h_plain, groups(long=True), known=_nan()),
     Case("plain_ancient", "full", h_plain_ancient, groups(long=True), known=_nan()),
-    Case("partitioned", "partition_ops", h_partitioned, groups(), known=_nan()),
+    # Partitioned tables with NaN read right: each file there holds one
+    # partition's rows, so the footer bounds that leave NaN out prune nothing.
+    Case("partitioned", "partition_ops", h_partitioned, groups()),
     Case("dv", "full", h_dv, groups(), known=_nan()),
-    Case("dv_partitioned", "full", h_dv_partitioned, groups(), known=_nan()),
+    Case("dv_partitioned", "full", h_dv_partitioned, groups()),
     Case(
         "cdf",
         "full",
@@ -1284,7 +1288,7 @@ CASES: list[Case] = [
         known=_nan(**{"cdf-before-add-column": CDF_SCHEMA}),
     ),
     Case("type_widening", "widen", h_type_widening, groups(nested=False), known=_nan()),
-    Case("ntz", "full", h_ntz, groups(nested=False), known=_nan()),
+    Case("ntz", "full", h_ntz, groups(nested=False)),
     Case("types", "full", h_types, groups(long=True), known=_nan()),
     Case(
         "generated",
@@ -1307,13 +1311,14 @@ CASES: list[Case] = [
         adds_column=False,
         known=_nan(),
     ),
-    Case("everything", "full", h_everything, groups(), cdf=True, known=_nan()),
+    Case("everything", "full", h_everything, groups(), cdf=True),
     Case(
         "variant",
         "databricks_created",
         h_variant,
         ("integer", "string", "nested"),
         variant=_VARIANT_TEMPLATES,
+        unordered=frozenset({("v",), ("sv", "x")}),
         known={"variant-merge-null-element": VARIANT_NULL},
     ),
     Case(
@@ -1358,12 +1363,19 @@ class Diff:
     db_rows: int
     db_only: int
     ds_only: int
+    db_columns: list[str] = field(default_factory=list)
+    ds_columns: list[str] = field(default_factory=list)
     samples: dict[str, list[str]] = field(default_factory=dict)
     note: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.db_only == 0 and self.ds_only == 0 and self.db_rows == self.ds_rows
+        return (
+            self.db_only == 0
+            and self.ds_only == 0
+            and self.db_rows == self.ds_rows
+            and self.db_columns == self.ds_columns
+        )
 
     def explain(self) -> str:
         lines = [
@@ -1371,6 +1383,8 @@ class Diff:
             f"only on Databricks {self.db_only}, only in deltaswamp {self.ds_only}",
             f"  relation: {_short(self.relation, 300)}",
         ]
+        if self.db_columns != self.ds_columns:
+            lines.append(f"  columns: Databricks {self.db_columns}, deltaswamp {self.ds_columns}")
         for side, rs in self.samples.items():
             lines += [f"  {side}: {_short(r, 400)}" for r in rs]
         if self.note:
@@ -1462,8 +1476,9 @@ def compare_many(
 
     Both sides become one JSON document per row (`to_json` of the row's
     struct), so every type, nested value and column name compares the same
-    way, and a column only one side has shows up as a row difference. All
-    pairs go in one statement.
+    way. `to_json` leaves NULL fields out, so a column only one side has
+    could hide there; the column lists are compared separately. All row
+    counts go in one statement.
     """
     if not items:
         return {}
@@ -1483,7 +1498,11 @@ def compare_many(
             for i, n in enumerate(table.column_names)
         )
         b = f"(SELECT to_json(named_struct({fields})) j FROM parquet.`{uri}`)"
-        sides[label] = (a, b, relation, table.num_rows)
+        db_columns = [
+            c.name
+            for c in ctx.warehouse.run(f"SELECT * FROM {inner} LIMIT 0").manifest.schema.columns
+        ]
+        sides[label] = (a, b, relation, table.num_rows, db_columns, table.column_names)
         parts += [
             f"(SELECT count(*) FROM {a} x)",
             f"(SELECT count(*) FROM (SELECT * FROM {a} x EXCEPT ALL SELECT * FROM {b} y))",
@@ -1491,9 +1510,9 @@ def compare_many(
         ]
     counts = ctx.warehouse.rows("SELECT " + ", ".join(parts))[0]
     out: dict[str, Diff] = {}
-    for n, (label, (a, b, relation, ds_rows)) in enumerate(sides.items()):
+    for n, (label, (a, b, relation, ds_rows, db_cols, ds_cols)) in enumerate(sides.items()):
         db_rows, db_only, ds_only = (int(x) for x in counts[3 * n : 3 * n + 3])
-        diff = Diff(label, relation, ds_rows, db_rows, db_only, ds_only)
+        diff = Diff(label, relation, ds_rows, db_rows, db_only, ds_only, db_cols, list(ds_cols))
         if not diff.ok:
             with contextlib.suppress(Exception):
                 diff.samples["only on Databricks"] = [
@@ -1630,7 +1649,9 @@ def _group(path: tuple[str, ...], ty: pa.DataType, values: list[Any]) -> str | N
     return None
 
 
-def predicate_battery(table: pa.Table) -> dict[str, list[tuple[str, int]]]:
+def predicate_battery(
+    table: pa.Table, skip: frozenset[tuple[str, ...]] = frozenset()
+) -> dict[str, list[tuple[str, int]]]:
     """Selective predicates per leaf column, with the row count each must return.
 
     For the smallest, median and largest value of every leaf (struct fields
@@ -1640,6 +1661,8 @@ def predicate_battery(table: pa.Table) -> dict[str, list[tuple[str, int]]]:
     data = table.to_pylist()
     out: dict[str, list[tuple[str, int]]] = {}
     for path, ty in _leaves(table.schema):
+        if path in skip:
+            continue
         values = [_get(r, path) for r in data]
         group = _group(path, ty, values)
         if group is None:
@@ -1853,7 +1876,7 @@ def run_case(case: Case, ctx: Context) -> CaseResult:
     # (e) data skipping: selective predicates on the most fragmented version
     with res.gather(*[f"stats-{g}" for g in case.stats], "stats-coverage"):
         version = b.marks.get("stats", latest)
-        battery = predicate_battery(_read(pre, version))
+        battery = predicate_battery(_read(pre, version), case.unordered)
         res.evidence["stats-coverage"] = (sorted(case.stats), sorted(battery))
         for g in case.stats:
             with res.gather(f"stats-{g}"):

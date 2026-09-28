@@ -145,13 +145,19 @@ DELTASWAMP_TEST_INTEROP=1 DELTASWAMP_TEST_INTEROP_SHAPES=plain,dv,cdf \
 ```
 
 Cases run in the background, six at a time (`DELTASWAMP_TEST_INTEROP_WORKERS`),
-and each test waits for its case; the whole suite takes about RUNTIME. It
-creates no tables: everything lives on one volume with a random name
-(`dsi_...`), dropped at the end of the session even when tests fail.
+and each test waits for its case; all 26 cases (about 570 tests) take about
+12 minutes. The suite creates no tables: everything lives on one volume with a
+random name (`dsi_...`), dropped at the end of the session even when tests
+fail.
 
 Open bugs are marked `xfail(strict=True)` on the one check they break
 (`Case.known` in `tests/live/interop.py`), so a fix turns the test into an
-unexpected pass, and the suite fails until the mark comes off.
+unexpected pass, and the suite fails until the mark comes off. Open at the
+time of writing: NaN in DOUBLE columns of unpartitioned tables (the footer and
+delta-rs stats leave NaN out, so Databricks prunes those files), decimal
+bounds after kernel deletion-vector DML, reading ARRAY<TIMESTAMP> Databricks
+wrote as INT96, MERGE of a NULL ARRAY<VARIANT> element, and the
+`table_changes()` schema for a range that ends before a later ADD COLUMN.
 
 A PAT cannot be refreshed, so anything that outlives it stops with what looks
 like an authentication error. Use OAuth M2M in production.
