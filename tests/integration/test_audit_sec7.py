@@ -214,3 +214,70 @@ class TestAzureEndpointAllowlist:
             "https://acct.r2.cloudflarestorage.com"
         )
         assert r2_endpoint_for("r2://b@acct.evil.example/t") is None
+
+
+def _old_file(path: Any, days: int = 30) -> None:
+    import time
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("unrelated")
+    old = time.time() - days * 86400
+    os.utime(path, (old, old))
+
+
+class TestForeignFilesInTheTableRoot:
+    """SEC-P1: a table created in a non-empty folder, and a VACUUM deleting its files."""
+
+    @pytest.mark.parametrize("how", ["create_table", "write_table"])
+    def test_create_refuses_a_non_empty_directory(self, conn: Any, tmp_path: Any, how: str) -> None:
+        from deltaswamp.errors import UnreachableTableError
+
+        root = tmp_path / "docs"
+        _old_file(root / "notes.txt")
+        with pytest.raises(UnreachableTableError, match="not a Delta table"):
+            if how == "create_table":
+                conn.create_table(str(root), SCHEMA)
+            else:
+                conn.write_table(str(root), pa.table({"id": [1], "s": ["a"]}), mode="append")
+        assert sorted(os.listdir(root)) == ["notes.txt"]
+
+    def test_an_empty_log_directory_is_not_foreign(self, conn: Any, tmp_path: Any) -> None:
+        root = tmp_path / "t"
+        (root / "_delta_log").mkdir(parents=True)
+        conn.create_table(str(root), SCHEMA)
+
+    @pytest.mark.parametrize("dv", [False, True])
+    def test_vacuum_deletes_only_delta_named_files(
+        self, conn: Any, tmp_path: Any, dv: bool
+    ) -> None:
+        from deltaswamp.errors import DeltaSwampWarning
+
+        path = _table(conn, tmp_path, dv=dv)
+        root = tmp_path / "t"
+        _old_file(root / "resume.docx")
+        _old_file(root / "taxes" / "2025.pdf")
+        _old_file(root / "part-00000-orphan-c000.snappy.parquet")
+        with pytest.warns(DeltaSwampWarning, match="not deleted"):
+            removed = conn.open_table(path).vacuum(dry_run=False)
+        assert removed == ["part-00000-orphan-c000.snappy.parquet"]
+        assert (root / "resume.docx").exists()
+        assert (root / "taxes" / "2025.pdf").exists()
+        assert not (root / "part-00000-orphan-c000.snappy.parquet").exists()
+        assert _rows(conn, path) == ["hit", "keep", "z"]
+
+    def test_a_remote_catalog_cannot_place_a_table_on_local_disk(self) -> None:
+        from deltaswamp.connection import _refuse_local_catalog_location
+        from deltaswamp.errors import UnreachableTableError
+
+        class Remote:
+            _base_url = "https://uc.example.com/api/2.1/unity-catalog"
+
+        class Local:
+            _base_url = "http://localhost:8080/api/2.1/unity-catalog"
+
+        with pytest.raises(UnreachableTableError, match="this machine's filesystem"):
+            _refuse_local_catalog_location(Remote(), "file:///home/u/Documents")
+        with pytest.raises(UnreachableTableError):
+            _refuse_local_catalog_location(Remote(), "/home/u/Documents")
+        _refuse_local_catalog_location(Local(), "file:///tmp/uc/t")
+        _refuse_local_catalog_location(Remote(), "s3://bucket/t")

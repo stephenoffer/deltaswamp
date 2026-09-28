@@ -457,6 +457,93 @@ def _check_local_create_path(name: str) -> None:
         )
 
 
+def _refuse_foreign_files(location: str, options: Mapping[str, str] | None = None) -> None:
+    """Refuse to create a table where files that are not a Delta table already are.
+
+    Spark refuses a create at a non-empty location. Here the create succeeded,
+    and the table's first standard VACUUM then deleted every file already in
+    the directory -- documents, another dataset -- as unreferenced. What a
+    Delta table leaves behind is allowed (a log directory, Parquet and
+    deletion-vector files, ``col=value`` partition directories, hidden
+    entries): a table recreated where one was, or an interrupted create.
+    """
+    from urllib.parse import unquote, urlparse
+
+    from .engine.deltars import _delta_file_name
+
+    parsed = urlparse(location)
+    listed: list[tuple[str, bool]] = []
+    if parsed.scheme.lower() in ("", "file"):
+        path = unquote(parsed.path) if parsed.scheme else location
+        if not os.path.isdir(path):
+            return
+        listed = [(e.name, e.is_dir()) for e in os.scandir(path)]
+    else:
+        try:
+            import pyarrow.fs as pafs
+            from deltalake._internal import DeltaFileSystemHandler
+
+            handler = DeltaFileSystemHandler(location, dict(options or {}))
+            infos = handler.get_file_info_selector("", True, False)
+        except Exception:
+            # Not listable with these credentials (or not at all): the create
+            # itself decides, as before.
+            return
+        listed = [
+            (str(i.path).rstrip("/").rsplit("/", 1)[-1], i.type == pafs.FileType.Directory)
+            for i in infos
+        ]
+    entries = [
+        name
+        for name, is_dir in listed
+        if name
+        and not name.startswith(("_", "."))
+        and not (is_dir and "=" in name)
+        and not (not is_dir and _delta_file_name(name))
+    ]
+    if entries:
+        shown = ", ".join(sorted(entries)[:3]) + (", ..." if len(entries) > 3 else "")
+        raise UnreachableTableError(
+            f"create a table at {location}",
+            f"the location already holds {len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
+            f"that are not a Delta table ({shown}); a VACUUM of the new table would delete "
+            "them as unreferenced files",
+            "create the table in an empty directory, or convert_to_delta() a directory of "
+            "Parquet files",
+        )
+
+
+def _refuse_local_catalog_location(catalog: Any, location: str) -> None:
+    """Refuse a local location a remote catalog chose for a table.
+
+    A catalog server that answers a staging or create request with
+    ``file:///home/<user>/...`` had version 0 written into that directory of
+    this machine, and a VACUUM later deleted what else was there. Only a
+    catalog on this machine (the OSS UC quickstart) may place tables on its
+    filesystem.
+    """
+    from urllib.parse import urlparse
+
+    scheme = urlparse(location).scheme.lower()
+    if scheme not in ("", "file"):
+        return
+    endpoint = str(
+        getattr(catalog, "_base_url", "")
+        or getattr(catalog, "base_url", "")
+        or getattr(catalog, "_host", "")
+        or ""
+    )
+    host = (urlparse(endpoint).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return
+    raise UnreachableTableError(
+        f"create a table at {location}",
+        f"the catalog{f' at {endpoint}' if endpoint else ''} placed the table on this "
+        "machine's filesystem, which only a catalog running on this machine may do",
+        "check the catalog's storage root; a remote catalog must use cloud storage",
+    )
+
+
 def _local_log_dir(ref: TableRef, name: str) -> str | None:
     """The `_delta_log` directory of a local-path table name, else None.
 
@@ -745,7 +832,8 @@ class Connection:
                     f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
                 )
             _check_local_create_path(name)
-            if mode in ("error", "create", "ignore") and self.table_exists(name):
+            exists = self.table_exists(name)
+            if mode in ("error", "create", "ignore") and exists:
                 if mode == "ignore":
                     # Nothing is created, so nothing (the comment included)
                     # may be changed on the table that is already there.
@@ -755,6 +843,8 @@ class Connection:
                     "a Delta table already exists there",
                     "pass mode='ignore' to keep it or mode='overwrite' to replace it",
                 )
+            if not exists:
+                _refuse_foreign_files(name, self.storage_options)
             try:
                 return self._create_at(
                     FilesystemCatalog().resolve(ref),
@@ -888,6 +978,16 @@ class Connection:
         from .credentials.base import StaticCredentialProvider
 
         credentials = catalog.path_credentials(location, "PATH_CREATE_TABLE")
+        from ._storage import engine_options, store_options
+
+        _refuse_foreign_files(
+            location,
+            store_options(
+                engine_options(
+                    self.storage_options, getattr(credentials, "secrets", None), location
+                )
+            ),
+        )
         staged = ResolvedTable(
             ref=parse_ref(location),
             location=location,
@@ -983,6 +1083,7 @@ class Connection:
                 comment=comment,
             )
             return self.table(ref.full_name)
+        _refuse_local_catalog_location(catalog, staging.location)
         configuration: dict[str, str] = {}
         # What the kernel's own UC create flow writes, then what this catalog
         # says it requires, then what the caller asked for.

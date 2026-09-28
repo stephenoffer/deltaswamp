@@ -17,6 +17,7 @@ import math
 import os
 import re
 import threading
+import warnings
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -51,6 +52,7 @@ from ..errors import (
     SQL_FALLBACK_REMEDY,
     CommitConflictError,
     DeltaSwampError,
+    DeltaSwampWarning,
     EngineLimitError,
     InvalidArgumentError,
     UnreachableTableError,
@@ -1375,8 +1377,24 @@ class DeltaRsEngine:
         dv_table = "deletionVectors" in table.effective_reader_features
         try:
             dt = self._open(table, write=True)
-            if dv_table and not lite:
-                return self._vacuum_keeping_vectors(dt, retention_hours, dry_run, kwargs)
+            if not lite:
+                candidates: list[str] = dt.vacuum(
+                    retention_hours=retention_hours, dry_run=True, full=True, **kwargs
+                )
+                foreign = [p for p in candidates if not _delta_file_name(p)]
+                if foreign:
+                    warnings.warn(
+                        f"vacuum keeps {len(foreign)} file(s) in the table directory that no "
+                        f"Delta writer names that way (e.g. {sorted(foreign)[0]!r}); they were "
+                        "never part of the table, so they are not deleted -- move them out of "
+                        "the table's directory",
+                        DeltaSwampWarning,
+                        stacklevel=4,
+                    )
+                if dv_table or foreign:
+                    return self._vacuum_keeping_vectors(
+                        dt, candidates, dry_run, keep_vectors=dv_table
+                    )
             result: list[str] = dt.vacuum(
                 retention_hours=retention_hours, dry_run=dry_run, full=not lite, **kwargs
             )
@@ -1395,7 +1413,7 @@ class DeltaRsEngine:
 
     @staticmethod
     def _vacuum_keeping_vectors(
-        dt: Any, retention_hours: int | None, dry_run: bool, kwargs: dict[str, Any]
+        dt: Any, candidates: list[str], dry_run: bool, *, keep_vectors: bool = True
     ) -> list[str]:
         """A full VACUUM of a deletion-vector table that never deletes a vector file.
 
@@ -1408,14 +1426,19 @@ class DeltaRsEngine:
         reader still needs -- and the rest is deleted here through the
         table's own store. Unreferenced vector files are left behind, which
         costs a little storage and loses nothing.
+
+        The same path deletes only the orphans named as Delta writers name
+        data files (`_delta_file_name`) when the directory also holds other
+        files: a table created where documents already were deleted them all.
         """
-        candidates: list[str] = dt.vacuum(
-            retention_hours=retention_hours, dry_run=True, full=True, **kwargs
-        )
         removable = [
             path
             for path in candidates
-            if not re.fullmatch(r"deletion_vector_[0-9a-fA-F-]+\.bin", path.rsplit("/", 1)[-1])
+            if _delta_file_name(path)
+            and not (
+                keep_vectors
+                and re.fullmatch(r"deletion_vector_[0-9a-fA-F-]+\.bin", path.rsplit("/", 1)[-1])
+            )
         ]
         if dry_run or not removable:
             return removable
@@ -1929,6 +1952,17 @@ def _vends_gcs_bearer_token(table: ResolvedTable) -> bool:
         # must not turn a routing question into a raise.
         return _bearer_in_options(provider.peek().secrets, location)
     return True
+
+
+def _delta_file_name(path: str) -> bool:
+    """Whether a vacuum candidate is named as Delta writers name table files.
+
+    Data and change-data files are Parquet (``part-...c000.snappy.parquet``,
+    ``<uuid>.parquet``); deletion vectors are ``deletion_vector_<uuid>.bin``.
+    Anything else in the directory was never written as part of the table.
+    """
+    name = path.rstrip("/").rsplit("/", 1)[-1].lower()
+    return name.endswith(".parquet") or bool(re.fullmatch(r"deletion_vector_[0-9a-f-]+\.bin", name))
 
 
 def _table_relative(paths: list[str], location: str, *, full: bool = True) -> list[str]:
