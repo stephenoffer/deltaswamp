@@ -696,3 +696,90 @@ class TestCatalogRecheck:
         t.to_arrow()
         assert "_named_checked_at" in t.__dict__
         assert "_named_checked_at" not in t.__getstate__()
+
+
+def _never_added(path: str) -> set[str]:
+    """Data files in storage that no commit of the log ever added."""
+    import glob
+    import json
+    import os
+    from urllib.parse import unquote
+
+    ever = set()
+    for commit in glob.glob(os.path.join(path, "_delta_log", "*.json")):
+        with open(commit) as f:
+            for line in f:
+                action = json.loads(line)
+                if "add" in action:
+                    ever.add(unquote(action["add"]["path"]))
+    disk = {
+        os.path.relpath(p, path)
+        for p in glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True)
+        if "_delta_log" not in p
+    }
+    return disk - ever
+
+
+class TestUncommittedFilesAreRemoved:
+    """B3/A4: a failed or lost kernel write leaves no data file behind."""
+
+    def test_a_failed_compaction_step(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deltaswamp.engine.kernel import KernelEngine
+
+        path = str(tmp_path / "t")
+        ds.connect().create_table(
+            path, schema=pa.schema([("id", pa.int64()), ("p", pa.string())]), partition_by=["p"]
+        )
+        for i in range(24):
+            deltalake.write_deltalake(
+                path,
+                pa.table({"id": pa.array([i], pa.int64()), "p": [f"p{i % 4}"]}),
+                mode="append",
+            )
+        real = KernelEngine._compacted_batches
+
+        def failing(self: Any, *args: Any, **kwargs: Any) -> Any:
+            stream = real(self, *args, **kwargs)
+
+            def batches() -> Any:
+                for n, batch in enumerate(stream):
+                    if n == 2:
+                        raise RuntimeError("injected")
+                    yield batch
+
+            return pa.RecordBatchReader.from_batches(stream.schema, batches())
+
+        monkeypatch.setattr(KernelEngine, "_compacted_batches", failing)
+        with pytest.raises(Exception, match="injected"):
+            ds.connect().open_table(path).optimize()
+        assert _never_added(path) == set()
+
+    def test_a_kernel_append_that_lost_its_race(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deltaswamp.engine.kernel import KernelEngine
+        from deltaswamp.errors import CommitConflictError
+
+        path = str(tmp_path / "t")
+        ds.connect().create_table(path, schema=pa.schema([("id", pa.int64())]))
+        t = ds.connect().open_table(path)
+        real = KernelEngine.snapshot
+        fired: list[int] = []
+
+        def racing(self: Any, table: Any, **kw: Any) -> Any:
+            snapshot = real(self, table, **kw)
+            if kw.get("write") and not fired:
+                fired.append(1)
+                deltalake.write_deltalake(
+                    path, pa.table({"id": pa.array([9], pa.int64())}), mode="append"
+                )
+            return snapshot
+
+        monkeypatch.setattr(KernelEngine, "snapshot", racing)
+        # A stream cannot be staged twice, so the lost race surfaces.
+        reader = pa.table({"id": pa.array([1, 2], pa.int64())}).to_reader()
+        with pytest.raises(CommitConflictError):
+            KernelEngine().append(t.resolved, reader, max_commit_retries=0)
+        assert _never_added(path) == set()

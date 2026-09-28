@@ -154,8 +154,17 @@ pub async fn write_physical(
         .ok_or_else(|| Error::generic(format!("no object store is registered for {url}")))?;
     let location = Path::from_url_path(url.path())?;
     store.put(&location, buffer.into()).await?;
-    let head = store.head(&location).await?;
+    // Past the PUT the file exists, but no add-file metadata will name it if
+    // this fails: taken back out, best effort, or it is nobody's to clean up.
+    let head = match store.head(&location).await {
+        Ok(head) => head,
+        Err(err) => {
+            let _ = store.delete(&location).await;
+            return Err(err.into());
+        }
+    };
     if head.size != size {
+        let _ = store.delete(&location).await;
         return Err(Error::generic(format!(
             "Size mismatch after writing parquet file: expected {size}, got {}",
             head.size

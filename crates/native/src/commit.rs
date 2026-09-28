@@ -260,6 +260,7 @@ pub fn write(
     // scan the same snapshot to learn which files to remove.
     let scan_source = snapshot.clone();
     let codec = crate::writer::codec_for(&snapshot);
+    let root = snapshot.table_root().clone();
     let partition_columns = snapshot
         .table_configuration()
         .logical_partition_columns()
@@ -290,20 +291,20 @@ pub fn write(
         }
     }
 
-    let mut txn = transaction;
-    stage_batches(
-        &mut txn,
-        &engine,
-        &partition_columns,
-        &table_schema,
-        batches,
-        codec,
-    )?;
-
     // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
     // with block_in_place, so the commit must run inside the shared
     // multi-threaded runtime rather than on a bare Python thread.
-    finish_commit(txn, &engine)
+    stage_and_commit(transaction, &engine, &root, |txn, written| {
+        stage_batches(
+            txn,
+            &engine,
+            &partition_columns,
+            &table_schema,
+            batches,
+            codec,
+            written,
+        )
+    })
 }
 
 /// Align `batches` with the table schema and coalesce them, as every write does.
@@ -341,6 +342,7 @@ pub(crate) fn stage_batches(
     table_schema: &delta_kernel::schema::SchemaRef,
     batches: Vec<arrow::array::RecordBatch>,
     codec: Compression,
+    written: &mut Vec<String>,
 ) -> Result<()> {
     let write_state = txn.write_state()?;
     let mut staged = Vec::new();
@@ -354,7 +356,7 @@ pub(crate) fn stage_batches(
                 &write_context,
                 codec,
             ))?;
-            staged.push(metadata);
+            staged.push(track_written(metadata, written)?);
         }
     } else {
         for batch in batches {
@@ -369,7 +371,7 @@ pub(crate) fn stage_batches(
                     &write_context,
                     codec,
                 ))?;
-                staged.push(metadata);
+                staged.push(track_written(metadata, written)?);
             }
         }
     }
@@ -377,6 +379,56 @@ pub(crate) fn stage_batches(
         txn.add_files(metadata);
     }
     Ok(())
+}
+
+/// Record the data files `metadata` adds in `written`, handing it back to add.
+pub(crate) fn track_written(
+    metadata: Box<dyn delta_kernel::EngineData>,
+    written: &mut Vec<String>,
+) -> Result<Box<dyn delta_kernel::EngineData>> {
+    let batch = add_metadata_batch(metadata)?;
+    written.extend(batch_paths(&batch)?);
+    Ok(Box::new(ArrowEngineData::new(batch)))
+}
+
+/// Whether a failed commit certainly did not land, so the files it staged are
+/// nobody's: another writer took the version, the table is unchanged by the
+/// error's own account, or the catalog refused it. Any other failure (a
+/// timeout on the log PUT, say) may have committed, and its files are kept.
+pub(crate) fn never_committed(err: &NativeError) -> bool {
+    matches!(
+        err,
+        NativeError::CommitConflict(_)
+            | NativeError::Retryable(_)
+            | NativeError::BackfillRequired(_)
+            | NativeError::CatalogPermission(_)
+            | NativeError::CatalogNotFound(_)
+    )
+}
+
+/// Stage with `stage`, then commit `txn`; on a failure that certainly left
+/// the table without this commit, delete the data files it wrote.
+///
+/// Each lost race, failed step or interrupted stream left its output files in
+/// storage, referenced by no commit, until a VACUUM found them.
+pub(crate) fn stage_and_commit(
+    mut txn: Transaction,
+    engine: &SharedEngine,
+    root: &url::Url,
+    stage: impl FnOnce(&mut Transaction, &mut Vec<String>) -> Result<()>,
+) -> Result<u64> {
+    let mut written = Vec::new();
+    if let Err(err) = stage(&mut txn, &mut written) {
+        let _ = remove_written(engine, root, &written);
+        return Err(err);
+    }
+    match finish_commit(txn, engine) {
+        Err(err) if never_committed(&err) => {
+            let _ = remove_written(engine, root, &written);
+            Err(err)
+        }
+        other => other,
+    }
 }
 
 /// Output files written at once by [`stage_stream`] at most, and the Arrow
@@ -397,15 +449,53 @@ pub(crate) fn stage_stream(
     table_schema: &delta_kernel::schema::SchemaRef,
     batches: impl Iterator<Item = Result<Vec<arrow::array::RecordBatch>>>,
     codec: Compression,
+    written: &mut Vec<String>,
 ) -> Result<()> {
-    type Write = tokio::task::JoinHandle<DeltaResult<Box<dyn delta_kernel::EngineData>>>;
+    let mut inflight: Inflight = Default::default();
+    let result = stage_stream_into(
+        txn,
+        engine,
+        partition_columns,
+        table_schema,
+        batches,
+        codec,
+        written,
+        &mut inflight,
+    );
+    if result.is_err() {
+        // The writes still running finish (at most WRITE_FILES of them), and
+        // their files are recorded for removal with the rest: aborting the
+        // task does not stop a PUT already under way (a local store writes
+        // on a blocking thread), which then left a file nobody knew of.
+        for (handle, _) in inflight.drain(..) {
+            if let Ok(Ok(metadata)) = runtime::block_on(handle) {
+                let _ = track_written(metadata, written);
+            }
+        }
+    }
+    result
+}
+
+type Write = tokio::task::JoinHandle<DeltaResult<Box<dyn delta_kernel::EngineData>>>;
+type Inflight = std::collections::VecDeque<(Write, usize)>;
+
+#[allow(clippy::too_many_arguments)]
+fn stage_stream_into(
+    txn: &mut Transaction,
+    engine: &SharedEngine,
+    partition_columns: &[String],
+    table_schema: &delta_kernel::schema::SchemaRef,
+    batches: impl Iterator<Item = Result<Vec<arrow::array::RecordBatch>>>,
+    codec: Compression,
+    written: &mut Vec<String>,
+    inflight: &mut Inflight,
+) -> Result<()> {
     let write_state = txn.write_state()?;
-    let mut inflight: std::collections::VecDeque<(Write, usize)> = Default::default();
     let mut inflight_bytes = 0usize;
-    let finish = |txn: &mut Transaction, handle: Write| -> Result<()> {
+    let mut finish = |txn: &mut Transaction, handle: Write| -> Result<()> {
         let metadata = runtime::block_on(handle)
             .map_err(|e| NativeError::Invalid(format!("writing a data file failed: {e}")))??;
-        txn.add_files(metadata);
+        txn.add_files(track_written(metadata, written)?);
         Ok(())
     };
     for prepared in batches {
