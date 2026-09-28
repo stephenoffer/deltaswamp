@@ -668,6 +668,8 @@ def store_cast(column: Any, target: Any, name: str) -> Any:
     if column.null_count == len(column):
         return pa.nulls(len(column), target)
     try:
+        if pa.types.is_nested(target):
+            column = _placeholder_children(column, target)
         if pa.types.is_integer(target) and pa.types.is_floating(column.type):
             column = pc.trunc(column)
         elif pa.types.is_integer(target) and pa.types.is_decimal(column.type):
@@ -683,6 +685,87 @@ def store_cast(column: Any, target: Any, name: str) -> Any:
             f"the value written to {name!r} is {column.type}, which cannot be stored in the "
             f"column's type {target}: {exc}"
         ) from exc
+
+
+def _placeholder_children(column: Any, target: Any) -> Any:
+    """`column` with a placeholder under every null struct whose `target` field is required.
+
+    A VARIANT is a struct of two required binaries, and a NULL one holds
+    b"" in both (`variant_column`). DuckDB hands a NULL struct back with
+    null children, so a MERGE whose source ARRAY<VARIANT> held a NULL element
+    failed the cast ("field 'metadata' ... has nulls") that the append of the
+    same row passed. Only children of null parents are filled: a required
+    field that is null in a present struct still fails, as it should.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if isinstance(column, pa.ChunkedArray):
+        chunks = [_placeholder_children(c, target) for c in column.chunks]
+        return pa.chunked_array(chunks, type=chunks[0].type) if chunks else column
+    kind = column.type
+    if pa.types.is_struct(target) and pa.types.is_struct(kind):
+        parent_null = column.is_null()
+        names = [kind.field(i).name for i in range(kind.num_fields)]
+        wanted = {target.field(i).name: target.field(i) for i in range(target.num_fields)}
+        children = []
+        for i, name in enumerate(names):
+            child = column.field(i)
+            want = wanted.get(name)
+            if want is not None:
+                child = _placeholder_children(child, want.type)
+                zero = _zero(want.type) if not want.nullable else None
+                if zero is not None and child.null_count:
+                    child = pc.if_else(
+                        pc.and_(parent_null, child.is_null()), pa.scalar(zero, child.type), child
+                    )
+            children.append(child)
+        return pa.StructArray.from_arrays(
+            children, fields=list(kind), mask=parent_null if column.null_count else None
+        )
+    if (
+        (pa.types.is_list(target) or pa.types.is_large_list(target))
+        and (pa.types.is_list(kind) or pa.types.is_large_list(kind))
+        and pa.types.is_nested(target.value_type)
+    ):
+        values = _placeholder_children(column.values, target.value_type)
+        field = kind.value_field.with_type(values.type)
+        if pa.types.is_large_list(kind):
+            cls, rebuilt = pa.LargeListArray, pa.large_list(field)
+        else:
+            cls, rebuilt = pa.ListArray, pa.list_(field)
+        return cls.from_arrays(
+            column.offsets,
+            values,
+            type=rebuilt,
+            mask=column.is_null() if column.null_count else None,
+        )
+    if pa.types.is_map(target) and pa.types.is_map(kind) and pa.types.is_nested(target.item_type):
+        items = _placeholder_children(column.items, target.item_type)
+        return pa.MapArray.from_arrays(
+            column.offsets,
+            column.keys,
+            items,
+            type=pa.map_(kind.key_field, kind.item_field.with_type(items.type)),
+            mask=column.is_null() if column.null_count else None,
+        )
+    return column
+
+
+def _zero(datatype: Any) -> Any:
+    """A placeholder value of `datatype`, or None where there is no plain one."""
+    import pyarrow as pa
+
+    t = pa.types
+    if t.is_binary(datatype) or t.is_large_binary(datatype):
+        return b""
+    if t.is_string(datatype) or t.is_large_string(datatype):
+        return ""
+    if t.is_boolean(datatype):
+        return False
+    if t.is_integer(datatype) or t.is_floating(datatype):
+        return 0
+    return None
 
 
 def _same_comparison_type(source: Any, target: Any) -> bool:

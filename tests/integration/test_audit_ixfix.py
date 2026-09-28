@@ -12,6 +12,8 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 ds = pytest.importorskip("deltaswamp")
 
+from tests.integration.test_audit_live3 import _nested_variant_table  # noqa: E402
+
 
 @pytest.fixture
 def conn() -> Any:
@@ -270,3 +272,53 @@ def test_int96_timestamps_in_lists_read(tmp_path: Any) -> None:
         {"id": 1, "a": [ts, None], "s": {"y": [ts]}, "aos": [{"x": 1, "y": [old]}]},
         {"id": 2, "a": None, "s": {"y": None}, "aos": []},
     ]
+
+
+def _dv_variant_table(conn: Any, tmp_path: Any) -> Any:
+    """`_nested_variant_table` with deletion vectors, so a MERGE runs on the kernel."""
+    path = _nested_variant_table(conn, tmp_path).resolved.location
+    log = os.path.join(path, "_delta_log", f"{0:020}.json")
+    with open(log) as f:
+        actions = [json.loads(line) for line in f if line.strip()]
+    for action in actions:
+        if "protocol" in action:
+            action["protocol"]["readerFeatures"].append("deletionVectors")
+            action["protocol"]["writerFeatures"].append("deletionVectors")
+        if "metaData" in action:
+            action["metaData"]["configuration"] = {"delta.enableDeletionVectors": "true"}
+    with open(log, "w") as f:
+        f.write("\n".join(json.dumps(a) for a in actions))
+    return conn.open_table(path)
+
+
+class TestVariantMergeNullElements:
+    """A MERGE whose source ARRAY/MAP/STRUCT of VARIANT held a NULL failed the store cast."""
+
+    def _source(self, i: int) -> Any:
+        return pa.table(
+            {
+                "id": pa.array([i], pa.int64()),
+                "s": pa.array(
+                    [{"v2": None, "n": 2}], pa.struct([("v2", pa.string()), ("n", pa.int32())])
+                ),
+                "arr": pa.array([["[3]", None]], pa.list_(pa.string())),
+                "m": pa.array([[("k", None), ("j", "1")]], pa.map_(pa.string(), pa.string())),
+            }
+        )
+
+    @pytest.mark.parametrize("key", [1, 5], ids=["update", "insert"])
+    def test_merge_stores_null_variants(self, conn: Any, tmp_path: Any, key: int) -> None:
+        t = _dv_variant_table(conn, tmp_path)
+        (
+            t.merge(self._source(key), "target.id = source.id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute()
+        )
+        rows = {
+            r["id"]: r
+            for r in pa.table(conn.open_table(t.resolved.location).to_arrow()).to_pylist()
+        }
+        assert rows[key]["arr"] == ["[3]", None]
+        assert rows[key]["s"] == {"v2": None, "n": 2}
+        assert rows[key]["m"] == [("k", None), ("j", "1")]
