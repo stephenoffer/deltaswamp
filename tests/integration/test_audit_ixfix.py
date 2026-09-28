@@ -369,7 +369,10 @@ def test_a_stale_checkpoint_hint_is_a_typed_refusal_can_then_agrees(
     from deltaswamp.errors import CorruptTableError, DeltaSwampError
 
     path = str(tmp_path / "stale")
-    ids = lambda *v: pa.table({"id": pa.array(v, pa.int64())})  # noqa: E731
+
+    def ids(*v: int) -> Any:
+        return pa.table({"id": pa.array(v, pa.int64())})
+
     t = conn.create_table(path, pa.schema([("id", pa.int64())]))
     t.append(ids(1, 2))
     t.checkpoint()
