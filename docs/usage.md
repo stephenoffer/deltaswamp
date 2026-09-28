@@ -588,7 +588,14 @@ does:
   two-argument `trim`/`ltrim`/`rtrim` take the characters first;
   `regexp_replace` replaces every match; `^` is XOR;
 - `RLIKE`/`REGEXP`, `<=>`, `nvl`, `nvl2`, `if`, `pmod`, `1.5D`, `7L`, `1.5BD`
-  and LIKE's default `\` escape work on both.
+  and LIKE's default `\` escape work on both;
+- where DuckDB filters a read (a table delta-rs misreads, a Delta Sharing
+  filter), a FLOAT compares with a decimal literal as DOUBLE (`f = 0.1` is
+  false for the FLOAT 0.1, as on Spark), and BIGINT arithmetic that overflows
+  raises, as ANSI Spark's does, rather than being folded away. Such a filter
+  is one expression over the row: a subquery (`SELECT`, `VALUES`, `PIVOT`,
+  `DESCRIBE` ...), a statement or a comment is refused, with string literals
+  read as DuckDB reads them.
 
 SQL no rewrite makes agree is refused, and routes to the warehouse (the
 `spark_sql` need, which `can()` reports): an array subscript (0-based in Spark,

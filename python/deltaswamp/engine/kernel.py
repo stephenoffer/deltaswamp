@@ -4258,7 +4258,7 @@ def _sql_filtered_read(
             )
     from .duckfilter import RowFilter
 
-    return RowFilter(text, reader.schema).filtered(reader, keep)
+    return RowFilter(text, reader.schema, spark=True).filtered(reader, keep)
 
 
 _REJECTED_CREDENTIAL_MARKERS = (

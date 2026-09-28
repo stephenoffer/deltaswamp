@@ -196,15 +196,85 @@ def _duckdb() -> Any:
 
 _SQL_LITERAL = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
 _OUTSIDE_EXPRESSION = re.compile(
-    r";|--|/\*|\*/|\b(?:select|from|with|pragma|set|attach|copy)\b", re.I
+    r";|--|/\*|\*/|\b(?:select|from|with|pragma|set|attach|copy)\b"
+    # The statements DuckDB also takes as a subquery, which open one: a
+    # column may be called `values`, but not directly after a parenthesis.
+    r"|\(\s*(?:values|pivot|unpivot|describe|show|summarize|table|call)\b",
+    re.I,
 )
+
+
+def _literal_end(text: str, start: int) -> int | None:
+    """Where the string literal DuckDB's tokenizer found at `start` ends, by DuckDB's rules."""
+    if text.startswith("$", start):
+        close = text.find("$", start + 1)
+        if close < 0:
+            return None
+        tag = text[start : close + 1]
+        end = text.find(tag, close + 1)
+        return None if end < 0 else end + len(tag)
+    escapes = text[start : start + 1] in ("e", "E")
+    quote_at = text.find("'", start)
+    if quote_at < 0 or quote_at - start > 1:
+        return None
+    i = quote_at + 1
+    while i < len(text):
+        if escapes and text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "'":
+            if text.startswith("'", i + 1):
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return None
+
+
+def _without_literals(text: str) -> str:
+    """`text` with every string literal replaced by ``0``, as DuckDB reads its literals.
+
+    A regular expression of Spark's quoting cannot know DuckDB's: a
+    dollar-quoted ``$$'$$`` or an escape string ``e'a\\''`` hid a quote, and
+    with it a subquery, from the screen while DuckDB ran it. DuckDB's own
+    tokenizer says where each literal starts; any doubt refuses.
+    """
+    predicate_module = importlib.import_module("deltaswamp.predicate")
+    duckdb = _duckdb()
+    tokenize = getattr(duckdb, "tokenize", None)
+    if tokenize is None:
+        return _SQL_LITERAL.sub(" 0 ", text)
+    try:
+        tokens = tokenize(text)
+    except Exception as exc:
+        raise predicate_module.PredicateError(
+            f"cannot read the predicate {text!r}: {exc}"
+        ) from None
+    string = getattr(getattr(duckdb, "token_type", None), "string_const", None)
+    out, pos = [], 0
+    starts = [start for start, _ in tokens]
+    for index, (start, kind) in enumerate(tokens):
+        if kind != string:
+            continue
+        end = _literal_end(text, start)
+        following = starts[index + 1] if index + 1 < len(starts) else len(text)
+        if end is None or end > following:
+            raise predicate_module.PredicateError(
+                f"cannot tell where a string literal ends in the predicate {text!r}"
+            )
+        out += [text[pos:start], " 0 "]
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _screen_expression(text: str) -> None:
     """Refuse text that could be more than one boolean expression over the row."""
     predicate_module = importlib.import_module("deltaswamp.predicate")
-    bare = _SQL_LITERAL.sub(" 0 ", text)
-    if "'" in bare or '"' in bare:
+    bare = _without_literals(text)
+    # Double-quoted names are identifiers to DuckDB, and hide nothing.
+    bare = re.sub(r"\"(?:[^\"]|\"\")*\"", " x ", bare)
+    if "'" in bare or '"' in bare or "$" in bare:
         raise predicate_module.PredicateError(f"unbalanced quotes in predicate {text!r}")
     found = _OUTSIDE_EXPRESSION.search(bare)
     if found is not None:
@@ -225,6 +295,7 @@ def _sandboxed_filter(table: Any, text: str) -> Any:
         )
     if table.num_rows == 0:
         return table
+    duckfilter = importlib.import_module("deltaswamp.engine.duckfilter")
     con = duckdb.connect(
         ":memory:",
         config={
@@ -232,12 +303,16 @@ def _sandboxed_filter(table: Any, text: str) -> Any:
             "autoinstall_known_extensions": False,
             "autoload_known_extensions": False,
             "lock_configuration": True,
+            # Evaluated as Spark does: overflow raises, FLOAT compares as DOUBLE.
+            **duckfilter.SPARK_CONFIG,
         },
     )
+    widened = duckfilter.spark_widened(table.schema)
+    rows = table.cast(widened) if widened is not None else table
     try:
         importlib.import_module("deltaswamp.engine.dialect").install_duckdb_macros(con)
         # The relational API parses an expression list, never a statement.
-        result = con.from_arrow(table).project(f"CAST(({text}) AS BOOLEAN) AS __deltaswamp_keep")
+        result = con.from_arrow(rows).project(f"CAST(({text}) AS BOOLEAN) AS __deltaswamp_keep")
         result = result.arrow()
         if isinstance(result, pa.RecordBatchReader):
             result = result.read_all()

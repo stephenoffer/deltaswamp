@@ -396,3 +396,108 @@ class TestIntervalColumns:
         path = table.location
         raw = deltalake.DeltaTable(path).to_pyarrow_table(filters=[("id", "=", 9)])
         assert raw.column("y").to_pylist() == [12]
+
+
+def _legacy_float_table(tmp_path: pathlib.Path) -> Any:
+    """A table delta-rs misreads (a Spark legacy-calendar file), so SQL is RowFilter's."""
+    import json
+    import time
+
+    root = tmp_path / "t"
+    (root / "_delta_log").mkdir(parents=True)
+    rows = pa.table(
+        {
+            "rid": pa.array([1, 2], pa.int64()),
+            "dt": pa.array([-719164, 19723], pa.int32()).cast(pa.date32()),
+            "f": pa.array([0.1, 0.5], pa.float32()),
+        }
+    ).replace_schema_metadata(
+        {
+            "org.apache.spark.version": "3.5.0",
+            "org.apache.spark.legacyDateTime": "",
+            "org.apache.spark.timeZone": "UTC",
+        }
+    )
+    pq.write_table(rows, root / "a.parquet")
+    fields = [
+        {"name": n, "type": k, "nullable": True, "metadata": {}}
+        for n, k in (("rid", "long"), ("dt", "date"), ("f", "float"))
+    ]
+    actions = [
+        {"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}},
+        {
+            "metaData": {
+                "id": "6a6e6f3e-0000-4000-8000-00000000000f",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": json.dumps({"type": "struct", "fields": fields}),
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0,
+            }
+        },
+        {
+            "add": {
+                "path": "a.parquet",
+                "partitionValues": {},
+                "size": (root / "a.parquet").stat().st_size,
+                "modificationTime": int(time.time() * 1000),
+                "dataChange": True,
+            }
+        },
+    ]
+    (root / "_delta_log" / f"{0:020d}.json").write_text("\n".join(map(json.dumps, actions)) + "\n")
+    return ds.connect().open_table(str(root))
+
+
+class TestRowFilterSemantics:
+    """D2-D4: the DuckDB evaluation of Spark predicates outside the kernel's grammar."""
+
+    @pytest.mark.parametrize(
+        "predicate, expected",
+        [("abs(f) = 0.1", []), ("abs(f) > 0.1", [1, 2]), ("abs(rid) > 0", [1, 2])],
+    )
+    def test_float_compares_as_double(
+        self, tmp_path: pathlib.Path, predicate: str, expected: list[int]
+    ) -> None:
+        t = _legacy_float_table(tmp_path)
+        assert t.can("scan", predicate=predicate).engine is ds.Engine.KERNEL
+        assert sorted(t.to_arrow(predicate=predicate).column("rid").to_pylist()) == expected
+
+    @pytest.mark.parametrize(
+        "predicate", ["rid + 9223372036854775807 > 0", "rid * 9223372036854775807 > 0"]
+    )
+    def test_integer_overflow_raises(self, tmp_path: pathlib.Path, predicate: str) -> None:
+        from deltaswamp.predicate import PredicateError
+
+        t = _legacy_float_table(tmp_path)
+        with pytest.raises(PredicateError, match="Overflow"):
+            t.to_arrow(predicate=predicate)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "$$'$$ = $$x$$ OR rid IN (SELECT 1) OR $$'$$ = $$y$$",
+            "$t$'$t$ = 'x' OR rid IN (SELECT 1) OR 'a' = $t$'$t$",
+            "e'a\\'' OR rid IN (SELECT 1) OR 'x' = 'x'",
+            "rid IN (VALUES (1))",
+            "rid IN ( PIVOT t ON a)",
+            "EXISTS (DESCRIBE t)",
+            "rid IN (SUMMARIZE t)",
+        ],
+    )
+    def test_screen_reads_literals_as_duckdb_does(self, text: str) -> None:
+        pytest.importorskip("duckdb")
+        from deltaswamp.engine.sharing import _screen_expression
+        from deltaswamp.predicate import PredicateError
+
+        with pytest.raises(PredicateError):
+            _screen_expression(text)
+
+    @pytest.mark.parametrize(
+        "text", ["(rid = 1)", "(s = 'select')", '("values" > 1)', "(s = 'it''s')"]
+    )
+    def test_screen_passes_plain_expressions(self, text: str) -> None:
+        pytest.importorskip("duckdb")
+        from deltaswamp.engine.sharing import _screen_expression
+
+        _screen_expression(text)
