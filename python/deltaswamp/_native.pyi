@@ -17,8 +17,9 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
-"path_clone", "row_tracking_dml", "check_constraints", "schema_evolution". Gate on
-this list, not `hasattr`, so a stale build refuses cleanly.
+"path_clone", "row_tracking_dml", "check_constraints", "schema_evolution", "log_cleanup",
+"symlink_manifest", "fsck". Gate on this list, not `hasattr`, so a stale build refuses
+cleanly.
 """
 
 def kernel_version() -> str:
@@ -394,6 +395,41 @@ class Snapshot:
 
     def delete_files(self, keys: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
         """Delete `keys` from `vacuum_plan` under the root: (deleted, [(key, error)])."""
+
+    @property
+    def log_retention_ms(self) -> int:
+        """`delta.logRetentionDuration` in ms, or Delta's default (30 days) if unset."""
+
+    def cleanup_log(
+        self, cutoff_ms: int, dry_run: bool = False
+    ) -> tuple[int | None, list[str], list[tuple[str, str]]]:
+        """Delete the log below the newest checkpoint committed at or before `cutoff_ms`.
+
+        Commit, checksum, checkpoint and compacted files below that checkpoint,
+        and sidecars no retained v2 checkpoint references that are older than
+        the cutoff. Commit times are in-commit timestamps where the table has
+        them, else monotonized file modification times. Returns
+        `(kept_checkpoint, deleted_keys, [(key, error)])`; `dry_run` returns
+        the plan. Refuses a catalog-managed table and checkpointProtection.
+        Requires "log_cleanup".
+        """
+
+    def write_symlink_manifest(self) -> list[str]:
+        """Write `_symlink_format_manifest/[<partition>/]manifest` for the live files.
+
+        As Spark writes them: one decoded absolute path per line, a manifest
+        per Hive-escaped partition directory (an empty one for an empty
+        unpartitioned table), and the manifests of partitions with no files
+        deleted. Returns the manifests written, relative to the table root.
+        Requires "symlink_manifest".
+        """
+
+    def missing_data_files(self) -> list[str]:
+        """The add actions (JSON, as `add_actions`) of live files whose data file is gone.
+
+        Deletion vectors are not looked for; a file outside the table root
+        counts as gone. Requires "fsck".
+        """
 
     def missing_files(self, adds: list[str]) -> list[str]:
         """URLs of the data and deletion-vector files `adds` (JSON) name that are gone."""

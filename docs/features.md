@@ -137,17 +137,17 @@ variant; all three are writer-only, so both engines read and neither writes.
 | VACUUM (standard and LITE) | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | dry run by default here. The kernel plans it from its log replay, as Spark's VACUUM does, on deletion-vector tables and on every table delta-rs cannot commit to (clustering, row tracking, in-commit timestamps, type widening, `vacuumProtocolCheck`, ...), and commits VACUUM START/END |
 | VACUUM on managed tables | DBR | warehouse | Databricks forbids external VACUUM on managed tables |
 | RESTORE | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | the kernel serves deletion-vector tables (delta-rs leaves DV changes in place, delta-rs#4613), column-mapped tables and the tables delta-rs cannot write; restored files keep their row ids, and the target's schema and properties come back |
-| FSCK REPAIR | DBR, delta-rs | delta-rs, warehouse | |
+| FSCK REPAIR | DBR, delta-rs | delta-rs, kernel, warehouse | the kernel serves the tables delta-rs cannot commit to: live files whose data file is gone are removed as logged (row ids and deletion vectors kept), `dataChange` true as delta-rs removes them; refused on shallow clones, and (except a dry run) on append-only and Iceberg-enabled tables |
 | Checkpoint | all | delta-rs, kernel | the kernel checkpoints catalog-managed tables, publishing first |
 | Version checksums (`.crc`) | DBR, Spark, kernel | kernel, delta-rs | written after every commit where the previous one is at most 100 versions back (or the log is short); delta-rs writes none itself (delta-rs#4190) |
 | Log compaction | Spark, delta-rs | delta-rs | kernel's writer is a stub |
-| Expired log cleanup | all | delta-rs | `Table.cleanup_metadata()` |
+| Expired log cleanup | all | kernel, delta-rs | `Table.cleanup_metadata()`. The kernel deletes log files older than `delta.logRetentionDuration` below the newest checkpoint committed before the boundary (so every retained version reads), v2 sidecars nothing retained references included, by in-commit timestamps where the table has them; catalog-managed tables and `checkpointProtection` are refused. delta-rs where the kernel cannot read the table |
 | Publish staged commits | kernel | kernel | required on catalog-managed tables |
 | ANALYZE (DELTA) STATISTICS | DBR | warehouse | |
 | REORG PURGE / UPGRADE UNIFORM | DBR, Spark | warehouse | |
 | CLONE (shallow, deep) | DBR, Spark | kernel, warehouse | the kernel clones a path table to a path (delta-rs#2456): shallow with absolute-path adds and vectors, deep by copying; catalog targets and catalog-scoped credentials need the warehouse. A shallow clone is for Spark and Databricks: the direct engines read only files under a table's root. Row-tracked tables are refused: the clone would have to carry every file's `baseRowId` and the high-water mark, and its rows' commit versions have no meaning in the new table's history |
 | CONVERT TO DELTA | DBR, Spark, delta-rs | delta-rs | |
-| Symlink manifests | Spark, delta-rs | delta-rs | |
+| Symlink manifests | Spark, delta-rs | delta-rs, kernel | `Table.generate()`. The kernel writes them as Spark does for the tables delta-rs cannot open for writing (clustering, row tracking, in-commit timestamps, type widening, defaults): a manifest per Hive-escaped partition directory listing decoded absolute paths, stale partitions' manifests deleted. Deletion vectors and column mapping are refused, as Spark refuses them |
 | Predictive optimization | DBR | — | server-side scheduling; `Table.info()` reports whether it is on |
 | Auto optimize / auto compaction | DBR | — | writer-side behavior of Databricks; stored as properties only |
 

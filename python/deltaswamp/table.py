@@ -4554,8 +4554,11 @@ class Table:
         """Delete log files older than ``delta.logRetentionDuration``.
 
         This is what makes versions past log retention unreachable by time
-        travel. It runs regardless of ``delta.enableExpiredLogCleanup``. It
-        also happens implicitly, as in Spark: a delta-rs write that lands on
+        travel. It runs regardless of ``delta.enableExpiredLogCleanup``. Only
+        what lies below the newest checkpoint committed before the retention
+        boundary is deleted, so every retained version still reads; a
+        commit's time is its in-commit timestamp where the table has them.
+        It also happens implicitly, as in Spark: a delta-rs write that lands on
         a checkpoint interval deletes expired log files unless the table sets
         ``delta.enableExpiredLogCleanup=false`` (kernel writes never do).
         """

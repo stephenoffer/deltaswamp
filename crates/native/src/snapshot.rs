@@ -730,6 +730,56 @@ impl PySnapshot {
         Ok(py.detach(|| crate::vacuum::delete(self.store()?, self.inner.table_root(), keys))?)
     }
 
+    /// `delta.logRetentionDuration` in milliseconds, as the kernel parses it,
+    /// or Delta's default (30 days) when the table does not set it.
+    #[getter]
+    fn log_retention_ms(&self) -> u64 {
+        self.inner
+            .table_properties()
+            .log_retention_duration
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(crate::logclean::DEFAULT_LOG_RETENTION_MS)
+    }
+
+    /// Clean up the log below the newest checkpoint committed at or before
+    /// `cutoff_ms` (see `crate::logclean`). Returns `(kept_checkpoint,
+    /// deleted, failed)`: the checkpoint the retained history starts from,
+    /// the keys deleted (relative to the table root) and `(key, error)` for
+    /// each that was not. `dry_run` deletes nothing and returns the plan.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (cutoff_ms, dry_run = false))]
+    fn cleanup_log(
+        &self,
+        py: Python<'_>,
+        cutoff_ms: i64,
+        dry_run: bool,
+    ) -> PyResult<(Option<u64>, Vec<String>, Vec<(String, String)>)> {
+        Ok(py.detach(
+            || -> Result<(Option<u64>, Vec<String>, Vec<(String, String)>)> {
+                let store = self.store()?;
+                let plan = crate::logclean::plan(
+                    &self.inner,
+                    self.engine.as_ref(),
+                    store.clone(),
+                    cutoff_ms,
+                )?;
+                if dry_run {
+                    return Ok((plan.kept_checkpoint, plan.keys, Vec::new()));
+                }
+                let (deleted, failed) =
+                    crate::logclean::delete(store, self.inner.table_root(), plan.keys)?;
+                Ok((plan.kept_checkpoint, deleted, failed))
+            },
+        )?)
+    }
+
+    /// Write the symlink format manifests of this snapshot (see
+    /// `crate::manifest`), deleting those of partitions with no files.
+    /// Returns the manifests written, relative to the table root.
+    fn write_symlink_manifest(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| crate::manifest::write(&self.inner, self.engine.as_ref(), self.store()?))?)
+    }
+
     /// Of the data and deletion-vector files `adds` (add actions as JSON)
     /// reference, the ones missing from storage, as URLs.
     fn missing_files(&self, py: Python<'_>, adds: Vec<String>) -> PyResult<Vec<String>> {
@@ -754,6 +804,39 @@ impl PySnapshot {
                 }
             }
             crate::vacuum::missing(self.store()?, root, urls)
+        })?)
+    }
+
+    /// The live files whose data file is gone from storage (FSCK REPAIR):
+    /// their add actions as JSON, as `add_actions` gives them. A deletion
+    /// vector is not looked for; a file outside the table root counts as
+    /// gone, so callers refuse shallow clones.
+    fn missing_data_files(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| -> Result<Vec<String>> {
+            let root = self.inner.table_root();
+            let adds = files::add_actions(self.inner.clone(), self.engine.as_ref())?;
+            let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
+            let mut urls = Vec::new();
+            for add in adds {
+                let parsed: serde_json::Value = serde_json::from_str(&add)
+                    .map_err(|e| NativeError::Invalid(format!("bad add action: {e}")))?;
+                let path = parsed
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| NativeError::Invalid("an add action without a path".into()))?;
+                let url = match url::Url::parse(path) {
+                    Ok(url) => url,
+                    Err(_) => root.join(path)?,
+                };
+                by_url.entry(url.to_string()).or_default().push(add);
+                urls.push(url);
+            }
+            let missing = crate::vacuum::missing(self.store()?, root, urls)?;
+            let mut out = Vec::new();
+            for url in missing {
+                out.extend(by_url.remove(&url).unwrap_or_default());
+            }
+            Ok(out)
         })?)
     }
 

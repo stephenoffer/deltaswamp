@@ -229,9 +229,12 @@ def test_cleanup_and_log_compaction_of_a_clustered_table(conn: Any, tmp_path: Pa
 
 
 @needs_native
-def test_cleanup_is_still_refused_on_in_commit_timestamps(conn: Any, tmp_path: Path) -> None:
+def test_cleanup_of_in_commit_timestamps_is_served_by_the_kernel(conn: Any, tmp_path: Path) -> None:
+    """delta-rs refuses the table; the kernel cleans up by in-commit timestamps."""
     path = _make(conn, tmp_path, {"delta.enableInCommitTimestamps": "true"})
-    assert not conn.table(path).can("cleanup_metadata").ok
+    assert conn.table(path).can("cleanup_metadata").engine is Engine.KERNEL
+    conn.table(path).cleanup_metadata()
+    assert conn.table(path).to_arrow().num_rows == 6
 
 
 def test_history_exemptions_do_not_leak_into_writes() -> None:
@@ -588,5 +591,7 @@ def test_repair_dry_run_on_an_in_commit_timestamp_table(conn: Any, tmp_path: Pat
     os.remove(glob.glob(os.path.join(path, "*.parquet"))[0])
     result = conn.table(path).repair(dry_run=True)
     assert result["dry_run"] is True and len(result["files_removed"]) == 1
-    with pytest.raises(UnreachableTableError):
-        conn.table(path).repair()
+    # delta-rs cannot commit the repair; the kernel does.
+    assert conn.table(path).can("repair").engine is Engine.KERNEL
+    assert conn.table(path).repair()["files_removed"] == result["files_removed"]
+    assert conn.table(path).repair(dry_run=True)["files_removed"] == []

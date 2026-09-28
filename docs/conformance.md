@@ -142,15 +142,15 @@ serve.
 | `zorder` | kernel, deltars, sql | as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one |
 | `vacuum` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel's log replay for the rest (clustering, row tracking, in-commit timestamps, type widening, vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files delta-rs cannot tell apart from orphans |
 | `restore` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel re-adds the target version's files as logged (deletion vectors, row ids) on deletion-vector tables, which delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write |
-| `repair` | deltars, sql | kernel has no FSCK |
+| `repair` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel removes the missing files as logged (row ids kept) on the rest |
 | `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first |
 | `log_compaction` | deltars | kernel's log_compaction_writer is a no-op stub (kernel#2337) |
 | `publish` | kernel | Snapshot::publish; only kernel implements staged->published |
 | `reorg` | sql | Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM) |
 | `clone` | kernel, sql | kernel: path table to a path (a raw version 0 over the source's files); Databricks for catalog tables |
 | `convert` | deltars | kernel has no CONVERT TO DELTA |
-| `generate` | deltars | kernel has no manifest generation |
-| `cleanup_metadata` | deltars | delta-rs removes log files older than delta.logRetentionDuration |
+| `generate` | deltars, kernel | delta-rs for tables it can open for writing; the kernel's file listing for the rest (clustering, row tracking, in-commit timestamps, type widening, defaults). Deletion vectors and column mapping are refused, as Spark refuses them |
+| `cleanup_metadata` | kernel, deltars | the kernel deletes log files older than delta.logRetentionDuration below a checkpoint every retained version reads from, by in-commit timestamps where the table has them, v2 checkpoints' sidecars included; delta-rs where the kernel cannot read the table |
 | `analyze` | sql | Databricks-only (ANALYZE TABLE ... COMPUTE [DELTA] STATISTICS) |
 | `sync_iceberg` | sql | Databricks-only (MSCK REPAIR TABLE ... SYNC METADATA regenerates UniForm Iceberg metadata) |
 | `refresh` | sql | Databricks-only (REFRESH of a materialized view or streaming table) |

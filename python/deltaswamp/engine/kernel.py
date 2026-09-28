@@ -526,6 +526,12 @@ def _implemented() -> frozenset[Operation]:
         ops |= {Operation.OPTIMIZE, Operation.ZORDER}
     if _native_has("vacuum", "commit_raw"):
         ops.add(Operation.VACUUM)
+    if _native_has("log_cleanup"):
+        ops.add(Operation.CLEANUP_METADATA)
+    if _native_has("symlink_manifest"):
+        ops.add(Operation.GENERATE)
+    if _native_has("fsck", "commit_raw", "metadata_json"):
+        ops.add(Operation.REPAIR)
     if _native_has("restore", "commit_raw", "metadata_json"):
         ops.add(Operation.RESTORE)
     if _native_has("path_clone", "commit_raw", "files", "metadata_json"):
@@ -744,6 +750,12 @@ class KernelEngine:
         if operation is Operation.VACUUM:
             # Their own gates: see _vacuum_capability and _restore_capability.
             return self._vacuum_capability(table, shape)
+        if operation is Operation.CLEANUP_METADATA:
+            return self._cleanup_capability(table)
+        if operation is Operation.GENERATE:
+            return self._generate_capability(table)
+        if operation is Operation.REPAIR:
+            return self._repair_capability(table, shape)
         if operation is Operation.RESTORE:
             return self._restore_capability(table, shape)
 
@@ -4207,6 +4219,252 @@ class KernelEngine:
             )
         shown = {key: path for key, path, _ in doomed}
         return sorted(shown[key] for key in deleted)
+
+    # ------------------------------------------------------------ log cleanup
+
+    def _cleanup_capability(self, table: ResolvedTable) -> Capability:
+        """Expired log cleanup, planned by the kernel (crates/native/src/logclean.rs).
+
+        It commits nothing and deletes only log files below a checkpoint every
+        retained version is read from, so no feature that governs data or
+        schema binds it: the tables delta-rs cannot open for writing (in-commit
+        timestamps among them) are served. A catalog's log is its own, and
+        `checkpointProtection` restricts which history may go.
+        """
+        reason = None
+        if table.is_catalog_managed:
+            reason = (
+                "the table is catalog-managed: Unity Catalog owns its log, and cleans it up itself"
+            )
+        elif "checkpointProtection" in table.effective_writer_features:
+            reason = (
+                "the table has checkpointProtection: its history before "
+                "delta.requireCheckpointProtectionBeforeVersion may only be truncated as a "
+                "whole (DROP FEATURE ... TRUNCATE HISTORY), by a writer supporting every "
+                "feature it ever had"
+            )
+        else:
+            unknown = sorted(
+                name
+                for name in table.effective_reader_features | table.effective_writer_features
+                if feature_from_wire(name) is None
+            )
+            if unknown:
+                reason = (
+                    "the table carries table features nothing here recognizes ("
+                    + ", ".join(unknown)
+                    + "), and one could restrict which log files may be removed"
+                )
+        if reason is not None:
+            return Capability(
+                Operation.CLEANUP_METADATA, ok=False, reason=reason, remedy=SQL_FALLBACK_REMEDY
+            )
+        return Capability(Operation.CLEANUP_METADATA, ok=True, engine=self.kind)
+
+    def cleanup_metadata(self, table: ResolvedTable) -> None:
+        """Delete log files older than `delta.logRetentionDuration` (30 days by default).
+
+        Only below the newest checkpoint committed before the retention
+        boundary, so every retained version still reads: commit, checksum,
+        checkpoint and compacted files, and the sidecars no retained v2
+        checkpoint references. A commit's time is its in-commit timestamp where
+        the table has them, else its file's modification time (see
+        crates/native/src/logclean.rs). Runs regardless of
+        `delta.enableExpiredLogCleanup`, as delta-rs's does.
+        """
+        import time
+
+        capability = self._cleanup_capability(table)
+        if not capability.ok:
+            raise UnreachableTableError(
+                "clean up the log", capability.reason, capability.remedy or None
+            )
+        _enter_native("clean up the log")
+        snapshot = self.snapshot(table, write=True)
+        cutoff = int(time.time() * 1000) - int(snapshot.log_retention_ms)
+        with translating(EngineKind.KERNEL, "cleanup_metadata"):
+            _, deleted, failed = snapshot.cleanup_log(cutoff)
+        if deleted and table.location is not None:
+            self.forget(table.location)
+        if failed:
+            key, message = failed[0]
+            raise EngineLimitError(
+                "clean up the log",
+                f"{len(failed)} log file(s) were not deleted (e.g. {key}: {message}); "
+                f"{len(deleted)} older ones were, and the log still reads from its oldest "
+                "remaining checkpoint",
+                "check the credential's delete permission and run cleanup_metadata again",
+            )
+
+    # -------------------------------------------------------------- fsck
+
+    def _repair_capability(self, table: ResolvedTable, shape: dict[str, Any]) -> Capability:
+        """FSCK REPAIR: the live files whose data file is gone, removed.
+
+        Needs no kernel transaction (the removes are written as the adds
+        logged them, row ids included), so the tables delta-rs cannot commit
+        to are served. A dry run commits nothing.
+        """
+        refusal = self._file_operation_refusal(Operation.REPAIR, table)
+        if refusal is None and not shape.get("dry_run"):
+            if str(table.properties.get("delta.appendOnly", "")).strip().lower() == "true":
+                refusal = (
+                    "the table is append-only (delta.appendOnly=true), so no commit may remove "
+                    "its files, and a repair does"
+                )
+            elif table.has_iceberg_compat:
+                refusal = (
+                    "the table has Iceberg reads enabled, and a repair written here would "
+                    "leave its Iceberg metadata stale"
+                )
+        if refusal is not None:
+            return Capability(
+                Operation.REPAIR, ok=False, reason=refusal, remedy=SQL_FALLBACK_REMEDY
+            )
+        return Capability(Operation.REPAIR, ok=True, engine=self.kind)
+
+    def repair(
+        self, table: ResolvedTable, *, dry_run: bool = False, **kwargs: Any
+    ) -> dict[str, Any]:
+        """FSCK REPAIR TABLE [DRY RUN], shaped like delta-rs's result.
+
+        Every live file whose data file is gone from storage is removed, with
+        `dataChange` true as delta-rs removes it, and its deletion vector,
+        statistics and row ids as the add logged them. Returns `{"dry_run",
+        "files_removed"}` (paths as logged), and the version committed.
+        """
+        from deltaswamp import _native
+
+        capability = self._repair_capability(table, {"dry_run": dry_run})
+        if not capability.ok:
+            raise UnreachableTableError("repair", capability.reason, capability.remedy or None)
+        properties = kwargs.pop("commit_properties", None)
+        metadata = {
+            **dict(getattr(properties, "custom_metadata", None) or {}),
+            **dict(kwargs.pop("commit_metadata", None) or {}),
+        }
+        kwargs.pop("max_commit_retries", None)
+        hooks = kwargs.pop("post_commithook_properties", None)
+        if kwargs:
+            raise InvalidArgumentError(f"repair got unexpected option(s) {sorted(kwargs)}")
+        _enter_native("repair the table")
+        import time
+
+        last_error: Exception | None = None
+        for _ in range(self.metadata_commit_attempts):
+            current, state = self._state(table)
+            with translating(EngineKind.KERNEL, "repair"):
+                missing = [json.loads(add) for add in current.missing_data_files()]
+            paths = sorted(add["path"] for add in missing)
+            if dry_run or not missing:
+                return {"dry_run": dry_run, "files_removed": paths}
+            now_ms = int(time.time() * 1000)
+            files = []
+            for add in missing:
+                remove = {
+                    "path": add["path"],
+                    "deletionTimestamp": now_ms,
+                    "dataChange": True,
+                    "extendedFileMetadata": True,
+                    "partitionValues": add.get("partitionValues") or {},
+                    "size": add.get("size"),
+                }
+                for field in ("tags", "deletionVector", "baseRowId", "defaultRowCommitVersion"):
+                    if add.get(field) is not None:
+                        remove[field] = add[field]
+                files.append({"remove": remove})
+            actions = build_actions(
+                state, meta.Change(operation="FSCK", parameters={}), engine_info=_engine_info()
+            )
+            info = json.loads(actions[0])
+            info["commitInfo"].update({k: str(v) for k, v in metadata.items()})
+            info["commitInfo"]["operationMetrics"] = {
+                "dry_run": "false",
+                "files_removed": json.dumps(paths),
+            }
+            actions[0] = json.dumps(info, separators=(",", ":"))
+            actions.extend(json.dumps(a, separators=(",", ":")) for a in files)
+            try:
+                assert table.location is not None  # supports() refused otherwise
+                version: int = _native.commit_raw(
+                    table.location,
+                    state.version + 1,
+                    actions,
+                    options=self._options(table, write=True) or None,
+                )
+            except _native.CommitConflictError as exc:
+                # Recomputed on the table as it now is: a file another
+                # writer removed meanwhile is no longer this repair's.
+                last_error = exc
+                continue
+            if getattr(hooks, "create_checkpoint", True) is not False:
+                self._maybe_checkpoint(table, version)
+            return {"dry_run": False, "files_removed": paths, "version": version}
+        raise CommitConflictError(
+            conflict_version(str(last_error)),
+            f"cannot commit the repair: another writer committed first on each of "
+            f"{self.metadata_commit_attempts} attempts ({last_error}); retry when the table "
+            "is less busy",
+        )
+
+    # -------------------------------------------------------- symlink manifest
+
+    #: Features whose files a symlink manifest cannot describe, and why. Spark
+    #: refuses GENERATE on both (DELTA_UNSUPPORTED_GENERATE_WITH_DELETION_VECTORS,
+    #: and column mapping as unsupported for manifest generation).
+    _MANIFEST_BLOCKERS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("deletionVectors", "manifest readers would return the rows deletion vectors remove"),
+        ("columnMapping", "manifest readers would see physical column names"),
+    )
+
+    def _generate_capability(self, table: ResolvedTable) -> Capability:
+        """GENERATE symlink_format_manifest, from the kernel's file listing.
+
+        It commits nothing and lists only live files, so no feature that
+        governs writes binds it: the tables delta-rs cannot open for writing
+        (clustering, row tracking, in-commit timestamps, type widening, column
+        defaults) are served.
+        """
+        reason = None
+        if table.is_catalog_managed:
+            reason = (
+                "the table is catalog-managed: Unity Catalog owns its storage, and it refuses "
+                "files written there by external engines"
+            )
+        else:
+            mode = str(table.properties.get("delta.columnMapping.mode", "none")).strip().lower()
+            active = set(table.features) - {"columnMapping"}
+            if mode in ("name", "id"):
+                active.add("columnMapping")
+            reason = next(
+                (
+                    f"the table uses {feature}, and {why}"
+                    for feature, why in self._MANIFEST_BLOCKERS
+                    if feature in active
+                ),
+                None,
+            )
+        if reason is not None:
+            return Capability(Operation.GENERATE, ok=False, reason=reason)
+        return Capability(Operation.GENERATE, ok=True, engine=self.kind)
+
+    def generate(self, table: ResolvedTable) -> None:
+        """Write symlink format manifests for engines that read them (Presto, Athena).
+
+        As Spark's GENERATE writes them (crates/native/src/manifest.rs):
+        `_symlink_format_manifest/manifest`, or one per partition directory,
+        each listing the absolute paths of the live files; the manifests of
+        partitions with no files left are deleted.
+        """
+        capability = self._generate_capability(table)
+        if not capability.ok:
+            raise UnreachableTableError(
+                "generate a symlink manifest", capability.reason, capability.remedy or None
+            )
+        _enter_native("generate a symlink manifest")
+        snapshot = self.snapshot(table, write=True)
+        with translating(EngineKind.KERNEL, "generate"):
+            snapshot.write_symlink_manifest()
 
     def _commit_info_only(
         self,
