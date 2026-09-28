@@ -108,6 +108,24 @@ def test_a_checksum_carried_over_a_metadata_commit_keeps_the_file_stats(
     assert (_crc(path, v + 1)["numFiles"], _crc(path, v + 1)["tableSizeBytes"]) == (files, size)
 
 
+def test_a_row_tracked_tables_checksum_is_counted_from_storage(tmp_path: Any) -> None:
+    """Removes on a row-tracked table are written past the kernel's commit, so
+    the post-commit snapshot's in-memory checksum would not count them."""
+    conn = _only(Engine.KERNEL)
+    path = str(tmp_path / "t")
+    props = {"delta.enableRowTracking": "true", "delta.enableDeletionVectors": "true"}
+    conn.create_table(path, pa.schema([("id", pa.int64())]), properties=props)
+    t = conn.table(path)
+    t.append(pa.table({"id": [1, 2, 3]}))
+    t.append(pa.table({"id": [4]}))
+    t.delete("id = 4")
+    t.update(new_values={"id": 9}, predicate="id = 1")
+    latest = conn.table(path).version
+    files, size = _live_totals(conn.table(path))
+    crc = _crc(path, latest)
+    assert (crc["numFiles"], crc["tableSizeBytes"]) == (files, size)
+
+
 # ------------------------------------------------------- #15 write results
 
 
