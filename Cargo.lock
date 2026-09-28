@@ -702,6 +702,7 @@ dependencies = [
  "delta-kernel-unity-catalog",
  "delta_kernel",
  "delta_kernel_default_engine",
+ "humantime",
  "pyo3",
  "pyo3-arrow",
  "roaring",

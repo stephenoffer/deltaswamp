@@ -175,73 +175,79 @@ const RETRY_KEYS: [&str; 5] = [
     "backoff_config.base",
 ];
 
-/// A duration as delta-rs spells one: `30s`, `500ms`, `2m`, `1h 30m`, or
-/// bare seconds.
-fn parse_duration(text: &str) -> Result<Duration> {
-    let invalid = || NativeError::Invalid(format!("{text:?} is not a duration (e.g. 30s, 500ms)"));
-    let trimmed = text.trim();
-    if let Ok(secs) = trimmed.parse::<f64>() {
-        return if secs.is_finite() && secs >= 0.0 {
-            Ok(Duration::from_secs_f64(secs))
-        } else {
-            Err(invalid())
-        };
+/// The longest retry duration taken. object_store's backoff turns durations
+/// into f64 seconds and back (`Duration::from_secs_f64`, which panics past
+/// u64 seconds), so a value near that bound -- "20000000000000000000s" --
+/// panicked inside a read instead of being refused. A century is far more
+/// than any retry policy means.
+const MAX_RETRY_DURATION: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
+/// A duration as delta-rs reads one: humantime's form (`30s`, `30 s`,
+/// `2 minutes`, `1h 30m`, `1.5s`, `1d`), which object_store's own config
+/// parsing uses. Bare seconds ("2") are not one: delta-rs refuses them, and
+/// taking them here let the kernel read with options delta-rs then failed on
+/// after can() had named it.
+fn parse_duration(key: &str, text: &str) -> Result<Duration> {
+    let parsed = humantime::parse_duration(text.trim()).map_err(|e| {
+        NativeError::Invalid(format!(
+            "{key}: {text:?} is not a duration such as 30s, 500ms or 2 minutes ({e})"
+        ))
+    })?;
+    if parsed > MAX_RETRY_DURATION {
+        return Err(NativeError::Invalid(format!(
+            "{key}: {text:?} is longer than a retry policy can use (at most 100 years)"
+        )));
     }
-    let mut total = Duration::ZERO;
-    let mut rest = trimmed;
-    while !rest.is_empty() {
-        let digits = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .ok_or_else(invalid)?;
-        let value: f64 = rest[..digits].parse().map_err(|_| invalid())?;
-        rest = &rest[digits..];
-        let unit_end = rest
-            .find(|c: char| !c.is_ascii_alphabetic())
-            .unwrap_or(rest.len());
-        let factor = match &rest[..unit_end] {
-            "ms" => 0.001,
-            "s" | "sec" | "secs" => 1.0,
-            "m" | "min" | "mins" => 60.0,
-            "h" | "hr" | "hrs" => 3600.0,
-            _ => return Err(invalid()),
-        };
-        total += Duration::from_secs_f64(value * factor);
-        rest = rest[unit_end..].trim_start();
-    }
-    Ok(total)
+    Ok(parsed)
 }
 
 /// The retry policy the options ask for, or None to keep object_store's.
-fn retry_config(options: &HashMap<String, String>) -> Result<Option<RetryConfig>> {
-    let get = |key: &str| {
-        options
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.as_str())
-    };
+///
+/// Read as delta-rs reads the same keys, so that both engines accept the same
+/// options: the key names exactly (delta-rs ignores `RETRY_TIMEOUT`), an
+/// unsigned integer for `max_retries` and a float for the base, untrimmed.
+/// Beyond delta-rs, values object_store's backoff would panic on are refused
+/// (`validate_retry_options` applies the same rules for every engine): a
+/// base that is not a finite number above 1 (the next backoff is drawn from
+/// `init..prev * base`, empty otherwise) and a zero initial backoff.
+pub fn retry_config(options: &HashMap<String, String>) -> Result<Option<RetryConfig>> {
+    let get = |key: &str| options.get(key).map(String::as_str);
     if RETRY_KEYS.iter().all(|k| get(k).is_none()) {
         return Ok(None);
     }
     let mut config = RetryConfig::default();
     let mut backoff = BackoffConfig::default();
     if let Some(v) = get("max_retries") {
-        config.max_retries = v.trim().parse().map_err(|_| {
-            NativeError::Invalid(format!("max_retries must be an integer, got {v:?}"))
+        config.max_retries = v.parse().map_err(|_| {
+            NativeError::Invalid(format!(
+                "max_retries must be a non-negative integer, got {v:?}"
+            ))
         })?;
     }
     if let Some(v) = get("retry_timeout") {
-        config.retry_timeout = parse_duration(v)?;
+        config.retry_timeout = parse_duration("retry_timeout", v)?;
     }
     if let Some(v) = get("backoff_config.init_backoff") {
-        backoff.init_backoff = parse_duration(v)?;
+        backoff.init_backoff = parse_duration("backoff_config.init_backoff", v)?;
+        if backoff.init_backoff.is_zero() {
+            return Err(NativeError::Invalid(format!(
+                "backoff_config.init_backoff must be longer than zero, got {v:?}"
+            )));
+        }
     }
     if let Some(v) = get("backoff_config.max_backoff") {
-        backoff.max_backoff = parse_duration(v)?;
+        backoff.max_backoff = parse_duration("backoff_config.max_backoff", v)?;
     }
     if let Some(v) = get("backoff_config.base") {
-        backoff.base = v.trim().parse().map_err(|_| {
+        let base: f64 = v.parse().map_err(|_| {
             NativeError::Invalid(format!("backoff_config.base must be a number, got {v:?}"))
         })?;
+        if !(base.is_finite() && base > 1.0) {
+            return Err(NativeError::Invalid(format!(
+                "backoff_config.base must be a finite number above 1, got {v:?}"
+            )));
+        }
+        backoff.base = base;
     }
     config.backoff = backoff;
     Ok(Some(config))
@@ -387,13 +393,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn durations_parse_as_delta_rs_spells_them() {
-        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
-        assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_secs(5400));
-        assert_eq!(parse_duration("2").unwrap(), Duration::from_secs(2));
-        assert!(parse_duration("soon").is_err());
-        assert!(parse_duration("-1").is_err());
+    fn durations_parse_as_delta_rs_reads_them() {
+        let d = |t: &str| parse_duration("k", t);
+        assert_eq!(d("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(d("30 s").unwrap(), Duration::from_secs(30));
+        assert_eq!(d(" 30s ").unwrap(), Duration::from_secs(30));
+        assert_eq!(d("2 minutes").unwrap(), Duration::from_secs(120));
+        assert_eq!(d("1d").unwrap(), Duration::from_secs(86400));
+        assert_eq!(d("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(d("1h 30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(d("1.5s").unwrap(), Duration::from_millis(1500));
+        // delta-rs refuses all of these.
+        for bad in ["2", "1e19", "-1s", "30S", "nan", "", "soon", "+1s"] {
+            assert!(d(bad).is_err(), "{bad}");
+        }
+        // Accepted by delta-rs, but a panic in object_store's backoff.
+        assert!(d("20000000000000000000s").is_err());
+        assert!(d("1e30").is_err());
     }
 
     #[test]
@@ -401,12 +417,27 @@ mod tests {
         assert!(retry_config(&opts(&[("aws_region", "us-east-1")]))
             .unwrap()
             .is_none());
-        let config = retry_config(&opts(&[("max_retries", "0"), ("RETRY_TIMEOUT", "1s")]))
+        let config = retry_config(&opts(&[("max_retries", "0"), ("retry_timeout", "1s")]))
             .unwrap()
             .unwrap();
         assert_eq!(config.max_retries, 0);
         assert_eq!(config.retry_timeout, Duration::from_secs(1));
-        assert!(retry_config(&opts(&[("max_retries", "many")])).is_err());
+        // delta-rs reads the keys as spelled, and ignores this one.
+        assert!(retry_config(&opts(&[("RETRY_TIMEOUT", "1s")]))
+            .unwrap()
+            .is_none());
+        for (key, bad) in [
+            ("max_retries", "many"),
+            ("max_retries", " 3 "),
+            ("max_retries", "-1"),
+            ("backoff_config.base", "nan"),
+            ("backoff_config.base", "-5"),
+            ("backoff_config.base", "1"),
+            ("backoff_config.base", "inf"),
+            ("backoff_config.init_backoff", "0s"),
+        ] {
+            assert!(retry_config(&opts(&[(key, bad)])).is_err(), "{key}={bad}");
+        }
     }
 
     #[test]

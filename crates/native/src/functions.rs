@@ -93,6 +93,18 @@ pub fn probe_put_if_absent(
     Ok(py.detach(|| store::probe_put_if_absent(&url, &options))?)
 }
 
+/// Refuse retry storage options (`max_retries`, `retry_timeout`,
+/// `backoff_config.*`) that either engine would refuse or panic on.
+///
+/// `connect()` calls this, so a value delta-rs rejects is refused before any
+/// engine is chosen, rather than accepted by the kernel's reads and failing
+/// the first call routed to delta-rs.
+#[pyfunction]
+pub fn validate_retry_options(options: HashMap<String, String>) -> PyResult<()> {
+    store::retry_config(&options)?;
+    Ok(())
+}
+
 /// The UC `CreateTableRequest` body for a freshly committed version 0, as JSON.
 ///
 /// Step three of the managed-table creation flow: after staging the table in

@@ -501,3 +501,40 @@ class TestRowFilterSemantics:
         from deltaswamp.engine.sharing import _screen_expression
 
         _screen_expression(text)
+
+
+class TestRetryOptions:
+    """D8/D9: retry storage options are read as delta-rs reads them, for every engine."""
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"retry_timeout": "2"},
+            {"backoff_config.init_backoff": "1e19"},
+            {"retry_timeout": "1e30"},
+            {"retry_timeout": "20000000000000000000s"},
+            {"backoff_config.base": "nan"},
+            {"backoff_config.base": "-5"},
+            {"max_retries": " 3 "},
+        ],
+    )
+    def test_refused_at_connect(self, options: dict[str, str]) -> None:
+        from deltaswamp.errors import InvalidArgumentError
+
+        with pytest.raises(InvalidArgumentError, match="storage_options"):
+            ds.connect(storage_options=options)
+
+    @pytest.mark.parametrize(
+        "options",
+        [{"retry_timeout": "30 s"}, {"retry_timeout": "2 minutes"}, {"retry_timeout": "1d"}],
+    )
+    def test_humantime_durations_serve_both_engines(
+        self, tmp_path: pathlib.Path, options: dict[str, str]
+    ) -> None:
+        path = str(tmp_path / "t")
+        ds.connect().write_table(path, pa.table({"id": pa.array([1, 2], pa.int64())}))
+        t = ds.connect(storage_options=options).open_table(path)
+        assert t.to_arrow().num_rows == 2
+        assert t.can("delete", predicate="abs(id) = 1").engine is ds.Engine.DELTARS
+        t.delete("abs(id) = 1")
+        assert t.count() == 1

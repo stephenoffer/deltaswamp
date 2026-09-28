@@ -132,9 +132,13 @@ table's vended credentials in this order:
    the credential ones only when nothing above gave a credential.
 
 The client retry policy is set the way delta-rs reads it, on both engines:
-`max_retries`, `retry_timeout` (`30s`, `500ms`, `2m`),
-`backoff_config.init_backoff`, `backoff_config.max_backoff` and
-`backoff_config.base`.
+`max_retries` (an integer), `retry_timeout`, `backoff_config.init_backoff`
+and `backoff_config.max_backoff` (durations as humantime spells them: `30s`,
+`30 s`, `500ms`, `2 minutes`, `1h 30m`, `1d`; not bare seconds), and
+`backoff_config.base`. The keys are lower-case, as delta-rs reads them.
+`connect()` refuses a value either engine would refuse, and a base that is not
+a finite number above 1, a zero initial backoff or a duration over 100 years,
+on which object_store's backoff panics.
 
 S3 keys with a region and no endpoint get an explicit one,
 `https://s3.<region>.amazonaws.com` (`.amazonaws.com.cn` in China regions).
