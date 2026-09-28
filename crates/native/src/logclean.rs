@@ -37,8 +37,7 @@ use std::sync::Arc;
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::DataType as ArrowType;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::history_manager::error::LogHistoryError;
-use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
+use delta_kernel::history_manager::HistoryCommitType;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectMeta};
 use delta_kernel::schema::{DataType, StructField, StructType};
@@ -309,22 +308,6 @@ fn list(store: &DynObjectStore, prefix: &Path, recursive: bool) -> Result<Vec<Ob
     })
 }
 
-/// The latest of `commits` (ascending `(version, modification ms)`) whose
-/// time, made monotonic as time travel makes it, is at or before `cutoff_ms`.
-fn latest_at_or_before(commits: &[(Version, i64)], cutoff_ms: i64) -> Option<Version> {
-    let mut found = None;
-    let mut previous = i64::MIN;
-    for &(version, raw) in commits {
-        let time = raw.max(previous.saturating_add(1));
-        if time > cutoff_ms {
-            break;
-        }
-        found = Some(version);
-        previous = time;
-    }
-    found
-}
-
 /// What cleaning up the log of `snapshot` (the latest) deletes, with the
 /// retention boundary at `cutoff_ms` (epoch ms).
 pub fn plan(
@@ -363,32 +346,17 @@ pub fn plan(
     let sidecars = list(store.as_ref(), &sidecar_path, true)?;
     let present: HashSet<Path> = sidecars.iter().map(|m| m.location.clone()).collect();
 
-    // The latest version committed at or before the boundary.
-    let ict = snapshot
-        .table_properties()
-        .enable_in_commit_timestamps
-        .unwrap_or(false);
-    let expired = if ict {
-        match latest_version_as_of(snapshot, engine, cutoff_ms, HistoryCommitType::Published) {
-            Ok(commit) => Some(commit.version.min(snapshot.version())),
-            Err(delta_kernel::Error::LogHistory(e))
-                if matches!(*e, LogHistoryError::TimestampOutOfRange { .. }) =>
-            {
-                None // every commit is newer than the boundary
-            }
-            Err(e) => return Err(e.into()),
-        }
-    } else {
-        // Not the history manager: it answers any time after the latest
-        // commit's raw modification time with the latest version, and so
-        // expired every version after one whose file looked newer.
-        let commits: Vec<(Version, i64)> = listed
-            .iter()
-            .filter(|f| f.kind == LogFile::Commit && f.version <= snapshot.version())
-            .map(|f| (f.version, f.meta.last_modified.timestamp_millis()))
-            .collect();
-        latest_at_or_before(&commits, cutoff_ms)
-    };
+    // The latest version committed at or before the boundary, by the commit
+    // times time travel resolves against.
+    let expired = crate::commit_time::lookup(
+        snapshot,
+        engine,
+        cutoff_ms,
+        crate::commit_time::Bound::AtOrBefore,
+        HistoryCommitType::Published,
+    )?
+    .ok()
+    .map(|(version, _)| version.min(snapshot.version()));
 
     let mut checkpoints: BTreeMap<Version, Vec<&Listed>> = BTreeMap::new();
     for f in &listed {
@@ -547,16 +515,6 @@ mod tests {
         ] {
             assert_eq!(parse(&other), None, "{other}");
         }
-    }
-
-    #[test]
-    fn modification_times_are_made_monotonic() {
-        let commits = [(0, 10), (1, 20), (2, 90), (3, 30), (4, 40)];
-        assert_eq!(latest_at_or_before(&commits, 50), Some(1));
-        assert_eq!(latest_at_or_before(&commits, 91), Some(3));
-        assert_eq!(latest_at_or_before(&commits, 92), Some(4));
-        assert_eq!(latest_at_or_before(&commits, 5), None);
-        assert_eq!(latest_at_or_before(&[], 5), None);
     }
 
     #[test]

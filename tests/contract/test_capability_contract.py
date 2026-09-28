@@ -93,9 +93,16 @@ class Ctx:
 
 
 def _latest_timestamp(path: str) -> str:
-    """When the latest commit was made, the way a reader resolves timestamps."""
-    log = sorted(pathlib.Path(path, "_delta_log").glob("[0-9]*.json"))[-1]
-    millis = int(log.stat().st_mtime * 1000)
+    """When the latest commit was made, the way a reader resolves timestamps.
+
+    A commit timed by its file is at least a millisecond after the one before
+    it: two commits written within one millisecond are a millisecond apart.
+    """
+    logs = sorted(pathlib.Path(path, "_delta_log").glob("[0-9]*.json"))
+    millis = 0
+    for f in logs:
+        millis = max(f.stat().st_mtime_ns // 1_000_000, millis + 1)
+    log = logs[-1]
     for line in log.read_text().splitlines():
         info = json.loads(line).get("commitInfo") if line.strip() else None
         if info and "inCommitTimestamp" in info:

@@ -37,7 +37,7 @@ from .engine.base import (
 from .engine.boundary import engine_cause
 from .engine.deltars import DeltaRsEngine
 from .engine.intervals import interval_paths, interval_schema, interval_stream, storage_columns
-from .engine.kernel import KernelEngine
+from .engine.kernel import KernelEngine, commit_timestamp
 from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
     SQL_FALLBACK_REMEDY,
@@ -1483,8 +1483,6 @@ class Table:
         )
 
         def scan(engine: Any) -> Any:
-            if timestamp is not None and isinstance(engine, (KernelEngine, DeltaRsEngine)):
-                self._refuse_future_timestamp(timestamp)
             stream = engine.scan(
                 self._resolved,
                 columns=columns,
@@ -2860,10 +2858,10 @@ class Table:
         """When `version` was committed (the in-commit timestamp where there is one)."""
         import datetime as dt
 
-        kernel = self._connection.router.engines.get(EngineKind.KERNEL)
+        kernel = self._timestamp_kernel()
         if kernel is not None and hasattr(kernel, "snapshot"):
             with contextlib.suppress(Exception):
-                ms = int(kernel.snapshot(pinned._resolved, version=version).timestamp())
+                ms = commit_timestamp(kernel.snapshot(pinned._resolved, version=version))
                 return dt.datetime.fromtimestamp(ms / 1000, tz=dt.UTC)
         for entry in pinned._connection._reresolve(pinned).history():
             if entry.get("version") == version and entry.get("timestamp") is not None:
@@ -4126,41 +4124,30 @@ class Table:
         self._invalidate()
         return _results.restore(result, getattr(engine, "kind", None))
 
-    def _refuse_future_timestamp(self, timestamp: Any) -> None:
-        """Refuse time travel to a time after the latest commit, as the warehouse does.
+    def _timestamp_kernel(self) -> Any:
+        """The kernel that resolves timestamps to versions, or None.
 
-        The direct engines resolve such a timestamp to the latest version and
-        read it; Databricks refuses it (DELTA_TIMESTAMP_GREATER_THAN_COMMIT),
-        since no version exists at that time yet -- the same timestamp read
-        different data once the next commit landed.
+        The router's; else the one delta-rs resolves its own time travel with,
+        so a connection without the kernel engine resolves a restore's
+        timestamp as its reads do rather than by delta-rs's raw file times.
         """
         kernel = self._connection.router.engines.get(EngineKind.KERNEL)
-        if not isinstance(kernel, KernelEngine) or self._resolved.location is None:
-            return
-        try:
-            millis = timestamp_ms(timestamp)
-            latest = kernel.snapshot(self._resolved)
-            last = int(latest.timestamp())
-        except Exception:
-            return  # the read reports what is wrong
-        if millis > last:
-            raise InvalidArgumentError(
-                f"cannot time travel to {timestamp}: it is after the latest commit (version "
-                f"{int(latest.version)}), so no version of the table exists at that time "
-                "(DELTA_TIMESTAMP_GREATER_THAN_COMMIT); read the latest version without a "
-                "timestamp"
-            )
+        if isinstance(kernel, KernelEngine):
+            return kernel
+        deltars = self._connection.router.engines.get(EngineKind.DELTARS)
+        return deltars._kernel() if isinstance(deltars, DeltaRsEngine) else None
 
     def _restore_version(self, timestamp: Any) -> Any:
         """The version a restore to `timestamp` means: the one a read at it sees.
 
         That is the latest commit at or before it (in-commit timestamps when
         enabled); one before the first recreatable commit is refused, as a read
-        refuses it. Without a kernel that can open the table, the timestamp is
-        passed on for the engine to resolve.
+        refuses it, and so is one after the latest commit. Without a kernel
+        that can open the table, the timestamp is passed on for the engine to
+        resolve.
         """
 
-        kernel = self._connection.router.engines.get(EngineKind.KERNEL)
+        kernel = self._timestamp_kernel()
         if not isinstance(kernel, KernelEngine) or self._resolved.location is None:
             return timestamp
         try:
@@ -4177,23 +4164,20 @@ class Table:
                     "log retention kept)"
                 ) from exc
             return timestamp
-        except Exception:
-            return timestamp
-        try:
+        except InvalidArgumentError as exc:
+            if "after the latest commit" not in str(exc):
+                raise
+            # A restore to it would be a silent no-op. Spark refuses it
+            # (DELTA_TIMESTAMP_GREATER_THAN_COMMIT): nothing is committed at
+            # that time yet.
             latest = kernel.snapshot(self._resolved)
-            after_latest = int(snapshot.version) == int(latest.version) and millis > int(
-                latest.timestamp()
-            )
-        except Exception:
-            after_latest = False
-        if after_latest:
-            # It resolved to the latest version, so the restore was a silent
-            # no-op. Spark refuses it (DELTA_TIMESTAMP_GREATER_THAN_COMMIT):
-            # nothing is committed at that time yet.
             raise InvalidArgumentError(
                 f"cannot restore to {timestamp}: it is after the latest commit (version "
-                f"{int(latest.version)}), so there is no version of the table at that time"
-            )
+                f"{int(latest.version)}, at {commit_timestamp(latest)} ms), so there is no "
+                "version of the table at that time"
+            ) from exc
+        except Exception:
+            return timestamp
         return int(snapshot.version)
 
     def repair(self, **kwargs: Any) -> dict[str, Any]:

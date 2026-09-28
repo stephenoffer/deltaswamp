@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
+use delta_kernel::history_manager::HistoryCommitType;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::{Engine, LogPath, Version};
 use pyo3::prelude::*;
@@ -19,6 +19,7 @@ use pyo3_arrow::{PyRecordBatchReader, PySchema, PyTable};
 use url::Url;
 
 use crate::commit::{self, SharedEngine, UcCommitConfig};
+use crate::commit_time::{self, Bound};
 use crate::dml;
 use crate::error::{NativeError, Result};
 use crate::files;
@@ -228,7 +229,9 @@ impl PySnapshot {
         })?)
     }
 
-    /// Resolve the latest recreatable version as of `timestamp_ms`.
+    /// Resolve the latest recreatable version as of `timestamp_ms`, by commit
+    /// times as Delta assigns them (see `commit_time`); a time after the
+    /// latest commit is refused.
     ///
     /// The history search needs a snapshot to bound it, and on a catalog-managed
     /// table only the catalog's tail says what "latest" is -- so resolve the
@@ -242,30 +245,37 @@ impl PySnapshot {
         max_catalog_version: Option<Version>,
     ) -> Result<SnapshotRef> {
         let latest = Self::build(engine, url, None, log_tail, max_catalog_version)?;
-        let found = latest_version_as_of(
+        let (found, _) = commit_time::version_at(
             &latest,
             engine.as_ref() as &dyn Engine,
             timestamp_ms,
+            Bound::AtOrBefore,
             HistoryCommitType::Recreatable,
         )
         .map_err(|e| match e {
-            delta_kernel::Error::LogHistory(inner) => NativeError::Invalid(format!(
+            NativeError::Invalid(inner) => NativeError::Invalid(format!(
                 "no version of {url} can be reconstructed as of timestamp {timestamp_ms} ms \
                  ({inner}). The timestamp is before the earliest recreatable commit (version 0 \
                  or the oldest retained checkpoint); choose a later timestamp."
             )),
-            other => NativeError::from(other),
+            other => other,
         })?;
-        if found.version == latest.version() {
+        if found == latest.version() {
+            let last = commit_time::commit_time(&latest, engine.as_ref() as &dyn Engine)?;
+            if timestamp_ms > last {
+                // Databricks refuses it (DELTA_TIMESTAMP_GREATER_THAN_COMMIT):
+                // no version exists at that time yet, and the same timestamp
+                // would read different data once the next commit landed.
+                return Err(NativeError::Invalid(format!(
+                    "timestamp {timestamp_ms} ms is after the latest commit (version {}, at \
+                     {last} ms), so no version of {url} exists at that time \
+                     (DELTA_TIMESTAMP_GREATER_THAN_COMMIT)",
+                    latest.version()
+                )));
+            }
             return Ok(latest);
         }
-        Self::build(
-            engine,
-            url,
-            Some(found.version),
-            log_tail,
-            max_catalog_version,
-        )
+        Self::build(engine, url, Some(found), log_tail, max_catalog_version)
     }
 }
 
@@ -1002,6 +1012,50 @@ impl PySnapshot {
                 .map_err(NativeError::from)
         })?;
         Ok(ts)
+    }
+
+    /// This snapshot's commit timestamp in milliseconds as Delta assigns it:
+    /// the in-commit timestamp when ICT is enabled, else the commit file's
+    /// modification time made monotonic -- no earlier than a millisecond
+    /// after the commit before it, as Spark's history reports it and time
+    /// travel compares it. Lists the log when ICT is off.
+    fn commit_timestamp(&self, py: Python<'_>) -> PyResult<i64> {
+        Ok(py.detach(|| commit_time::commit_time(&self.inner, self.engine.as_ref()))?)
+    }
+
+    /// `(version, ms)` of every commit timed by its file (all of them when
+    /// in-commit timestamps are off, those before their enablement when they
+    /// were turned on later), the times made monotonic as `commit_timestamp`.
+    fn file_commit_timestamps(&self, py: Python<'_>) -> PyResult<Vec<(u64, i64)>> {
+        Ok(py.detach(|| commit_time::file_commit_times(&self.inner, self.engine.as_ref()))?)
+    }
+
+    /// The commit `timestamp_ms` names among the published commits, as
+    /// `(version, commit ms)`: the latest at or before it, or with
+    /// `at_or_after` the first at or after it -- what a change feed's bounds
+    /// resolve to. A time before the first commit (at or before) or after the
+    /// latest (at or after) raises ValueError.
+    #[pyo3(signature = (timestamp_ms, at_or_after = false))]
+    fn version_at(
+        &self,
+        py: Python<'_>,
+        timestamp_ms: i64,
+        at_or_after: bool,
+    ) -> PyResult<(u64, i64)> {
+        let bound = if at_or_after {
+            Bound::AtOrAfter
+        } else {
+            Bound::AtOrBefore
+        };
+        Ok(py.detach(|| {
+            commit_time::version_at(
+                &self.inner,
+                self.engine.as_ref(),
+                timestamp_ms,
+                bound,
+                HistoryCommitType::Published,
+            )
+        })?)
     }
 
     /// Write a checkpoint at this snapshot's version.

@@ -20,6 +20,7 @@ from deltaswamp.engine.deltars import DeltaRsEngine  # noqa: E402
 from deltaswamp.errors import (  # noqa: E402
     EngineLimitError,
     EnginePanicError,
+    InvalidArgumentError,
     UnreachableTableError,
 )
 from deltaswamp.identity import RefKind, TableRef  # noqa: E402
@@ -217,9 +218,18 @@ def test_scan_refuses_version_and_timestamp(engine: DeltaRsEngine, plain: str) -
 
 
 def test_scan_accepts_datetime_and_naive_timestamp(engine: DeltaRsEngine, plain: str) -> None:
-    later = dt.datetime.now(dt.UTC) + dt.timedelta(days=1)
-    for ts in (later, later.replace(tzinfo=None).isoformat(), later.date().isoformat()):
+    import os
+    import pathlib
+
+    # Committed at midnight, so a date names the commit's own instant: a time
+    # after the latest commit is refused, as Databricks refuses it.
+    at = dt.datetime(2020, 1, 2, tzinfo=dt.UTC)
+    for f in pathlib.Path(plain, "_delta_log").glob("*.json"):
+        os.utime(f, (at.timestamp(), at.timestamp()))
+    for ts in (at, at.replace(tzinfo=None).isoformat(), at.date().isoformat()):
         assert pa.table(engine.scan(_resolved(plain), timestamp=ts)).num_rows == 2  # type: ignore[arg-type]
+    with pytest.raises(InvalidArgumentError, match="after the latest commit"):
+        engine.scan(_resolved(plain), timestamp=(at + dt.timedelta(days=1)).isoformat())
 
 
 @pytest.fixture
