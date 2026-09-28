@@ -1089,9 +1089,11 @@ def h_dv_decimal_stats(b: Builder) -> None:
     b.step("update", lambda t: t.update({"s": "'u'"}, predicate="id = 4"), expect="ok")
     b.step(
         "merge_delete",
-        lambda t: t.merge(pa.table({"id": pa.array([5], pa.int64())}), "target.id = source.id")
-        .when_matched_delete()
-        .execute(),
+        lambda t: (
+            t.merge(pa.table({"id": pa.array([5], pa.int64())}), "target.id = source.id")
+            .when_matched_delete()
+            .execute()
+        ),
         expect="ok",
     )
     b.mark("stats")
@@ -1249,7 +1251,8 @@ _VARIANT_TEMPLATES = {
 
 
 def _nan(**more: str) -> dict[str, str]:
-    return {"stats-nan": NAN_STATS, **more}
+    """Open bugs a case still has; empty once they are fixed (audit7/ixfix)."""
+    return {}
 
 
 CASES: list[Case] = [
@@ -1299,7 +1302,7 @@ CASES: list[Case] = [
     ),
     Case("constraints", "violations", h_constraints, groups(), known=_nan()),
     Case("v2_checkpoints", "full", h_v2_checkpoints, groups(), known=_nan()),
-    Case("liquid", "recluster", h_liquid, groups(), known=_nan()),
+    Case("liquid", "recluster", h_liquid, groups(), known={"stats-nan": NAN_STATS}),
     Case("checkpoint_interval", "log_compaction", h_log_compaction, groups(), known=_nan()),
     Case("legacy_deltalake", "upgrade", h_legacy_upgrade, groups(), known=_nan()),
     Case(
@@ -1319,14 +1322,14 @@ CASES: list[Case] = [
         ("integer", "string", "nested"),
         variant=_VARIANT_TEMPLATES,
         unordered=frozenset({("v",), ("sv", "x")}),
-        known={"variant-merge-null-element": VARIANT_NULL},
+        known={},
     ),
     Case(
         "dv_decimal",
         "kernel_dv_dml",
         h_dv_decimal_stats,
         ("integer", "decimal", "string"),
-        known={"stats-decimal": DV_DECIMAL},
+        known={},
     ),
     Case(
         "nested_timestamps",
