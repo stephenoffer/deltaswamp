@@ -28,7 +28,12 @@ from .capability import READ_OPERATIONS as _READ_OPERATIONS
 from .capability import Engine as EngineKind
 from .catalog import ResolvedTable, TableType
 from .credentials import Operation as CredentialOperation
-from .engine.base import TranslatingStream, merge_clause, translating_stream
+from .engine.base import (
+    TranslatingStream,
+    merge_clause,
+    merge_clause_values,
+    translating_stream,
+)
 from .engine.boundary import engine_cause
 from .engine.deltars import DeltaRsEngine
 from .engine.intervals import interval_paths, interval_schema, interval_stream, storage_columns
@@ -37,6 +42,7 @@ from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
     SQL_FALLBACK_REMEDY,
     CorruptTableError,
+    CredentialError,
     DeltaSwampError,
     EngineFallbackWarning,
     EngineLimitError,
@@ -912,6 +918,14 @@ class Table:
         self._refresh_commit_tail(before_write=True)
         self._named_checked_at = now
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        # A time.monotonic() reading, which means nothing on another host: a
+        # handle shipped to a Ray worker whose clock started later skipped
+        # the catalog re-check until the worker's uptime passed the driver's.
+        state.pop("_named_checked_at", None)
+        return state
+
     def _refresh_commit_tail(self, *, before_write: bool = False) -> None:
         """Re-read a catalog-managed table's ratified commits from the catalog.
 
@@ -929,7 +943,12 @@ class Table:
             if before_write:
                 raise
             return
-        except DeltaSwampError:
+        except DeltaSwampError as exc:
+            if getattr(exc, "denied", False) or isinstance(exc, CredentialError):
+                # A revoked privilege or rejected credentials: reading on at
+                # the location resolved earlier would serve a principal the
+                # catalog now refuses.
+                raise
             # The call that got us here succeeded; a re-open reads the tail.
             return
         recreated = any(
@@ -1173,6 +1192,44 @@ class Table:
         except Exception:
             return set()
         return {"char_padding"} if any(p[0].lower() in chars for p in paths) else set()
+
+    def _interval_columns(self) -> frozenset[str]:
+        """The top-level columns (lower-cased) that are, or hold, an ANSI interval."""
+        try:
+            groups = interval_paths(self._raw_schema(with_log=True)[1])
+        except Exception:
+            return frozenset()
+        return frozenset(p[0].lower() for paths in groups.values() for p in paths if p)
+
+    def _interval_needs(self, *texts: Any) -> set[str]:
+        """``interval_columns`` when SQL names a column Databricks stores an interval in.
+
+        The log spells the interval; the files hold its INT32 months or INT64
+        microseconds, and the direct engines see only those. delta-rs does not
+        even resolve the column ("Schema error: No such field: ym") after
+        can() had named it, and a kernel read compared the raw integers
+        (``ym = -14`` matched ``INTERVAL '-1-2' YEAR TO MONTH``) where Spark
+        compares intervals. Only the warehouse evaluates SQL on an interval
+        as Spark does. `texts` are SQL strings, or mappings whose keys (the
+        columns set) and values count.
+        """
+        names = self._interval_columns()
+        if not names:
+            return set()
+        from .engine.intervals import sql_identifiers
+
+        for text in texts:
+            if isinstance(text, dict):
+                keys = {str(k).strip("`").split(".")[-1].lower() for k in text}
+                if keys & names:
+                    return {"interval_columns"}
+                values = [v for v in text.values() if isinstance(v, str)]
+            else:
+                values = [text] if isinstance(text, str) else []
+            for value in values:
+                if sql_identifiers(value) & names:
+                    return {"interval_columns"}
+        return set()
 
     def _variant_needs(self, columns: Any, predicate: Any) -> set[str]:
         """``variant_free`` when a read on a variant-shredding table skips every VARIANT column.
@@ -1718,6 +1775,11 @@ class Table:
         # the binary value: a pushed `v = '"x"'` compared a struct with a
         # string and failed. Nothing on such a column is pushed.
         opaque = frozenset(p[0] for p in self._variant_paths() if len(p) == 1)
+        # An interval column is shown as a duration or Spark's text, but the
+        # scan filters the stored integers (and refuses a predicate on them,
+        # `_interval_needs`): a filter on one is evaluated on the frame.
+        intervals = self._interval_columns()
+        opaque |= frozenset(f.name for f in schema if f.name.lower() in intervals)
         return TableDataset(
             source,
             schema,
@@ -3459,24 +3521,32 @@ class Table:
         source = _write_data(source)
         request = self._request(Operation.MERGE, {"predicate": predicate, **kwargs}, source)
 
+        routed = {"request": request}
+
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
-            engine = self._route(request, exclude=exclude)
+            engine = self._route(routed["request"], exclude=exclude)
             builder = engine.merge(
                 self._resolved, self._variant_input(engine, source), predicate, **kwargs
             )
             return builder, getattr(engine, "kind", None)
 
-        def clauses_routed(clauses: list[tuple[str, Any]]) -> None:
+        def clauses_routed(clauses: list[tuple[Any, ...]]) -> EngineKind | None:
             # The clauses are known only at execute(), and they can add a need
             # (an UPDATE or DELETE clause removes rows, which an append-only
-            # table forbids). Routed again with them, before anything runs,
-            # exactly as can("merge", ..., clauses=[...]) answers.
-            extra = self._request(Operation.MERGE, {"clauses": clauses}, source).needs
+            # table forbids; a SET value may be an early date delta-rs must
+            # not write). Routed again with them, before anything runs,
+            # exactly as can("merge", ..., clauses=[...]) answers; the engine
+            # that serves the clauses is returned for the builder to move to.
+            aliases: dict[str, Any] = {
+                k: kwargs[k] for k in ("source_alias", "target_alias") if k in kwargs
+            }
+            extra = self._request(Operation.MERGE, {**aliases, "clauses": clauses}, source).needs
             if extra <= request.needs:
-                return
-            self._connection.router.engine_for(
-                Operation.MERGE, self._enrich(), needs=request.needs | extra, **request.shape
-            )
+                return None
+            widened = dataclasses.replace(request, needs=request.needs | extra)
+            engine = self._route(widened)
+            routed["request"] = widened
+            return getattr(engine, "kind", None)
 
         builder, kind = build(frozenset())
         # A consumed stream cannot be offered to a second engine.
@@ -4862,7 +4932,7 @@ class _InvalidatingMerger:
         invalidate: Any,
         rebuild: Callable[[frozenset[EngineKind]], tuple[Any, EngineKind | None]] | None = None,
         kind: EngineKind | None = None,
-        preflight: Callable[[list[tuple[str, Any]]], None] | None = None,
+        preflight: Callable[[list[tuple[Any, ...]]], EngineKind | None] | None = None,
     ) -> None:
         self._builder = builder
         self._preflight = preflight
@@ -4923,13 +4993,34 @@ class _InvalidatingMerger:
 
         return call
 
+    def _move_to(self, kind: EngineKind) -> None:
+        """Rebuild the MERGE on engine `kind`, which its clauses need, replaying them."""
+        if self._rebuild is None:
+            raise UnreachableTableError(
+                "merge",
+                f"its clauses need {kind.value} rather than "
+                f"{self._kind.value if self._kind else 'the engine the builder was made on'}, "
+                "and the source is a stream that cannot be handed to a second engine",
+                "pass the source as a pyarrow Table rather than a stream",
+            )
+        builder, built = self._rebuild(frozenset(k for k in EngineKind if k is not kind))
+        for name, call_args, call_kwargs in self._calls:
+            result = getattr(builder, name)(*call_args, **call_kwargs)
+            if result is not None and type(result) is type(builder):
+                builder = result
+        self._builder, self._kind = builder, built
+
     def _execute(self, execute: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         if self._preflight is not None:
-            clauses = []
+            clauses: list[tuple[Any, ...]] = []
             for name, call_args, call_kwargs in self._calls:
                 clause = merge_clause(name, call_args, call_kwargs)
-                clauses.append((name, "condition" if clause and clause[1] else None))
-            self._preflight(clauses)
+                values = merge_clause_values(name, call_args, call_kwargs)
+                clauses.append((name, "condition" if clause and clause[1] else None, values))
+            kind = self._preflight(clauses)
+            if kind is not None and kind is not self._kind:
+                self._move_to(kind)
+                execute = self._builder.execute
         tried: set[EngineKind] = set()
         refusals: list[EngineLimitError] = []
         while True:

@@ -371,3 +371,11 @@ def merge_clause(
     position = 1 if name in _MAPPING_CLAUSES else 0
     predicate = kwargs.get("predicate", args[position] if len(args) > position else None)
     return kind, predicate is not None
+
+
+def merge_clause_values(name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """The column -> SQL mapping a MERGE builder call sets, or None for one that sets none."""
+    if name not in _MAPPING_CLAUSES:
+        return None
+    values = kwargs.get("updates", args[0] if args else None)
+    return dict(values) if isinstance(values, dict) else None

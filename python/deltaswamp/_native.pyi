@@ -15,7 +15,7 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
-"compaction", "commit_info_patch", "streaming_compaction". Gate on this
+"compaction", "commit_info_patch", "streaming_compaction", "retry_options". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
 
@@ -136,6 +136,12 @@ def table_changes(
     `predicate` is the same JSON AST as `Snapshot.scan` and only skips files.
     Path-based tables only (no catalog log tail). Raises ValueError if CDF was
     not enabled at the range's endpoints or the schema changed across it.
+    """
+
+def validate_retry_options(options: dict[str, str]) -> None:
+    """Refuse retry storage options either engine would refuse or panic on.
+
+    Raises InvalidInputError. Keys are read as delta-rs reads them.
     """
 
 def probe_put_if_absent(table_root: str, options: dict[str, str] | None = None) -> bool:

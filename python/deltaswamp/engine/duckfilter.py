@@ -17,7 +17,48 @@ from typing import Any
 
 from .. import predicate as sqlpred
 
-__all__ = ["RowFilter"]
+__all__ = ["SPARK_CONFIG", "RowFilter", "spark_widened"]
+
+#: DuckDB settings for evaluating a Spark SQL predicate. DuckDB's expression
+#: rewriter moves constants across a comparison, so ``rid + 9223372036854775807
+#: > 0`` became ``rid > -9223372036854775807`` and kept every row where Spark
+#: (ANSI) raises ARITHMETIC_OVERFLOW; without it the addition is evaluated and
+#: overflows as it does on Databricks.
+SPARK_CONFIG: dict[str, Any] = {"disabled_optimizers": "expression_rewriter"}
+
+
+def _widened_type(pa: Any, kind: Any) -> Any:
+    if pa.types.is_float32(kind) or pa.types.is_float16(kind):
+        return pa.float64()
+    if pa.types.is_struct(kind):
+        fields = [kind.field(i) for i in range(kind.num_fields)]
+        return pa.struct([f.with_type(_widened_type(pa, f.type)) for f in fields])
+    if pa.types.is_large_list(kind):
+        return pa.large_list(kind.value_field.with_type(_widened_type(pa, kind.value_type)))
+    if pa.types.is_list(kind):
+        return pa.list_(kind.value_field.with_type(_widened_type(pa, kind.value_type)))
+    if pa.types.is_map(kind):
+        return pa.map_(
+            kind.key_field.with_type(_widened_type(pa, kind.key_type)),
+            kind.item_field.with_type(_widened_type(pa, kind.item_type)),
+        )
+    return kind
+
+
+def spark_widened(schema: Any) -> Any:
+    """`schema` with every FLOAT as DOUBLE, or None when it has no FLOAT.
+
+    Spark compares a FLOAT with a decimal literal (``f = 0.1``) as DOUBLE,
+    both sides widened; DuckDB narrowed the literal to FLOAT instead, so
+    ``abs(f) = 0.1`` matched the FLOAT 0.1 that Spark does not. A FLOAT
+    widens to DOUBLE exactly, so FLOAT-to-FLOAT comparisons are unchanged.
+    """
+    import pyarrow as pa
+
+    widened = pa.schema(
+        [f.with_type(_widened_type(pa, f.type)) for f in schema], metadata=schema.metadata
+    )
+    return None if widened == schema else widened
 
 
 class RowFilter:
@@ -28,7 +69,7 @@ class RowFilter:
     a stream. Failures are PredicateError. `close()` releases the connection.
     """
 
-    def __init__(self, text: str, schema: Any) -> None:
+    def __init__(self, text: str, schema: Any, *, spark: bool = False) -> None:
         import duckdb
         import pyarrow as pa
 
@@ -36,14 +77,18 @@ class RowFilter:
 
         self.text = text
         self.expression = f"CAST(({text}) AS BOOLEAN) AS __deltaswamp_keep"
-        self.con = duckdb.connect(
-            ":memory:",
-            config={
-                "enable_external_access": False,
-                "autoinstall_known_extensions": False,
-                "autoload_known_extensions": False,
-            },
-        )
+        # `spark`: the text is a Spark SQL predicate respelled for DuckDB, to
+        # be evaluated as Spark evaluates it (`SPARK_CONFIG`, `spark_widened`).
+        # Without it, a lazy hand-off's DuckDB filter keeps DuckDB's meaning.
+        self.widened = spark_widened(schema) if spark else None
+        config: dict[str, Any] = {
+            "enable_external_access": False,
+            "autoinstall_known_extensions": False,
+            "autoload_known_extensions": False,
+            **(SPARK_CONFIG if spark else {}),
+        }
+        self.con = duckdb.connect(":memory:", config=config)
+        schema = self.widened or schema
         try:
             install_duckdb_macros(self.con)
             # Databricks evaluates a zoned literal in the session zone, UTC by
@@ -63,7 +108,10 @@ class RowFilter:
         if batch.num_rows == 0:
             return batch
         try:
-            result = self.con.from_arrow(pa.Table.from_batches([batch])).project(self.expression)
+            rows = pa.Table.from_batches([batch])
+            if self.widened is not None:
+                rows = rows.cast(self.widened)
+            result = self.con.from_arrow(rows).project(self.expression)
             keep = result.arrow()
             if isinstance(keep, pa.RecordBatchReader):
                 keep = keep.read_all()

@@ -132,9 +132,13 @@ table's vended credentials in this order:
    the credential ones only when nothing above gave a credential.
 
 The client retry policy is set the way delta-rs reads it, on both engines:
-`max_retries`, `retry_timeout` (`30s`, `500ms`, `2m`),
-`backoff_config.init_backoff`, `backoff_config.max_backoff` and
-`backoff_config.base`.
+`max_retries` (an integer), `retry_timeout`, `backoff_config.init_backoff`
+and `backoff_config.max_backoff` (durations as humantime spells them: `30s`,
+`30 s`, `500ms`, `2 minutes`, `1h 30m`, `1d`; not bare seconds), and
+`backoff_config.base`. The keys are lower-case, as delta-rs reads them.
+`connect()` refuses a value either engine would refuse, and a base that is not
+a finite number above 1, a zero initial backoff or a duration over 100 years,
+on which object_store's backoff panics.
 
 S3 keys with a region and no endpoint get an explicit one,
 `https://s3.<region>.amazonaws.com` (`.amazonaws.com.cn` in China regions).
@@ -277,9 +281,19 @@ to add a footer key, so:
 - a write whose rows hold a date before 1582-10-15 or a timestamp before
   1900 (APPEND, OVERWRITE, replaceWhere, a MERGE source) goes to the kernel
   or the warehouse instead of delta-rs, or is refused when neither can serve
-  it (MERGE into a table without deletion vectors, schema merge). Only
-  in-memory data (a pyarrow Table or RecordBatch, a pandas or polars
-  DataFrame) is inspected; a stream is not, and is written as before;
+  it (MERGE into a table without deletion vectors, schema merge). In-memory
+  data (a pyarrow Table or RecordBatch, a list of batches, a pandas or
+  polars DataFrame) is inspected. A stream (a RecordBatchReader, any Arrow
+  stream) cannot be without consuming it, so one with a DATE or TIMESTAMP
+  column counts as holding such values and goes to the kernel;
+- an UPDATE or MERGE whose SET or INSERT values may be such a value goes the
+  same way. A value counts unless it is provably at or after the limits:
+  NULL, a DATE or TIMESTAMP (or string) literal after them,
+  `current_date()`/`current_timestamp()`, or a copy of a column whose values
+  are (a target column the file check below has cleared, or a column of an
+  inspected MERGE source). Arithmetic, functions and casts count;
+  `can("merge", ..., clauses=[("when_matched_update", None, {"d": "..."})])`
+  takes a clause's values as its third item;
 - DELETE, UPDATE, MERGE, replaceWhere, and an OPTIMIZE or Z-ORDER that only
   delta-rs can run (`writer_properties=` and the other delta-rs-only
   options), skip delta-rs on a table whose statistics allow such a value in
@@ -383,7 +397,19 @@ staged for the warehouse as microseconds and multiplied back into an interval
 (Databricks casts a bare BIGINT to an interval as *seconds*), and the kernel and
 delta-rs store the integers Databricks stores. A plain integer bound for a
 day-time interval column is refused. A duration nested in a struct, list or map
-cannot be staged for the warehouse.
+cannot be staged for the warehouse. Year-month text is checked as Spark checks
+it: the month of `'1-13'` is out of range, and a value past the INT32 of months
+is refused; `YEAR TO MONTH` text written to an `INTERVAL YEAR` column keeps the
+whole years, as Spark's cast does.
+
+SQL that names an interval column -- a read or DML predicate, an UPDATE or
+MERGE value -- needs the warehouse (`allow_sql_fallback=True`) and is refused
+without it: the files hold the bare integers, and a direct engine would compare
+those (`ym = -14` matched `INTERVAL '-1-2' YEAR TO MONTH`) where Spark compares
+intervals. The lazy hand-offs (`to_duckdb`, `to_polars(lazy=True)`,
+`to_pyarrow_dataset`) push no filter on such a column into the scan, so
+`rel.filter("i > INTERVAL 1 DAY")` or `pl.col("ym") == "INTERVAL '-1-2' YEAR TO
+MONTH"` is evaluated on the values they show.
 
 A Delta timestamp holds microseconds. A nanosecond timestamp (pandas'
 `datetime64[ns]`, `pa.timestamp("ns")`) creates a microsecond column, as Spark
@@ -566,7 +592,14 @@ does:
   two-argument `trim`/`ltrim`/`rtrim` take the characters first;
   `regexp_replace` replaces every match; `^` is XOR;
 - `RLIKE`/`REGEXP`, `<=>`, `nvl`, `nvl2`, `if`, `pmod`, `1.5D`, `7L`, `1.5BD`
-  and LIKE's default `\` escape work on both.
+  and LIKE's default `\` escape work on both;
+- where DuckDB filters a read (a table delta-rs misreads, a Delta Sharing
+  filter), a FLOAT compares with a decimal literal as DOUBLE (`f = 0.1` is
+  false for the FLOAT 0.1, as on Spark), and BIGINT arithmetic that overflows
+  raises, as ANSI Spark's does, rather than being folded away. Such a filter
+  is one expression over the row: a subquery (`SELECT`, `VALUES`, `PIVOT`,
+  `DESCRIBE` ...), a statement or a comment is refused, with string literals
+  read as DuckDB reads them.
 
 SQL no rewrite makes agree is refused, and routes to the warehouse (the
 `spark_sql` need, which `can()` reports): an array subscript (0-based in Spark,
@@ -936,7 +969,10 @@ so a table whose shredded VARIANT columns the direct engines cannot read still
 counts directly. `can(Operation.ZORDER, columns=[...])` takes `z_order()`'s
 own spelling. A MERGE clause with a condition is given as `(name, condition)`,
 e.g. `clauses=[("when_not_matched_insert_all", "s.v > 0")]`: on a change-feed
-table delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. On a
+table delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. A
+clause that sets columns may give them as a third item,
+`("when_matched_update", None, {"d": "source.d"})`: a value that may be a date
+before 1582 keeps the MERGE off delta-rs. On a
 handle opened with `version=`, every write is refused.
 
 `Capability` is truthy when `ok`. Every refusal carries a reason, and a remedy
@@ -1119,8 +1155,10 @@ reached.
 - delta-rs writes Parquet footers without `org.apache.spark.version`, which
   Databricks reads with the legacy calendar rebase, so writes and rewrites of
   dates before 1582-10-15 or timestamps before 1900 skip it (see above). A
-  streamed source is not inspected, and an UPDATE that sets such a value by a
-  literal on a table holding none is not caught; both still go to delta-rs.
+  streamed write with DATE or TIMESTAMP columns, and an UPDATE or MERGE whose
+  SET values cannot be bounded, count as holding such values: they go to the
+  kernel, and are refused where it cannot serve them (a MERGE into a table
+  without deletion vectors, `writer_properties=`).
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.
 - A MERGE with `merge_schema=True` whose SET or INSERT assigns a column the

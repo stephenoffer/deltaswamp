@@ -81,6 +81,12 @@ First release.
   table feature, contradictory `partition_overwrite`/`predicate`, a misspelt
   keyword, data that is not a table) is `InvalidArgumentError`, no longer an
   `UnreachableTableError` that read as "no engine can serve this".
+- Data files the kernel writes (appends, overwrites, DML rewrites, OPTIMIZE,
+  Z-ORDER, distributed workers) are snappy-compressed, as Spark's and
+  delta-rs's are, or use the table's `delta.parquet.compression.codec`
+  (`zstd`, `gzip`, `lz4`, `lz4_raw`, `brotli`, `uncompressed`; `lzo`, which
+  arrow-rs cannot write, as snappy). They were uncompressed, and an OPTIMIZE
+  grew a table 2-4x.
 
 ### Security
 
@@ -123,7 +129,9 @@ See docs/usage.md, "Security notes".
 - `INTERVAL DAY TO SECOND` columns read as `duration[us]` and year-month
   intervals as Spark's text (`INTERVAL '1-2' YEAR TO MONTH`) on every engine,
   warehouse included; both append back unchanged. A duration nested in a
-  struct, list or map cannot be staged for the warehouse.
+  struct, list or map cannot be staged for the warehouse. SQL naming an
+  interval column (a predicate, an UPDATE or MERGE value) needs the
+  warehouse; the lazy hand-offs filter such columns on the values they show.
 - A predicate on a `CHAR(n)` column needs the SQL fallback: Spark compares
   CHAR values padded to `n`, the direct engines compare bytes.
 - Time travel to a timestamp after the latest commit is refused
@@ -346,7 +354,10 @@ See docs/usage.md, "Security notes".
   files it misread. delta-rs cannot write the key: writes whose rows hold
   such a value, and delta-rs rewrites of tables whose files may, go to the
   kernel or the warehouse, or are refused (a MERGE into a table without
-  deletion vectors). Streamed sources are not inspected. Files delta-rs
+  deletion vectors). The same holds for UPDATE and MERGE SET/INSERT values
+  that are not provably after the limits (`DATE '1000-01-01'`, arithmetic,
+  functions), and for streamed writes with DATE or TIMESTAMP columns, which
+  cannot be inspected. The file check fails closed. Files delta-rs
   already wrote stay misread by Databricks until rewritten (`optimize()`).
 - Lazy hand-offs (`to_duckdb`, `to_polars(lazy=True)`, `to_pyarrow_dataset`,
   `Connection.sql`) read the version current when they were made;

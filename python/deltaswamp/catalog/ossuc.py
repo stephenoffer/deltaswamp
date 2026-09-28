@@ -754,12 +754,14 @@ class OSSUnityCatalog:
                 raise PreflightError(
                     f"cannot {action}: Unity Catalog rejected the credentials (HTTP 401: "
                     "the token is missing, expired or invalid for this server). "
-                    f"Underlying error: {exc}"
+                    f"Underlying error: {exc}",
+                    denied=True,
                 ) from exc
             if exc.status == 403:
                 raise PreflightError(
                     f"cannot {action}: access to {name} was denied. {_NEEDS[needs]} "
-                    f"Underlying error: {exc}"
+                    f"Underlying error: {exc}",
+                    denied=True,
                 ) from exc
             raise
 

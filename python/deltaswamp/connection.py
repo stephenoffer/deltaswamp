@@ -126,6 +126,7 @@ def connect(
     # rather than at the first table.
     for cloud_scheme in ("s3://", "abfss://", "gs://"):
         canonical_options(storage_options, cloud_scheme)
+    _check_retry_options(storage_options)
     if SharingEngine.available():
         http = http_settings(storage_options)
         engines[EngineKind.SHARING] = SharingEngine(
@@ -618,6 +619,28 @@ _CATALOG_MANAGED_KEYS = frozenset(
 
 #: The save modes a create at a path takes.
 _CREATE_MODES = frozenset({"error", "create", "ignore", "overwrite", "append"})
+
+
+def _check_retry_options(options: Mapping[str, Any] | None) -> None:
+    """Refuse retry options (`max_retries`, `retry_timeout`, ...) an engine cannot use.
+
+    Read as delta-rs reads them (humantime durations, exact key names), for
+    every engine at once: the kernel took bare seconds ("2") that delta-rs
+    refuses, so a read worked and can() named delta-rs for a DELETE that then
+    failed; delta-rs took "30 s" and the kernel refused the connection; and
+    "1e30" panicked inside the kernel's store. A base or initial backoff
+    object_store's backoff cannot draw from is refused too.
+    """
+    from .engine.kernel import _native_has
+
+    if not options or not _native_has("retry_options"):
+        return
+    from . import _native
+
+    try:
+        _native.validate_retry_options({str(k): str(v) for k, v in options.items()})
+    except Exception as exc:
+        raise InvalidArgumentError(f"storage_options: {exc}") from None
 
 
 def _default_catalog(

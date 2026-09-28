@@ -43,6 +43,7 @@ from ..errors import (
     CommitConflictError,
     EngineLimitError,
     InvalidArgumentError,
+    MetadataChangedError,
     UnreachableTableError,
 )
 from ..properties import (
@@ -53,8 +54,8 @@ from ..properties import (
     parse_byte_size,
 )
 from . import metadata as meta
-from .base import missing_method
-from .boundary import conflict_version, engine_cause, translating
+from .base import missing_file_error, missing_method
+from .boundary import conflict_version, engine_cause, recorded, translating
 from .metadata import CLUSTERING_DOMAIN, TableState, arrow_to_delta_field, build_actions
 
 __all__ = ["KernelEngine"]
@@ -84,6 +85,11 @@ def _as_record_batch_reader(data: Any) -> Any:
             "the data does not export the Arrow PyCapsule interface and pyarrow is not "
             "installed to convert it",
         ) from exc
+    batches = isinstance(data, (list, tuple)) and data
+    if batches and all(isinstance(b, pa.RecordBatch) for b in data):
+        # A list of batches, as delta-rs takes one: pa.table() reads a list
+        # as columns and raised "Must pass names or schema".
+        return pa.RecordBatchReader.from_batches(data[0].schema, data)
     return pa.table(data).to_reader()
 
 
@@ -1354,7 +1360,7 @@ class KernelEngine:
                             f"concurrent writer (the table records version {last}); "
                             "this batch is already in the table",
                         )
-                reader = _as_record_batch_reader(data)
+                reader = recorded(_as_record_batch_reader(data))
                 try:
                     version: int = snapshot.append(
                         reader,
@@ -2093,6 +2099,7 @@ class KernelEngine:
             return None
         if txn is not None and self._txn_won_race(read, table, txn):
             return None
+        metadata_changed = False
         try:
             fresh = self.snapshot(table, write=True)
             if int(fresh.version) <= int(read.version):
@@ -2100,8 +2107,11 @@ class KernelEngine:
             level = (fresh.table_properties() or {}).get("delta.isolationLevel", "")
             if level.lower() == "serializable" and not compaction:
                 return None
-            if fresh.metadata_json() != read.metadata_json():
-                return None
+            metadata_changed = fresh.metadata_json() != read.metadata_json()
+            if metadata_changed and compaction:
+                return None  # planned again from the new layout
+            if metadata_changed:
+                raise _MetadataMoved(int(fresh.version))
             if fresh.protocol_json() != read.protocol_json():
                 return None
 
@@ -2121,6 +2131,16 @@ class KernelEngine:
             if before != vectors(fresh) or set(before) != touched:
                 return None
             added = not compaction and self._added_what_was_read(read, fresh, read_predicate)
+        except _MetadataMoved as moved:
+            # Spark's MetadataChangedException, and what the delta-rs path
+            # raises for the same race: a caller that re-plans on
+            # MetadataChangedError caught it on one engine only.
+            raise MetadataChangedError(
+                moved.version,
+                f"another writer changed the table's metadata (schema, partitioning or "
+                f"properties) in version {moved.version}, after this commit read it; "
+                "plan the operation again against the table as it is now",
+            ) from None
         except Exception:
             return None  # cannot tell; surfacing the conflict is the safe answer
         if added:
@@ -2423,13 +2443,18 @@ class KernelEngine:
                         [_filter_text(f) for f in partition_filters or []],
                     )
                     break
-                except CommitConflictError:
+                except CommitConflictError as exc:
                     conflicts += 1
                     if conflicts > retries:
                         raise
                     rebased = self._rebase_dv_commit(
                         table, snapshot, set(removing), None, compaction=True
                     )
+                    missing = getattr(exc, "missing", None)
+                    if missing is not None and rebased is not None:
+                        # Still in the table, yet gone from storage: no race,
+                        # a dangling file, which planning again reads again.
+                        raise missing from exc
                     commit_backoff(conflicts - 1)
                     if rebased is None:
                         # Another writer changed a file this one would remove
@@ -2576,6 +2601,7 @@ class KernelEngine:
         positions = [_FILE_COLUMN]
         schema = pa.schema([f for f in stream.schema if f.name not in positions])
         cap = max(1, int(self.compaction_max_file_bytes))
+        codec = _pyarrow_codec((snapshot.table_properties() or {}).get(_CODEC_PROPERTY))
 
         def files_of(index: int, batches: list[Any], final: bool) -> tuple[list[Any], list[Any]]:
             """Output files cut from `batches` of bin `index`, and the rows left over.
@@ -2600,18 +2626,36 @@ class KernelEngine:
                 # (files came out 40% over the target): size them by how the
                 # first file's worth of them (a sample, at most) encodes.
                 sample = rows.slice(0, min(per_file, _SIZE_SAMPLE_ROWS))
-                per_file = _encoded_rows_per_file(sample, target, per_file)
+                per_file = _encoded_rows_per_file(sample, target, per_file, codec)
             # As many files as the target size asks, and enough that none
             # holds more than the memory bound.
             count = max(-(-rows.num_rows // per_file), -(-rows.nbytes // cap), 1)
             size = max(1, -(-rows.num_rows // count))
             return [_one_batch(rows.slice(i, size)) for i in range(0, rows.num_rows, size)], []
 
+        def inputs() -> Any:
+            try:
+                yield from stream
+            except Exception as exc:
+                missing = missing_file_error(exc, "the files this compaction rewrites")
+                if missing is None:
+                    raise
+                # Another writer removed the file and VACUUM deleted it after
+                # this step was planned: a lost race (Spark's
+                # ConcurrentDeleteReadException), planned again from the
+                # table as it is now, not a bad argument.
+                conflict = CommitConflictError(
+                    int(snapshot.version),
+                    f"a file this compaction reads is gone from storage: {missing}",
+                )
+                conflict.missing = missing  # type: ignore[attr-defined]
+                raise conflict from exc
+
         def generate() -> Any:
             current: int | None = None
             held: list[Any] = []
             held_bytes = 0
-            for batch in stream:
+            for batch in inputs():
                 if batch.num_rows == 0:
                     continue
                 paths = batch.column(_FILE_COLUMN)
@@ -2659,7 +2703,7 @@ class KernelEngine:
         with translating(EngineKind.KERNEL, "commit"):
             version, _deleted, _dvs, _removed = snapshot.commit_dml(
                 empty.to_reader(),
-                data=data,
+                data=recorded(data),
                 whole_files=removing,
                 engine_info=_engine_info(),
                 operation="OPTIMIZE",
@@ -3889,11 +3933,37 @@ def _decoded_row_bytes(schema: Any) -> int:
 _SIZE_SAMPLE_ROWS = 256 * 1024
 
 
-def _encoded_rows_per_file(sample: Any, target: int, fallback: int) -> int:
+#: The table property naming the codec the kernel's writer compresses with
+#: (`crates/native/src/writer.rs`, snappy when unset).
+_CODEC_PROPERTY = "delta.parquet.compression.codec"
+
+
+def _pyarrow_codec(name: Any) -> str:
+    """pyarrow's name for the codec the kernel writes a table's files with."""
+    lowered = str(name or "").strip().lower()
+    if lowered in ("uncompressed", "none"):
+        return "none"
+    if lowered in ("gzip", "zstd", "brotli", "lz4"):
+        return lowered
+    if lowered in ("lz4_raw", "lz4raw"):
+        return "lz4"
+    return "snappy"
+
+
+class _MetadataMoved(Exception):
+    """Internal: a concurrent commit changed the metadata a DML commit read."""
+
+    def __init__(self, version: int) -> None:
+        super().__init__(version)
+        self.version = version
+
+
+def _encoded_rows_per_file(sample: Any, target: int, fallback: int, codec: str = "snappy") -> int:
     """Rows per `target` bytes of Parquet, judged by encoding `sample` as the kernel writes.
 
-    The kernel's writer stores pages uncompressed, dictionary-encoded where
-    it helps; pyarrow's with the same settings comes within a few percent.
+    The kernel's writer compresses pages with the table's codec, dictionary-
+    encoded where it helps; pyarrow's with the same settings comes within a
+    few percent.
     """
     import io
 
@@ -3903,7 +3973,7 @@ def _encoded_rows_per_file(sample: Any, target: int, fallback: int) -> int:
         return fallback
     buffer = io.BytesIO()
     try:
-        pq.write_table(sample, buffer, compression="none")
+        pq.write_table(sample, buffer, compression=codec)
     except Exception:
         return fallback
     size = buffer.tell()
@@ -4234,7 +4304,7 @@ def _sql_filtered_read(
             )
     from .duckfilter import RowFilter
 
-    return RowFilter(text, reader.schema).filtered(reader, keep)
+    return RowFilter(text, reader.schema, spark=True).filtered(reader, keep)
 
 
 _REJECTED_CREDENTIAL_MARKERS = (

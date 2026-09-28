@@ -438,6 +438,14 @@ _ROUTER_HINTS: frozenset[str] = frozenset(
         "early_datetimes",
     }
 )
+#: What a need means, where its name alone does not say.
+_NEED_REASONS: dict[str, str] = {
+    "interval_columns": (
+        "SQL on an ANSI interval column: its files hold the interval as bare integers "
+        "(months, or microseconds), which a direct engine would compare in place of the "
+        "interval; filter after reading (the frames show the interval), or use the warehouse"
+    ),
+}
 #: Operations on a directory with no Delta log yet: can("convert") refused a
 #: Parquet directory because its (absent) log could not be read.
 _NO_LOG_YET: frozenset[Operation] = frozenset({Operation.CREATE, Operation.CONVERT})
@@ -736,7 +744,8 @@ class Router:
             ):
                 missing = []
             if missing:
-                reasons.append(f"{kind.value}: does not support {', '.join(missing)}")
+                described = [_NEED_REASONS.get(need, need) for need in missing]
+                reasons.append(f"{kind.value}: does not support {', '.join(described)}")
                 continue
             # A need the engine has in general but not for this table.
             need_refusal = getattr(engine, "need_refusal", None)
@@ -898,16 +907,22 @@ class Router:
         snapshot = getattr(kernel, "snapshot", None)
         if snapshot is None:
             return None
+        writes_itself = getattr(engine, "writes_files_itself", None)
+        if writes_itself is not None and not writes_itself(operation, table, shape):
+            return None
         try:
             from .engine.calendar import early_datetime_files
 
             found = early_datetime_files(snapshot(table))
-        except Exception:
-            return None
+        except Exception as exc:
+            # Unknown is not "none": a wrong guess copies early values into
+            # files Databricks reads shifted.
+            return (
+                "could not check whether its data files hold dates before 1582-10-15 or "
+                f"timestamps before 1900 ({type(exc).__name__}: {str(exc)[:160]}), which a "
+                "rewrite through delta-rs copies into files Databricks reads shifted"
+            )
         if not found:
-            return None
-        writes_itself = getattr(engine, "writes_files_itself", None)
-        if writes_itself is not None and not writes_itself(operation, table, shape):
             return None
         return (
             f"{len(found)} data file(s) (such as {found[0]}) may hold dates before "

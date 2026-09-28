@@ -602,7 +602,8 @@ class DatabricksUnityCatalog:
             return PreflightError(
                 f"could not resolve {ref.full_name}: the Databricks credentials were "
                 "rejected (expired or invalid token, or the wrong workspace host). "
-                f"Underlying error: {sdk_message(exc)}"
+                f"Underlying error: {sdk_message(exc)}",
+                denied=True,
             )
         if kind == "transient":
             # Text heuristics below would read a throttling message that happens
@@ -626,7 +627,8 @@ class DatabricksUnityCatalog:
         ):
             return PreflightError(
                 f"access to {ref.full_name} was denied. {self._missing_privileges(ref)} "
-                f"Underlying error: {exc}"
+                f"Underlying error: {exc}",
+                denied=True,
             )
         return PreflightError(f"could not resolve {ref.full_name}: {exc}")
 
@@ -687,7 +689,8 @@ class DatabricksUnityCatalog:
             return PreflightError(
                 f"cannot {action} ({full_name}): the Databricks credentials were rejected "
                 "(expired or invalid token, or the wrong workspace host). "
-                f"Underlying error: {sdk_message(exc)}"
+                f"Underlying error: {sdk_message(exc)}",
+                denied=True,
             )
         # Databricks allowlists which connectors may WRITE through the UC Delta
         # API, by product User-Agent. deltaswamp sets one (see _sdk.py), but an
@@ -749,7 +752,8 @@ class DatabricksUnityCatalog:
             seen = "" if held is None else f"Effective privileges on {target}: {held or 'none'}. "
             return PreflightError(
                 f"cannot {action}: access to {full_name} was denied. {needs} {seen}"
-                f"Underlying error: {exc}".replace("  ", " ")
+                f"Underlying error: {exc}".replace("  ", " "),
+                denied=True,
             )
         return PreflightError(f"cannot {action} ({full_name}): {exc}")
 

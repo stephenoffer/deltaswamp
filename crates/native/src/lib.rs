@@ -76,6 +76,8 @@ pub const FEATURES: &[&str] = &[
     // commits past the value-constraint features, and file-restricted scans
     // read files in the order given.
     "streaming_compaction",
+    // `validate_retry_options`: retry storage options read as delta-rs reads them.
+    "retry_options",
 ];
 
 #[pyfunction]
@@ -130,6 +132,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;
     m.add_function(wrap_pyfunction!(functions::probe_put_if_absent, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::validate_retry_options, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;

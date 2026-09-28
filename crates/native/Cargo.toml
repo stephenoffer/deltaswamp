@@ -29,6 +29,9 @@ z85 = "3"
 # Already in the tree through delta_kernel; the StorageHandler trait reads
 # files as `Bytes` (confine.rs wraps it).
 bytes = "1"
+# Parses retry durations as delta-rs does (object_store's config parsing
+# uses it); already in the tree through object_store.
+humantime = "2"
 thiserror.workspace = true
 tracing.workspace = true
 

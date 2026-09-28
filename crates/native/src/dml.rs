@@ -281,6 +281,7 @@ pub fn commit_dml(
         ));
     }
     let table_root = snapshot.table_root().clone();
+    let codec = crate::writer::codec_for(&snapshot);
 
     // Log replay once: the scan files to join the deletions against, kept
     // whole because the kernel's DV update and remove both take them as is.
@@ -574,6 +575,7 @@ pub fn commit_dml(
         }
         None => None,
     };
+    let mut written = Vec::new();
     let staged = match (&materialized_row_ids, stream) {
         (_, Some(stream)) => commit::stage_stream(
             &mut transaction,
@@ -586,6 +588,8 @@ pub fn commit_dml(
                 // step are never in memory at once.
                 batch.and_then(|b| commit::prepare_batches(&snapshot, vec![b]))
             }),
+            codec,
+            &mut written,
         ),
         (None, None) => commit::stage_batches(
             &mut transaction,
@@ -593,6 +597,8 @@ pub fn commit_dml(
             &partition_columns,
             &table_schema,
             batches,
+            codec,
+            &mut written,
         ),
         (Some(column), None) => stage_with_row_ids(
             &mut transaction,
@@ -601,9 +607,19 @@ pub fn commit_dml(
             &table_schema,
             batches,
             column,
+            codec,
+            &mut written,
         ),
     };
+    let staging_failed = staged.is_err();
     let result = staged.and_then(|()| commit::finish_commit(transaction, &engine));
+    if let Err(err) = &result {
+        if staging_failed || commit::never_committed(err) {
+            // Rows a lost race or a failed step wrote, which no commit names:
+            // orphans until VACUUM otherwise.
+            let _ = commit::remove_written(&engine, &table_root, &written);
+        }
+    }
     match result {
         Ok(version) => Ok(DmlOutcome {
             version,
@@ -712,6 +728,7 @@ fn with_column(
 /// Mirrors `writer::write_parquet` -- the logical-to-physical transform, then
 /// the Parquet write -- with the materialized row-id column appended to
 /// the physical data in between. Batches without row ids are written normally.
+#[allow(clippy::too_many_arguments)]
 fn stage_with_row_ids(
     txn: &mut delta_kernel::transaction::Transaction,
     engine: &SharedEngine,
@@ -719,6 +736,8 @@ fn stage_with_row_ids(
     table_schema: &delta_kernel::schema::SchemaRef,
     batches: Vec<RecordBatch>,
     column: &str,
+    codec: delta_kernel::parquet::basic::Compression,
+    written: &mut Vec<String>,
 ) -> Result<()> {
     use delta_kernel::engine::arrow_conversion::TryFromArrow;
     use delta_kernel::engine::arrow_data::EngineDataArrowExt;
@@ -751,11 +770,13 @@ fn stage_with_row_ids(
         };
         let Ok(index) = batch.schema().index_of(crate::scan::ROW_ID_COLUMN) else {
             let data = ArrowEngineData::new(batch);
-            staged.push(runtime::block_on(crate::writer::write_parquet(
+            let metadata = runtime::block_on(crate::writer::write_parquet(
                 engine,
                 &data,
                 &write_context,
-            ))?);
+                codec,
+            ))?;
+            staged.push(commit::track_written(metadata, written)?);
             continue;
         };
         let row_ids = batch.column(index).clone();
@@ -771,11 +792,13 @@ fn stage_with_row_ids(
             .evaluate(&ArrowEngineData::new(logical))?
             .try_into_record_batch()?;
         let physical = with_column(&physical, column, row_ids)?;
-        staged.push(runtime::block_on(crate::writer::write_physical(
+        let metadata = runtime::block_on(crate::writer::write_physical(
             engine,
             &physical,
             &write_context,
-        ))?);
+            codec,
+        ))?;
+        staged.push(commit::track_written(metadata, written)?);
     }
     for metadata in staged {
         txn.add_files(metadata);

@@ -26,6 +26,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
+use delta_kernel::parquet::basic::Compression;
 use delta_kernel::parquet::file::metadata::KeyValue;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::schema::StructType;
@@ -44,10 +45,47 @@ pub const SPARK_VERSION_KEY: &str = "org.apache.spark.version";
 /// is rebased, in any session time zone.
 pub const SPARK_VERSION_VALUE: &str = "3.5.0";
 
+/// The table property naming the codec data files are written with.
+pub const CODEC_PROPERTY: &str = "delta.parquet.compression.codec";
+
+/// The codec to write `snapshot`'s data files with.
+pub fn codec_for(snapshot: &delta_kernel::snapshot::SnapshotRef) -> Compression {
+    codec_named(
+        snapshot
+            .metadata_configuration()
+            .get(CODEC_PROPERTY)
+            .map(String::as_str),
+    )
+}
+
+/// The codec a `delta.parquet.compression.codec` value names; snappy when unset.
+///
+/// arrow-rs's writer defaults to UNCOMPRESSED, and so did every file the
+/// kernel wrote: an OPTIMIZE of ten snappy files (10.9 MB) wrote one
+/// uncompressed file of 19.4 MB. Spark and delta-rs write snappy unless the
+/// table says otherwise. LZO, which arrow-rs cannot write, falls back to
+/// snappy, as does a value no codec answers to (the property is a writer's
+/// preference, and every reader reads every codec).
+pub fn codec_named(name: Option<&str>) -> Compression {
+    let name = name.map(|n| n.trim().to_ascii_lowercase());
+    match name.as_deref() {
+        Some("uncompressed") | Some("none") => Compression::UNCOMPRESSED,
+        Some("gzip") => Compression::GZIP(Default::default()),
+        Some("zstd") => Compression::ZSTD(Default::default()),
+        Some("brotli") => Compression::BROTLI(Default::default()),
+        // Spark's "lz4" is the Hadoop-framed LZ4 codec, which arrow-rs's
+        // LZ4 writes; LZ4_RAW is the newer, unframed one.
+        Some("lz4") => Compression::LZ4,
+        Some("lz4_raw") | Some("lz4raw") => Compression::LZ4_RAW,
+        _ => Compression::SNAPPY,
+    }
+}
+
 /// The writer options for a data file: the kernel's (no embedded Arrow
-/// schema), plus the Spark version key.
-fn writer_options() -> ArrowWriterOptions {
+/// schema), plus the Spark version key, compressed with `codec`.
+fn writer_options(codec: Compression) -> ArrowWriterOptions {
     let properties = WriterProperties::builder()
+        .set_compression(codec)
         .set_key_value_metadata(Some(vec![KeyValue::new(
             SPARK_VERSION_KEY.to_string(),
             SPARK_VERSION_VALUE.to_string(),
@@ -59,10 +97,10 @@ fn writer_options() -> ArrowWriterOptions {
 }
 
 /// `batch` as the bytes of one Parquet file with the footer described above.
-pub fn encode(batch: &RecordBatch) -> DeltaResult<Vec<u8>> {
+pub fn encode(batch: &RecordBatch, codec: Compression) -> DeltaResult<Vec<u8>> {
     let mut buffer = vec![];
     let mut writer =
-        ArrowWriter::try_new_with_options(&mut buffer, batch.schema(), writer_options())?;
+        ArrowWriter::try_new_with_options(&mut buffer, batch.schema(), writer_options(codec))?;
     writer.write(batch)?;
     writer.close()?; // the footer is written on close
     Ok(buffer)
@@ -75,6 +113,7 @@ pub async fn write_parquet(
     engine: &SharedEngine,
     data: &ArrowEngineData,
     write_context: &BoundWriteContext,
+    codec: Compression,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let input_schema = StructType::try_from_arrow(data.record_batch().schema().as_ref())?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
@@ -83,7 +122,7 @@ pub async fn write_parquet(
         write_context.physical_schema().clone().into(),
     )?;
     let physical = evaluator.evaluate(data)?.try_into_record_batch()?;
-    write_physical(engine, &physical, write_context).await
+    write_physical(engine, &physical, write_context, codec).await
 }
 
 /// `DefaultParquetHandler::write_parquet_file`, writing the file here:
@@ -92,13 +131,14 @@ pub async fn write_physical(
     engine: &SharedEngine,
     batch: &RecordBatch,
     write_context: &BoundWriteContext,
+    codec: Compression,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let stats = collect_stats(
         batch,
         write_context.stats_columns(),
         write_context.physical_schema().as_ref(),
     )?;
-    let buffer = encode(batch)?;
+    let buffer = encode(batch, codec)?;
     let size = u64::try_from(buffer.len())
         .map_err(|_| Error::generic("unable to convert usize to u64"))?;
 
@@ -114,8 +154,17 @@ pub async fn write_physical(
         .ok_or_else(|| Error::generic(format!("no object store is registered for {url}")))?;
     let location = Path::from_url_path(url.path())?;
     store.put(&location, buffer.into()).await?;
-    let head = store.head(&location).await?;
+    // Past the PUT the file exists, but no add-file metadata will name it if
+    // this fails: taken back out, best effort, or it is nobody's to clean up.
+    let head = match store.head(&location).await {
+        Ok(head) => head,
+        Err(err) => {
+            let _ = store.delete(&location).await;
+            return Err(err.into());
+        }
+    };
     if head.size != size {
+        let _ = store.delete(&location).await;
         return Err(Error::generic(format!(
             "Size mismatch after writing parquet file: expected {size}, got {}",
             head.size
@@ -151,7 +200,7 @@ mod tests {
         )
         .unwrap();
         let path = std::env::temp_dir().join(format!("ds-footer-{}.parquet", uuid::Uuid::new_v4()));
-        std::fs::write(&path, encode(&batch).unwrap()).unwrap();
+        std::fs::write(&path, encode(&batch, Compression::SNAPPY).unwrap()).unwrap();
         let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
         let kv = reader
@@ -172,5 +221,33 @@ mod tests {
             !spec.dates && !spec.timestamps && !spec.int96_micros,
             "{spec:?}"
         );
+    }
+
+    #[test]
+    fn files_are_compressed_with_the_tables_codec_and_snappy_by_default() {
+        assert_eq!(codec_named(None), Compression::SNAPPY);
+        assert_eq!(codec_named(Some("lzo")), Compression::SNAPPY);
+        assert_eq!(
+            codec_named(Some(" ZSTD ")),
+            Compression::ZSTD(Default::default())
+        );
+        assert_eq!(codec_named(Some("none")), Compression::UNCOMPRESSED);
+        assert_eq!(codec_named(Some("lz4_raw")), Compression::LZ4_RAW);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from((0..1000).collect::<Vec<i32>>()))],
+        )
+        .unwrap();
+        for codec in [Compression::SNAPPY, Compression::ZSTD(Default::default())] {
+            let path =
+                std::env::temp_dir().join(format!("ds-codec-{}.parquet", uuid::Uuid::new_v4()));
+            std::fs::write(&path, encode(&batch, codec).unwrap()).unwrap();
+            let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let written = reader.metadata().row_group(0).column(0).compression();
+            assert_eq!(written, codec);
+        }
     }
 }
