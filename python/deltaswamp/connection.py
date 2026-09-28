@@ -7,7 +7,7 @@ import dataclasses
 import os
 import re
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._util import check_keywords
 from .capability import Engine as EngineKind
@@ -32,6 +32,9 @@ from .identity import RefKind, TableRef, parse_ref
 from .properties import with_checkpoint_stats
 from .router import Router
 from .table import Table, _call, _check_version, _governed, _require, _write_data
+
+if TYPE_CHECKING:
+    from .governance import FunctionSummary, Grant, TableSummary, Volume, VolumeSummary
 
 __all__ = ["Connection", "connect"]
 
@@ -1603,7 +1606,7 @@ class Connection:
         *,
         schema_pattern: str | None = None,
         table_pattern: str | None = None,
-    ) -> list[Any]:
+    ) -> list[TableSummary]:
         """Table summaries matching SQL LIKE patterns, in one listing call."""
         target = catalog or self.default_catalog
         if target is None:
@@ -1613,13 +1616,13 @@ class Connection:
             _call("search tables", cat.search_tables, target, schema_pattern, table_pattern)
         )
 
-    def list_functions(self, schema: str) -> list[Any]:
+    def list_functions(self, schema: str) -> list[FunctionSummary]:
         """The functions in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list functions")
         return list(_call("list functions", cat.list_functions, catalog, name))
 
-    def list_volumes(self, schema: str) -> list[Any]:
+    def list_volumes(self, schema: str) -> list[VolumeSummary]:
         """The volumes in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list volumes")
@@ -1632,11 +1635,11 @@ class Connection:
         volume_type: str = "MANAGED",
         storage_location: str | None = None,
         comment: str | None = None,
-    ) -> Any:
+    ) -> VolumeSummary:
         """Create a Unity Catalog volume, ``MANAGED`` or ``EXTERNAL`` at `storage_location`."""
         ref = self._bound_ref(name, "create the volume")
         cat = self._namespaces(f"create volume {name}")
-        return _call(
+        summary: VolumeSummary = _call(
             f"create volume {name}",
             cat.create_volume,
             ref.catalog,
@@ -1646,6 +1649,7 @@ class Connection:
             storage_location,
             comment,
         )
+        return summary
 
     def drop_volume(self, name: str) -> None:
         """Drop a Unity Catalog volume."""
@@ -1653,15 +1657,16 @@ class Connection:
         cat = self._namespaces(f"drop volume {name}")
         _call(f"drop volume {name}", cat.drop_volume, ref.catalog, ref.schema, ref.table)
 
-    def volume(self, name: str) -> Any:
+    def volume(self, name: str) -> Volume:
         """A Unity Catalog volume: list, read, write and delete its files."""
         ref = self._bound_ref(name, "open the volume")
         cat = self._namespaces(f"open volume {name}")
-        return _call(f"open volume {name}", cat.volume, ref)
+        volume: Volume = _call(f"open volume {name}", cat.volume, ref)
+        return volume
 
     def grants(
         self, securable: str, *, securable_type: str = "SCHEMA", principal: str | None = None
-    ) -> list[Any]:
+    ) -> list[Grant]:
         """Grants on a catalog, schema, volume or function. Tables: `Table.grants()`."""
         cat = _governed(self.catalog, "GovernedCatalog", f"read grants on {securable}")
         return list(
@@ -1681,7 +1686,7 @@ class Connection:
         privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
-    ) -> list[Any]:
+    ) -> list[Grant]:
         """Grant privileges on a catalog, schema, volume or function to a principal.
 
         `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);
@@ -1708,7 +1713,7 @@ class Connection:
         privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
-    ) -> list[Any]:
+    ) -> list[Grant]:
         """Revoke privileges on a catalog, schema, volume or function from a principal.
 
         `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);

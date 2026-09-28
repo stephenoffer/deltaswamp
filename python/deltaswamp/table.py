@@ -54,7 +54,10 @@ from .errors import (
 from .identity import RefKind, parse_ref
 
 if TYPE_CHECKING:
+    import datetime
+
     from .connection import Connection
+    from .governance import ColumnLineage, Grant, Lineage, TableInfo
 
 __all__ = ["Table"]
 
@@ -1422,10 +1425,14 @@ class Table:
         columns: list[str] | None = None,
         predicate: str | None = None,
         version: int | None = None,
-        timestamp: str | None = None,
+        timestamp: str | datetime.date | int | None = None,
         limit: int | None = None,
     ) -> Any:
         """Read the table as an Arrow stream (exports `__arrow_c_stream__`).
+
+        `columns` projects, `predicate` is a Spark SQL boolean expression, and
+        `version` or `timestamp` (a datetime, a date, an ISO-8601 string or
+        epoch milliseconds; naive values are UTC) travels back in time.
 
         `limit` is a hint passed to the engine. Streaming engines ignore it and
         the caller simply stops reading; the SQL warehouse turns it into a real
@@ -4587,31 +4594,32 @@ class Table:
         )
         return _governed(catalog, "GovernedCatalog", what)
 
-    def info(self) -> Any:
+    def info(self) -> TableInfo:
         """The catalog's view of the table: owner, comment, columns, row filter,
         column masks, predictive optimization, audit timestamps."""
         cat = self._governance("read table info")
-        return _call("read table info", cat.table_info, self._resolved.ref)
+        info: TableInfo = _call("read table info", cat.table_info, self._resolved.ref)
+        return info
 
-    def grants(self, principal: str | None = None) -> list[Any]:
+    def grants(self, principal: str | None = None) -> list[Grant]:
         """Direct grants on the table, optionally for one principal. Unity Catalog only."""
         cat = self._governance("read grants")
         return list(_call("read grants", cat.grants, self._resolved.ref, principal))
 
-    def effective_grants(self, principal: str | None = None) -> list[Any]:
+    def effective_grants(self, principal: str | None = None) -> list[Grant]:
         """Grants including those inherited from the schema and catalog."""
         cat = self._governance("read effective grants")
         return list(
             _call("read effective grants", cat.effective_grants, self._resolved.ref, principal)
         )
 
-    def grant(self, principal: str, privileges: list[str] | str) -> list[Any]:
+    def grant(self, principal: str, privileges: list[str] | str) -> list[Grant]:
         """Grant privileges (``"SELECT"``, ``["SELECT", "MODIFY"]``) on the table to a principal."""
         names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = self._governance("grant")
         return list(_call("grant", cat.grant, self._resolved.ref, principal, names))
 
-    def revoke(self, principal: str, privileges: list[str] | str) -> list[Any]:
+    def revoke(self, principal: str, privileges: list[str] | str) -> list[Grant]:
         """Revoke privileges on the table from a principal."""
         names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = self._governance("revoke")
@@ -4664,20 +4672,22 @@ class Table:
         cat = self._governance("set owner")
         _call("set owner", cat.set_owner, self._resolved.ref, principal)
 
-    def lineage(self, direction: str = "both") -> Any:
+    def lineage(self, direction: str = "both") -> Lineage:
         """Upstream and downstream tables, notebooks, jobs and dashboards."""
         cat = self._governance("read lineage")
-        return _call("read lineage", cat.lineage, self._resolved.ref, direction)
+        lineage: Lineage = _call("read lineage", cat.lineage, self._resolved.ref, direction)
+        return lineage
 
-    def column_lineage(self, column: str, direction: str = "both") -> Any:
+    def column_lineage(self, column: str, direction: str = "both") -> ColumnLineage:
         """Upstream and downstream lineage of one column.
 
         `direction` is ``"upstream"``, ``"downstream"`` or ``"both"``.
         """
         cat = self._governance("read column lineage")
-        return _call(
+        lineage: ColumnLineage = _call(
             "read column lineage", cat.column_lineage, self._resolved.ref, column, direction
         )
+        return lineage
 
     def add_primary_key(self, name: str, columns: list[str], *, rely: bool = False) -> None:
         """An informational PRIMARY KEY constraint in Unity Catalog (not enforced)."""
