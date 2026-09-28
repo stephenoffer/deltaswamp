@@ -38,10 +38,10 @@ VACUUM, RESTORE, checkpoints and ALTER TABLE all work; the calls in the
 
 | Extra | Adds | You need it for |
 |---|---|---|
-| `pyarrow` | pyarrow | `to_arrow`, `count`, `head`, `plan_scan`, predicates on the kernel path, `delete`/`update`/predicate `overwrite`, a MERGE on the kernel (deletion-vector tables), `optimize`/`z_order`, `create_table` with a list or dict schema, the SQL fallback |
+| `pyarrow` | pyarrow, NumPy (Z-ORDER) | `to_arrow`, `count`, `head`, `plan_scan`, predicates on the kernel path, `delete`/`update`/predicate `overwrite`, a MERGE on the kernel (deletion-vector tables), `optimize`/`z_order`, `create_table` with a list or dict schema, the SQL fallback |
 | `pandas` | pandas, pyarrow | `to_pandas` |
 | `polars` | Polars, pyarrow | `to_polars`, `Connection.sql(engine="polars")` |
-| `duckdb` | DuckDB | `to_duckdb`, `Connection.sql` |
+| `duckdb` | DuckDB, pyarrow, pytz | `to_duckdb`, `Connection.sql` |
 | `daft` | Daft | `to_daft` |
 | `ray` | Ray Data | `to_ray_dataset` |
 | `sql` | pyarrow | the SQL warehouse fallback (the warehouse itself is reached through `databricks-sdk`) |
@@ -544,10 +544,14 @@ Through the warehouse, `update` sets a struct field by its dotted path
 bytes, dicts (a struct) and lists (an array) as well as scalars.
 
 `delete`, `update`, `merge(...).execute()`, `optimize`, `z_order` and
-`restore` return an `OperationResult`, a dict with the same keys on every
-engine (`num_deleted_rows`, `num_updated_rows`, `num_inserted_rows`,
-`num_affected_rows`, `num_files_added`, `num_files_removed`, `version` where
-known) next to the serving engine's own metrics; `.engine` names the engine.
+`restore` return an `OperationResult`, a dict whose keys are named the same on
+every engine, next to the serving engine's own metrics; `.engine` names the
+engine. DML reports `num_deleted_rows`, `num_updated_rows`,
+`num_inserted_rows`, `num_affected_rows`, `num_files_added`,
+`num_files_removed` and `version`; OPTIMIZE and Z-ORDER `num_files_added` and
+`num_files_removed`; RESTORE `num_removed_files` and `num_restored_files`. A key
+is left out where the engine does not report it: a deletion-vector DELETE, for
+one, reports rows and the version but no file counts. Read with `.get()`.
 
 `merge` returns a builder with delta-rs's clause API, whichever engine serves
 it. When the warehouse serves it, the builder generates one `MERGE INTO`
