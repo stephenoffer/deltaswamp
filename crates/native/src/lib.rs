@@ -19,6 +19,7 @@ mod runtime;
 mod scan;
 mod snapshot;
 mod store;
+mod vacuum;
 mod writer;
 
 pub use error::{NativeError, Result};
@@ -78,6 +79,10 @@ pub const FEATURES: &[&str] = &[
     "streaming_compaction",
     // `validate_retry_options`: retry storage options read as delta-rs reads them.
     "retry_options",
+    // `vacuum_plan`/`delete_files`: VACUUM from the kernel's log replay.
+    "vacuum",
+    // `add_actions`/`missing_files`: RESTORE committed from the target's adds.
+    "restore",
 ];
 
 #[pyfunction]

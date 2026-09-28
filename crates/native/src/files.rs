@@ -245,6 +245,137 @@ fn num_records(stats: &StringArray) -> Int64Array {
     out.finish()
 }
 
+/// Every live file as the `add` action that would add it back, as JSON.
+///
+/// For RESTORE: a restored file must come back exactly as it was at the
+/// target version -- statistics, partition values, tags, and under row
+/// tracking the `baseRowId` and `defaultRowCommitVersion` its rows' ids are
+/// derived from. The kernel's scan-row schema carries all of it; `dataChange`
+/// is set true, as a restore changes the table's data.
+pub fn add_actions(snapshot: SnapshotRef, engine: &dyn Engine) -> Result<Vec<String>> {
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .without_row_transforms()
+        .build()?;
+    let mut out = Vec::new();
+    for metadata in scan.scan_metadata(engine)? {
+        let (data, selection) = metadata?.scan_files.into_parts();
+        let batch = data.try_into_record_batch()?;
+        let mask: BooleanArray = (0..batch.num_rows())
+            .map(|i| Some(selection.get(i).copied().unwrap_or(true)))
+            .collect();
+        let batch = filter_record_batch(&batch, &mask)?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .cloned()
+                .ok_or_else(|| missing(name))
+        };
+        let path = arrow::compute::cast(&column("path")?, &DataType::Utf8)?;
+        let path = path.as_string::<i32>();
+        let size = arrow::compute::cast(&column("size")?, &DataType::Int64)?;
+        let size = size.as_primitive::<Int64Type>();
+        let modified = arrow::compute::cast(&column("modificationTime")?, &DataType::Int64)?;
+        let modified = modified.as_primitive::<Int64Type>();
+        let stats = arrow::compute::cast(&column("stats")?, &DataType::Utf8)?;
+        let stats = stats.as_string::<i32>();
+        let dv = column("deletionVector")?;
+        let dv = deletion_vector_json(
+            dv.as_struct_opt()
+                .ok_or_else(|| missing("deletionVector"))?,
+        )?;
+        let constants = column("fileConstantValues")?;
+        let constants = constants
+            .as_struct_opt()
+            .ok_or_else(|| missing("fileConstantValues"))?;
+        let field = |name: &str| {
+            constants
+                .column_by_name(name)
+                .cloned()
+                .ok_or_else(|| missing(&format!("fileConstantValues.{name}")))
+        };
+        let partitions = normalize_map(&field("partitionValues")?)?;
+        let tags = field("tags")?;
+        let tags = normalize_map(&tags)?;
+        let base_row_id = arrow::compute::cast(&field("baseRowId")?, &DataType::Int64)?;
+        let base_row_id = base_row_id.as_primitive::<Int64Type>();
+        let commit_version =
+            arrow::compute::cast(&field("defaultRowCommitVersion")?, &DataType::Int64)?;
+        let commit_version = commit_version.as_primitive::<Int64Type>();
+        let provider = arrow::compute::cast(&field("clusteringProvider")?, &DataType::Utf8)?;
+        let provider = provider.as_string::<i32>();
+        for i in 0..batch.num_rows() {
+            let mut add = serde_json::Map::new();
+            add.insert("path".into(), path.value(i).into());
+            add.insert(
+                "partitionValues".into(),
+                map_json(&partitions, i).unwrap_or_else(|| serde_json::json!({})),
+            );
+            add.insert("size".into(), size.value(i).into());
+            add.insert(
+                "modificationTime".into(),
+                if modified.is_null(i) {
+                    0
+                } else {
+                    modified.value(i)
+                }
+                .into(),
+            );
+            add.insert("dataChange".into(), true.into());
+            if !stats.is_null(i) {
+                add.insert("stats".into(), stats.value(i).into());
+            }
+            if let Some(tags) = map_json(&tags, i) {
+                add.insert("tags".into(), tags);
+            }
+            if !dv.is_null(i) {
+                let parsed: serde_json::Value = serde_json::from_str(dv.value(i))
+                    .map_err(|e| NativeError::Invalid(format!("bad deletion vector: {e}")))?;
+                add.insert("deletionVector".into(), parsed);
+            }
+            if !base_row_id.is_null(i) {
+                add.insert("baseRowId".into(), base_row_id.value(i).into());
+            }
+            if !commit_version.is_null(i) {
+                add.insert(
+                    "defaultRowCommitVersion".into(),
+                    commit_version.value(i).into(),
+                );
+            }
+            if !provider.is_null(i) {
+                add.insert("clusteringProvider".into(), provider.value(i).into());
+            }
+            out.push(serde_json::Value::Object(add).to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Row `i` of a string map column as a JSON object, or None when null.
+fn map_json(map: &ArrayRef, i: usize) -> Option<serde_json::Value> {
+    let map = map.as_map_opt()?;
+    if map.is_null(i) {
+        return None;
+    }
+    let entries = map.value(i);
+    let keys = entries.column(0).as_string::<i32>();
+    let values = entries.column(1).as_string::<i32>();
+    let mut out = serde_json::Map::new();
+    for j in 0..entries.len() {
+        let value = if values.is_null(j) {
+            serde_json::Value::Null
+        } else {
+            values.value(j).into()
+        };
+        out.insert(keys.value(j).to_string(), value);
+    }
+    Some(serde_json::Value::Object(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
