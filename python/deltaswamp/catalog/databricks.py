@@ -155,7 +155,11 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 def _segment(part: str) -> str:
-    return urllib.parse.quote(part, safe="")
+    quoted = urllib.parse.quote(part, safe="")
+    # quote() leaves a name of "." or ".." as it is, and a client, proxy or
+    # server that removes dot segments then sent the request -- bearer token
+    # and all -- to another endpoint. Encoded, it is only a name.
+    return quoted.replace(".", "%2E") if quoted in (".", "..") else quoted
 
 
 def _url_name(name: str) -> str:

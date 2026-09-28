@@ -559,3 +559,47 @@ class TestDdlFromTableMetadata:
         default = pa.field("d", pa.string(), metadata={"CURRENT_DEFAULT": "'a, b'"})
         clause, has_default = _column_ddl("c.s.t", "d", "STRING", default)
         assert has_default and clause.endswith("DEFAULT 'a, b'")
+
+
+class TestDotSegmentNames:
+    """INJ-4: a name part '.' or '..' became a dot segment in UC REST paths."""
+
+    def test_dot_names_are_encoded(self) -> None:
+        from deltaswamp.catalog.databricks import _segment
+        from deltaswamp.catalog.ossuc import _q
+
+        for quote in (_q, _segment):
+            assert quote("..") == "%2E%2E"
+            assert quote(".") == "%2E"
+            assert quote("a.b") == "a.b"
+            assert quote("x/y") == "x%2Fy"
+
+    def test_the_server_sees_no_dot_segment(self) -> None:
+        import http.server
+
+        from deltaswamp.catalog.ossuc import OSSUnityCredentialProvider
+        from deltaswamp.identity import parse_ref
+
+        seen: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                seen.append(self.path)
+                self.send_response(404)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        server = _serve(Handler)
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            ref = parse_ref("cat.`..`.`..`")
+            with pytest.raises(DeltaSwampError):
+                OSSUnityCredentialProvider(base, ref, "tok", "tid", "file:///tmp/x").credentials()
+        finally:
+            server.shutdown()
+        assert seen and all("/../" not in p and not p.endswith("/..") for p in seen), seen
+        assert all("%2E%2E" in p for p in seen), seen

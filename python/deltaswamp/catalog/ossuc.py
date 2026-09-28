@@ -93,7 +93,11 @@ def _dotted(ref: TableRef) -> str:
 
 
 def _q(part: str) -> str:
-    return urllib.parse.quote(part, safe="")
+    quoted = urllib.parse.quote(part, safe="")
+    # quote() leaves a name of "." or ".." as it is, and a client, proxy or
+    # server that removes dot segments then sent the request -- bearer token
+    # and all -- to another endpoint. Encoded, it is only a name.
+    return quoted.replace(".", "%2E") if quoted in (".", "..") else quoted
 
 
 def _like(pattern: str | None) -> re.Pattern[str] | None:
