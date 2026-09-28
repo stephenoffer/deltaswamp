@@ -138,7 +138,8 @@ _READ_ONLY_OPS: frozenset[Operation] = frozenset(
 #: Why delta-rs does not write dates before 1582-10-15 or timestamps before
 #: 1900 (see `engine/calendar.py`).
 _FOOTERLESS_EARLY_VALUES = (
-    "the rows hold dates before 1582-10-15 or timestamps before 1900, and delta-rs "
+    "the rows written may hold dates before 1582-10-15 or timestamps before 1900 (in the "
+    "data, a stream of it, or the values an UPDATE or MERGE sets), and delta-rs "
     "writes Parquet files whose footer names no Spark version, which Databricks reads "
     "with Spark's legacy calendar rebase (0001-01-01 reads there as 0001-01-03)"
 )

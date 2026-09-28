@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -57,9 +58,13 @@ _TIMESTAMP_LIMIT = dt.datetime(1900, 1, 1, tzinfo=dt.UTC)
 #: milliseconds, so the day before is the safe side of it).
 _INT96_LIMIT = dt.datetime(2262, 4, 10, tzinfo=dt.UTC)
 
-#: Results per (table root, version); a version's files never change.
-_CACHE: OrderedDict[tuple[str, int], tuple[str, ...]] = OrderedDict()
-_EARLY_CACHE: OrderedDict[tuple[str, int], tuple[str, ...]] = OrderedDict()
+#: Results per table instance and version; a version's files never change.
+#: A table dropped and re-created at the same path starts again at version 0,
+#: so (root, version) alone handed the new table the old one's verdict and
+#: delta-rs rewrote its legacy-calendar files shifted. The key adds the table's
+#: metaData id and the identity of the commit file (`_cache_key`).
+_CACHE: OrderedDict[tuple[str, ...], tuple[str, ...]] = OrderedDict()
+_EARLY_CACHE: OrderedDict[tuple[str, ...], tuple[str, ...]] = OrderedDict()
 _CACHE_SIZE = 64
 _CACHE_LOCK = threading.Lock()
 
@@ -198,15 +203,33 @@ def _suspects(
     return out
 
 
+def _cache_key(snapshot: Any) -> tuple[str, ...] | None:
+    """What identifies `snapshot`'s files for the caches, or None if nothing strong does.
+
+    The commit file's identity (ETag or object version; inode, mtime and size
+    locally) changes when the table is re-created, even at the same version
+    and with a copied metaData id. A snapshot without one is never cached, as
+    the kernel's snapshot cache never reuses one.
+    """
+    identity = getattr(snapshot, "commit_identity", None)
+    if not isinstance(identity, str) or not identity:
+        return None
+    try:
+        table_id = str(getattr(snapshot, "metadata_id", "") or "")
+    except Exception:
+        table_id = ""
+    return (str(snapshot.table_root), str(int(snapshot.version)), table_id, identity)
+
+
 def legacy_calendar_files(snapshot: Any) -> tuple[str, ...]:
     """Live files of `snapshot` that delta-rs would misread and rewrite shifted.
 
     `snapshot` is a native kernel snapshot. Files are named as the log names
-    them. Cached per table version.
+    them. Cached per table version (and instance, see `_cache_key`).
     """
-    key = (str(snapshot.table_root), int(snapshot.version))
+    key = _cache_key(snapshot)
     with _CACHE_LOCK:
-        if key in _CACHE:
+        if key is not None and key in _CACHE:
             _CACHE.move_to_end(key)
             return _CACHE[key]
 
@@ -230,6 +253,8 @@ def legacy_calendar_files(snapshot: Any) -> tuple[str, ...]:
             if suspects:
                 found = tuple(snapshot.legacy_calendar_files(suspects))
 
+    if key is None:
+        return found
     with _CACHE_LOCK:
         _CACHE[key] = found
         while len(_CACHE) > _CACHE_SIZE:
@@ -268,11 +293,11 @@ def early_datetime_files(snapshot: Any) -> tuple[str, ...]:
     a rewrite through delta-rs copies them into files without Spark's
     writer metadata, which Databricks then reads shifted (see the module
     docstring). By statistics alone; a file they cannot clear counts.
-    Cached per table version.
+    Cached per table version (and instance, see `_cache_key`).
     """
-    key = (str(snapshot.table_root), int(snapshot.version))
+    key = _cache_key(snapshot)
     with _CACHE_LOCK:
-        if key in _EARLY_CACHE:
+        if key is not None and key in _EARLY_CACHE:
             _EARLY_CACHE.move_to_end(key)
             return _EARLY_CACHE[key]
 
@@ -296,6 +321,8 @@ def early_datetime_files(snapshot: Any) -> tuple[str, ...]:
         if leaves or unstatted:
             found = tuple(_early(snapshot.files(), leaves, unstatted))
 
+    if key is None:
+        return found
     with _CACHE_LOCK:
         _EARLY_CACHE[key] = found
         while len(_EARLY_CACHE) > _CACHE_SIZE:
@@ -373,3 +400,189 @@ def holds_early_datetimes(data: Any) -> bool:
         return any(_array_holds_early(column) for column in data.columns)
     except (pa.ArrowException, TypeError, ValueError):
         return True  # could not tell: the safe side is the writer that says so
+
+
+def _stream_schema(data: Any) -> Any:
+    """The Arrow schema a stream declares, or None if it declares none it can be asked for."""
+    import pyarrow as pa
+
+    schema = getattr(data, "schema", None)
+    if isinstance(schema, pa.Schema):
+        return schema
+    if hasattr(data, "__arrow_c_schema__"):
+        try:
+            return pa.schema(data)
+        except Exception:
+            return None
+    return None
+
+
+def _schema_holds_datetimes(schema: Any) -> bool:
+    import pyarrow as pa
+
+    def holds(kind: Any) -> bool:
+        if pa.types.is_date(kind):
+            return True
+        if pa.types.is_timestamp(kind):
+            # Naive ones too: an Arrow timestamp written to a TIMESTAMP
+            # column is stored zoned.
+            return True
+        if pa.types.is_dictionary(kind):
+            return holds(kind.value_type)
+        if pa.types.is_struct(kind):
+            return any(holds(kind.field(i).type) for i in range(kind.num_fields))
+        if pa.types.is_map(kind):
+            return holds(kind.key_type) or holds(kind.item_type)
+        value = getattr(kind, "value_type", None)
+        return value is not None and holds(value)
+
+    return any(holds(field.type) for field in schema)
+
+
+def stream_may_hold_early_datetimes(data: Any) -> bool:
+    """Whether a stream of rows (not inspectable without consuming it) may hold such values.
+
+    A RecordBatchReader, or any object exporting an Arrow stream, is read
+    only once, by the engine that writes it. Nothing says what its rows
+    hold, so a stream whose schema has a DATE or TIMESTAMP column (or whose
+    schema cannot be read) is taken to: the kernel, which writes the footer
+    Databricks needs, serves it rather than delta-rs, which cannot.
+    """
+    try:
+        import pyarrow as pa  # noqa: F401
+    except ImportError:
+        return False
+    schema = _stream_schema(data)
+    if schema is None:
+        # An Arrow stream that declares no schema up front may hold anything;
+        # an object that is no stream at all (a generator) is for the engine
+        # to refuse as data.
+        return hasattr(data, "__arrow_c_stream__")
+    try:
+        return _schema_holds_datetimes(schema)
+    except Exception:
+        return True
+
+
+def is_stream(data: Any) -> bool:
+    """Whether writing `data` consumes it, so `holds_early_datetimes` cannot look."""
+    return (
+        hasattr(data, "read_next_batch")
+        or hasattr(data, "__next__")
+        or not hasattr(data, "__len__")
+    )
+
+
+# ------------------------------------------------------------ SET values
+
+#: SQL whose value is today's date or time: never before either limit.
+_NOW = re.compile(r"\s*(?:current_date|current_timestamp|now)\s*(?:\(\s*\))?\s*", re.IGNORECASE)
+#: A naive timestamp is read in whatever zone the session has, up to 14h away
+#: from UTC; a day's margin keeps the comparison on the safe side.
+_NAIVE_TIMESTAMP_LIMIT = dt.datetime(1900, 1, 2)
+
+
+def datetime_kind(kind: Any) -> str | None:
+    """``date`` or ``timestamp`` for a column Spark rebases, ``nested`` for one holding one.
+
+    None for any other column. A timestamp without a zone is TIMESTAMP_NTZ,
+    which Spark writes and reads without rebasing.
+    """
+    import pyarrow as pa
+
+    if pa.types.is_date(kind):
+        return "date"
+    if pa.types.is_timestamp(kind):
+        return "timestamp" if kind.tz is not None else None
+    if pa.types.is_dictionary(kind):
+        return datetime_kind(kind.value_type)
+    if pa.types.is_struct(kind):
+        inner = [datetime_kind(kind.field(i).type) for i in range(kind.num_fields)]
+        return "nested" if any(inner) else None
+    if pa.types.is_map(kind):
+        return "nested" if datetime_kind(kind.key_type) or datetime_kind(kind.item_type) else None
+    value = getattr(kind, "value_type", None)
+    if value is not None:
+        return "nested" if datetime_kind(value) else None
+    return None
+
+
+def _value_early(value: Any, kind: str) -> bool:
+    """Whether a Python value, stored in a `kind` column, may be before its limit."""
+    if value is None:
+        return False
+    if kind == "nested":
+        return True  # a struct or list value is not looked into
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            if kind == "date":
+                # Spark casts 'yyyy-mm-dd' and any longer timestamp text to a date.
+                value = dt.date.fromisoformat(text[:10])
+            else:
+                value = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+    if isinstance(value, dt.datetime):
+        if kind == "date":
+            return value.date() < _DATE_LIMIT
+        if value.tzinfo is None:
+            return value < _NAIVE_TIMESTAMP_LIMIT
+        return value < _TIMESTAMP_LIMIT
+    if isinstance(value, dt.date):
+        if kind == "date":
+            return value < _DATE_LIMIT
+        return value < _NAIVE_TIMESTAMP_LIMIT.date()
+    return True  # a number, a numpy scalar, anything else: not bounded here
+
+
+def assigned_early(
+    target: Any,
+    value: Any,
+    *,
+    sql: bool,
+    column_type: Any = None,
+) -> bool:
+    """Whether setting a column of Arrow type `target` to `value` may write an early value.
+
+    `value` is SQL text (`sql`), as UPDATE's SET list and MERGE's clauses
+    take it, or a Python value (UPDATE's ``new_values``). The new value is
+    bounded when it is NULL, a DATE or TIMESTAMP literal (or a string one
+    Spark casts) at or after the limits, today's date or time, or a copy of
+    a column whose own values are bounded: `column_type(path)` gives the
+    Arrow type of such a column, or None when the column's values are not
+    known to be (a partition column, a streamed source, a column of another
+    type). Anything else -- arithmetic, a function, a cast -- may be anything
+    and counts as early.
+    """
+    kind = datetime_kind(target)
+    if kind is None:
+        return False
+    if not sql:
+        return _value_early(value, kind)
+    if not isinstance(value, str):
+        return True
+    text = value.strip()
+    if text.upper() == "NULL":
+        return False
+    if kind != "nested" and _NOW.fullmatch(text):
+        return False
+    from ..predicate import Literal, PredicateError, parse_value
+
+    try:
+        parsed = parse_value(text)
+    except PredicateError:
+        return True
+    if isinstance(parsed, Literal):
+        if parsed.type not in ("date", "timestamp", "timestamp_ntz", "string", "null"):
+            return True
+        return _value_early(parsed.value, kind)
+    # A column: bounded when its own values are.
+    source = column_type(parsed.path) if column_type is not None else None
+    if source is None:
+        return True
+    if source == target:
+        return False
+    # A TIMESTAMP at or after 1900 casts to a DATE after 1582; a DATE after
+    # 1582 may still be before 1900 as a TIMESTAMP.
+    return not (kind == "date" and datetime_kind(source) == "timestamp")

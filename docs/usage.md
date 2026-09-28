@@ -277,9 +277,19 @@ to add a footer key, so:
 - a write whose rows hold a date before 1582-10-15 or a timestamp before
   1900 (APPEND, OVERWRITE, replaceWhere, a MERGE source) goes to the kernel
   or the warehouse instead of delta-rs, or is refused when neither can serve
-  it (MERGE into a table without deletion vectors, schema merge). Only
-  in-memory data (a pyarrow Table or RecordBatch, a pandas or polars
-  DataFrame) is inspected; a stream is not, and is written as before;
+  it (MERGE into a table without deletion vectors, schema merge). In-memory
+  data (a pyarrow Table or RecordBatch, a list of batches, a pandas or
+  polars DataFrame) is inspected. A stream (a RecordBatchReader, any Arrow
+  stream) cannot be without consuming it, so one with a DATE or TIMESTAMP
+  column counts as holding such values and goes to the kernel;
+- an UPDATE or MERGE whose SET or INSERT values may be such a value goes the
+  same way. A value counts unless it is provably at or after the limits:
+  NULL, a DATE or TIMESTAMP (or string) literal after them,
+  `current_date()`/`current_timestamp()`, or a copy of a column whose values
+  are (a target column the file check below has cleared, or a column of an
+  inspected MERGE source). Arithmetic, functions and casts count;
+  `can("merge", ..., clauses=[("when_matched_update", None, {"d": "..."})])`
+  takes a clause's values as its third item;
 - DELETE, UPDATE, MERGE, replaceWhere, and an OPTIMIZE or Z-ORDER that only
   delta-rs can run (`writer_properties=` and the other delta-rs-only
   options), skip delta-rs on a table whose statistics allow such a value in
@@ -936,7 +946,10 @@ so a table whose shredded VARIANT columns the direct engines cannot read still
 counts directly. `can(Operation.ZORDER, columns=[...])` takes `z_order()`'s
 own spelling. A MERGE clause with a condition is given as `(name, condition)`,
 e.g. `clauses=[("when_not_matched_insert_all", "s.v > 0")]`: on a change-feed
-table delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. On a
+table delta-rs cannot run a MERGE whose last NOT MATCHED clause has one. A
+clause that sets columns may give them as a third item,
+`("when_matched_update", None, {"d": "source.d"})`: a value that may be a date
+before 1582 keeps the MERGE off delta-rs. On a
 handle opened with `version=`, every write is refused.
 
 `Capability` is truthy when `ok`. Every refusal carries a reason, and a remedy
@@ -1068,8 +1081,10 @@ reached.
 - delta-rs writes Parquet footers without `org.apache.spark.version`, which
   Databricks reads with the legacy calendar rebase, so writes and rewrites of
   dates before 1582-10-15 or timestamps before 1900 skip it (see above). A
-  streamed source is not inspected, and an UPDATE that sets such a value by a
-  literal on a table holding none is not caught; both still go to delta-rs.
+  streamed write with DATE or TIMESTAMP columns, and an UPDATE or MERGE whose
+  SET values cannot be bounded, count as holding such values: they go to the
+  kernel, and are refused where it cannot serve them (a MERGE into a table
+  without deletion vectors, `writer_properties=`).
 - Distributed planning is kernel-only; tables served by other engines are read
   on the driver.
 - A MERGE with `merge_schema=True` whose SET or INSERT assigns a column the

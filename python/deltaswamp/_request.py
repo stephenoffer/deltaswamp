@@ -250,11 +250,147 @@ def _calendar_needs(data: Any) -> set[str]:
     Databricks reads a date before 1582-10-15 (a timestamp before 1900 in a
     zone other than UTC) shifted from a Parquet file whose footer names no
     Spark version, and delta-rs cannot write one that does; see
-    `engine/calendar.py`.
+    `engine/calendar.py`. A stream cannot be looked into without consuming
+    it: one with a DATE or TIMESTAMP column counts, where it was taken to
+    hold none and delta-rs wrote its early dates footerless.
     """
-    from .engine.calendar import holds_early_datetimes
+    from .engine.calendar import (
+        holds_early_datetimes,
+        is_stream,
+        stream_may_hold_early_datetimes,
+    )
 
+    if isinstance(data, (list, tuple)) and data:
+        early = any(holds_early_datetimes(batch) for batch in data)
+        if not early and not all(_is_batch(batch) for batch in data):
+            early = stream_may_hold_early_datetimes(data[0])
+        return {"early_datetimes"} if early else set()
+    if is_stream(data):
+        return {"early_datetimes"} if stream_may_hold_early_datetimes(data) else set()
     return {"early_datetimes"} if holds_early_datetimes(data) else set()
+
+
+def _is_batch(data: Any) -> bool:
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return False
+    return isinstance(data, (pa.Table, pa.RecordBatch))
+
+
+def _assignment_needs(
+    table: Table,
+    assignments: list[tuple[Any, bool]],
+    *,
+    source: Any = NO_DATA,
+    aliases: tuple[str, str] | None = None,
+) -> set[str]:
+    """``early_datetimes`` when a SET or INSERT value may be an early date or timestamp.
+
+    UPDATE's SET list and MERGE's clauses compute new values from SQL: an
+    UPDATE setting ``DATE '1000-01-01'`` went to delta-rs, whose file names
+    no Spark version, and Databricks read the date as 0999-12-27. Each value
+    set into a DATE or TIMESTAMP column must be provably at or after the
+    limits (`engine/calendar.assigned_early`), or the request needs a writer
+    that says which calendar it wrote in. `assignments` pairs each mapping
+    (column -> value) with whether its values are SQL. `aliases` are a
+    MERGE's (source, target); a source column is bounded when the source
+    rows were inspected (`_calendar_needs` judged them), never a stream's.
+    Anything that cannot be judged counts as early.
+    """
+    assignments = [(a, sql) for a, sql in assignments if isinstance(a, dict) and a]
+    if not assignments:
+        return set()
+    from .engine.calendar import assigned_early, datetime_kind, is_stream
+
+    try:
+        fields = {f.name.lower(): f for f in table.schema()}
+        partitions = {p.lower() for p in table._enrich().partition_columns}
+    except Exception:
+        return {"early_datetimes"}
+    if not any(datetime_kind(f.type) for f in fields.values()):
+        return set()
+    source_fields: dict[str, Any] = {}
+    if source is not NO_DATA and not is_stream(source) and not isinstance(source, (list, tuple)):
+        try:
+            import pyarrow as pa
+
+            source_fields = {f.name.lower(): f for f in pa.table(source).schema}
+        except Exception:
+            source_fields = {}
+
+    def nested(field: Any, rest: tuple[str, ...]) -> Any:
+        import pyarrow as pa
+
+        kind = field.type
+        for part in rest:
+            if not pa.types.is_struct(kind):
+                return None
+            index = next(
+                (i for i in range(kind.num_fields) if kind.field(i).name.lower() == part.lower()),
+                None,
+            )
+            if index is None:
+                return None
+            kind = kind.field(index).type
+        return kind
+
+    def column_type(path: tuple[str, ...]) -> Any:
+        def target(rest: tuple[str, ...]) -> Any:
+            field = fields.get(rest[0].lower()) if rest else None
+            if field is None or field.name.lower() in partitions:
+                # A partition value lives in the log, where the statistics
+                # check of the files (`Router._footerless_rewrite`) never looks.
+                return None
+            return nested(field, rest[1:])
+
+        def from_source(rest: tuple[str, ...]) -> Any:
+            field = source_fields.get(rest[0].lower()) if rest else None
+            return None if field is None else nested(field, rest[1:])
+
+        if aliases is None:
+            return target(path)
+        source_alias, target_alias = aliases
+        head = path[0].lower()
+        if len(path) > 1 and head == target_alias.lower():
+            return target(path[1:])
+        if len(path) > 1 and head == source_alias.lower():
+            return from_source(path[1:])
+        in_target = path[0].lower() in fields
+        in_source = path[0].lower() in source_fields or (
+            source is not NO_DATA and not source_fields
+        )
+        if in_target and in_source:
+            return None  # ambiguous; Spark refuses it
+        return target(path) if in_target else from_source(path)
+
+    for mapping, sql in assignments:
+        for key, value in mapping.items():
+            if not isinstance(key, str):
+                continue
+            quoted = len(key) > 1 and key[0] == key[-1] == "`"
+            bare = key[1:-1].replace("``", "`") if quoted else key
+            if aliases is not None and "." in bare and not key.startswith("`"):
+                alias, _, unaliased = bare.partition(".")
+                if alias.lower() == aliases[1].lower():
+                    bare = unaliased
+            field = fields.get(bare.lower())
+            if field is None:
+                kind = None
+                if "." in bare:
+                    first, *inner = bare.split(".")
+                    top = fields.get(first.lower())
+                    kind = nested(top, tuple(inner)) if top is not None else None
+                if kind is None:
+                    continue  # no such column: the call names it
+            else:
+                kind = field.type
+            try:
+                if assigned_early(kind, value, sql=sql, column_type=column_type):
+                    return {"early_datetimes"}
+            except Exception:
+                return {"early_datetimes"}
+    return set()
 
 
 def _commit_options(table: Table, shape: dict[str, Any]) -> set[str]:
@@ -286,6 +422,7 @@ def _update(
     )
     needs |= table._expression_needs(shape.get("predicate"), spelled)
     needs |= table._char_needs(shape.get("predicate"))
+    needs |= _assignment_needs(table, [(spelled or {}, True), (new_values, False)])
     return Operation.UPDATE, needs | _commit_options(table, shape)
 
 
@@ -312,13 +449,25 @@ def _merge(
     if not isinstance(clauses, (list, tuple, set, frozenset)):
         return Operation.MERGE, needs
     # Each clause is its method name, or (name, condition) for one with a
-    # condition, as the builder reports them at execute().
+    # condition, or (name, condition, values) for one that sets columns, as
+    # the builder reports them at execute().
     named = [
         (str(c[0]), c[1] if len(c) > 1 else None)
         if isinstance(c, (list, tuple)) and c
         else (str(c), None)
         for c in clauses
     ]
+    assigned = [
+        c[2] for c in clauses if isinstance(c, (list, tuple)) and len(c) > 2 and c[2] is not None
+    ]
+    if assigned:
+        aliases = (
+            str(shape.get("source_alias") or "source"),
+            str(shape.get("target_alias") or "target"),
+        )
+        needs |= _assignment_needs(
+            table, [(a, True) for a in assigned], source=data, aliases=aliases
+        )
     if any(name.startswith(_REMOVING_CLAUSES) for name, _ in named):
         needs.add("removes_rows")
     inserts = [

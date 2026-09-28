@@ -310,7 +310,10 @@ First release.
   files it misread. delta-rs cannot write the key: writes whose rows hold
   such a value, and delta-rs rewrites of tables whose files may, go to the
   kernel or the warehouse, or are refused (a MERGE into a table without
-  deletion vectors). Streamed sources are not inspected. Files delta-rs
+  deletion vectors). The same holds for UPDATE and MERGE SET/INSERT values
+  that are not provably after the limits (`DATE '1000-01-01'`, arithmetic,
+  functions), and for streamed writes with DATE or TIMESTAMP columns, which
+  cannot be inspected. The file check fails closed. Files delta-rs
   already wrote stay misread by Databricks until rewritten (`optimize()`).
 - Lazy hand-offs (`to_duckdb`, `to_polars(lazy=True)`, `to_pyarrow_dataset`,
   `Connection.sql`) read the version current when they were made;

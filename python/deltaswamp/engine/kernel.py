@@ -84,6 +84,11 @@ def _as_record_batch_reader(data: Any) -> Any:
             "the data does not export the Arrow PyCapsule interface and pyarrow is not "
             "installed to convert it",
         ) from exc
+    batches = isinstance(data, (list, tuple)) and data
+    if batches and all(isinstance(b, pa.RecordBatch) for b in data):
+        # A list of batches, as delta-rs takes one: pa.table() reads a list
+        # as columns and raised "Must pass names or schema".
+        return pa.RecordBatchReader.from_batches(data[0].schema, data)
     return pa.table(data).to_reader()
 
 

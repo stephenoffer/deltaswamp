@@ -28,7 +28,12 @@ from .capability import READ_OPERATIONS as _READ_OPERATIONS
 from .capability import Engine as EngineKind
 from .catalog import ResolvedTable, TableType
 from .credentials import Operation as CredentialOperation
-from .engine.base import TranslatingStream, merge_clause, translating_stream
+from .engine.base import (
+    TranslatingStream,
+    merge_clause,
+    merge_clause_values,
+    translating_stream,
+)
 from .engine.boundary import engine_cause
 from .engine.deltars import DeltaRsEngine
 from .engine.intervals import interval_paths, interval_schema, interval_stream, storage_columns
@@ -3421,24 +3426,32 @@ class Table:
         source = _write_data(source)
         request = self._request(Operation.MERGE, {"predicate": predicate, **kwargs}, source)
 
+        routed = {"request": request}
+
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
-            engine = self._route(request, exclude=exclude)
+            engine = self._route(routed["request"], exclude=exclude)
             builder = engine.merge(
                 self._resolved, self._variant_input(engine, source), predicate, **kwargs
             )
             return builder, getattr(engine, "kind", None)
 
-        def clauses_routed(clauses: list[tuple[str, Any]]) -> None:
+        def clauses_routed(clauses: list[tuple[Any, ...]]) -> EngineKind | None:
             # The clauses are known only at execute(), and they can add a need
             # (an UPDATE or DELETE clause removes rows, which an append-only
-            # table forbids). Routed again with them, before anything runs,
-            # exactly as can("merge", ..., clauses=[...]) answers.
-            extra = self._request(Operation.MERGE, {"clauses": clauses}, source).needs
+            # table forbids; a SET value may be an early date delta-rs must
+            # not write). Routed again with them, before anything runs,
+            # exactly as can("merge", ..., clauses=[...]) answers; the engine
+            # that serves the clauses is returned for the builder to move to.
+            aliases: dict[str, Any] = {
+                k: kwargs[k] for k in ("source_alias", "target_alias") if k in kwargs
+            }
+            extra = self._request(Operation.MERGE, {**aliases, "clauses": clauses}, source).needs
             if extra <= request.needs:
-                return
-            self._connection.router.engine_for(
-                Operation.MERGE, self._enrich(), needs=request.needs | extra, **request.shape
-            )
+                return None
+            widened = dataclasses.replace(request, needs=request.needs | extra)
+            engine = self._route(widened)
+            routed["request"] = widened
+            return getattr(engine, "kind", None)
 
         builder, kind = build(frozenset())
         # A consumed stream cannot be offered to a second engine.
@@ -4823,7 +4836,7 @@ class _InvalidatingMerger:
         invalidate: Any,
         rebuild: Callable[[frozenset[EngineKind]], tuple[Any, EngineKind | None]] | None = None,
         kind: EngineKind | None = None,
-        preflight: Callable[[list[tuple[str, Any]]], None] | None = None,
+        preflight: Callable[[list[tuple[Any, ...]]], EngineKind | None] | None = None,
     ) -> None:
         self._builder = builder
         self._preflight = preflight
@@ -4883,13 +4896,34 @@ class _InvalidatingMerger:
 
         return call
 
+    def _move_to(self, kind: EngineKind) -> None:
+        """Rebuild the MERGE on engine `kind`, which its clauses need, replaying them."""
+        if self._rebuild is None:
+            raise UnreachableTableError(
+                "merge",
+                f"its clauses need {kind.value} rather than "
+                f"{self._kind.value if self._kind else 'the engine the builder was made on'}, "
+                "and the source is a stream that cannot be handed to a second engine",
+                "pass the source as a pyarrow Table rather than a stream",
+            )
+        builder, built = self._rebuild(frozenset(k for k in EngineKind if k is not kind))
+        for name, call_args, call_kwargs in self._calls:
+            result = getattr(builder, name)(*call_args, **call_kwargs)
+            if result is not None and type(result) is type(builder):
+                builder = result
+        self._builder, self._kind = builder, built
+
     def _execute(self, execute: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         if self._preflight is not None:
-            clauses = []
+            clauses: list[tuple[Any, ...]] = []
             for name, call_args, call_kwargs in self._calls:
                 clause = merge_clause(name, call_args, call_kwargs)
-                clauses.append((name, "condition" if clause and clause[1] else None))
-            self._preflight(clauses)
+                values = merge_clause_values(name, call_args, call_kwargs)
+                clauses.append((name, "condition" if clause and clause[1] else None, values))
+            kind = self._preflight(clauses)
+            if kind is not None and kind is not self._kind:
+                self._move_to(kind)
+                execute = self._builder.execute
         tried: set[EngineKind] = set()
         refusals: list[EngineLimitError] = []
         while True:
