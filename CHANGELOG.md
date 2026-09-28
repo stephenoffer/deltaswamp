@@ -113,6 +113,14 @@ First release.
   says so. `changes(start, include_snapshot=True)` yields the table at
   `start` as inserts before the feed.
 
+- A handle pinned to a version (`conn.table(..., version=n)`) can write
+  (delta-rs#4417): `append` appends at the latest version (it reads nothing),
+  and `delete`, `update` and `merge` read version n and commit at the latest
+  through the kernel's deletion-vector conflict check against every commit
+  since, raising `CommitConflictError` when one changed what they read.
+  Other writes, tables without deletion vectors and catalog-managed tables
+  still refuse, and `can()` agrees.
+
 ### Security
 
 See docs/usage.md, "Security notes".

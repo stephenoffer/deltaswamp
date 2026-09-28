@@ -214,3 +214,93 @@ def test_changes_can_start_from_a_snapshot(conn: Any, tmp_path: Any) -> None:
     assert got[2][1].column("_change_type").to_pylist() == ["delete"]
     projected = next(iter(conn.table(path).changes(start, include_snapshot=True, columns=["id"])))
     assert projected[1].column_names == ["id"]
+
+
+# ------------------------------------------------ #13 DML from a pinned read
+
+_DV = {"delta.enableDeletionVectors": "true"}
+
+
+def _one_file_per_row(conn: Any, path: str, ids: list[int]) -> None:
+    conn.write_table(path, pa.table({"id": [ids[0]], "v": [0]}), properties=_DV)
+    for i in ids[1:]:
+        conn.table(path).append(pa.table({"id": [i], "v": [0]}))
+
+
+def _rows(conn: Any, path: str) -> list[tuple[int, int]]:
+    return sorted((r["id"], r["v"]) for r in conn.table(path).to_arrow().to_pylist())
+
+
+def test_dml_from_a_pinned_handle_commits_over_blind_appends(conn: Any, tmp_path: Any) -> None:
+    """delta-rs#4417: a pinned handle refused every write."""
+    path = str(tmp_path / "t")
+    _one_file_per_row(conn, path, [1, 2, 3])
+    pinned = conn.table(path, version=conn.table(path).version)
+    conn.table(path).append(pa.table({"id": [4], "v": [0]}))  # a blind append since
+    for op, args in (("delete", {"predicate": "id = 1"}), ("merge", {})):
+        cap = pinned.can(op, **args)
+        assert cap.ok and cap.engine is Engine.KERNEL, (op, cap)
+    assert pinned.delete("id = 1")["num_deleted_rows"] == 1
+    assert pinned.update(new_values={"v": 9}, predicate="id = 2")["num_updated_rows"] == 1
+    merged = (
+        pinned.merge(pa.table({"id": [3, 7], "v": [5, 5]}), "target.id = source.id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute()
+    )
+    assert (merged["num_updated_rows"], merged["num_inserted_rows"]) == (1, 1)
+    # The row appended since was not read, so it is left alone.
+    assert _rows(conn, path) == [(2, 9), (3, 5), (4, 0), (7, 5)]
+
+
+def test_dml_from_a_pinned_handle_conflicts_with_what_changed_since(
+    conn: Any, tmp_path: Any
+) -> None:
+    from deltaswamp.errors import CommitConflictError
+
+    path = str(tmp_path / "t")
+    _one_file_per_row(conn, path, [1, 2])
+    pinned = conn.table(path, version=conn.table(path).version)
+    conn.table(path).delete("id = 2")  # changes the file the pinned read matches
+    with pytest.raises(CommitConflictError, match="pinned to version"):
+        pinned.update(new_values={"v": 1}, predicate="id = 2")
+    assert _rows(conn, path) == [(1, 0)]
+    # A later non-blind write that added a row the read would have matched.
+    other = str(tmp_path / "u")
+    _one_file_per_row(conn, other, [1, 2])
+    pinned = conn.table(other, version=conn.table(other).version)
+    conn.table(other).merge(
+        pa.table({"id": [5], "v": [0]}), "target.id = source.id"
+    ).when_not_matched_insert_all().execute()
+    with pytest.raises(CommitConflictError, match="could have matched"):
+        pinned.delete("id >= 1")
+    assert _rows(conn, other) == [(1, 0), (2, 0), (5, 0)]
+
+
+def test_a_pinned_append_appends_at_the_latest_version(conn: Any, tmp_path: Any) -> None:
+    path = str(tmp_path / "t")
+    conn.write_table(path, pa.table({"id": [1]}))
+    conn.table(path).add_column(pa.field("s", pa.string()))
+    pinned = conn.table(path, version=0)
+    assert pinned.can("append").ok
+    pinned.append(pa.table({"id": [2]}))
+    assert conn.table(path).to_arrow().sort_by("id").to_pylist() == [
+        {"id": 1, "s": None},
+        {"id": 2, "s": None},
+    ]
+
+
+def test_pinned_dml_is_still_refused_where_it_cannot_be_checked(conn: Any, tmp_path: Any) -> None:
+    from deltaswamp.errors import InvalidArgumentError
+
+    path = str(tmp_path / "t")
+    conn.write_table(path, pa.table({"id": [1, 2]}))  # no deletion vectors
+    conn.table(path).append(pa.table({"id": [3]}))
+    pinned = conn.table(path, version=0)
+    cap = pinned.can("delete", predicate="id = 1")
+    assert not cap.ok and "deletion vectors" in (cap.reason or "")
+    with pytest.raises(InvalidArgumentError, match="deletion vectors"):
+        pinned.delete("id = 1")
+    for op in ("overwrite", "optimize"):
+        assert not pinned.can(op).ok
+    assert conn.table(path).count() == 3

@@ -68,7 +68,18 @@ def derive(table: Table, operation: Operation, args: Mapping[str, Any], data: An
     op, needs = operation, set[str]()
     if rule is not None:
         op, needs = rule(table, operation, shape, data)
+    if table._version is not None and op in PINNED_DML:
+        # Read at the pinned version, committed at the latest after Delta's
+        # conflict check against every commit since (delta-rs#4417): what the
+        # kernel's deletion-vector DML does when it loses a race.
+        needs.add("pinned_read")
     return Request(op, frozenset(needs), shape, operation)
+
+
+#: What a handle pinned to a past version may still change: the rows it read,
+#: conflict-checked against the commits since, as a transaction that started
+#: at that version would be.
+PINNED_DML: frozenset[Operation] = frozenset({Operation.DELETE, Operation.UPDATE, Operation.MERGE})
 
 
 #: What the calls refuse on a handle opened at a past version (see
@@ -76,13 +87,9 @@ def derive(table: Table, operation: Operation, args: Mapping[str, Any], data: An
 #: latest version.
 _PINNED_REFUSED: frozenset[Operation] = frozenset(
     {
-        Operation.APPEND,
         Operation.OVERWRITE,
         Operation.REPLACE_WHERE,
         Operation.MERGE_SCHEMA,
-        Operation.DELETE,
-        Operation.UPDATE,
-        Operation.MERGE,
         Operation.OPTIMIZE,
         Operation.ZORDER,
         Operation.RESTORE,
@@ -110,7 +117,10 @@ def refusal(table: Table, request: Request) -> Capability | None:
     """The refusal the call makes of `request` before any engine is asked, if any.
 
     A handle pinned to a version refuses every write in the method; can()
-    asked only the router, which judged the latest table and said yes.
+    asked only the router, which judged the latest table and said yes. Two
+    are served: a blind append (it reads nothing, so it appends at the latest
+    version as from any handle) and DELETE, UPDATE and MERGE where the kernel
+    commits them from the pinned version (see `PINNED_DML`).
     """
     version = table._version
     if request.operation is Operation.OVERWRITE and request.shape.get("schema_mode") == "overwrite":
@@ -125,7 +135,22 @@ def refusal(table: Table, request: Request) -> Capability | None:
                 remedy="drop the constraints first (drop_constraint()), or write the data as "
                 "a new table (write_table() at another location)",
             )
-    if version is None or request.operation not in _PINNED_REFUSED:
+    if version is not None and request.operation in PINNED_DML:
+        verdict = table._connection.router.capability(
+            request.operation, table._enrich(), needs=request.needs, **request.shape
+        )
+        if verdict.ok:
+            return None
+        return Capability(
+            request.asked,
+            ok=False,
+            reason=f"this handle is pinned to version {version}; a {request.operation.value} "
+            "commits from a past version only as deletion vectors on the kernel, "
+            f"conflict-checked against the commits since, and here: {verdict.reason}",
+            remedy="open the table without version= to write to it",
+        )
+    distributed = request.operation is Operation.APPEND and request.shape.get("distributed")
+    if version is None or (request.operation not in _PINNED_REFUSED and not distributed):
         return None
     return Capability(
         request.asked,

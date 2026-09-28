@@ -1741,15 +1741,16 @@ class Table:
             return frozenset({"sql_column_defaults"})
         return frozenset()
 
-    def _check_writable(self, what: str) -> None:
+    def _check_writable(self, what: str, *, pinned: bool = False) -> None:
         """Refuse a write through a handle opened at a past version.
 
         Every engine writes to the latest version, so a delete on
         ``conn.table(path, version=1)`` removed rows from the current table,
         not the version the handle shows. Delta refuses writes to a
-        time-travelled table for the same reason.
+        time-travelled table for the same reason. `pinned=True`: the call
+        serves a pinned handle itself (and refuses through `_check_pinned`).
         """
-        if self._version is not None:
+        if self._version is not None and not pinned:
             raise InvalidArgumentError(
                 f"cannot {what}: this handle is pinned to version {self._version}; "
                 "open the table without version= to write to it"
@@ -1759,6 +1760,44 @@ class Table:
             # captured at resolution was a guaranteed 409 once anyone else had
             # committed -- and stayed one on every retry through this handle.
             self._refresh_commit_tail(before_write=True)
+
+    def _check_pinned(self, request: Request) -> dict[str, Any]:
+        """Refuse a pinned-handle DML `can()` refuses; else the engine's `read_version=`.
+
+        DELETE, UPDATE and MERGE from a handle pinned to a past version read
+        there and commit at the latest after Delta's conflict check against
+        every commit since (delta-rs#4417): what the kernel's deletion-vector
+        DML does when it loses a race to them. Where that cannot be done the
+        call is refused, as before, saying why.
+        """
+        if self._version is None:
+            return {}
+        refused = refusal(self, request)
+        if refused is not None:
+            raise InvalidArgumentError(
+                f"cannot {request.operation.value}: {refused.reason}; {refused.remedy}"
+            )
+        return {"read_version": self._version}
+
+    def _pinned_write(self, write: Callable[[], Any]) -> Any:
+        """`write()`, saying so when a pinned handle's commit lost to a later one.
+
+        "Re-read the table and retry" never helps a handle pinned to the
+        version it read: the same call conflicts again.
+        """
+        from .errors import CommitConflictError
+
+        if self._version is None:
+            return write()
+        try:
+            return write()
+        except CommitConflictError as exc:
+            exc.args = (
+                f"{exc} This handle is pinned to version {self._version}, and a commit "
+                "since then changed what it read: open a later version (or the latest) and "
+                "run it from there.",
+            )
+            raise
 
     def to_arrow(self, **kwargs: Any) -> Any:
         pa = _require("pyarrow", "pyarrow")
@@ -3150,6 +3189,19 @@ class Table:
         removes the common replay case; it is not a substitute for engine-level
         enforcement, because a concurrent writer could still commit in between.
         """
+        if self._version is not None and schema_mode is None:
+            # A blind append reads nothing, so it means the same from any
+            # handle: rows added at the latest version. Aligned to the latest
+            # schema, not the pinned one.
+            return Table(self._connection, self._resolved).append(
+                data,
+                partition_by=partition_by,
+                target_file_size=target_file_size,
+                writer_properties=writer_properties,
+                commit_metadata=commit_metadata,
+                txn=txn,
+                max_commit_retries=max_commit_retries,
+            )
         self._check_writable("append")
         _check_write_sizes(target_file_size, max_commit_retries)
         if schema_mode not in (None, "merge"):
@@ -3554,18 +3606,19 @@ class Table:
 
     def delete(self, predicate: str | None = None, **kwargs: Any) -> dict[str, Any]:
         """DELETE rows matching a SQL predicate (every row when None)."""
-        self._check_writable("delete")
+        self._check_writable("delete", pinned=True)
         _check_options("delete", kwargs, _DML_OPTIONS)
         _check_predicate(predicate, "delete")
         request = self._request(Operation.DELETE, {"predicate": predicate, **kwargs})
+        pinned = self._check_pinned(request)
         served: list[Any] = []
 
         def run() -> Any:
             engine = self._route(request)
             served.append(getattr(engine, "kind", None))
-            return engine.delete(self._resolved, predicate, **_given(kwargs))
+            return engine.delete(self._resolved, predicate, **_given(kwargs), **pinned)
 
-        result = self._backfilled(run)
+        result = self._pinned_write(lambda: self._backfilled(run))
         self._invalidate()
         return _results.dml(result, served[-1] if served else None)
 
@@ -3579,7 +3632,7 @@ class Table:
     ) -> dict[str, Any]:
         """UPDATE. `updates` maps columns to SQL expressions; `new_values` to
         plain Python values, which need no quoting."""
-        self._check_writable("update")
+        self._check_writable("update", pinned=True)
         _check_options("update", kwargs, _DML_OPTIONS | {"error_on_type_mismatch"})
         _check_predicate(predicate, "update")
         if updates is not None and new_values is not None:
@@ -3597,6 +3650,7 @@ class Table:
             Operation.UPDATE,
             {"updates": updates, "new_values": new_values, "predicate": predicate, **kwargs},
         )
+        pinned = self._check_pinned(request)
         engine = self._route(request)
         defaults = self._update_defaults(updates)[0]
         if defaults and isinstance(engine, (KernelEngine, DeltaRsEngine)):
@@ -3612,9 +3666,11 @@ class Table:
         if new_values is not None:
             kwargs["new_values"] = self._update_targets(new_values, deltars)
             self._refuse_zoned_ntz(kwargs["new_values"])
-        result: dict[str, Any] = self._backfilled(
-            lambda: engine.update(
-                self._resolved, updates=updates, predicate=predicate, **_given(kwargs)
+        result: dict[str, Any] = self._pinned_write(
+            lambda: self._backfilled(
+                lambda: engine.update(
+                    self._resolved, updates=updates, predicate=predicate, **_given(kwargs), **pinned
+                )
             )
         )
         self._invalidate()
@@ -3752,7 +3808,7 @@ class Table:
     def merge(self, source: Any, predicate: str, **kwargs: Any) -> Any:
         """MERGE INTO. Returns a builder with the delta-rs clause API
         (``when_matched_update_all()`` ... ``execute()``) whichever engine serves it."""
-        self._check_writable("merge")
+        self._check_writable("merge", pinned=True)
         _check_options("merge", kwargs, _MERGE_OPTIONS)
         if predicate is None:
             raise InvalidArgumentError("merge needs a join predicate")
@@ -3760,13 +3816,14 @@ class Table:
         _check_sql_fragment(predicate, "the MERGE ON condition")
         source = _write_data(source)
         request = self._request(Operation.MERGE, {"predicate": predicate, **kwargs}, source)
+        pinned = self._check_pinned(request)
 
         routed = {"request": request}
 
         def build(exclude: frozenset[EngineKind]) -> tuple[Any, EngineKind | None]:
             engine = self._route(routed["request"], exclude=exclude)
             builder = engine.merge(
-                self._resolved, self._variant_input(engine, source), predicate, **kwargs
+                self._resolved, self._variant_input(engine, source), predicate, **kwargs, **pinned
             )
             return builder, getattr(engine, "kind", None)
 

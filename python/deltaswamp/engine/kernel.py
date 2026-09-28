@@ -474,6 +474,28 @@ class KernelEngine:
     #: and function calls go to an engine that evaluates SQL.
     supports_sql_expressions = False
 
+    #: DELETE/UPDATE/MERGE from a handle pinned to a past version: read there,
+    #: committed at the latest through the conflict check a lost race gets
+    #: (`_rebase_dv_commit`). Deletion-vector tables only; see need_refusal.
+    supports_pinned_read = True
+
+    def need_refusal(self, needs: frozenset[str], table: ResolvedTable) -> str | None:
+        """Why a request need this engine has in general fails on `table`."""
+        if "pinned_read" not in needs:
+            return None
+        if not self._dv_path(table):
+            return (
+                "the table does not enable deletion vectors, and only deletion-vector DML "
+                "can be conflict-checked from a past version (a rewrite replaces files the "
+                "commits since may have changed)"
+            )
+        if table.is_catalog_managed:
+            return (
+                "the table is catalog-managed, and a commit that lost to the catalog's "
+                "later versions is not rebased here"
+            )
+        return None
+
     @property
     def supports_incremental_files(self) -> bool:
         """`added_since()`: the file diff between two versions (the incremental scan)."""
@@ -1955,6 +1977,7 @@ class KernelEngine:
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, Any] | None = None,
         engine_info: str | None = None,
+        read_version: int | None = None,
     ) -> dict[str, Any]:
         """DELETE, UPDATE or replaceWhere as deletion vectors, as Databricks writes them.
 
@@ -1969,7 +1992,10 @@ class KernelEngine:
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        snapshot = self.snapshot(table, write=True)
+        # A pinned handle reads at its version; the commit then conflicts with
+        # the later ones and is rebased over them only where Delta's rules
+        # allow (`_rebase_dv_commit`), as a transaction begun there would be.
+        snapshot = self.snapshot(table, version=read_version, write=True)
         schema = _arrow_schema(snapshot)
         if predicate is None and transform is None and replacement is None:
             emptied = self._delete_every_file(table, snapshot, txn, commit_metadata, engine_info)
@@ -2837,17 +2863,27 @@ class KernelEngine:
         predicate: str | None = None,
         *,
         commit_metadata: dict[str, Any] | None = None,
+        read_version: int | None = None,
         **unsupported: Any,
     ) -> dict[str, Any]:
         """DELETE by rewriting the table without the matching rows.
 
         SQL semantics: a row is deleted only where the predicate is TRUE; a
-        NULL result keeps it.
+        NULL result keeps it. `read_version` reads at that version (a pinned
+        handle), deletion vectors only.
         """
         _refuse_options("delete", unsupported)
         if self._dv_path(table):
             result = self._dv_dml(
-                table, predicate, operation="DELETE", commit_metadata=commit_metadata
+                table,
+                predicate,
+                operation="DELETE",
+                commit_metadata=commit_metadata,
+                read_version=read_version,
+            )
+        elif read_version is not None:
+            raise UnreachableTableError(
+                "delete from a past version", self.need_refusal(frozenset({"pinned_read"}), table)
             )
         else:
             result = self._rewrite(
@@ -2867,6 +2903,7 @@ class KernelEngine:
         new_values: dict[str, Any] | None = None,
         predicate: str | None = None,
         commit_metadata: dict[str, Any] | None = None,
+        read_version: int | None = None,
         **unsupported: Any,
     ) -> dict[str, Any]:
         """UPDATE by rewriting the table. Assignments are plain values.
@@ -2951,6 +2988,11 @@ class KernelEngine:
                     matched, pa.nulls(matched.num_rows, pa.bool_()).fill_null(False)
                 ),
                 commit_metadata=commit_metadata,
+                read_version=read_version,
+            )
+        elif read_version is not None:
+            raise UnreachableTableError(
+                "update from a past version", self.need_refusal(frozenset({"pinned_read"}), table)
             )
         else:
             result = self._rewrite(

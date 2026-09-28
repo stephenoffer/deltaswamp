@@ -200,6 +200,18 @@ looking the name up in its own catalog.
 `dbfs:/` and `/mnt/...` paths are refused with an explanation, since they are
 unreachable from outside Databricks.
 
+A handle opened with `version=` reads that version, and writes as a
+transaction begun there would (delta-rs#4417). `append` is blind -- it reads
+nothing -- so it appends at the latest version, as from any handle. `delete`,
+`update` and `merge` read the pinned version and commit at the latest after
+Delta's conflict check against every commit since: they go through if the
+commits since were blind appends or left the files they read alone, and
+raise `CommitConflictError` otherwise (open a later version and run it
+again). Only the kernel's deletion-vector DML does that, so they need a table
+with `delta.enableDeletionVectors`, not catalog-managed; elsewhere, and for
+every other write (overwrite, schema-merging appends, OPTIMIZE, RESTORE,
+ALTER), a pinned handle refuses, and `can()` says so.
+
 ## Reading
 
 `scan()` is the primitive. It returns an Arrow stream that exports
