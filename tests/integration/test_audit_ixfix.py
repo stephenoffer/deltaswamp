@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any
 
@@ -108,3 +109,78 @@ class TestDeletionVectorStatsKeepDecimals:
         assert f'"d0":{self.D0}' in stats and f'"d0":-{self.D0}' in stats, stats
         assert '"tightBounds":false' in stats
         assert "e+" not in stats
+
+
+# ------------------------------------------------------- 2: NaN statistics
+
+
+def _footer_bounds(path: str, add: dict[str, Any]) -> dict[str, bool]:
+    import pyarrow.parquet as pq
+
+    group = pq.ParquetFile(os.path.join(path, add["path"])).metadata.row_group(0)
+    return {
+        group.column(i).path_in_schema: bool(
+            group.column(i).statistics is not None and group.column(i).statistics.has_min_max
+        )
+        for i in range(group.num_columns)
+    }
+
+
+NAN_DATA = {
+    "id": pa.array([1, 2, 3, 4], pa.int64()),
+    "f": pa.array([1.0, float("nan"), 3.0, None], pa.float64()),
+    "g": pa.array([1.0, 2.0, 3.0, 4.0], pa.float64()),
+    "st": pa.array(
+        [{"x": float("nan")}, {"x": 1.0}, None, {"x": 2.0}], pa.struct([("x", pa.float32())])
+    ),
+}
+
+
+class TestNaNStatistics:
+    """Files with NaN carried a max below it, and Databricks skipped the NaN rows."""
+
+    def test_kernel_footer_has_no_bounds_for_nan_columns(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "k")
+        conn = _kernel_only()
+        data = pa.table(NAN_DATA)
+        conn.create_table(path, data.schema)
+        conn.open_table(path).append(data)
+        (add,) = _adds(path)
+        assert _footer_bounds(path, add) == {"id": True, "f": False, "g": True, "st.x": False}
+        stats = json.loads(add["stats"])
+        # NaN is the maximum: the kernel's collector writes no max for it.
+        assert stats["maxValues"].get("f") is None and stats["maxValues"]["g"] == 4.0
+
+    def test_kernel_keeps_bounds_without_nan(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "k2")
+        conn = _kernel_only()
+        data = pa.table({"id": pa.array([1, 2], pa.int64()), "f": pa.array([1.0, 2.0])})
+        conn.create_table(path, data.schema)
+        conn.open_table(path).append(data)
+        (add,) = _adds(path)
+        assert _footer_bounds(path, add) == {"id": True, "f": True}
+
+    def test_deltars_writes_no_bounds_below_a_nan(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "d")
+        conn = _deltars_only()
+        data = pa.table(NAN_DATA)
+        conn.create_table(path, data.schema)
+        conn.open_table(path).append(data)
+        (add,) = _adds(path)
+        stats = json.loads(add["stats"])
+        assert "f" not in stats.get("maxValues", {}) and "st" not in stats.get("maxValues", {})
+        assert stats["maxValues"]["g"] == 4.0  # NaN-free: still skippable
+        assert not _footer_bounds(path, add)["f"]
+
+    def test_deltars_rewrite_turns_float_bounds_off(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "d2")
+        conn = _deltars_only()
+        data = pa.table(NAN_DATA)
+        conn.create_table(path, data.schema)
+        conn.open_table(path).append(data)
+        conn.open_table(path).update({"id": "id + 10"}, predicate="id = 1")
+        for add in _adds(path):
+            stats = json.loads(add["stats"])
+            assert "f" not in stats.get("maxValues", {}) and "g" not in stats.get("maxValues", {})
+        got = pa.table(conn.open_table(path).to_arrow()).sort_by("id").column("f").to_pylist()
+        assert math.isnan(got[0]) and got[1:] == [3.0, None, 1.0]

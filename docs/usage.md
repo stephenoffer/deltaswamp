@@ -1179,6 +1179,14 @@ reached.
   columns of more than 15 digits (or structs holding one): delta-rs would log
   them as rounded doubles, which Databricks trusts for data skipping. Files
   written before this change may still carry such stats.
+- FLOAT and DOUBLE columns holding a NaN keep no Parquet footer min/max in
+  files deltaswamp writes (Spark writes none either; arrow-rs's leave the NaN
+  out, and Databricks then skipped NaN rows for `f = 'NaN'` or `f > 100`).
+  The kernel checks each file; delta-rs, whose log stats come from the
+  footer, checks an append of in-memory data and writes no float min/max
+  (null counts included) for streamed appends and every DML rewrite. Files
+  written before this change may still be skipped wrongly for NaN
+  predicates until rewritten.
 - A binary partition column is written by the kernel only, as UTF-8 text; a
   value that is not valid UTF-8 is refused. An empty-string partition value is
   written as null, as Spark does.

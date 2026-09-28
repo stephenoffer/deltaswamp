@@ -18,17 +18,20 @@
 //! transform, the kernel's statistics, a PUT and a HEAD, and the kernel's own
 //! add-file metadata, which `build_add_file_metadata` is public for.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::datatypes::{DataType, Float32Type, Float64Type, Schema};
 use delta_kernel::engine::arrow_conversion::TryFromArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
-use delta_kernel::parquet::basic::Compression;
+use delta_kernel::parquet::arrow::ArrowSchemaConverter;
+use delta_kernel::parquet::basic::{Compression, Type as PhysicalType};
 use delta_kernel::parquet::file::metadata::KeyValue;
-use delta_kernel::parquet::file::properties::WriterProperties;
+use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::schema::StructType;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{DeltaResult, Engine, EngineData, Error, FileMeta};
@@ -82,25 +85,87 @@ pub fn codec_named(name: Option<&str>) -> Compression {
 }
 
 /// The writer options for a data file: the kernel's (no embedded Arrow
-/// schema), plus the Spark version key, compressed with `codec`.
-fn writer_options(codec: Compression) -> ArrowWriterOptions {
-    let properties = WriterProperties::builder()
+/// schema), plus the Spark version key, compressed with `codec`, and no
+/// statistics for the FLOAT/DOUBLE leaves of the columns in `nan_columns`.
+fn writer_options(
+    codec: Compression,
+    schema: &Schema,
+    nan_columns: &HashSet<String>,
+) -> DeltaResult<ArrowWriterOptions> {
+    let mut builder = WriterProperties::builder()
         .set_compression(codec)
         .set_key_value_metadata(Some(vec![KeyValue::new(
             SPARK_VERSION_KEY.to_string(),
             SPARK_VERSION_VALUE.to_string(),
-        )]))
-        .build();
-    ArrowWriterOptions::new()
+        )]));
+    if !nan_columns.is_empty() {
+        let descriptor = ArrowSchemaConverter::new().convert(schema)?;
+        for column in descriptor.columns() {
+            let float = matches!(
+                column.physical_type(),
+                PhysicalType::FLOAT | PhysicalType::DOUBLE
+            );
+            let top = column.path().parts().first();
+            if float && top.is_some_and(|name| nan_columns.contains(name)) {
+                builder = builder
+                    .set_column_statistics_enabled(column.path().clone(), EnabledStatistics::None);
+            }
+        }
+    }
+    Ok(ArrowWriterOptions::new()
         .with_skip_arrow_metadata(true)
-        .with_properties(properties)
+        .with_properties(builder.build()))
+}
+
+/// The top-level columns of `batch` with a NaN in some FLOAT or DOUBLE leaf.
+///
+/// arrow-rs leaves NaN out of a column chunk's min/max, and Spark, for which
+/// NaN is greater than every other value, writes no min/max for a float
+/// column holding one. Databricks prunes row groups on the footer's bounds, so
+/// a file written here with max 3.0 beside a NaN answered `f = 'NaN'`,
+/// `f > 100` and `NOT (f < 100)` without its NaN rows. Such columns get no
+/// footer statistics (the file is read, never wrongly skipped); every other
+/// column, and every NaN-free file, keeps them. The Delta stats need nothing:
+/// the kernel's collector counts NaN as the maximum and writes it as null.
+fn columns_with_nan(batch: &RecordBatch) -> HashSet<String> {
+    fn has_nan(array: &dyn Array) -> bool {
+        match array.data_type() {
+            DataType::Float32 => array
+                .as_primitive::<Float32Type>()
+                .iter()
+                .any(|v| v.is_some_and(f32::is_nan)),
+            DataType::Float64 => array
+                .as_primitive::<Float64Type>()
+                .iter()
+                .any(|v| v.is_some_and(f64::is_nan)),
+            // A child's slots under a null parent, or past a list's offsets,
+            // count too: at worst a column loses statistics it could keep.
+            DataType::Struct(_) => array.as_struct().columns().iter().any(|c| has_nan(c)),
+            DataType::List(_) => has_nan(array.as_list::<i32>().values()),
+            DataType::LargeList(_) => has_nan(array.as_list::<i64>().values()),
+            DataType::FixedSizeList(_, _) => has_nan(array.as_fixed_size_list().values()),
+            DataType::Map(_, _) => {
+                let map = array.as_map();
+                has_nan(map.keys()) || has_nan(map.values())
+            }
+            _ => false,
+        }
+    }
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .filter(|(_, column)| has_nan(column.as_ref()))
+        .map(|(field, _)| field.name().clone())
+        .collect()
 }
 
 /// `batch` as the bytes of one Parquet file with the footer described above.
 pub fn encode(batch: &RecordBatch, codec: Compression) -> DeltaResult<Vec<u8>> {
     let mut buffer = vec![];
-    let mut writer =
-        ArrowWriter::try_new_with_options(&mut buffer, batch.schema(), writer_options(codec))?;
+    let options = writer_options(codec, &batch.schema(), &columns_with_nan(batch))?;
+    let mut writer = ArrowWriter::try_new_with_options(&mut buffer, batch.schema(), options)?;
     writer.write(batch)?;
     writer.close()?; // the footer is written on close
     Ok(buffer)
@@ -181,7 +246,7 @@ pub async fn write_physical(
 mod tests {
     use super::*;
     use arrow::array::{Date32Array, Int32Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::Field;
     use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 
     #[test]
@@ -220,6 +285,60 @@ mod tests {
         assert!(
             !spec.dates && !spec.timestamps && !spec.int96_micros,
             "{spec:?}"
+        );
+    }
+
+    #[test]
+    fn float_columns_holding_nan_get_no_footer_statistics() {
+        use arrow::array::{Float64Array, ListArray, StructArray};
+        use arrow::datatypes::{Fields, Float64Type};
+
+        let inner = Fields::from(vec![Field::new("x", DataType::Float64, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("g", DataType::Float64, true),
+            Field::new("st", DataType::Struct(inner.clone()), true),
+            Field::new_list("l", Field::new("item", DataType::Float64, true), true),
+            Field::new("i", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float64Array::from(vec![1.0, f64::NAN, 3.0])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+                Arc::new(StructArray::new(
+                    inner,
+                    vec![Arc::new(Float64Array::from(vec![f64::NAN, 1.0, 2.0]))],
+                    None,
+                )),
+                Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+                    Some(vec![Some(1.0), Some(f64::NAN)]),
+                    None,
+                    Some(vec![]),
+                ])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("ds-nan-{}.parquet", uuid::Uuid::new_v4()));
+        std::fs::write(&path, encode(&batch, Compression::SNAPPY).unwrap()).unwrap();
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let group = reader.metadata().row_group(0);
+        let with_stats: Vec<(String, bool)> = group
+            .columns()
+            .iter()
+            .map(|c| (c.column_path().string(), c.statistics().is_some()))
+            .collect();
+        assert_eq!(
+            with_stats,
+            vec![
+                ("f".to_string(), false),
+                ("g".to_string(), true),
+                ("st.x".to_string(), false),
+                ("l.list.item".to_string(), false),
+                ("i".to_string(), true),
+            ]
         );
     }
 

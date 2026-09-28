@@ -929,8 +929,11 @@ class DeltaRsEngine:
         incoming = _data_delta_schema(data)
         if incoming is None:
             return None
+        nan_free = _nan_free_columns(data)
         if not any(
-            _too_precise(f.get("type")) or _nested_too_precise(f.get("type"))
+            _too_precise(f.get("type"))
+            or _nested_too_precise(f.get("type"))
+            or (_holds_float(f.get("type")) and f["name"].lower() not in nan_free)
             for f in incoming["fields"]
         ):
             return None
@@ -987,7 +990,9 @@ class DeltaRsEngine:
             "schema_mode": schema_mode,
             "partition_by": partition_by,
             "target_file_size": target_file_size,
-            "writer_properties": _exact_stats(writer_properties, self._stats_schema(table, data)),
+            "writer_properties": _exact_stats(
+                writer_properties, self._stats_schema(table, data), _nan_free_columns(data)
+            ),
             "commit_properties": _commit_properties(commit_metadata, txn, max_commit_retries),
             "post_commithook_properties": _hooks(table),
         }
@@ -3326,7 +3331,54 @@ def _nested_too_precise(datatype: Any) -> bool:
     )
 
 
-def _exact_stats(writer_properties: Any, schema: Mapping[str, Any] | None) -> Any:
+def _holds_float(datatype: Any) -> bool:
+    """A FLOAT or DOUBLE, or a struct holding one at any depth."""
+    if datatype in ("float", "double"):
+        return True
+    if not isinstance(datatype, dict) or datatype.get("type") != "struct":
+        return False
+    return any(_holds_float(f.get("type")) for f in datatype.get("fields") or [])
+
+
+def _nan_free_columns(data: Any) -> frozenset[str]:
+    """The top-level columns of `data` (lower-cased) holding a float and no NaN.
+
+    Known only for data already in memory; a stream would be consumed.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if isinstance(data, pa.RecordBatch):
+        data = pa.Table.from_batches([data])
+    if not isinstance(data, pa.Table):
+        return frozenset()
+
+    def floats(t: Any) -> bool:
+        if pa.types.is_floating(t):
+            return True
+        return pa.types.is_struct(t) and any(floats(t.field(i).type) for i in range(t.num_fields))
+
+    def has_nan(column: Any) -> bool:
+        t = column.type
+        if pa.types.is_floating(t):
+            return bool(pc.any(pc.is_nan(column)).as_py())
+        if pa.types.is_struct(t):
+            chunks = column.chunks if isinstance(column, pa.ChunkedArray) else [column]
+            return any(has_nan(chunk.field(i)) for chunk in chunks for i in range(t.num_fields))
+        return False
+
+    return frozenset(
+        name.lower()
+        for name, column in zip(data.column_names, data.columns, strict=True)
+        if floats(column.type) and not has_nan(column)
+    )
+
+
+def _exact_stats(
+    writer_properties: Any,
+    schema: Mapping[str, Any] | None,
+    nan_free: frozenset[str] = frozenset(),
+) -> Any:
     """Writer properties under which delta-rs writes no inexact decimal stats.
 
     delta-rs 1.6.5 writes a decimal's min/max into the log as a JSON double.
@@ -3338,6 +3390,14 @@ def _exact_stats(writer_properties: Any, schema: Mapping[str, Any] | None) -> An
     A nested one cannot be named here (delta-rs keys column properties by
     top-level name only), so there every column's statistics are off except
     the top-level ones known to be safe.
+
+    FLOAT and DOUBLE columns likewise, unless `nan_free` (logical names,
+    lower-cased) says the data written holds no NaN: arrow-rs leaves NaN out
+    of the footer's min/max and delta-rs copies them into the log, where
+    Spark, for which NaN is the largest value, writes max "NaN". Databricks
+    then skipped the NaN rows for `f = 'NaN'`, `f > 100` or `NOT (f < 100)`,
+    by the log's stats and by the footer's alike. Only an append of data in
+    memory can be checked; a DML rewrite carries rows it never saw.
     """
     if not schema:
         return _writer_properties(writer_properties)
@@ -3346,8 +3406,19 @@ def _exact_stats(writer_properties: Any, schema: Mapping[str, Any] | None) -> An
     def physical(f: Mapping[str, Any]) -> str:
         return str((f.get("metadata") or {}).get("delta.columnMapping.physicalName") or f["name"])
 
-    top = [physical(f) for f in fields if _too_precise(f.get("type"))]
-    nested = any(_nested_too_precise(f.get("type")) for f in fields)
+    def nan_suspect(f: Mapping[str, Any]) -> bool:
+        return str(f.get("name", "")).lower() not in nan_free
+
+    top = [
+        physical(f)
+        for f in fields
+        if _too_precise(f.get("type")) or (f.get("type") in ("float", "double") and nan_suspect(f))
+    ]
+    nested = any(
+        _nested_too_precise(f.get("type"))
+        or (isinstance(f.get("type"), dict) and _holds_float(f.get("type")) and nan_suspect(f))
+        for f in fields
+    )
     if not top and not nested:
         return _writer_properties(writer_properties)
     import copy
