@@ -38,54 +38,114 @@ def _has_product(config: Any) -> bool:
     return bool(name) and name != "unknown"
 
 
-#: JSON keys whose values are secrets in the credential-vending responses
-#: (and in OAuth token responses) that databricks-sdk logs at DEBUG.
-_SECRET_KEYS = (
-    "secret_access_key",
-    "session_token",
-    "access_key_id",
-    "sas_token",
-    "oauth_token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "client_secret",
+#: Name parts that make a field's value a secret, whatever the separators:
+#: ``secret_access_key``, ``s3.secret-access-key``, ``adls.sas-token.<host>``,
+#: ``gcs.oauth2.token``, ``aad_token``, ``client_secret``, ``password``.
+_SECRET_PARTS = frozenset(
+    {"secret", "token", "password", "passwd", "pwd", "signature", "sig", "sas", "authorization"}
 )
+#: ``<qualifier>_key`` names that hold key material, not a key's name.
+_KEY_QUALIFIERS = frozenset({"access", "account", "private", "secret", "sas", "storage", "api"})
+#: Named explicitly: an identifier that, with the secret, is a credential.
+_SECRET_NAMES = frozenset({"access_key_id", "accesskeyid"})
+
+
+def _is_secret_key(name: str) -> bool:
+    import re
+
+    lowered = name.strip().lower()
+    parts = [p for p in re.split(r"[^a-z0-9]+", lowered) if p]
+    if lowered.replace("-", "_").replace(".", "_") in _SECRET_NAMES or "access_key_id" in lowered:
+        return True
+    if any(p in _SECRET_PARTS or p.endswith(("token", "secret", "password")) for p in parts):
+        return True
+    return any(
+        p == "key" and i > 0 and parts[i - 1] in _KEY_QUALIFIERS for i, p in enumerate(parts)
+    )
 
 
 class _RedactSecrets:
-    """A `logging.Filter` that blanks vended secrets in the SDK's debug log.
+    """A `logging.Filter` that blanks secrets in the SDK's debug log.
 
-    databricks-sdk logs every response body at DEBUG, masking only a few
-    field names of its own. The temporary-credentials responses carry the
-    storage secret key and session token in fields it does not mask, so
-    turning on DEBUG to chase a routing problem wrote them to the log.
+    databricks-sdk logs every request and response at DEBUG, masking only a
+    few field names of its own. The credential responses carry storage
+    secrets in fields it does not mask -- hyphenated in the UC Delta API
+    (``s3.secret-access-key``, ``adls.sas-token.<host>``), ``aad_token`` in
+    an Azure answer -- and ``debug_headers=True`` logs the Authorization
+    header. So any field whose name marks a secret (`_is_secret_key`), any
+    Authorization / Cookie header line, and presigned-URL signatures are
+    blanked.
     """
 
     def __init__(self) -> None:
         import re
 
-        keys = "|".join(_SECRET_KEYS)
-        self._pattern = re.compile(rf'("(?:{keys})"\s*:\s*)"[^"]*"')
+        self._fields = re.compile(
+            r"""(["'])([^"'\n]{1,200})\1(\s*:\s*)(["'])((?:\\.|(?!\4).)*)\4"""
+        )
+        self._headers = re.compile(
+            r"(?im)^((?:[^\S\n]|[<>*])*(?:proxy-)?(?:authorization|cookie|set-cookie|"
+            r"x-databricks-[a-z-]*token)[^\S\n]*:[^\S\n]*).+$"
+        )
+        self._query = re.compile(
+            r"(?i)([?&](?:sig|signature|x-amz-signature|x-amz-security-token|"
+            r"x-goog-signature|x-ms-signature)=)[^&\s\"']+"
+        )
+
+    def _field(self, match: Any) -> str:
+        quote, name, sep, vquote, _value = match.groups()
+        if not _is_secret_key(name):
+            return str(match.group(0))
+        return f"{quote}{name}{quote}{sep}{vquote}**REDACTED**{vquote}"
+
+    def redact(self, message: str) -> str:
+        message = self._fields.sub(self._field, message)
+        message = self._headers.sub(r"\1**REDACTED**", message)
+        return self._query.sub(r"\1**REDACTED**", message)
 
     def filter(self, record: Any) -> bool:
         try:
             message = record.getMessage()
         except Exception:
             return True
-        redacted = self._pattern.sub(r'\1"**REDACTED**"', message)
+        redacted = self.redact(message)
         if redacted != message:
             record.msg, record.args = redacted, None
         return True
 
 
+_NAMESPACE = "databricks.sdk"
+
+
 def _install_log_redaction() -> None:
-    """Attach `_RedactSecrets` to the SDK's logger, once per process."""
+    """Redact every record of the SDK's loggers, once per process.
+
+    A filter on the ``databricks.sdk`` logger does not see records of its
+    children (``databricks.sdk.oauth``, ...): logging runs only the emitting
+    logger's filters. So the filter also runs from the log-record factory,
+    for records of the SDK's namespace only, and wraps whatever factory is
+    installed.
+    """
     import logging
 
-    logger = logging.getLogger("databricks.sdk")
-    if not any(isinstance(f, _RedactSecrets) for f in logger.filters):
-        logger.addFilter(_RedactSecrets())
+    logger = logging.getLogger(_NAMESPACE)
+    redactor = next((f for f in logger.filters if isinstance(f, _RedactSecrets)), None)
+    if redactor is None:
+        redactor = _RedactSecrets()
+        logger.addFilter(redactor)
+    previous = logging.getLogRecordFactory()
+    if getattr(previous, "_deltaswamp_redacts", False):
+        return
+
+    def factory(*args: Any, **kwargs: Any) -> Any:
+        record = previous(*args, **kwargs)
+        name = getattr(record, "name", "")
+        if name == _NAMESPACE or str(name).startswith(_NAMESPACE + "."):
+            redactor.filter(record)
+        return record
+
+    factory._deltaswamp_redacts = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
 
 
 _PROXY_VARIABLES = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")

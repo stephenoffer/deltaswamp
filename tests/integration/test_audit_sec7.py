@@ -466,3 +466,62 @@ class TestSharingPresignedUrls:
             _CheckedRedirect().redirect_request(
                 request, None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data/"
             )
+
+
+class TestSdkDebugRedaction:
+    """SEC-C3: secrets the SDK logs at DEBUG that the redaction filter missed."""
+
+    @pytest.fixture
+    def captured(self) -> Any:
+        import io
+        import logging
+
+        from deltaswamp import _sdk
+
+        _sdk._install_log_redaction()
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        logger = logging.getLogger("databricks.sdk")
+        old = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        yield buf
+        logger.removeHandler(handler)
+        logger.setLevel(old)
+
+    def test_hyphenated_and_nested_secret_fields(self, captured: Any) -> None:
+        import json
+        import logging
+
+        body = {
+            "config": {
+                "s3.access-key-id": "ASIAKEYID",
+                "s3.secret-access-key": "SECRETKEY1",
+                "s3.session-token": "SESSIONTOK",
+                "adls.sas-token.acct.dfs.core.windows.net": "sig=ADLSSAS",
+                "gcs.oauth2.token": "GCSTOKEN",
+            },
+            "azure_aad": {"aad_token": "AADTOKEN"},
+            "location": "s3://b/t",
+        }
+        logging.getLogger("databricks.sdk").debug("< %s", json.dumps(body))
+        out = captured.getvalue()
+        for secret in ("ASIAKEYID", "SECRETKEY1", "SESSIONTOK", "ADLSSAS", "GCSTOKEN", "AADTOKEN"):
+            assert secret not in out, secret
+        assert "s3://b/t" in out
+
+    def test_headers_signatures_and_child_loggers(self, captured: Any) -> None:
+        import logging
+
+        logging.getLogger("databricks.sdk").debug(
+            "POST /api\n> * Authorization: Bearer dapiPAT123\n> * Content-Length: 2"
+        )
+        logging.getLogger("databricks.sdk.oauth").debug('{"access_token": "CHILDTOKEN"}')
+        logging.getLogger("databricks.sdk").debug(
+            "GET https://a.blob.core.windows.net/c/x?sv=1&sig=SASSIG%3D&se=2"
+            " https://b.s3.amazonaws.com/x?X-Amz-Signature=AMZSIG&X-Amz-Date=1"
+        )
+        out = captured.getvalue()
+        for secret in ("dapiPAT123", "CHILDTOKEN", "SASSIG", "AMZSIG"):
+            assert secret not in out, secret
+        assert "Content-Length: 2" in out and "se=2" in out
