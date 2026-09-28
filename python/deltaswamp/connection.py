@@ -790,6 +790,7 @@ class Connection:
         return _call(what, fn, *args)
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
+        """The tables in `catalog.schema`, as the catalog resolves them."""
         what = f"list tables in {catalog}.{schema}"
         return list(self._catalog_call("list_tables", what, catalog, schema))
 
@@ -1556,10 +1557,12 @@ class Connection:
     def create_catalog(
         self, name: str, *, comment: str | None = None, storage_root: str | None = None
     ) -> None:
+        """Create a catalog, optionally with a comment and a managed storage root."""
         cat = self._namespaces(f"create catalog {name}")
         _call(f"create catalog {name}", cat.create_catalog, name, comment, storage_root)
 
     def drop_catalog(self, name: str, *, force: bool = False) -> None:
+        """Drop a catalog; `force` drops it even when it still holds schemas."""
         cat = self._namespaces(f"drop catalog {name}")
         _call(f"drop catalog {name}", cat.drop_catalog, name, force)
 
@@ -1576,6 +1579,10 @@ class Connection:
         _call(f"create schema {name}", cat.create_schema, catalog, schema, comment, storage_root)
 
     def drop_schema(self, name: str, *, force: bool = False) -> None:
+        """Drop `catalog.schema` (or `schema` under the default catalog).
+
+        `force` drops it even when it still holds tables.
+        """
         catalog, schema = self._schema_parts(name)
         cat = self._namespaces(f"drop schema {name}")
         _call(f"drop schema {name}", cat.drop_schema, catalog, schema, force)
@@ -1607,11 +1614,13 @@ class Connection:
         )
 
     def list_functions(self, schema: str) -> list[Any]:
+        """The functions in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list functions")
         return list(_call("list functions", cat.list_functions, catalog, name))
 
     def list_volumes(self, schema: str) -> list[Any]:
+        """The volumes in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list volumes")
         return list(_call("list volumes", cat.list_volumes, catalog, name))
@@ -1624,6 +1633,7 @@ class Connection:
         storage_location: str | None = None,
         comment: str | None = None,
     ) -> Any:
+        """Create a Unity Catalog volume, ``MANAGED`` or ``EXTERNAL`` at `storage_location`."""
         ref = self._bound_ref(name, "create the volume")
         cat = self._namespaces(f"create volume {name}")
         return _call(
@@ -1638,6 +1648,7 @@ class Connection:
         )
 
     def drop_volume(self, name: str) -> None:
+        """Drop a Unity Catalog volume."""
         ref = self._bound_ref(name, "drop the volume")
         cat = self._namespaces(f"drop volume {name}")
         _call(f"drop volume {name}", cat.drop_volume, ref.catalog, ref.schema, ref.table)
@@ -1667,10 +1678,17 @@ class Connection:
         self,
         securable: str,
         principal: str,
-        privileges: list[str],
+        privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
     ) -> list[Any]:
+        """Grant privileges on a catalog, schema, volume or function to a principal.
+
+        `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);
+        tables: `Table.grant`. Returns the securable's grants afterwards.
+        """
+        # A bare string was iterated into one privilege per character.
+        names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = _governed(self.catalog, "GovernedCatalog", f"grant on {securable}")
         return list(
             _call(
@@ -1678,7 +1696,7 @@ class Connection:
                 cat.grant,
                 securable,
                 principal,
-                privileges,
+                names,
                 securable_type=securable_type,
             )
         )
@@ -1687,10 +1705,17 @@ class Connection:
         self,
         securable: str,
         principal: str,
-        privileges: list[str],
+        privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
     ) -> list[Any]:
+        """Revoke privileges on a catalog, schema, volume or function from a principal.
+
+        `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);
+        tables: `Table.revoke`. Returns the securable's grants afterwards.
+        """
+        # A bare string was iterated into one privilege per character.
+        names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = _governed(self.catalog, "GovernedCatalog", f"revoke on {securable}")
         return list(
             _call(
@@ -1698,7 +1723,7 @@ class Connection:
                 cat.revoke,
                 securable,
                 principal,
-                privileges,
+                names,
                 securable_type=securable_type,
             )
         )
