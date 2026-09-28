@@ -64,8 +64,11 @@ def connect(
     the SDK find one. A PAT cannot be refreshed, so prefer OAuth M2M for anything
     that runs longer than the token's lifetime.
 
-    `uri` may name an OSS Unity Catalog server (``uc://http://host:8080``) or a
-    Hive metastore (``hms://thrift://host:9083``). Omit it for Databricks.
+    `uri` may name an OSS Unity Catalog server (``uc://http://host:8080``), a
+    Hive metastore (``hms://thrift://host:9083``), AWS Glue (``glue://``), a
+    Delta Sharing profile (``sharing:///path/config.share``), or no catalog at
+    all (``file://``), for tables opened by path with `Connection.table` or
+    `Connection.open_table`. Omit it for Databricks.
 
     Set `allow_sql_fallback=True` to permit routing through a SQL warehouse for
     operations no open-source engine implements. Without `warehouse_id` one is
@@ -76,8 +79,8 @@ def connect(
     reroute is exactly the kind of surprise this library exists to avoid.
 
     `storage_options` reach every engine: the kernel and delta-rs take them as
-    object_store options (see docs/storage.md for how they merge with vended
-    credentials); Iceberg tables get their PyIceberg FileIO equivalents
+    object_store options (see "Storage options" in docs/usage.md for how they
+    merge with vended credentials); Iceberg tables get their PyIceberg FileIO equivalents
     (``s3.endpoint``, ``s3.region``, ``s3.proxy-uri``, ...), and Delta Sharing
     downloads their ``proxy_url`` and ``timeout``. `iceberg_properties` are
     PyIceberg catalog and FileIO properties passed verbatim, over those.

@@ -307,8 +307,6 @@ from the registry one. Mixing them yields two kernels and two incompatible
   would need them; DELETE through deletion vectors does not.
 - The change feed of a catalog-managed table. The kernel's `TableChanges`
   lists the log itself and would miss unpublished commits.
-- Incremental reads through the kernel's `incremental_scan`. `Table.changes()`
-  follows the change data feed instead.
 - Credential refresh inside a single long read.
 - Databricks server-side behavior: predictive optimization, auto compaction,
   row-level concurrency, UniForm metadata generation. The

@@ -80,6 +80,7 @@ conn = ds.connect("hms://thrift://metastore:9083")  # Hive Metastore
 conn = ds.connect("glue://")  # AWS Glue, ambient region
 conn = ds.connect("glue://123456789012")  # a specific Glue catalog id
 conn = ds.connect("sharing:///path/to/config.share")  # a Delta Sharing profile
+conn = ds.connect("file://")  # no catalog: tables by path only
 ```
 
 Useful keyword arguments:
@@ -360,8 +361,9 @@ does: a range ending before an ADD COLUMN reads that column as null. On a
 column-mapping table, Delta reads a batch feed under its end version's
 schema instead, and so does `cdf()`. A `columns=` projection is left as asked.
 
-delta-rs serves CDF on tables it can open and the kernel serves the others.
-A catalog-managed table's feed needs the warehouse, since the kernel's change
+The kernel serves CDF first, and delta-rs what the kernel cannot (a read past
+the table's last version, a predicate outside the kernel's grammar). A
+catalog-managed table's feed needs the warehouse, since the kernel's change
 feed cannot take the catalog's commit tail. Guards fire before any read.
 A table without `delta.enableChangeDataFeed` is refused, because enabling it is
 not retroactive. A table whose `delta.deletedFileRetentionDuration` is shorter
@@ -1079,12 +1081,15 @@ engine, and why not when it cannot.
 
 ```python
 >>> t.capabilities()[ds.Operation.DELETE]
-Capability(ok=False, engine=None,
-  reason="table has row filters; UC credential vending refuses it",
-  remedy="ds.connect(..., allow_sql_fallback=True)")
+Capability(operation=<Operation.DELETE: 'delete'>, ok=False, engine=None,
+  reason='table has row filters; UC credential vending refuses it',
+  remedy='ds.connect(..., allow_sql_fallback=True)', blockers=())
 
 >>> t.can("scan")
-Capability(ok=True, engine=Engine.KERNEL, ...)
+Capability(operation=<Operation.SCAN: 'scan'>, ok=True, engine=<Engine.KERNEL: 'kernel'>, ...)
+
+>>> print(t.can("scan"))
+scan: via kernel
 
 >>> t.can("create", properties={"delta.enableRowTracking": "true"})
 >>> t.can("append", data=batch, schema_mode="merge")
