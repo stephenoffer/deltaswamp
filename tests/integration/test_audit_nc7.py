@@ -538,3 +538,108 @@ class TestRetryOptions:
         assert t.can("delete", predicate="abs(id) = 1").engine is ds.Engine.DELTARS
         t.delete("abs(id) = 1")
         assert t.count() == 1
+
+
+class TestKernelStreamFailures:
+    """B1, B2, B4: what a kernel write fed by a Python stream, or losing a race, raises."""
+
+    @staticmethod
+    def _table(tmp_path: pathlib.Path, props: dict[str, str] | None = None) -> Any:
+        path = str(tmp_path / "t")
+        ds.connect().create_table(
+            path, schema=pa.schema([("id", pa.int64())]), properties=props or {}
+        )
+        t = ds.connect().open_table(path)
+        for i in range(3):
+            t.append(pa.table({"id": pa.array([i], pa.int64())}))
+        return t
+
+    def test_interrupt_in_an_appended_stream_is_not_an_argument_error(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        from deltaswamp.engine.kernel import KernelEngine
+
+        t = self._table(tmp_path)
+
+        def gen() -> Any:
+            yield pa.record_batch({"id": pa.array([1], pa.int64())})
+            raise KeyboardInterrupt
+
+        reader = pa.RecordBatchReader.from_batches(pa.schema([("id", pa.int64())]), gen())
+        with pytest.raises(KeyboardInterrupt):
+            KernelEngine().append(t.resolved, reader)
+        assert t.count() == 3
+
+    def test_interrupt_during_optimize_propagates(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deltaswamp.engine.kernel import KernelEngine
+
+        t = self._table(tmp_path)
+        real = KernelEngine._compacted_batches
+
+        def interrupted(self: Any, *args: Any, **kwargs: Any) -> Any:
+            stream = real(self, *args, **kwargs)
+
+            def batches() -> Any:
+                yield from stream
+                raise KeyboardInterrupt
+
+            return pa.RecordBatchReader.from_batches(stream.schema, batches())
+
+        monkeypatch.setattr(KernelEngine, "_compacted_batches", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            t.optimize()
+        assert sorted(ds.connect().open_table(t.location).to_arrow().column("id").to_pylist()) == [
+            0,
+            1,
+            2,
+        ]
+
+    def test_a_vacuumed_input_file_replans_the_compaction(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deltaswamp.engine.kernel import KernelEngine
+
+        t = self._table(tmp_path)
+        t.append(pa.table({"id": pa.array([3], pa.int64())}))
+        path = t.location
+        real = KernelEngine._compacted_batches
+        fired: list[int] = []
+
+        def raced(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if not fired:
+                fired.append(1)
+                # Another writer rewrites a file this step reads, and VACUUMs it.
+                deltalake.DeltaTable(path).delete("id = 0")
+                deltalake.DeltaTable(path).vacuum(
+                    retention_hours=0, enforce_retention_duration=False, dry_run=False
+                )
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(KernelEngine, "_compacted_batches", raced)
+        t.optimize()
+        got = sorted(ds.connect().open_table(path).to_arrow().column("id").to_pylist())
+        assert got == [1, 2, 3]
+
+    def test_dv_delete_losing_to_a_metadata_change(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deltaswamp.engine.kernel import KernelEngine
+        from deltaswamp.errors import MetadataChangedError
+
+        t = self._table(tmp_path, DV)
+        path = t.location
+        real = KernelEngine.snapshot
+        fired: list[int] = []
+
+        def racing(self: Any, table: Any, **kw: Any) -> Any:
+            snapshot = real(self, table, **kw)
+            if kw.get("write") and not fired:
+                fired.append(1)
+                deltalake.DeltaTable(path).alter.set_table_properties({"delta.appendOnly": "false"})
+            return snapshot
+
+        monkeypatch.setattr(KernelEngine, "snapshot", racing)
+        with pytest.raises(MetadataChangedError):
+            t.delete("id = 1")

@@ -624,17 +624,61 @@ _CALL_SOURCES: contextvars.ContextVar[_Sources | None] = contextvars.ContextVar(
 )
 
 
+#: What the streams handed to native code inside the `translating()` block in
+#: progress raised (see `recorded`).
+_STREAM_ERRORS: contextvars.ContextVar[list[BaseException] | None] = contextvars.ContextVar(
+    "deltaswamp_stream_errors", default=None
+)
+
+
+def recorded(reader: Any) -> Any:
+    """`reader`, read through a wrapper that keeps what it raises for `translating()`.
+
+    Native code pulls a Python stream through Arrow's C interface, which
+    carries only an error's text: Ctrl-C inside an OPTIMIZE's batches, or a
+    caller's generator raising, came back as "C Data interface error ...
+    KeyboardInterrupt", translated to InvalidArgumentError, so an
+    `except Exception` retry loop swallowed the interrupt. Recorded here, the
+    exception itself is raised again. Outside a `translating()` block the
+    reader is returned as it is.
+    """
+    errors = _STREAM_ERRORS.get()
+    if errors is None:
+        return reader
+    import pyarrow as pa
+
+    if not isinstance(reader, pa.RecordBatchReader):
+        return reader  # another Arrow stream is handed on untouched
+
+    def batches() -> Iterator[Any]:
+        try:
+            yield from reader
+        except BaseException as exc:
+            errors.append(exc)
+            raise
+
+    return pa.RecordBatchReader.from_batches(reader.schema, batches())
+
+
 @contextlib.contextmanager
 def translating(kind: EngineKind, what: str) -> Iterator[None]:
     """Translate what the block raises, as the boundary would.
 
     For the few places inside an engine that must act on a typed error before
     the call returns -- a retry loop that re-reads the table on a lost commit
-    race -- so they use the boundary's rules rather than a second set.
+    race -- so they use the boundary's rules rather than a second set. What a
+    `recorded` stream raised inside the block is raised as itself when it
+    would pass the boundary (an interrupt, the library's own error) or is the
+    caller's own.
     """
+    errors: list[BaseException] = []
+    token = _STREAM_ERRORS.set(errors)
     try:
         yield
     except BaseException as exc:
+        for error in errors:
+            if error is not exc and (_passes(error) or _callers_own(type(error))):
+                raise error  # noqa: B904 - the engine's error stays as its context
         if _passes(exc):
             raise
         sources = _CALL_SOURCES.get()
@@ -644,6 +688,8 @@ def translating(kind: EngineKind, what: str) -> Iterator[None]:
         if mine is not None:
             raise mine  # noqa: B904 - the engine's error stays as its context
         raise translate(kind, what, exc) from exc
+    finally:
+        _STREAM_ERRORS.reset(token)
 
 
 # ---------------------------------------------------------------------------
