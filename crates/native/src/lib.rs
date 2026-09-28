@@ -6,6 +6,7 @@
 //! its own (forked) build of the kernel.
 
 mod changes;
+mod checksum;
 mod commit;
 mod confine;
 mod dml;
@@ -78,6 +79,11 @@ pub const FEATURES: &[&str] = &[
     "streaming_compaction",
     // `validate_retry_options`: retry storage options read as delta-rs reads them.
     "retry_options",
+    // `<version>.crc` after every kernel commit, and `write_checksum()` for
+    // one another writer committed.
+    "write_checksum",
+    // `incremental_files(base_version)`: the file diff between two versions.
+    "incremental_files",
 ];
 
 #[pyfunction]

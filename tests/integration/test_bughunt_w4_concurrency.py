@@ -243,7 +243,9 @@ def test_overwrite_after_a_concurrent_optimize_conflicts(tmp_path: Any, monkeypa
     monkeypatch.setattr(
         deltalake,
         "write_deltalake",
-        lambda target, data, **kw: real(stale if isinstance(target, str) else target, data, **kw),
+        # The write opens the table and writes through it; the stale handle
+        # stands in for one opened before the compaction committed.
+        lambda target, data, **kw: real(stale, data, **kw),
     )
     with pytest.raises(CommitConflictError):
         t.overwrite(_rows(1, 9))

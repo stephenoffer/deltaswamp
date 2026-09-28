@@ -137,6 +137,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | RESTORE | DBR, Spark, delta-rs | delta-rs, warehouse | refused on DV tables through delta-rs (delta-rs#4613) |
 | FSCK REPAIR | DBR, delta-rs | delta-rs, warehouse | |
 | Checkpoint | all | delta-rs, kernel | the kernel checkpoints catalog-managed tables, publishing first |
+| Version checksums (`.crc`) | DBR, Spark, kernel | kernel, delta-rs | written after every commit where the previous one is at most 100 versions back (or the log is short); delta-rs writes none itself (delta-rs#4190) |
 | Log compaction | Spark, delta-rs | delta-rs | kernel's writer is a stub |
 | Expired log cleanup | all | delta-rs | `Table.cleanup_metadata()` |
 | Publish staged commits | kernel | kernel | required on catalog-managed tables |

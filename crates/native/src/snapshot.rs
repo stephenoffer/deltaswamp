@@ -731,6 +731,59 @@ impl PySnapshot {
         Ok(texts)
     }
 
+    /// Write `_delta_log/<version>.crc` for this snapshot, best effort.
+    ///
+    /// For a commit another writer made (delta-rs writes none). Only when it
+    /// is cheap -- a checksum at most `checksum::MAX_TAIL` commits back, or a
+    /// short log with no checkpoint -- unless `always`. True if one was
+    /// written; False if it was not worth it, already existed, or failed.
+    #[pyo3(signature = (always = false))]
+    fn write_checksum(&self, py: Python<'_>, always: bool) -> bool {
+        py.detach(|| crate::checksum::write(&self.inner, self.engine.as_ref(), always))
+    }
+
+    /// The data files added and removed in `(base_version, self.version]`.
+    ///
+    /// `(live_adds, removes)`, each a sorted list of `(path, dv_unique_id)`
+    /// with paths as stored in the log: the adds still live at this version,
+    /// and every remove in the range. From the kernel's incremental scan,
+    /// which walks this snapshot's commit list (a catalog-managed table's
+    /// ratified tail included) rather than listing storage. None when those
+    /// commits are no longer all in the log (cleaned up past a checkpoint).
+    #[allow(clippy::type_complexity)]
+    fn incremental_files(
+        &self,
+        py: Python<'_>,
+        base_version: u64,
+    ) -> PyResult<Option<(Vec<(String, Option<String>)>, Vec<(String, Option<String>)>)>> {
+        type Keys = Vec<(String, Option<String>)>;
+        let diff = py.detach(|| -> Result<Option<(Keys, Keys)>> {
+            if base_version >= self.inner.version() {
+                return Ok(Some((Vec::new(), Vec::new())));
+            }
+            let Some(stream) = self
+                .inner
+                .clone()
+                .incremental_scan_builder(base_version)
+                .build(self.engine.as_ref())?
+            else {
+                return Ok(None);
+            };
+            let summary = stream.into_summary()?;
+            let keys =
+                |set: std::collections::HashSet<delta_kernel::log_replay::FileActionKey>| -> Keys {
+                    let mut out: Keys = set
+                        .iter()
+                        .map(|k| (k.path().to_string(), k.dv_unique_id().map(str::to_string)))
+                        .collect();
+                    out.sort();
+                    out
+                };
+            Ok(Some((keys(summary.live_adds), keys(summary.removes))))
+        })?;
+        Ok(diff)
+    }
+
     /// This snapshot's commit timestamp in milliseconds: the in-commit
     /// timestamp when ICT is enabled, else the commit file's modification time.
     fn timestamp(&self, py: Python<'_>) -> PyResult<i64> {

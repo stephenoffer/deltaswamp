@@ -88,6 +88,17 @@ First release.
   arrow-rs cannot write, as snappy). They were uncompressed, and an OPTIMIZE
   grew a table 2-4x.
 
+- Every commit writes its version checksum (`_delta_log/<version>.crc`), as
+  Spark and Databricks do (delta-rs#4190, delta-kernel-rs#1781): kernel
+  commits from the post-commit snapshot, delta-rs commits and raw metadata
+  commits afterwards, through the kernel's `Snapshot::write_checksum`. A
+  commit that changes no file (SET TBLPROPERTIES, ADD COLUMNS, VACUUM
+  START/END), which the kernel gives up on, carries the previous checksum
+  forward. Only when cheap -- the previous checksum at most 100 commits back,
+  or a log under 100 commits with no checkpoint -- so a long history that
+  never had one does not start a chain; never on a catalog-managed table (the
+  catalog's writer keeps those); and never at the cost of the write.
+
 ### Security
 
 See docs/usage.md, "Security notes".

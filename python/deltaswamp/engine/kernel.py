@@ -396,6 +396,32 @@ def _native_has(*features: str) -> bool:
     return set(features) <= set(getattr(_native, "FEATURES", ()))
 
 
+def write_checksum(
+    location: str | None, options: dict[str, str] | None, version: int | None = None
+) -> bool:
+    """Write `_delta_log/<version>.crc` for a commit the kernel did not make; best effort.
+
+    Kernel commits write their own (`crate::checksum`); delta-rs and a raw
+    commit write none, and Databricks, which keeps one per version, read a
+    table this library wrote as one whose chain broke at every append
+    (delta-rs#4190). Written only where the native side finds it cheap (a
+    checksum a few commits back, or a short log), and never raising: the
+    commit it follows has already succeeded.
+    """
+    if location is None or not _native_has("write_checksum"):
+        return False
+    try:
+        _enter_native("write a version checksum")
+        from deltaswamp._native import Snapshot
+
+        snapshot = Snapshot.resolve(
+            location, options=options or None, version=None if version is None else int(version)
+        )
+        return bool(snapshot.write_checksum())
+    except Exception:
+        return False
+
+
 def _implemented() -> frozenset[Operation]:
     ops = set(_IMPLEMENTED)
     if _native_has("commit_raw", "metadata_json"):
@@ -3026,6 +3052,8 @@ class KernelEngine:
             except _native.CommitConflictError as exc:
                 last_error = exc
                 continue
+            if not table.is_catalog_managed:
+                write_checksum(table.location, self._options(table, write=True), version)
             return version
         # A lost race is a conflict, not an unreachable table: callers that
         # catch CommitConflictError to retry never saw this one.

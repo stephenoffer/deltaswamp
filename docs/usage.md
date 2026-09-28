@@ -731,6 +731,17 @@ Checkpoints work on catalog-managed tables. The kernel publishes staged commits
 first, since it checkpoints only published versions. Commits made here also
 checkpoint on their own at the table's `delta.checkpointInterval`.
 
+Every commit made here also writes its version checksum,
+`_delta_log/<version>.crc` (the table's size, file count, protocol and
+metadata), which Databricks and Spark read to load a snapshot quickly and to
+check the state they rebuilt. delta-rs writes none, so one is written after
+each of its commits too. It is computed from the previous checksum, so it is
+written only while the chain is intact: the previous checksum at most 100
+versions back, or a log of fewer than 100 commits with no checkpoint. A table
+whose history never had them is left without, and a catalog-managed table's
+are left to the catalog's writer. A checksum that cannot be written never
+fails the commit.
+
 ## Metadata
 
 ```python

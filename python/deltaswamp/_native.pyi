@@ -15,7 +15,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
-"compaction", "commit_info_patch", "streaming_compaction", "retry_options". Gate on this
+"compaction", "commit_info_patch", "streaming_compaction", "retry_options",
+"write_checksum", "incremental_files". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
 
@@ -380,6 +381,25 @@ class Snapshot:
 
         `(version, text)`, each text the newline-delimited actions of that
         commit. Published commits only.
+        """
+
+    def write_checksum(self, always: bool = False) -> bool:
+        """Write `_delta_log/<version>.crc` for this snapshot, best effort.
+
+        Only when cheap (a checksum at most 100 commits back, or a short log
+        with no checkpoint) unless `always`; a commit that changed no file
+        carries the previous checksum forward. True if one was written; never
+        raises.
+        """
+
+    def incremental_files(
+        self, base_version: int
+    ) -> tuple[list[tuple[str, str | None]], list[tuple[str, str | None]]] | None:
+        """The data files added and removed in `(base_version, self.version]`.
+
+        `(live_adds, removes)`, each sorted `(path, dv_unique_id)` pairs with
+        paths as stored in the log; the adds are those still live here. None
+        when the range's commits are no longer all in the log.
         """
 
     def timestamp(self) -> int:
