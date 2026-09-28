@@ -139,7 +139,7 @@ def connect(
         engines[EngineKind.ICEBERG] = IcebergEngine(token=token, properties=properties or None)
         engines[EngineKind.ICEBERG]._ship_secrets = bool(ship_credentials)  # type: ignore[attr-defined]
     if ship_credentials and hasattr(resolved_catalog, "_ship_secrets"):
-        resolved_catalog._ship_secrets = True  # type: ignore[attr-defined]
+        resolved_catalog._ship_secrets = True
 
     # The warehouse addresses tables by Unity Catalog name in its own
     # workspace. Any other catalog -- an OSS Unity Catalog server above all,
@@ -841,8 +841,8 @@ class Connection:
                     f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
                 )
             _check_local_create_path(name)
-            exists = self.table_exists(name)
-            if mode in ("error", "create", "ignore") and exists:
+            present = self.table_exists(name)
+            if mode in ("error", "create", "ignore") and present:
                 if mode == "ignore":
                     # Nothing is created, so nothing (the comment included)
                     # may be changed on the table that is already there.
@@ -852,7 +852,7 @@ class Connection:
                     "a Delta table already exists there",
                     "pass mode='ignore' to keep it or mode='overwrite' to replace it",
                 )
-            if not exists:
+            if not present:
                 _refuse_foreign_files(name, self.storage_options)
             try:
                 return self._create_at(

@@ -766,7 +766,7 @@ class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req: Any) -> Any:
         if getattr(req, "_tunnel_host", None):
             return super().https_open(req)
-        return self.do_open(_GuardedHTTPSConnection, req, context=self._context)
+        return self.do_open(_GuardedHTTPSConnection, req, context=getattr(self, "_context", None))
 
 
 class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
