@@ -329,6 +329,51 @@ def _config_attributes(config: Any) -> dict[str, Any]:
     return out
 
 
+#: `Config` attributes that are literal secrets.
+_CONFIG_SECRETS = frozenset(
+    {
+        "token",
+        "client_secret",
+        "azure_client_secret",
+        "password",
+        "google_credentials",
+        "actions_id_token_request_token",
+        "oidc_token",
+    }
+)
+
+
+def without_secrets(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """`kwargs` without the attributes that are literal secrets.
+
+    What a pickled provider or catalog carries by default: the host, auth
+    type, client id and the like, from which a worker's SDK re-derives auth
+    from its own environment. A PAT or client secret the driver found in its
+    environment otherwise travelled in every pickle of a Table -- Ray task
+    arguments, joblib and dask caches, multiprocessing.
+    """
+    return {
+        k: v
+        for k, v in kwargs.items()
+        if k.lower() not in _CONFIG_SECRETS
+        and not k.lower().endswith(("_secret", "_token", "password"))
+    }
+
+
+def shipping(obj: Any) -> Any:
+    """A shallow copy of a provider or catalog that pickles its secrets.
+
+    For `plan_scan(ship_catalog_auth=True)` / `plan_write(...)` and
+    ``connect(ship_credentials=True)``, where workers are meant to re-vend.
+    """
+    if not hasattr(obj, "_ship_secrets"):
+        return obj
+    copy = obj.__class__.__new__(obj.__class__)
+    copy.__dict__.update(obj.__dict__)
+    copy._ship_secrets = True
+    return copy
+
+
 class DatabricksCredentialProvider:
     """Vends per-table credentials from the UC temporary-credentials API.
 
@@ -361,6 +406,8 @@ class DatabricksCredentialProvider:
         self._token = token
         self._config_kwargs = config_kwargs
         self._explicit_config = config
+        #: Pickle the literal secrets (token, client secret) too; see `shipping`.
+        self._ship_secrets = False
 
         self._client: Any = None
         self._cache: dict[Operation, Credentials] = {}
@@ -408,9 +455,13 @@ class DatabricksCredentialProvider:
         state["_explicit_config"] = None
         if config is not None:
             state["_config_kwargs"] = {**_config_attributes(config), **self._config_kwargs}
+        if not state.get("_ship_secrets"):
+            state["_token"] = None
+            state["_config_kwargs"] = without_secrets(state["_config_kwargs"])
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        state.setdefault("_ship_secrets", False)
         state.setdefault("_vended_at", {})
         state.setdefault("_retry_after", {})
         state.setdefault("_skewed", set())

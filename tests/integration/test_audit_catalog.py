@@ -258,19 +258,34 @@ def offline_sdk(monkeypatch: Any) -> None:
 
 class TestPickledProviderBuildsAClient:
     def test_unpickled_provider_builds_the_client(self, offline_sdk: None) -> None:
-        from deltaswamp.credentials.databricks import DatabricksCredentialProvider
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider, shipping
 
         provider = DatabricksCredentialProvider("tid-1", config=_FakeConfig())  # type: ignore[arg-type, unused-ignore]
-        clone = pickle.loads(pickle.dumps(provider))
+        # The token travels only on opt-in (round-7 SEC-C4); see the next test.
+        clone = pickle.loads(pickle.dumps(shipping(provider)))
         client = clone._workspace()  # TypeError: multiple values for 'host'
         assert client.config.host == _FakeConfig.host
         assert client.config.token == "dapi-x"
 
+    def test_by_default_a_worker_takes_the_token_from_its_environment(
+        self, offline_sdk: None, monkeypatch: Any
+    ) -> None:
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider
+
+        provider = DatabricksCredentialProvider("tid-1", config=_FakeConfig())  # type: ignore[arg-type, unused-ignore]
+        payload = pickle.dumps(provider)
+        assert b"dapi-x" not in payload
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-worker")
+        client = pickle.loads(payload)._workspace()
+        assert client.config.host == _FakeConfig.host
+        assert client.config.token == "dapi-worker"
+
     def test_unpickled_catalog_builds_the_client(self, offline_sdk: None) -> None:
         from deltaswamp.catalog.databricks import DatabricksUnityCatalog
+        from deltaswamp.credentials.databricks import shipping
 
         catalog = DatabricksUnityCatalog(config=_FakeConfig())  # type: ignore[arg-type, unused-ignore]
-        clone = pickle.loads(pickle.dumps(catalog))
+        clone = pickle.loads(pickle.dumps(shipping(catalog)))
         assert clone.workspace.config.host == _FakeConfig.host
 
     def test_auth_failure_is_not_sent_to_the_fallback(self) -> None:

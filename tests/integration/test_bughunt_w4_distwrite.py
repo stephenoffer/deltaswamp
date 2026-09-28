@@ -612,7 +612,12 @@ def test_a_databricks_provider_pat_does_not_travel_with_a_plan(conn: Any, monkey
     provider = DatabricksCredentialProvider(
         "tid", host="https://example.cloud.databricks.com", token=pat
     )
-    assert pat.encode() in pickle.dumps(provider), "premise: the provider itself carries it"
+    from deltaswamp.credentials.databricks import shipping
+
+    # A provider pickles its token only when asked to (round-7 SEC-C4).
+    assert pat.encode() not in pickle.dumps(provider)
+    assert pat.encode() in pickle.dumps(shipping(provider)), "premise: an opted-in copy does"
+    provider = shipping(provider)
     vended = Credentials(cloud=Cloud.LOCAL, url="file:///x", expires_at=None)
     monkeypatch.setattr(provider, "credentials", lambda *_a, **_k: vended)
 

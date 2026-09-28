@@ -51,6 +51,7 @@ def connect(
     default_catalog: str | None = None,
     default_schema: str | None = None,
     iceberg_properties: dict[str, str] | None = None,
+    ship_credentials: bool = False,
 ) -> Connection:
     """Open a connection.
 
@@ -80,6 +81,11 @@ def connect(
     (``s3.endpoint``, ``s3.region``, ``s3.proxy-uri``, ...), and Delta Sharing
     downloads their ``proxy_url`` and ``timeout``. `iceberg_properties` are
     PyIceberg catalog and FileIO properties passed verbatim, over those.
+
+    A pickled connection, table or credential provider carries no literal
+    secret (a token, a client secret): a worker re-derives Databricks auth
+    from its own environment. `ship_credentials=True` pickles them too, for
+    workers that have no auth of their own.
     """
     if not isinstance(allow_sql_fallback, bool):
         # The fallback costs money, so it is on only when asked for exactly.
@@ -131,6 +137,9 @@ def connect(
         # endpoint and region the other engines honour were silently ignored.
         properties = {**iceberg_fileio_properties(storage_options), **(iceberg_properties or {})}
         engines[EngineKind.ICEBERG] = IcebergEngine(token=token, properties=properties or None)
+        engines[EngineKind.ICEBERG]._ship_secrets = bool(ship_credentials)  # type: ignore[attr-defined]
+    if ship_credentials and hasattr(resolved_catalog, "_ship_secrets"):
+        resolved_catalog._ship_secrets = True  # type: ignore[attr-defined]
 
     # The warehouse addresses tables by Unity Catalog name in its own
     # workspace. Any other catalog -- an OSS Unity Catalog server above all,

@@ -603,3 +603,37 @@ class TestDotSegmentNames:
             server.shutdown()
         assert seen and all("/../" not in p and not p.endswith("/..") for p in seen), seen
         assert all("%2E%2E" in p for p in seen), seen
+
+
+class TestPickledSecrets:
+    """SEC-C4: a pickled Databricks Table carried the PAT, even one from the environment."""
+
+    def test_provider_and_catalog_pickle_no_literal_secret(self) -> None:
+        import pickle
+
+        from deltaswamp.catalog.databricks import DatabricksUnityCatalog
+        from deltaswamp.credentials.databricks import DatabricksCredentialProvider, shipping
+
+        pat = "dapiSECRET0123456789"
+        provider = DatabricksCredentialProvider(
+            "tid", host="https://h.cloud.databricks.com", token=pat, client_secret="CSECRET"
+        )
+        catalog = DatabricksUnityCatalog(host="https://h.cloud.databricks.com", token=pat)
+        for obj in (provider, catalog):
+            payload = pickle.dumps(obj)
+            assert pat.encode() not in payload
+            assert b"CSECRET" not in payload
+            assert b"h.cloud.databricks.com" in payload
+            assert pat.encode() in pickle.dumps(shipping(obj))
+
+    def test_connect_ship_credentials_opts_in(self) -> None:
+        import pickle
+
+        pytest.importorskip("databricks.sdk")
+        pat = "dapiSHIPPED0123456789"
+        plain = ds.connect(host="https://h.cloud.databricks.com", token=pat)
+        assert pat.encode() not in pickle.dumps(plain)
+        shipped = ds.connect(
+            host="https://h.cloud.databricks.com", token=pat, ship_credentials=True
+        )
+        assert pat.encode() in pickle.dumps(shipped)

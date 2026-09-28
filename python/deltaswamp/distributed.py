@@ -57,6 +57,8 @@ class ScanPlan:
         fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
         if not self.ship_catalog_auth:
             fields["table"] = _for_workers(self.table, write=False)
+        else:
+            fields["table"] = _shipping_table(self.table)
         return (_rebuild, (type(self), fields))
 
     @property
@@ -194,6 +196,11 @@ class WritePlan:
         if not self.ship_catalog_auth:
             fields["table"] = _for_workers(self.table, write=True)
             fields["catalog"] = None
+        else:
+            from .credentials.databricks import shipping
+
+            fields["table"] = _shipping_table(self.table)
+            fields["catalog"] = shipping(fields["catalog"])
         return (_rebuild, (type(self), fields))
 
     def write(self, data: Any) -> bytes:
@@ -701,6 +708,20 @@ class ShippedCredentials:
         self.__dict__.update(state)
         if carried is not None:
             self._credentials = Credentials._from_state(carried)
+
+
+def _shipping_table(table: Any) -> Any:
+    """`table` with a provider that pickles its catalog secrets: ship_catalog_auth=True.
+
+    A provider pickles no literal secret by default (`credentials.databricks.shipping`);
+    a plan that ships catalog auth is the caller asking for exactly that.
+    """
+    from .credentials.databricks import shipping
+
+    provider = getattr(table, "credential_provider", None)
+    if provider is None or not hasattr(provider, "_ship_secrets"):
+        return table
+    return replace(table, credential_provider=shipping(provider))
 
 
 def _for_workers(table: Any, *, write: bool) -> Any:

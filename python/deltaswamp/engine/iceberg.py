@@ -418,6 +418,8 @@ class IcebergEngine:
         """
         self._properties = dict(properties or {})
         self._token = token
+        #: Pickle `_token` too (``connect(ship_credentials=True)``).
+        self._ship_secrets = False
         self._factory: CatalogFactory = catalog_factory or _default_factory
         # (uri, warehouse) -> (token it was built with, catalog)
         self._catalogs: dict[tuple[str, str], tuple[str | None, Any]] = {}
@@ -431,9 +433,13 @@ class IcebergEngine:
         state["_catalogs"] = {}
         state["_built_seq"] = {}
         del state["_lock"]
+        if not state.get("_ship_secrets"):
+            # A worker's copy re-derives auth from its own environment.
+            state["_token"] = None
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        state.setdefault("_ship_secrets", False)
         self.__dict__.update(state)
         self._lock = threading.Lock()
 

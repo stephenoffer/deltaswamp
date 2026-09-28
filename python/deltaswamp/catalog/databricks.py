@@ -331,6 +331,9 @@ class DatabricksUnityCatalog:
         self._host = host
         self._token = token
         self._config_kwargs = config_kwargs
+        #: Pickle the literal secrets too (``connect(ship_credentials=True)``);
+        #: by default a copy re-derives auth from its own environment.
+        self._ship_secrets = False
         self._client: Any = None
         # Manifest capabilities are cached per schema: one list call is both
         # cheaper and more reliable than N per-table lookups.
@@ -365,9 +368,15 @@ class DatabricksUnityCatalog:
         if config is not None:
             state["_explicit_config"] = None
             state["_config_kwargs"] = {**_config_attributes(config), **self._config_kwargs}
+        if not state.get("_ship_secrets"):
+            from ..credentials.databricks import without_secrets
+
+            state["_token"] = None
+            state["_config_kwargs"] = without_secrets(state["_config_kwargs"])
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        state.setdefault("_ship_secrets", False)
         self.__dict__.update(state)
         self._lock = threading.RLock()
 
@@ -534,12 +543,14 @@ class DatabricksUnityCatalog:
         table_id = getattr(info, "table_id", None)
         if not table_id:
             return None
-        return DatabricksCredentialProvider(
+        provider = DatabricksCredentialProvider(
             table_id=table_id,
             table_url=getattr(info, "storage_location", None),
             region=self._metastore_region(),
             **self._provider_kwargs(),
         )
+        provider._ship_secrets = self._ship_secrets
+        return provider
 
     @staticmethod
     def _properties(info: Any) -> dict[str, str]:
