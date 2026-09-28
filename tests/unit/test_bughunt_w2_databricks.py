@@ -163,9 +163,9 @@ class TestAzureEndpoint:
             azure_endpoint_for("az://c@acct.blob.core.windows.net/t")
             == "https://acct.blob.core.windows.net"
         )
-        assert azure_endpoint_for("abfss://c@storage.corp.example/t") == (
-            "https://storage.corp.example"
-        )
+        # A host outside Azure Storage's domains gets no derived endpoint: the
+        # credentials go there only when the caller names it (round-7 SEC-C1).
+        assert azure_endpoint_for("abfss://c@storage.corp.example/t") is None
 
     def test_azurite_endpoint_keeps_the_account_segment(self) -> None:
         assert azure_endpoint_for("http://127.0.0.1:10000/devstoreaccount1/c/t") == (

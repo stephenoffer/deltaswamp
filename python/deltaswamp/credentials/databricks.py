@@ -30,7 +30,13 @@ from .base import DEFAULT_REFRESH_MARGIN_SECONDS, Cloud, Credentials, Operation
 if TYPE_CHECKING:  # pragma: no cover
     from databricks.sdk.core import Config
 
-__all__ = ["DatabricksCredentialProvider", "azure_endpoint_for", "r2_endpoint_for"]
+__all__ = [
+    "AZURE_STORAGE_SUFFIXES",
+    "DatabricksCredentialProvider",
+    "azure_endpoint_for",
+    "is_azure_storage_host",
+    "r2_endpoint_for",
+]
 
 #: How long a credential whose response carried no usable expiration is served
 #: before it is re-vended. Vended credentials live about an hour.
@@ -56,6 +62,29 @@ def _is_local_host(host: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+#: DNS suffixes Azure Storage serves accounts under: the public cloud (its
+#: private-link aliases included), the sovereign clouds, and Fabric OneLake.
+AZURE_STORAGE_SUFFIXES = (
+    "core.windows.net",
+    "core.chinacloudapi.cn",
+    "core.usgovcloudapi.net",
+    "core.cloudapi.de",
+    "fabric.microsoft.com",
+)
+
+
+def is_azure_storage_host(host: str) -> bool:
+    """Whether `host` (a port allowed) is under one of `AZURE_STORAGE_SUFFIXES`.
+
+    An endpoint is derived only for these. The connection's Azure secret (a
+    SAS, an AAD token) goes to whatever endpoint the location names, and the
+    location comes from a catalog entry or a log other users may write:
+    ``abfss://c@acct.dfs.evil.example/t`` sent it to that host.
+    """
+    name = host.rsplit(":", 1)[0].strip().lower().rstrip(".")
+    return any(name.endswith("." + suffix) for suffix in AZURE_STORAGE_SUFFIXES)
 
 
 def _blob_host(host: str) -> str:
@@ -85,7 +114,9 @@ def azure_endpoint_for(url: str) -> str | None:
     host is mapped to its ``blob`` sibling (see `_blob_host`). Beyond that
     label the host is kept verbatim, which is what keeps this correct on
     private-link and sovereign-cloud hosts, where the suffix is not
-    ``core.windows.net`` at all.
+    ``core.windows.net`` at all. A host under no Azure Storage suffix
+    (`is_azure_storage_host`) yields None: credentials go to such a host only
+    when the caller names it as the endpoint.
     """
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
@@ -109,6 +140,8 @@ def azure_endpoint_for(url: str) -> str | None:
         # dropping the account sent every request to a path Azurite rejects.
         account = next((seg for seg in parsed.path.split("/") if seg), "")
         return f"{prefix}://{host}/{account}" if account else f"{prefix}://{host}"
+    if not is_azure_storage_host(host):
+        return None
     return f"{prefix}://{_blob_host(host)}"
 
 
@@ -195,6 +228,9 @@ def r2_endpoint_for(url: str) -> str | None:
     parsed = urlparse(url)
     host = parsed.netloc.rpartition("@")[2]
     if not host or "." not in host:
+        return None
+    if not host.lower().rstrip(".").endswith(".r2.cloudflarestorage.com"):
+        # Only Cloudflare's own hosts receive the vended R2 keys.
         return None
     return f"https://{host}"
 

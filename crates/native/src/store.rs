@@ -17,7 +17,10 @@
 //! DNS, and the sovereign clouds. A fully qualified
 //! `abfss://container@account.dfs.<suffix>/` URL names its host, so the
 //! endpoint is taken from it (`https://account.blob.<suffix>`); only a host-less
-//! `az://container/` URL needs one passed.
+//! `az://container/` URL needs one passed. The endpoint is taken only from a
+//! host under an Azure Storage suffix, and only for the account the options
+//! name: the connection's secret otherwise went to whatever host a catalog
+//! entry or a log named.
 //!
 //! **Sovereign-cloud URLs.** object_store's URL parser knows only the
 //! `core.windows.net` and Fabric hosts; `abfss://c@a.dfs.core.chinacloudapi.cn/`
@@ -99,6 +102,31 @@ const PARSEABLE_AZURE_SUFFIXES: &[&str] = &[
     "blob.fabric.microsoft.com",
 ];
 
+/// DNS suffixes Azure Storage serves accounts under: the public cloud (its
+/// private-link aliases included), the sovereign clouds and Fabric OneLake.
+/// Mirrors `credentials.databricks.AZURE_STORAGE_SUFFIXES`.
+const AZURE_STORAGE_SUFFIXES: &[&str] = &[
+    "core.windows.net",
+    "core.chinacloudapi.cn",
+    "core.usgovcloudapi.net",
+    "core.cloudapi.de",
+    "fabric.microsoft.com",
+];
+
+fn is_azure_storage_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    AZURE_STORAGE_SUFFIXES
+        .iter()
+        .any(|s| host.ends_with(&format!(".{s}")))
+}
+
+fn option_value<'a>(options: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    options
+        .iter()
+        .find(|(k, v)| keys.iter().any(|key| k.eq_ignore_ascii_case(key)) && !v.trim().is_empty())
+        .map(|(_, v)| v.trim())
+}
+
 fn has_option(options: &HashMap<String, String>, keys: &[&str]) -> bool {
     options
         .iter()
@@ -138,6 +166,29 @@ fn azure_target(
     }
     let (account, rest) = host.split_once('.').unwrap_or((host.as_str(), ""));
     let fabric = rest.ends_with("fabric.microsoft.com");
+    if !has_azure_endpoint(options) {
+        // The connection's Azure secret goes to the host the URL names, and
+        // the URL comes from a catalog entry or a log others may write: a
+        // host outside Azure Storage's domains, or another account than the
+        // options name, is used only when the caller names the endpoint.
+        if !is_azure_storage_host(&host) {
+            return Err(NativeError::Invalid(format!(
+                "{url} names the host {host}, which is not an Azure Storage domain \
+                 (*.core.windows.net, the sovereign clouds, Fabric); storage credentials are \
+                 sent there only when you pass it as azure_storage_endpoint"
+            )));
+        }
+        if let Some(named) = option_value(options, &["azure_storage_account_name", "account_name"])
+        {
+            if !fabric && !named.eq_ignore_ascii_case(account) {
+                return Err(NativeError::Invalid(format!(
+                    "{url} is in the storage account {account}, but the connection's \
+                     credentials are for {named}; refused rather than send them to another \
+                     account"
+                )));
+            }
+        }
+    }
     if !has_azure_endpoint(options) && !fabric {
         // object_store speaks only the Blob API, so a dfs host maps to its
         // blob sibling; the suffix is kept, which is what makes this right on
@@ -500,6 +551,37 @@ mod tests {
         let (_, o) = azure_target(&url, &given).unwrap();
         assert!(!o.contains_key("azure_storage_endpoint"));
         assert!(!o.contains_key("azure_storage_account_name"));
+    }
+
+    #[test]
+    fn a_host_outside_azure_storage_needs_an_explicit_endpoint() {
+        // The connection's SAS went to https://acct.blob.evil.example.
+        let url = Url::parse("abfss://c@acct.dfs.evil.example/t/").unwrap();
+        let err = azure_target(&url, &opts(&[("azure_storage_sas_key", "sig")])).unwrap_err();
+        assert!(
+            err.to_string().contains("not an Azure Storage domain"),
+            "{err}"
+        );
+        let given = opts(&[
+            ("azure_storage_sas_key", "sig"),
+            ("azure_storage_endpoint", "https://acct.blob.evil.example"),
+        ]);
+        assert!(azure_target(&url, &given).is_ok());
+        let private = Url::parse("abfss://c@acct.privatelink.dfs.core.windows.net/t/").unwrap();
+        assert!(azure_target(&private, &opts(&[("azure_storage_sas_key", "sig")])).is_ok());
+    }
+
+    #[test]
+    fn another_account_than_the_options_name_is_refused() {
+        let url = Url::parse("abfss://c@other.dfs.core.windows.net/t/").unwrap();
+        let given = opts(&[
+            ("azure_storage_sas_key", "sig"),
+            ("azure_storage_account_name", "mine"),
+        ]);
+        let err = azure_target(&url, &given).unwrap_err();
+        assert!(err.to_string().contains("another account"), "{err}");
+        let same = Url::parse("abfss://c@mine.dfs.core.windows.net/t/").unwrap();
+        assert!(azure_target(&same, &given).is_ok());
     }
 
     #[test]

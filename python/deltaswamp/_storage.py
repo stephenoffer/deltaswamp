@@ -435,6 +435,7 @@ def azure_store_location(location: str, options: dict[str, str]) -> tuple[str, d
     container, at, host = parsed.netloc.rpartition("@")
     if not at or not container or "." not in host:
         return location, options
+    _check_azure_host(location, host, options)
     if host.lower().endswith(_PARSEABLE_AZURE_SUFFIXES):
         return location, options
     from .credentials.databricks import azure_endpoint_for
@@ -448,11 +449,46 @@ def azure_store_location(location: str, options: dict[str, str]) -> tuple[str, d
     return f"az://{container}{parsed.path}", out
 
 
+def _check_azure_host(location: str, host: str, options: dict[str, str]) -> None:
+    """Refuse a location whose host would receive credentials it should not.
+
+    Without an explicit endpoint the store talks to the host the location
+    names, with the connection's Azure secret. The location comes from a
+    catalog entry or a table log, which others may write, so a host outside
+    Azure Storage's domains (`is_azure_storage_host`) -- or another account
+    than the one the options name -- is refused unless the caller named the
+    endpoint. The native store refuses the same (store.rs).
+    """
+    from .credentials.databricks import is_azure_storage_host
+
+    if _names_azure_endpoint(options):
+        return
+    if not is_azure_storage_host(host):
+        raise InvalidArgumentError(
+            f"{location!r} names the host {host!r}, which is not an Azure Storage domain "
+            "(*.core.windows.net, the sovereign clouds, Fabric); storage credentials are "
+            "sent there only when you pass it as azure_storage_endpoint"
+        )
+    lowered = {k.lower(): str(v).strip() for k, v in options.items()}
+    named = lowered.get("azure_storage_account_name") or lowered.get("account_name")
+    account = host.split(".", 1)[0].lower()
+    if named and not host.lower().endswith("fabric.microsoft.com") and named.lower() != account:
+        raise InvalidArgumentError(
+            f"{location!r} is in the storage account {account!r}, but the connection's "
+            f"credentials are for {named!r}; refused rather than send them to another account"
+        )
+
+
 def _names_azure_endpoint(options: dict[str, str]) -> bool:
-    if str(options.get("azure_storage_endpoint") or "").strip():
-        return True
-    flag = str(options.get("azure_storage_use_emulator") or "").strip().lower()
-    return flag in ("1", "true", "yes", "on")
+    # Every alias object_store accepts, case-insensitively (store.rs does the same).
+    lowered = {str(k).lower(): v for k, v in options.items()}
+    for key in ("azure_storage_endpoint", "azure_endpoint", "endpoint"):
+        if str(lowered.get(key) or "").strip():
+            return True
+    for key in ("azure_storage_use_emulator", "use_emulator"):
+        if str(lowered.get(key) or "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
 
 
 # ------------------------------------------------------------- commit safety

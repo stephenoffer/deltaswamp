@@ -159,3 +159,58 @@ class TestOneExpression:
         from deltaswamp.engine.dialect import check_expression
 
         check_expression(text)
+
+
+class TestAzureEndpointAllowlist:
+    """SEC-C1: an Azure location naming any host sent the connection's secret there."""
+
+    def test_an_unknown_host_is_refused_without_an_explicit_endpoint(self) -> None:
+        from deltaswamp._storage import azure_store_location
+        from deltaswamp.credentials.databricks import azure_endpoint_for
+
+        loc = "abfss://c@acct.dfs.evil.example/t"
+        assert azure_endpoint_for(loc) is None
+        with pytest.raises(InvalidArgumentError, match="not an Azure Storage domain"):
+            azure_store_location(loc, {"azure_storage_sas_key": "sv=1&sig=x"})
+        # Named by the caller, the host is theirs to choose.
+        _, options = azure_store_location(
+            loc, {"azure_storage_sas_key": "s", "azure_storage_endpoint": "https://x.example"}
+        )
+        assert options["azure_storage_endpoint"] == "https://x.example"
+
+    def test_another_account_than_the_options_name_is_refused(self) -> None:
+        from deltaswamp._storage import azure_store_location
+
+        opts = {"azure_storage_account_name": "mine", "azure_storage_sas_key": "s"}
+        with pytest.raises(InvalidArgumentError, match="another account"):
+            azure_store_location("abfss://c@other.dfs.core.windows.net/t", opts)
+        with pytest.raises(InvalidArgumentError, match="another account"):
+            azure_store_location("abfss://c@other.dfs.core.chinacloudapi.cn/t", opts)
+        loc = "abfss://c@mine.dfs.core.windows.net/t"
+        assert azure_store_location(loc, opts) == (loc, opts)
+
+    def test_sovereign_private_link_and_fabric_hosts_still_derive(self) -> None:
+        from deltaswamp.credentials.databricks import azure_endpoint_for
+
+        for host, endpoint in [
+            ("a.dfs.core.usgovcloudapi.net", "https://a.blob.core.usgovcloudapi.net"),
+            ("a.privatelink.blob.core.windows.net", "https://a.privatelink.blob.core.windows.net"),
+            ("onelake.dfs.fabric.microsoft.com", "https://onelake.blob.fabric.microsoft.com"),
+        ]:
+            assert azure_endpoint_for(f"abfss://c@{host}/t") == endpoint
+
+    def test_the_native_store_refuses_the_unknown_host(self, tmp_path: Any) -> None:
+        from deltaswamp import _native
+
+        with pytest.raises(Exception, match="not an Azure Storage domain"):
+            _native.probe_put_if_absent(
+                "abfss://c@acct.dfs.evil.example/t", {"azure_storage_sas_key": "s"}
+            )
+
+    def test_r2_keys_go_only_to_cloudflare(self) -> None:
+        from deltaswamp.credentials.databricks import r2_endpoint_for
+
+        assert r2_endpoint_for("r2://b@acct.r2.cloudflarestorage.com/t") == (
+            "https://acct.r2.cloudflarestorage.com"
+        )
+        assert r2_endpoint_for("r2://b@acct.evil.example/t") is None
