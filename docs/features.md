@@ -52,7 +52,7 @@ Several values in one cell are a routing chain, tried in order.
 | Predicate filtering | all | kernel (native), delta-rs, warehouse | kernel skips files; the exact row filter is applied here, from one parsed predicate |
 | Time travel by version | all | kernel, delta-rs, warehouse | |
 | Time travel by timestamp | all | kernel, delta-rs, warehouse | kernel honors in-commit timestamps |
-| Change data feed | DBR, Spark, delta-rs, kernel | delta-rs, kernel, sharing, warehouse | kernel covers path tables delta-rs cannot open; by version or timestamp |
+| Change data feed | DBR, Spark, delta-rs, kernel | kernel, delta-rs, sharing, warehouse | kernel first; delta-rs reads past the last version and predicates the kernel cannot parse; by version or timestamp |
 | CDF on catalog-managed tables | DBR | warehouse | the kernel's TableChanges takes no catalog tail |
 | History | all | delta-rs, iceberg, warehouse | |
 | Detail / protocol / properties | all | kernel, delta-rs, warehouse | |

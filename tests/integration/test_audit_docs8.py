@@ -60,3 +60,15 @@ def test_base_install_appends_and_merges_arro3(tmp_path: Any, monkeypatch: Any) 
     assert merged["num_updated_rows"] == 2
     with pytest.raises(ImportError, match=r"deltaswamp\[pyarrow\]"):
         t.optimize()
+
+
+def test_merge_without_a_clause_is_refused_and_commits_nothing(tmp_path: Any) -> None:
+    import pyarrow as pa
+
+    conn = ds.connect()
+    t = conn.create_table(str(tmp_path / "t"), pa.schema([("id", pa.int64())]))
+    t.append(pa.table({"id": [1]}))
+    before = conn.table(str(tmp_path / "t")).version
+    with pytest.raises(InvalidArgumentError, match="at least one clause"):
+        t.merge(pa.table({"id": [2]}), "t.id = s.id", source_alias="s", target_alias="t").execute()
+    assert conn.table(str(tmp_path / "t")).version == before

@@ -5353,6 +5353,14 @@ class _InvalidatingMerger:
 
         def call(*args: Any, **kwargs: Any) -> Any:
             if name == "execute":
+                if not self._calls:
+                    # Spark refuses a MERGE without a WHEN clause when it
+                    # parses it; the engines committed an empty version.
+                    raise InvalidArgumentError(
+                        "a MERGE needs at least one clause: add when_matched_update(), "
+                        "when_matched_delete(), when_not_matched_insert() or "
+                        "when_not_matched_by_source_*() before execute()"
+                    )
                 result = self._execute(attr, args, kwargs)
                 self._invalidate()
                 return _results.dml(result, self._kind)
