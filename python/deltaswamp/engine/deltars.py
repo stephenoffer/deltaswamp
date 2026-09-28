@@ -3305,10 +3305,14 @@ def _bounded_merge_predicate(
     whose statistics rule it out. None when nothing safe can be derived: a
     source that is a stream (reading it for bounds would consume it), a
     predicate the parser does not read, or keys of types whose SQL literals
-    are not exact here (floats, timestamps, decimals).
+    are not exact here (floats, timestamps, decimals), or no pyarrow to read
+    the source's keys with (a base install's source is never a pyarrow Table).
     """
-    import pyarrow as pa
-    import pyarrow.compute as pc
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+    except ImportError:
+        return None
 
     from .. import predicate as sqlpred
 
@@ -3438,9 +3442,15 @@ def _nan_free_columns(data: Any) -> frozenset[str]:
     """The top-level columns of `data` (lower-cased) holding a float and no NaN.
 
     Known only for data already in memory; a stream would be consumed.
+    Without pyarrow nothing is known, and every float column is left
+    without statistics: the base install appends arro3 or any other
+    Arrow-exporting data, which is never a pyarrow Table.
     """
-    import pyarrow as pa
-    import pyarrow.compute as pc
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+    except ImportError:
+        return frozenset()
 
     if isinstance(data, pa.RecordBatch):
         data = pa.Table.from_batches([data])

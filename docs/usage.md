@@ -32,13 +32,13 @@ pip install deltaswamp
 The base install pulls in `deltalake` and `databricks-sdk` and nothing else.
 Data leaves through the Arrow PyCapsule interface, so pyarrow is optional.
 Without it, creating a table from an Arrow-exporting schema (arro3, for
-example), appends, merges, unfiltered scans, schema, history and table
-maintenance all work; the calls in the `pyarrow` row below raise an
-`ImportError` naming the extra.
+example), appends, merges on delta-rs, unfiltered scans, schema, history,
+VACUUM, RESTORE, checkpoints and ALTER TABLE all work; the calls in the
+`pyarrow` row below raise an `ImportError` naming the extra.
 
 | Extra | Adds | You need it for |
 |---|---|---|
-| `pyarrow` | pyarrow | `to_arrow`, `count`, `head`, `plan_scan`, predicates on the kernel path, `delete`/`update`/predicate `overwrite`, `create_table` with a list or dict schema, the SQL fallback |
+| `pyarrow` | pyarrow | `to_arrow`, `count`, `head`, `plan_scan`, predicates on the kernel path, `delete`/`update`/predicate `overwrite`, a MERGE on the kernel (deletion-vector tables), `optimize`/`z_order`, `create_table` with a list or dict schema, the SQL fallback |
 | `pandas` | pandas, pyarrow | `to_pandas` |
 | `polars` | Polars, pyarrow | `to_polars`, `Connection.sql(engine="polars")` |
 | `duckdb` | DuckDB | `to_duckdb`, `Connection.sql` |
