@@ -11,7 +11,7 @@ of truth is `python/deltaswamp/capability.py` (features and operations) and
 |---|---|
 | `FEATURE_SUPPORT` | 36 table features x {kernel, delta-rs} x {read, write} |
 | `OPERATION_ENGINES` | 46 operations -> engines in preference order |
-| `PROPERTY_SUPPORT` | 30 table properties x {create, set} x engine |
+| `PROPERTY_SUPPORT` | 32 table properties x {create, set} x engine |
 | `FEATURE_DEPENDENCIES` | what the kernel enforces before a write |
 
 ## Read this before changing routing
