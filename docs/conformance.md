@@ -133,8 +133,8 @@ serve.
 | `cluster_by` | kernel, sql | the delta.clustering domain; delta-rs has no domain metadata support |
 | `optimize` | kernel, deltars, sql | the kernel commits a compaction on the snapshot it read, so a concurrent one conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows both compacted, so delta-rs hands it to the kernel. The warehouse runs it on managed and clustered tables |
 | `zorder` | kernel, deltars, sql | as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one |
-| `vacuum` | deltars, sql | kernel has no VACUUM |
-| `restore` | deltars, sql | kernel has no RESTORE |
+| `vacuum` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel's log replay for the rest (clustering, row tracking, in-commit timestamps, type widening, vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files delta-rs cannot tell apart from orphans |
+| `restore` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel re-adds the target version's files as logged (deletion vectors, row ids) on deletion-vector tables, which delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write |
 | `repair` | deltars, sql | kernel has no FSCK |
 | `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first |
 | `log_compaction` | deltars | kernel's log_compaction_writer is a no-op stub (kernel#2337) |

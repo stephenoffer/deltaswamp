@@ -349,11 +349,18 @@ class TestRestoreColumnMapping:
         t.append(pa.table({"id": pa.array([2], pa.int64()), "v": ["b"]}))  # v2
         t.drop_column("v")  # v3
         t.add_column(pa.field("v", pa.string()))  # v4: maxColumnId 3
-        for target in (0, 2):
-            with pytest.raises(UnreachableTableError, match="column-mapping metadata changed"):
-                t.restore(target)
+        # Across the change of mode no engine restores; within it the kernel
+        # restores the old schema and keeps maxColumnId (delta-rs refused).
+        with pytest.raises(UnreachableTableError, match="column-mapping"):
+            t.restore(0)
         assert t.version == 4
-        assert t.properties()["delta.columnMapping.maxColumnId"] == "3"
+        t.restore(2)
+        restored = conn.open_table(path)
+        assert restored.properties()["delta.columnMapping.maxColumnId"] == "3"
+        assert sorted(restored.to_arrow().to_pylist(), key=lambda r: r["id"]) == [
+            {"id": 1, "v": "a"},
+            {"id": 2, "v": "b"},
+        ]
 
 
 class TestLogUpkeep:

@@ -408,6 +408,10 @@ def _implemented() -> frozenset[Operation]:
         ops.add(Operation.CHECKPOINT)
     if _native_has(*_COMPACTION_NATIVE):
         ops |= {Operation.OPTIMIZE, Operation.ZORDER}
+    if _native_has("vacuum", "commit_raw"):
+        ops.add(Operation.VACUUM)
+    if _native_has("restore", "commit_raw", "metadata_json"):
+        ops.add(Operation.RESTORE)
     return frozenset(ops)
 
 
@@ -563,6 +567,12 @@ class KernelEngine:
         if operation in (Operation.OPTIMIZE, Operation.ZORDER):
             # Its own gate, not the write gate below: see _compaction_capability.
             return self._compaction_capability(operation, table, shape)
+
+        if operation is Operation.VACUUM:
+            # Their own gates: see _vacuum_capability and _restore_capability.
+            return self._vacuum_capability(table, shape)
+        if operation is Operation.RESTORE:
+            return self._restore_capability(table, shape)
 
         if operation in METADATA_OPERATIONS:
             refusal = self._metadata_refusal(operation, table)
@@ -3211,6 +3221,532 @@ class KernelEngine:
             columns = [columns]
         return self._commit_metadata(table, lambda s: meta.cluster_by(s, list(columns or [])))
 
+    # ---------------------------------------------------------------- vacuum
+
+    def _file_operation_refusal(self, operation: Operation, table: ResolvedTable) -> str | None:
+        """Why VACUUM or RESTORE cannot account for this table's files, if it cannot.
+
+        Both decide which data files the table references, and a feature
+        nothing here knows could reference files some other way.
+        """
+        if table.is_catalog_managed:
+            return (
+                "the table is catalog-managed: Unity Catalog owns its files and ratifies "
+                "every commit, and it refuses file changes from external engines"
+            )
+        if table.is_shallow_clone:
+            return (
+                "the table is a shallow clone and borrows the source table's files by "
+                "absolute path; changing which files it references risks the source's data"
+            )
+        unknown = sorted(
+            name
+            for name in table.effective_reader_features | table.effective_writer_features
+            if feature_from_wire(name) is None
+        )
+        if unknown:
+            return (
+                "the table carries table features nothing here recognizes ("
+                + ", ".join(unknown)
+                + "), and one could reference files in a way a "
+                + operation.value.upper()
+                + " written here would not see"
+            )
+        return None
+
+    def _vacuum_capability(self, table: ResolvedTable, shape: dict[str, Any]) -> Capability:
+        """VACUUM from the kernel's log replay.
+
+        It deletes only files nothing references and commits only commitInfo
+        (VACUUM START/END), so no feature that governs data or schema binds it
+        -- which is why it serves the tables delta-rs cannot commit to. What
+        `vacuumProtocolCheck` asks of a VACUUM (that the client support every
+        feature of the table) is the unknown-feature check.
+        """
+        refusal = self._file_operation_refusal(Operation.VACUUM, table)
+        if refusal is not None:
+            return Capability(
+                Operation.VACUUM, ok=False, reason=refusal, remedy=SQL_FALLBACK_REMEDY
+            )
+        if shape.get("keep_versions") is not None:
+            return Capability(
+                Operation.VACUUM,
+                ok=False,
+                reason="the kernel VACUUM does not implement keep_versions",
+            )
+        return Capability(Operation.VACUUM, ok=True, engine=self.kind)
+
+    #: The retention Delta applies when a table sets none (one week).
+    default_file_retention_ms = 7 * 24 * 3600 * 1000
+
+    def vacuum(
+        self,
+        table: ResolvedTable,
+        *,
+        retention_hours: float | None = None,
+        dry_run: bool = True,
+        lite: bool = False,
+        enforce_retention_duration: bool = True,
+        **kwargs: Any,
+    ) -> list[str]:
+        """VACUUM (full, or LITE), planned from the kernel's log replay.
+
+        Deletes what Spark's VACUUM deletes (see crates/native/src/vacuum.rs):
+        files nothing references -- not a live file, not its deletion vector,
+        not a file a remove within the retention still protects, not a recent
+        commit's change data -- and, in a full VACUUM, last modified before
+        the retention cutoff. Of those only files named as Delta writers name
+        them are deleted (`*.parquet`, `deletion_vector_*.bin`); anything else
+        in the directory was never part of the table. A real VACUUM commits
+        VACUUM START before deleting and VACUUM END after, as Spark does.
+        Returns the paths, relative to the table root.
+        """
+        from .deltars import _delta_file_name
+
+        capability = self._vacuum_capability(table, kwargs)
+        if not capability.ok:
+            raise UnreachableTableError("vacuum", capability.reason, capability.remedy or None)
+        properties = kwargs.pop("commit_properties", None)
+        metadata = {
+            **dict(getattr(properties, "custom_metadata", None) or {}),
+            **dict(kwargs.pop("commit_metadata", None) or {}),
+        }
+        kwargs.pop("max_commit_retries", None)
+        kwargs.pop("post_commithook_properties", None)
+        kwargs.pop("keep_versions", None)
+        if kwargs:
+            raise InvalidArgumentError(f"vacuum got unexpected option(s) {sorted(kwargs)}")
+        _enter_native("vacuum the table")
+        import time
+
+        snapshot = self.snapshot(table, write=True)
+        configured = snapshot.deleted_file_retention_ms
+        configured = self.default_file_retention_ms if configured is None else int(configured)
+        retention_ms = (
+            configured if retention_hours is None else int(float(retention_hours) * 3_600_000)
+        )
+        if enforce_retention_duration and retention_ms < configured:
+            raise InvalidArgumentError(
+                f"vacuum retention_hours={retention_hours} is below the table's "
+                "delta.deletedFileRetentionDuration, and files a reader of an older "
+                "version still needs could be deleted; pass enforce_retention_duration=False "
+                "to vacuum anyway, or lower the table property"
+            )
+        cutoff = int(time.time() * 1000) - retention_ms
+        names = _physical_partition_names(snapshot)
+        with translating(EngineKind.KERNEL, "vacuum"):
+            plan = snapshot.vacuum_plan(
+                cutoff, lite=lite, partition_columns=sorted({*names, *names.values()})
+            )
+        foreign = [path for _, path, _, _ in plan if not _delta_file_name(path)]
+        if foreign:
+            import warnings
+
+            from ..errors import DeltaSwampWarning
+
+            warnings.warn(
+                f"vacuum keeps {len(foreign)} file(s) in the table directory that no Delta "
+                f"writer names that way (e.g. {sorted(foreign)[0]!r}); they were never part "
+                "of the table, so they are not deleted -- move them out of the table's "
+                "directory",
+                DeltaSwampWarning,
+                stacklevel=4,
+            )
+        doomed = [(key, path, size) for key, path, size, _ in plan if _delta_file_name(path)]
+        paths = [path for _, path, _ in doomed]
+        if dry_run or not doomed:
+            return paths
+        start_parameters = {
+            "retentionCheckEnabled": str(bool(enforce_retention_duration)).lower(),
+            "defaultRetentionMillis": str(configured),
+            "vacuumType": "LITE" if lite else "FULL",
+        }
+        if retention_hours is not None:
+            start_parameters["specifiedRetentionMillis"] = str(retention_ms)
+        self._commit_info_only(
+            table,
+            "VACUUM START",
+            start_parameters,
+            {
+                "numFilesToDelete": len(doomed),
+                "sizeOfDataToDelete": sum(size for _, _, size in doomed),
+            },
+            metadata,
+        )
+        with translating(EngineKind.KERNEL, "vacuum"):
+            deleted, failed = snapshot.delete_files([key for key, _, _ in doomed])
+        end = self._commit_info_only(
+            table,
+            "VACUUM END",
+            {"status": "FAILED" if failed else "COMPLETED"},
+            {"numDeletedFiles": len(deleted), "numVacuumedDirectories": 0},
+            metadata,
+        )
+        self._maybe_checkpoint(table, end)
+        if failed:
+            key, message = failed[0]
+            raise EngineLimitError(
+                "vacuum",
+                f"{len(failed)} of {len(doomed)} file(s) could not be deleted (e.g. {key}: "
+                f"{message}); the rest were",
+                "check the credential's delete permission and run VACUUM again",
+            )
+        shown = {key: path for key, path, _ in doomed}
+        return sorted(shown[key] for key in deleted)
+
+    def _commit_info_only(
+        self,
+        table: ResolvedTable,
+        operation: str,
+        parameters: dict[str, str],
+        metrics: dict[str, Any],
+        commit_metadata: dict[str, Any],
+    ) -> int:
+        """Commit a version holding only commitInfo, as VACUUM START/END are."""
+        from deltaswamp import _native
+
+        last_error: Exception | None = None
+        for _ in range(self.metadata_commit_attempts):
+            _, state = self._state(table)
+            actions = build_actions(
+                state,
+                meta.Change(operation=operation, parameters=parameters),
+                engine_info=_engine_info(),
+            )
+            info = json.loads(actions[0])
+            info["commitInfo"].update({k: str(v) for k, v in commit_metadata.items()})
+            info["commitInfo"]["operationMetrics"] = {k: str(v) for k, v in metrics.items()}
+            actions[0] = json.dumps(info, separators=(",", ":"))
+            try:
+                assert table.location is not None  # supports() refused otherwise
+                version: int = _native.commit_raw(
+                    table.location,
+                    state.version + 1,
+                    actions,
+                    options=self._options(table, write=True) or None,
+                )
+            except _native.CommitConflictError as exc:
+                last_error = exc
+                continue
+            return version
+        raise CommitConflictError(
+            conflict_version(str(last_error)),
+            f"cannot commit {operation}: another writer committed first on each of "
+            f"{self.metadata_commit_attempts} attempts ({last_error}); retry when the table "
+            "is less busy",
+        )
+
+    # --------------------------------------------------------------- restore
+
+    def _restore_capability(self, table: ResolvedTable, shape: dict[str, Any]) -> Capability:
+        """RESTORE committed here: the target's files re-added, the others removed.
+
+        Needs no kernel transaction, so the tables the kernel cannot remove
+        files from (row tracking) and the ones delta-rs restores wrongly
+        (deletion vectors, delta-rs#4613) are both served: every restored file
+        comes back exactly as the target version logged it.
+        """
+        refusal = self._file_operation_refusal(Operation.RESTORE, table)
+        if refusal is not None:
+            return Capability(
+                Operation.RESTORE, ok=False, reason=refusal, remedy=SQL_FALLBACK_REMEDY
+            )
+        if table.has_iceberg_compat:
+            return Capability(
+                Operation.RESTORE,
+                ok=False,
+                reason="the table has Iceberg reads enabled, and a restore written here "
+                "would leave its Iceberg metadata stale",
+                remedy=SQL_FALLBACK_REMEDY,
+            )
+        if shape.get("protocol_downgrade_allowed"):
+            return Capability(
+                Operation.RESTORE,
+                ok=False,
+                reason="the kernel RESTORE keeps the table's current protocol, as Spark "
+                "does; it does not implement protocol_downgrade_allowed",
+            )
+        target = shape.get("target")
+        if isinstance(target, int) and not isinstance(target, bool):
+            refused = self._restore_target_refusal(table, target)
+            if refused is not None:
+                return Capability(
+                    Operation.RESTORE,
+                    ok=False,
+                    reason=refused.reason,
+                    remedy=refused.remedy or SQL_FALLBACK_REMEDY,
+                )
+        return Capability(Operation.RESTORE, ok=True, engine=self.kind)
+
+    def _restore_target_refusal(
+        self, table: ResolvedTable, target: int
+    ) -> UnreachableTableError | None:
+        """Why the protocol or metadata of version `target` cannot be restored, if so.
+
+        Judged when routing, so a restore this refuses goes to an engine that
+        may serve it and `can()` says so. A version that cannot be read is
+        left to the call, which reports it.
+        """
+        try:
+            current = self.snapshot(table)
+            if target >= int(current.version):
+                return None
+            past = self.snapshot(table, version=target)
+            _restored_protocol_check(
+                json.loads(current.protocol_json()), json.loads(past.protocol_json()), target
+            )
+            _restored_metadata(
+                json.loads(current.metadata_json()), json.loads(past.metadata_json()), target
+            )
+        except UnreachableTableError as exc:
+            if exc.operation.startswith("restore version"):
+                return exc
+            return None
+        except Exception:
+            return None
+        return None
+
+    def restore(
+        self,
+        table: ResolvedTable,
+        target: Any,
+        *,
+        ignore_missing_files: bool = False,
+        protocol_downgrade_allowed: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """RESTORE to version `target` (or a timestamp), as Spark's RestoreTableCommand.
+
+        Files live at the target but not now are re-added exactly as the
+        target logged them (statistics, partition values, tags, deletion
+        vector, and the row-tracking `baseRowId`/`defaultRowCommitVersion`,
+        so restored rows keep their row ids); files live now but not then are
+        removed with their deletion vectors; a file whose deletion vector
+        changed is removed and re-added with the target's. A target file
+        VACUUM deleted refuses the restore (MissingDataFileError) unless
+        `ignore_missing_files`. The target's metadata is restored too, except
+        what must never go backwards (column-mapping ids, the in-commit
+        timestamp and row-tracking settings), and the protocol is kept. No
+        change-data files are written: a change-feed reader derives a
+        restore's changes from its adds and removes, as for Spark's.
+        """
+        from deltaswamp import _native
+
+        capability = self._restore_capability(
+            table, {"protocol_downgrade_allowed": protocol_downgrade_allowed}
+        )
+        if not capability.ok:
+            raise UnreachableTableError("restore", capability.reason, capability.remedy or None)
+        properties = kwargs.pop("commit_properties", None)
+        metadata = {
+            **dict(getattr(properties, "custom_metadata", None) or {}),
+            **dict(kwargs.pop("commit_metadata", None) or {}),
+        }
+        kwargs.pop("max_commit_retries", None)
+        hooks = kwargs.pop("post_commithook_properties", None)
+        if kwargs:
+            raise InvalidArgumentError(f"restore got unexpected option(s) {sorted(kwargs)}")
+        if isinstance(target, bool):
+            raise InvalidArgumentError("restore target must be a version or a timestamp")
+        if not isinstance(target, int):
+            target = int(self.snapshot(table, timestamp=timestamp_ms(target)).version)
+        _enter_native("restore the table")
+        import time
+
+        last_error: Exception | None = None
+        for _ in range(self.metadata_commit_attempts):
+            current, state = self._state(table)
+            if target > state.version:
+                raise InvalidArgumentError(
+                    f"cannot restore version {target}: the latest version is {state.version}"
+                )
+            if target == state.version:
+                return {"numRemovedFile": 0, "numRestoredFile": 0}
+            past = self.snapshot(table, version=target)
+            with translating(EngineKind.KERNEL, "restore"):
+                change, metrics = self._restore_change(
+                    table,
+                    current,
+                    past,
+                    state,
+                    target,
+                    ignore_missing_files,
+                    int(time.time() * 1000),
+                )
+            actions = build_actions(state, change.pop("change"), engine_info=_engine_info())
+            info = json.loads(actions[0])
+            info["commitInfo"].update({k: str(v) for k, v in metadata.items()})
+            info["commitInfo"]["operationMetrics"] = {k: str(v) for k, v in metrics.items()}
+            actions[0] = json.dumps(info, separators=(",", ":"))
+            actions.extend(json.dumps(a, separators=(",", ":")) for a in change["files"])
+            try:
+                assert table.location is not None  # supports() refused otherwise
+                version: int = _native.commit_raw(
+                    table.location,
+                    state.version + 1,
+                    actions,
+                    options=self._options(table, write=True) or None,
+                )
+            except _native.CommitConflictError as exc:
+                # Recomputed against the table as it now is: a restore to a
+                # version means the same files whatever was committed since.
+                last_error = exc
+                continue
+            if getattr(hooks, "create_checkpoint", True) is not False:
+                self._maybe_checkpoint(table, version)
+            return {
+                "numRemovedFile": metrics["numRemovedFiles"],
+                "numRestoredFile": metrics["numRestoredFiles"],
+                "version": version,
+                "operationMetrics": metrics,
+            }
+        raise CommitConflictError(
+            conflict_version(str(last_error)),
+            f"cannot commit the restore: another writer committed first on each of "
+            f"{self.metadata_commit_attempts} attempts ({last_error}); retry when the table "
+            "is less busy",
+        )
+
+    def _restore_change(
+        self,
+        table: ResolvedTable,
+        current: Any,
+        past: Any,
+        state: TableState,
+        target: int,
+        ignore_missing_files: bool,
+        now_ms: int,
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """The actions of a restore of `current` to `past` (version `target`).
+
+        Returns ({"change": the metadata Change, "files": remove and add
+        actions}, operationMetrics).
+        """
+        from ..errors import MissingDataFileError
+
+        def key(add: dict[str, Any]) -> tuple[str, str | None]:
+            dv = add.get("deletionVector")
+            if not dv:
+                return (add["path"], None)
+            offset = dv.get("offset")
+            unique = f"{dv.get('storageType')}{dv.get('pathOrInlineDv')}"
+            return (add["path"], unique if offset is None else f"{unique}@{offset}")
+
+        now_files = {key(a): a for a in map(json.loads, current.add_actions())}
+        then_files = {key(a): a for a in map(json.loads, past.add_actions())}
+        removed = [a for k, a in now_files.items() if k not in then_files]
+        restored = [a for k, a in then_files.items() if k not in now_files]
+
+        missing = current.missing_files([json.dumps(a) for a in restored]) if restored else []
+        if missing and not ignore_missing_files:
+            raise MissingDataFileError(
+                missing[0],
+                f"cannot restore version {target}: {len(missing)} file(s) it references are "
+                f"gone from storage (e.g. {missing[0]}), deleted by VACUUM or by hand, so the "
+                "table cannot be put back as it was; restore a later version, or pass "
+                "ignore_missing_files=True to restore without them",
+            )
+        if missing:
+            restored = [a for a in restored if not current.missing_files([json.dumps(a)])]
+
+        # Row ids: a restored file keeps the ids it had at the target, which
+        # its baseRowId and defaultRowCommitVersion are. A file logged before
+        # row tracking was enabled has none; it takes the ids the file has
+        # now if it is still live (a row-tracking backfill gave it some),
+        # else fresh ones above the high-water mark, as Spark assigns them.
+        writer_features = set(state.protocol.get("writerFeatures") or [])
+        domains: list[dict[str, Any]] = []
+        if "rowTracking" in writer_features:
+            by_path = {a["path"]: a for a in now_files.values()}
+            raw = current.domain_metadata("delta.rowTracking")
+            high = int(json.loads(raw).get("rowIdHighWaterMark", -1)) if raw else -1
+            moved = False
+            for add in restored:
+                if add.get("baseRowId") is None:
+                    same = by_path.get(add["path"])
+                    if same is not None and same.get("baseRowId") is not None:
+                        add["baseRowId"] = same["baseRowId"]
+                        add["defaultRowCommitVersion"] = same.get("defaultRowCommitVersion")
+                    else:
+                        records = json.loads(add.get("stats") or "{}").get("numRecords")
+                        if records is None:
+                            raise EngineLimitError(
+                                f"restore version {target}",
+                                f"the table tracks row ids, and the file {add['path']} it "
+                                "restores has none and no row count to assign them from",
+                                SQL_FALLBACK_REMEDY,
+                            )
+                        add["baseRowId"] = high + 1
+                        high += int(records)
+                        moved = True
+                if add.get("defaultRowCommitVersion") is None:
+                    add["defaultRowCommitVersion"] = state.version + 1
+            if moved:
+                domains.append(
+                    {
+                        "domainMetadata": {
+                            "domain": "delta.rowTracking",
+                            "configuration": json.dumps({"rowIdHighWaterMark": high}),
+                            "removed": False,
+                        }
+                    }
+                )
+
+        _restored_protocol_check(state.protocol, json.loads(past.protocol_json()), target)
+        restored_metadata = _restored_metadata(
+            json.loads(current.metadata_json()), json.loads(past.metadata_json()), target
+        )
+        now_clustering = current.domain_metadata(CLUSTERING_DOMAIN)
+        then_clustering = past.domain_metadata(CLUSTERING_DOMAIN)
+        if now_clustering != then_clustering:
+            domains.append(
+                {
+                    "domainMetadata": {
+                        "domain": CLUSTERING_DOMAIN,
+                        "configuration": then_clustering or now_clustering,
+                        "removed": then_clustering is None,
+                    }
+                }
+            )
+
+        files: list[dict[str, Any]] = []
+        for add in removed:
+            remove = {
+                "path": add["path"],
+                "deletionTimestamp": now_ms,
+                "dataChange": True,
+                "extendedFileMetadata": True,
+                "partitionValues": add.get("partitionValues") or {},
+                "size": add.get("size"),
+            }
+            for field in (
+                "stats",
+                "tags",
+                "deletionVector",
+                "baseRowId",
+                "defaultRowCommitVersion",
+            ):
+                if add.get(field) is not None:
+                    remove[field] = add[field]
+            files.append({"remove": remove})
+        files.extend({"add": add} for add in restored)
+        live = [a for k, a in now_files.items() if k in then_files] + restored
+        metrics = {
+            "numRestoredFiles": len(restored),
+            "numRemovedFiles": len(removed),
+            "restoredFilesSize": sum(int(a.get("size") or 0) for a in restored),
+            "removedFilesSize": sum(int(a.get("size") or 0) for a in removed),
+            "numOfFilesAfterRestore": len(live),
+            "tableSizeAfterRestore": sum(int(a.get("size") or 0) for a in live),
+        }
+        change = meta.Change(
+            operation="RESTORE",
+            parameters={"version": target},
+            metadata=restored_metadata,
+            domains=domains,
+        )
+        return {"change": change, "files": files}, metrics
+
     def metadata_count(
         self, table: ResolvedTable, *, predicate: str | None = None, version: int | None = None
     ) -> int | None:
@@ -3475,6 +4011,107 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
         return _planned_read(snapshot, columns, predicate, files=paths)
+
+
+#: Table properties a restore keeps at their current values. Each records a
+#: fact about the table's history that restoring older metadata would falsify:
+#: when in-commit timestamps began (readers resolve timestamps by it), whether
+#: rows carry ids and under which materialized columns, and the highest column
+#: id ever assigned (which must never decrease, or a new column reuses an id).
+_RESTORE_KEEPS: tuple[str, ...] = (
+    "delta.enableInCommitTimestamps",
+    "delta.inCommitTimestampEnablementVersion",
+    "delta.inCommitTimestampEnablementTimestamp",
+    "delta.enableRowTracking",
+    "delta.rowTracking.materializedRowIdColumnName",
+    "delta.rowTracking.materializedRowCommitVersionColumnName",
+    "delta.rowTrackingSuspended",
+    "delta.columnMapping.maxColumnId",
+)
+
+
+def _restored_protocol_check(now: dict[str, Any], then: dict[str, Any], version: int) -> None:
+    """Refuse a restore to a version whose protocol needed what the table's no longer has.
+
+    A restore keeps the current protocol (Spark never downgrades one), which
+    serves every older version unless a feature was dropped since.
+    """
+    features = ("readerFeatures", "writerFeatures")
+    gone = sorted(
+        {f for k in features for f in then.get(k) or []}
+        - {f for k in features for f in now.get(k) or []}
+    )
+    older = any(
+        int(then.get(k, 1)) > int(now.get(k, 1)) for k in ("minReaderVersion", "minWriterVersion")
+    )
+    if gone or older:
+        raise UnreachableTableError(
+            f"restore version {version}",
+            "the table's protocol no longer supports what that version needed ("
+            + (", ".join(gone) or "its protocol versions")
+            + "), and a restore keeps the current protocol",
+            SQL_FALLBACK_REMEDY,
+        )
+
+
+def _restored_metadata(
+    current: dict[str, Any], target: dict[str, Any], version: int
+) -> dict[str, Any] | None:
+    """The metaData a restore to `target` commits, or None when it keeps the current one.
+
+    Spark's RESTORE puts back the target's schema, description and
+    properties, apart from `_RESTORE_KEEPS`. Refused where that cannot be
+    done safely: across a table replacement (a new table id) or a change of
+    partitioning, across a change of column-mapping mode (the files of one
+    side are keyed by names the other side's schema lacks), and across a
+    schema change on a table with identity columns, whose high-water mark
+    would go back and hand out values already used.
+    """
+    what = f"restore version {version}"
+    compared = ("schemaString", "partitionColumns", "configuration", "description", "name")
+    if all(current.get(k) == target.get(k) for k in compared):
+        return None
+    if current.get("id") != target.get("id"):
+        raise UnreachableTableError(
+            what,
+            "the table was replaced since that version (its table id changed), so its "
+            "files belong to a different table",
+            SQL_FALLBACK_REMEDY,
+        )
+    if list(current.get("partitionColumns") or []) != list(target.get("partitionColumns") or []):
+        raise UnreachableTableError(
+            what,
+            "the table's partition columns changed since that version",
+            SQL_FALLBACK_REMEDY,
+        )
+    now = dict(current.get("configuration") or {})
+    then = dict(target.get("configuration") or {})
+    mode = "delta.columnMapping.mode"
+    if now.get(mode, "none").lower() != then.get(mode, "none").lower():
+        raise UnreachableTableError(
+            what,
+            f"the column-mapping mode changed since that version ({then.get(mode, 'none')} "
+            f"-> {now.get(mode, 'none')}), and the files of one side are keyed by column "
+            "names the other side's schema does not record",
+            SQL_FALLBACK_REMEDY,
+        )
+    if current.get("schemaString") != target.get("schemaString") and (
+        "delta.identity." in str(current.get("schemaString"))
+        or "delta.identity." in str(target.get("schemaString"))
+    ):
+        raise UnreachableTableError(
+            what,
+            "the table has identity columns and its schema changed since that version; "
+            "restoring the old schema would move the identity high-water mark back",
+            SQL_FALLBACK_REMEDY,
+        )
+    for key in _RESTORE_KEEPS:
+        if key in now:
+            then[key] = now[key]
+        else:
+            then.pop(key, None)
+    restored = {**target, "configuration": then}
+    return None if all(restored.get(k) == current.get(k) for k in compared) else restored
 
 
 #: Fragment schema-metadata key: the table layout its files were written

@@ -710,22 +710,49 @@ type, as delta-rs does: a NULL partition matches no comparison, `= ''` means
 NULL, and timestamps take ISO 8601 with or without the `T` and an offset.
 
 `vacuum` defaults to a dry run because the real thing deletes files. `lite=True`
-considers only files the log records as removed. On a table with deletion
-vectors, a full VACUUM through delta-rs keeps every `deletion_vector_*.bin`:
-delta-rs does not count the vector files live data files reference and would
-delete them, so its list of unreferenced files is taken without them and the
-rest deleted here. Unreferenced vector files stay until Databricks vacuums the
-table. `vacuum` returns the paths it deleted (or would delete) relative to the
-table root, on every store. A dry run after a lite vacuum still lists the files
-the lite run removed, because delta-rs keeps their tombstones in the log.
+considers only files the log records as removed. `vacuum` returns the paths it
+deleted (or would delete) relative to the table root, on every store.
 
-Three operations refuse rather than misbehave:
+On a table with deletion vectors, and on every table delta-rs cannot commit to
+(clustering, row tracking, in-commit timestamps, type widening,
+`vacuumProtocolCheck`, collations, ...), VACUUM is planned from the kernel's log
+replay the way Spark plans it. A file is kept if a live file is it or names it
+as its deletion vector, if a remove whose `deletionTimestamp` is within the
+retention names it (the checkpoint's tombstones included), or if a commit
+written within the retention lists it as change data. A full VACUUM lists the
+table directory, skips hidden paths as Spark does (names starting with `_` or
+`.`, other than `_change_data` and partition directories), and deletes the
+unreferenced files last modified before the cutoff; LITE deletes only what
+expired removes name. The retention defaults to
+`delta.deletedFileRetentionDuration` (a week), and a shorter one needs
+`enforce_retention_duration=False`. A real VACUUM commits `VACUUM START` and
+`VACUUM END`, as Databricks does, and deletes nothing when nothing qualifies.
+On the tables delta-rs vacuums itself, its full VACUUM keeps every
+`deletion_vector_*.bin`, and a dry run after a lite vacuum still lists the
+files the lite run removed, because delta-rs keeps their tombstones in the log.
 
-- `vacuum` on a shallow clone, which borrows the source's files.
-- `restore` through delta-rs on a table with deletion vectors, where delta-rs
-  reports success and leaves the rows deleted.
-- OPTIMIZE and VACUUM on UC managed tables. Databricks forbids them from
-  external clients, so they route to the warehouse.
+`restore` of a deletion-vector table, a column-mapped table, or a table
+delta-rs cannot write is committed here, as Spark's RESTORE: files live at the
+target and not now are re-added exactly as the target logged them (statistics,
+deletion vector, and `baseRowId`/`defaultRowCommitVersion`, so restored rows
+keep their row ids); files live now and not then are removed; a file whose
+deletion vector changed is removed and re-added with the target's. The
+target's schema and properties come back too, except the column-mapping
+`maxColumnId`, the in-commit-timestamp and the row-tracking settings, which
+keep their current values; the protocol is never downgraded. No change-data
+files are written: a change-feed reader derives the restore's inserts and
+deletes from its adds and removes. A target file VACUUM deleted raises
+`MissingDataFileError` unless `ignore_missing_files=True`.
+
+These refuse rather than misbehave:
+
+- `vacuum` and `restore` on a shallow clone, which borrows the source's files,
+  and on a table carrying a feature nothing here recognizes.
+- `restore` across a change of column-mapping mode, of partition columns, or
+  of the table id (a replaced table), or to a version whose protocol needed a
+  feature since dropped. `can("restore", target=n)` says so up front.
+- OPTIMIZE, VACUUM and RESTORE on UC managed tables. Databricks forbids them
+  from external clients, so they route to the warehouse.
 
 Checkpoints work on catalog-managed tables. The kernel publishes staged commits
 first, since it checkpoints only published versions. Commits made here also

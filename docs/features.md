@@ -132,9 +132,9 @@ variant; all three are writer-only, so both engines read and neither writes.
 | OPTIMIZE (compaction) | all | kernel, warehouse | committed by the kernel on the snapshot it planned from, so concurrent runs never compact a file twice (delta-rs's own commit duplicates their rows; a delta-rs connection hands it to the kernel). Legacy-calendar and INT96 files are rewritten with correct values and a Spark footer. Refused on row-tracked and column-mapped tables and with `writer_properties`/`min_commit_interval` |
 | OPTIMIZE ZORDER BY | DBR, Spark, delta-rs | kernel, warehouse | as above; top-level columns with statistics only (not STRUCT/ARRAY/MAP) |
 | OPTIMIZE on clustered / managed tables, OPTIMIZE FULL | DBR | warehouse | delta-rs cannot write clustered tables |
-| VACUUM (standard and LITE) | DBR, Spark, delta-rs | delta-rs, warehouse | dry run by default here |
+| VACUUM (standard and LITE) | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | dry run by default here. The kernel plans it from its log replay, as Spark's VACUUM does, on deletion-vector tables and on every table delta-rs cannot commit to (clustering, row tracking, in-commit timestamps, type widening, `vacuumProtocolCheck`, ...), and commits VACUUM START/END |
 | VACUUM on managed tables | DBR | warehouse | Databricks forbids external VACUUM on managed tables |
-| RESTORE | DBR, Spark, delta-rs | delta-rs, warehouse | refused on DV tables through delta-rs (delta-rs#4613) |
+| RESTORE | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | the kernel serves deletion-vector tables (delta-rs leaves DV changes in place, delta-rs#4613), column-mapped tables and the tables delta-rs cannot write; restored files keep their row ids, and the target's schema and properties come back |
 | FSCK REPAIR | DBR, delta-rs | delta-rs, warehouse | |
 | Checkpoint | all | delta-rs, kernel | the kernel checkpoints catalog-managed tables, publishing first |
 | Log compaction | Spark, delta-rs | delta-rs | kernel's writer is a stub |

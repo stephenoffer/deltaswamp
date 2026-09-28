@@ -269,6 +269,15 @@ impl PySnapshot {
     }
 }
 
+impl PySnapshot {
+    /// The object store this snapshot's engine reads through.
+    fn store(&self) -> Result<Arc<delta_kernel::object_store::DynObjectStore>> {
+        self.engine
+            .get_object_store_for_url(self.inner.table_root())
+            .ok_or_else(|| NativeError::Invalid("the engine has no object store".into()))
+    }
+}
+
 #[pymethods]
 impl PySnapshot {
     /// Resolve a snapshot, optionally pinned to a catalog-supplied tail.
@@ -629,6 +638,81 @@ impl PySnapshot {
         })?;
         let schema = batch.schema();
         PyTable::try_new(vec![batch], schema)
+    }
+
+    /// Every live file as the `add` action that restores it (JSON objects).
+    fn add_actions(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| files::add_actions(self.inner.clone(), self.engine.as_ref()))?)
+    }
+
+    /// `delta.deletedFileRetentionDuration` in milliseconds, as the kernel
+    /// parses it; None when the table does not set it.
+    #[getter]
+    fn deleted_file_retention_ms(&self) -> Option<u64> {
+        self.inner
+            .table_properties()
+            .deleted_file_retention_duration
+            .map(|d| d.as_millis() as u64)
+    }
+
+    /// What a VACUUM would delete with retention cutoff `cutoff_ms` (epoch
+    /// ms): `(key, path, size, modified_ms)` per file, `key` as `delete_files`
+    /// takes it and `path` relative to the table root.
+    #[pyo3(signature = (cutoff_ms, lite = false, partition_columns = None))]
+    fn vacuum_plan(
+        &self,
+        py: Python<'_>,
+        cutoff_ms: i64,
+        lite: bool,
+        partition_columns: Option<Vec<String>>,
+    ) -> PyResult<Vec<(String, String, u64, i64)>> {
+        let plan = py.detach(|| -> Result<Vec<crate::vacuum::Candidate>> {
+            crate::vacuum::plan(
+                &self.inner,
+                self.engine.as_ref(),
+                self.store()?,
+                cutoff_ms,
+                lite,
+                &partition_columns.unwrap_or_default(),
+            )
+        })?;
+        Ok(plan
+            .into_iter()
+            .map(|c| (c.key, c.path, c.size, c.modified_ms))
+            .collect())
+    }
+
+    /// Delete the files `vacuum_plan` reported, by key. Returns the keys
+    /// deleted (or already gone) and `(key, error)` for each that failed.
+    fn delete_files(&self, py: Python<'_>, keys: Vec<String>) -> PyResult<crate::vacuum::Deletion> {
+        Ok(py.detach(|| crate::vacuum::delete(self.store()?, self.inner.table_root(), keys))?)
+    }
+
+    /// Of the data and deletion-vector files `adds` (add actions as JSON)
+    /// reference, the ones missing from storage, as URLs.
+    fn missing_files(&self, py: Python<'_>, adds: Vec<String>) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| -> Result<Vec<String>> {
+            let root = self.inner.table_root();
+            let mut urls = Vec::new();
+            for add in &adds {
+                let add: serde_json::Value = serde_json::from_str(add)
+                    .map_err(|e| NativeError::Invalid(format!("bad add action: {e}")))?;
+                let path = add
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| NativeError::Invalid("an add action without a path".into()))?;
+                urls.push(match url::Url::parse(path) {
+                    Ok(url) => url,
+                    Err(_) => root.join(path)?,
+                });
+                if let Some(dv) = add.get("deletionVector").filter(|dv| !dv.is_null()) {
+                    if let Some(url) = crate::vacuum::deletion_vector_url_json(root, dv)? {
+                        urls.push(url);
+                    }
+                }
+            }
+            crate::vacuum::missing(self.store()?, root, urls)
+        })?)
     }
 
     /// Which of `files` (`(path, size)` pairs, paths as `files()` reports

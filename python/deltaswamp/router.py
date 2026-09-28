@@ -519,6 +519,31 @@ def _preference(
 
     if operation in _DV_DML and EngineKind.KERNEL in engines and deletion_vectors_writable(table):
         return (EngineKind.KERNEL, *(k for k in engines if k is not EngineKind.KERNEL))
+    if (
+        operation is Operation.VACUUM
+        and EngineKind.KERNEL in engines
+        and (
+            "deletionVectors" in table.effective_reader_features
+            or not _writes(
+                set(table.effective_reader_features | table.effective_writer_features), "deltars"
+            )
+        )
+    ):
+        # A dry run on these would reach delta-rs (it commits nothing), and
+        # the real VACUUM the kernel: one table, two plans. The kernel plans
+        # both. On a deletion-vector table delta-rs also cannot tell a live
+        # vector file from an orphan, so it keeps every one.
+        return (EngineKind.KERNEL, *(k for k in engines if k is not EngineKind.KERNEL))
+    if (
+        operation is Operation.RESTORE
+        and EngineKind.KERNEL in engines
+        and str(table.properties.get("delta.columnMapping.mode", "none")).lower()
+        not in ("", "none")
+    ):
+        # delta-rs restores a column-mapped table's old metadata verbatim,
+        # rewinding delta.columnMapping.maxColumnId, so it refuses whenever
+        # the schema changed; the kernel keeps the id and restores the rest.
+        return (EngineKind.KERNEL, *(k for k in engines if k is not EngineKind.KERNEL))
     if operation in _STATS_WRITES and EngineKind.KERNEL in engines and _deltars_drops_stats(table):
         # delta-rs matches delta.dataSkippingStatsColumns against top-level
         # leaf names only: a nested field ("s.a") or a whole struct ("s") got

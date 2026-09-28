@@ -45,6 +45,8 @@ write, and the kernel writes several of them.
 The other way round, delta-rs wins outright. The kernel has no MERGE, no
 `replaceWhere`, no schema evolution on write, no OPTIMIZE, Z-ORDER, VACUUM,
 RESTORE, FSCK, CONVERT or manifest generation, and its log compaction is a stub.
+(deltaswamp builds MERGE, OPTIMIZE, VACUUM and RESTORE on the kernel itself,
+for the tables delta-rs cannot write.)
 
 So the kernel is the default reader and delta-rs the default for DML and
 maintenance. Two rows break the pattern: for `checkConstraints` and

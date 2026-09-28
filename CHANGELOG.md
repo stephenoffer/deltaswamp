@@ -242,15 +242,30 @@ See docs/usage.md, "Security notes".
   gets "a Delta table already exists there".
 - `wasb://` and `wasbs://` locations are refused; use `abfss://`.
 - A path table with a GCS OAuth bearer token in `storage_options` is served by
-  the kernel only: history, OPTIMIZE, VACUUM, RESTORE, MERGE and log cleanup,
-  which only delta-rs implements, are refused on it.
+  the kernel only: history, MERGE and log cleanup, which only delta-rs
+  implements, are refused on it.
 
 - `convert_to_delta` refuses a hive-partitioned directory whose partition
   values are escaped (`region=a%20b`): delta-rs records those paths unencoded
   and the converted table cannot be read. Rewrite the data with `write_table`.
-- RESTORE through delta-rs is refused across a change to column-mapping
-  metadata (the mode, or `maxColumnId` after an ADD COLUMN): it would rewind
-  the mode or reuse column ids. Restore such tables from Databricks.
+- VACUUM (full and LITE, dry runs included) on the tables delta-rs cannot
+  commit to -- liquid clustering, row tracking, in-commit timestamps, type
+  widening, `vacuumProtocolCheck`, collations -- and on deletion-vector
+  tables is planned from the kernel's log replay as Spark's VACUUM plans it:
+  live files, their deletion vectors, files of removes within the retention
+  (checkpoint tombstones included) and recent change data are kept; hidden
+  paths are skipped; a real VACUUM commits VACUUM START/END. It was refused
+  outright on the first group, and delta-rs kept every vector file on the
+  second. Only Delta-named files are deleted, as before.
+- RESTORE of deletion-vector tables (delta-rs left DV changes in place,
+  delta-rs#4613), column-mapped tables and kernel-only tables is committed
+  here as Spark's RESTORE: the target's files come back as logged (row ids
+  kept), the current-only ones are removed, the target's schema and
+  properties are restored (keeping `maxColumnId`, in-commit-timestamp and
+  row-tracking settings), and a vacuumed target file raises
+  `MissingDataFileError` unless `ignore_missing_files=True`. Refused up front
+  (`can("restore", target=n)`) across a change of column-mapping mode,
+  partition columns or table id, or to a version needing a dropped feature.
 - Adding a NOT NULL column is refused on every engine, as Databricks refuses
   it: add it nullable, backfill, then `set_not_null()`.
 - On a kernel-only table without deletion vectors, DML is a whole-table

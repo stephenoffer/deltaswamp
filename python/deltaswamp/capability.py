@@ -828,8 +828,21 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             (_K, _D, _S),
             "as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one",
         ),
-        _op(Operation.VACUUM, (_D, _S), "kernel has no VACUUM"),
-        _op(Operation.RESTORE, (_D, _S), "kernel has no RESTORE"),
+        _op(
+            Operation.VACUUM,
+            (_D, _K, _S),
+            "delta-rs for tables it can commit to; the kernel's log replay for the rest "
+            "(clustering, row tracking, in-commit timestamps, type widening, "
+            "vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files "
+            "delta-rs cannot tell apart from orphans",
+        ),
+        _op(
+            Operation.RESTORE,
+            (_D, _K, _S),
+            "delta-rs for tables it can commit to; the kernel re-adds the target version's "
+            "files as logged (deletion vectors, row ids) on deletion-vector tables, which "
+            "delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write",
+        ),
         _op(Operation.REPAIR, (_D, _S), "kernel has no FSCK"),
         _op(Operation.CONVERT, (_D,), "kernel has no CONVERT TO DELTA"),
         _op(Operation.GENERATE, (_D,), "kernel has no manifest generation"),

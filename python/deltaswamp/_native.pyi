@@ -15,8 +15,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
-"compaction", "commit_info_patch", "streaming_compaction", "retry_options". Gate on this
-list, not `hasattr`, so a stale build refuses cleanly.
+"compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
+"restore". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -337,6 +337,43 @@ class Snapshot:
         `num_records` (int64 from stats, nullable; counts rows *before* the
         deletion vector). `predicate` skips files exactly as in `scan`.
         """
+
+    def add_actions(self) -> list[str]:
+        """Every live file as the `add` action (a JSON object) that restores it.
+
+        All of the add as the log recorded it -- statistics, partition values,
+        tags, deletion vector, `baseRowId`, `defaultRowCommitVersion`,
+        `clusteringProvider` -- with `dataChange` true. Requires "restore".
+        """
+
+    @property
+    def deleted_file_retention_ms(self) -> int | None:
+        """`delta.deletedFileRetentionDuration` in ms as the kernel parses it; None if unset."""
+
+    def vacuum_plan(
+        self,
+        cutoff_ms: int,
+        lite: bool = False,
+        partition_columns: list[str] | None = None,
+    ) -> list[tuple[str, str, int, int]]:
+        """What a VACUUM would delete with retention cutoff `cutoff_ms` (epoch ms).
+
+        `(key, path, size, modified_ms)` per file: `key` as `delete_files`
+        takes it, `path` relative to the table root. Referenced (never listed):
+        live files and their deletion vectors, files of removes whose
+        `deletionTimestamp` is at or after the cutoff and their vectors, and
+        the change-data files of commits written since. A full plan lists the
+        table directory (hidden paths skipped as Spark skips them) and keeps
+        files modified at or after the cutoff; `lite` lists only what expired
+        removes name. `partition_columns` are the names partition directories
+        may carry. Requires "vacuum".
+        """
+
+    def delete_files(self, keys: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+        """Delete `keys` from `vacuum_plan` under the root: (deleted, [(key, error)])."""
+
+    def missing_files(self, adds: list[str]) -> list[str]:
+        """URLs of the data and deletion-vector files `adds` (JSON) name that are gone."""
 
     def legacy_calendar_files(self, files: list[tuple[str, int]]) -> list[str]:
         """Which of `files` (`(path, size)`, paths as `files()` reports them)
