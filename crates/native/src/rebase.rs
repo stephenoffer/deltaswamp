@@ -388,12 +388,19 @@ fn block<F: Future>(fut: F) -> F::Output {
 
 /// `schema` with every nanosecond timestamp retyped to microseconds: the read
 /// hint that makes Arrow decode INT96 without overflowing.
+///
+/// Arrow infers INT96 without a zone, and the hint gives it UTC, the type the
+/// kernel asks for a TIMESTAMP in (INT96 is only ever Spark's TIMESTAMP).
+/// Left zoneless, the read needed a cast to UTC, and the kernel plans a cast
+/// of a list's element as a cast of the whole list: every ARRAY<TIMESTAMP>
+/// Databricks wrote failed with "Cannot cast LIST to non-list data type".
 fn int96_as_micros(schema: &Schema) -> Schema {
     fn retype(t: &DataType) -> DataType {
         match t {
-            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-                DataType::Timestamp(TimeUnit::Microsecond, tz.clone())
-            }
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(tz.clone().unwrap_or_else(|| "UTC".into())),
+            ),
             DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
             DataType::List(f) => DataType::List(field(f)),
             DataType::LargeList(f) => DataType::LargeList(field(f)),
@@ -1069,7 +1076,7 @@ mod tests {
             Field::new_list("l", Field::new("item", nanos, true), true),
             Field::new("d", DataType::Date32, true),
         ]);
-        let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let micros = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         let hinted = int96_as_micros(&schema);
         assert_eq!(hinted.field(0).data_type(), &micros);
         assert_eq!(

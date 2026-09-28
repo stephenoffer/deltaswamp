@@ -184,3 +184,89 @@ class TestNaNStatistics:
             assert "f" not in stats.get("maxValues", {}) and "g" not in stats.get("maxValues", {})
         got = pa.table(conn.open_table(path).to_arrow()).sort_by("id").column("f").to_pylist()
         assert math.isnan(got[0]) and got[1:] == [3.0, None, 1.0]
+
+
+# ----------------------------------------- 3: INT96 timestamps inside lists
+
+
+def test_int96_timestamps_in_lists_read(tmp_path: Any) -> None:
+    """Databricks writes INT96; a nested ARRAY<TIMESTAMP> failed to cast."""
+    import datetime as dt
+
+    import pyarrow.parquet as pq
+
+    utc = dt.UTC
+    ts = dt.datetime(2020, 1, 1, 12, 30, tzinfo=utc)
+    old = dt.datetime(1850, 3, 1, 0, 0, tzinfo=utc)
+    ns = pa.timestamp("ns")
+    inner = pa.struct([("x", pa.int64()), ("y", pa.list_(ns))])
+    data = pa.table(
+        {
+            "id": pa.array([1, 2], pa.int64()),
+            "a": pa.array([[ts.replace(tzinfo=None), None], None], pa.list_(ns)),
+            "s": pa.array(
+                [{"y": [ts.replace(tzinfo=None)]}, {"y": None}], pa.struct([("y", pa.list_(ns))])
+            ),
+            "aos": pa.array([[{"x": 1, "y": [old.replace(tzinfo=None)]}], []], pa.list_(inner)),
+        }
+    )
+    path = str(tmp_path / "int96")
+    os.makedirs(os.path.join(path, "_delta_log"))
+    data = data.replace_schema_metadata({"org.apache.spark.version": "3.5.0"})
+    pq.write_table(data, os.path.join(path, "part-0.parquet"), use_deprecated_int96_timestamps=True)
+    ts_list = {"type": "array", "elementType": "timestamp", "containsNull": True}
+
+    def field(name: str, kind: Any) -> dict[str, Any]:
+        return {"name": name, "type": kind, "nullable": True, "metadata": {}}
+
+    schema = {
+        "type": "struct",
+        "fields": [
+            field("id", "long"),
+            field("a", ts_list),
+            field("s", {"type": "struct", "fields": [field("y", ts_list)]}),
+            field(
+                "aos",
+                {
+                    "type": "array",
+                    "elementType": {
+                        "type": "struct",
+                        "fields": [field("x", "long"), field("y", ts_list)],
+                    },
+                    "containsNull": True,
+                },
+            ),
+        ],
+    }
+    actions = [
+        {"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}},
+        {
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000096",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": json.dumps(schema),
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0,
+            }
+        },
+        {
+            "add": {
+                "path": "part-0.parquet",
+                "partitionValues": {},
+                "size": os.path.getsize(os.path.join(path, "part-0.parquet")),
+                "modificationTime": 0,
+                "dataChange": True,
+            }
+        },
+    ]
+    with open(os.path.join(path, "_delta_log", f"{0:020}.json"), "w") as f:
+        f.write("\n".join(json.dumps(a) for a in actions))
+    rows = sorted(
+        pa.table(ds.connect("file://").open_table(path).to_arrow()).to_pylist(),
+        key=lambda r: r["id"],
+    )
+    assert rows == [
+        {"id": 1, "a": [ts, None], "s": {"y": [ts]}, "aos": [{"x": 1, "y": [old]}]},
+        {"id": 2, "a": None, "s": {"y": None}, "aos": []},
+    ]
