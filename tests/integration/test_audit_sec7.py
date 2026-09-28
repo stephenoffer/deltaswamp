@@ -362,3 +362,47 @@ class TestOssUcRedirects:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             ossuc._warn_plain_http("http://localhost:8080/api/2.1")
+
+
+class TestLogPathsStayInTheTable:
+    """SEC-P2 / SEC-P4: log paths outside the table root were read, and compacted in."""
+
+    @staticmethod
+    def _escaping(conn: Any, tmp_path: Any, add: str) -> tuple[str, str]:
+        import json
+
+        import pyarrow.parquet as pq
+
+        (tmp_path / "outside").mkdir()
+        secret = str(tmp_path / "outside" / "secret.parquet")
+        pq.write_table(pa.table({"id": pa.array([4242], pa.int64())}), secret)
+        root = str(tmp_path / "tbl")
+        conn.write_table(root, pa.table({"id": pa.array([1, 2], pa.int64())}))
+        conn.open_table(root).append(pa.table({"id": pa.array([3], pa.int64())}))
+        entry = {
+            "path": add.format(secret=secret),
+            "size": os.path.getsize(secret),
+            "partitionValues": {},
+            "modificationTime": 1,
+            "dataChange": True,
+        }
+        with open(os.path.join(root, "_delta_log", "00000000000000000002.json"), "w") as f:
+            f.write(json.dumps({"commitInfo": {"operation": "WRITE", "timestamp": 1}}) + "\n")
+            f.write(json.dumps({"add": entry}) + "\n")
+        return root, secret
+
+    @pytest.mark.parametrize(
+        "add",
+        ["../outside/secret.parquet", "%2E%2E/outside/secret.parquet", "file://{secret}"],
+    )
+    def test_reads_and_compaction_refuse(self, conn: Any, tmp_path: Any, add: str) -> None:
+        root, _ = self._escaping(conn, tmp_path, add)
+        t = conn.open_table(root)
+        with pytest.raises(DeltaSwampError, match="outside the table root"):
+            t.to_arrow()
+        with pytest.raises(DeltaSwampError, match="outside the table root"):
+            t.to_pyarrow_dataset().to_table()
+        with pytest.raises(DeltaSwampError, match="outside the table root"):
+            t.z_order("id")
+        files = [f for f in os.listdir(root) if f.endswith(".parquet")]
+        assert len(files) == 2  # nothing was written into the table

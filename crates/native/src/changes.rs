@@ -144,7 +144,10 @@ pub fn table_changes(
         .build()?;
     let schema = scan.logical_schema().clone();
     // Rebases Parquet files Spark wrote in its legacy hybrid calendar.
-    let iter = scan.execute(crate::rebase::reading_engine(&engine, url))?;
+    let iter = scan.execute(crate::confine::confined(
+        crate::rebase::reading_engine(&engine, url),
+        url,
+    ))?;
     Ok(KernelBatchReader::from_parts(schema.as_ref(), iter)?
         .without_column(crate::scan::ROW_COUNT_COLUMN))
 }

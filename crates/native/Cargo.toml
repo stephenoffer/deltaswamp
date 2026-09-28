@@ -26,6 +26,9 @@ uuid.workspace = true
 # Encodes the UUID in a deletion vector descriptor; already in the tree through
 # delta_kernel, which decodes the same form.
 z85 = "3"
+# Already in the tree through delta_kernel; the StorageHandler trait reads
+# files as `Bytes` (confine.rs wraps it).
+bytes = "1"
 thiserror.workspace = true
 tracing.workspace = true
 

@@ -578,7 +578,12 @@ impl PySnapshot {
 
             let scan = builder.build()?;
             // Rebases Parquet files Spark wrote in its legacy hybrid calendar.
-            let engine = crate::rebase::reading_engine(&self.engine, self.inner.table_root());
+            // Confined to the table root: a log path that climbs out of it is
+            // refused, not read with the table's credentials (confine.rs).
+            let engine = crate::confine::confined(
+                crate::rebase::reading_engine(&self.engine, self.inner.table_root()),
+                self.inner.table_root(),
+            );
             if row_positions {
                 let paths = files.map(|f| f.into_iter().collect());
                 return KernelBatchReader::try_new_positional(&scan, engine, paths);

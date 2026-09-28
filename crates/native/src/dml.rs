@@ -812,6 +812,7 @@ fn footer_num_rows(engine: &SharedEngine, root: &url::Url, file: &ScanFile) -> R
         ))
     };
     let url = root.join(&file.path)?;
+    crate::confine::check(root, &url)?;
     let store = engine
         .get_object_store_for_url(&url)
         .ok_or_else(|| NativeError::Invalid(format!("no object store is registered for {url}")))?;

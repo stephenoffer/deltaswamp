@@ -7,6 +7,7 @@
 
 mod changes;
 mod commit;
+mod confine;
 mod dml;
 mod error;
 mod files;
