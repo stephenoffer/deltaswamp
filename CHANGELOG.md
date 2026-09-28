@@ -81,6 +81,12 @@ First release.
   table feature, contradictory `partition_overwrite`/`predicate`, a misspelt
   keyword, data that is not a table) is `InvalidArgumentError`, no longer an
   `UnreachableTableError` that read as "no engine can serve this".
+- Data files the kernel writes (appends, overwrites, DML rewrites, OPTIMIZE,
+  Z-ORDER, distributed workers) are snappy-compressed, as Spark's and
+  delta-rs's are, or use the table's `delta.parquet.compression.codec`
+  (`zstd`, `gzip`, `lz4`, `lz4_raw`, `brotli`, `uncompressed`; `lzo`, which
+  arrow-rs cannot write, as snappy). They were uncompressed, and an OPTIMIZE
+  grew a table 2-4x.
 
 ### Known limits
 

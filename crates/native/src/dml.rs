@@ -281,6 +281,7 @@ pub fn commit_dml(
         ));
     }
     let table_root = snapshot.table_root().clone();
+    let codec = crate::writer::codec_for(&snapshot);
 
     // Log replay once: the scan files to join the deletions against, kept
     // whole because the kernel's DV update and remove both take them as is.
@@ -586,6 +587,7 @@ pub fn commit_dml(
                 // step are never in memory at once.
                 batch.and_then(|b| commit::prepare_batches(&snapshot, vec![b]))
             }),
+            codec,
         ),
         (None, None) => commit::stage_batches(
             &mut transaction,
@@ -593,6 +595,7 @@ pub fn commit_dml(
             &partition_columns,
             &table_schema,
             batches,
+            codec,
         ),
         (Some(column), None) => stage_with_row_ids(
             &mut transaction,
@@ -601,6 +604,7 @@ pub fn commit_dml(
             &table_schema,
             batches,
             column,
+            codec,
         ),
     };
     let result = staged.and_then(|()| commit::finish_commit(transaction, &engine));
@@ -719,6 +723,7 @@ fn stage_with_row_ids(
     table_schema: &delta_kernel::schema::SchemaRef,
     batches: Vec<RecordBatch>,
     column: &str,
+    codec: delta_kernel::parquet::basic::Compression,
 ) -> Result<()> {
     use delta_kernel::engine::arrow_conversion::TryFromArrow;
     use delta_kernel::engine::arrow_data::EngineDataArrowExt;
@@ -755,6 +760,7 @@ fn stage_with_row_ids(
                 engine,
                 &data,
                 &write_context,
+                codec,
             ))?);
             continue;
         };
@@ -775,6 +781,7 @@ fn stage_with_row_ids(
             engine,
             &physical,
             &write_context,
+            codec,
         ))?);
     }
     for metadata in staged {

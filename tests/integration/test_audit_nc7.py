@@ -261,3 +261,62 @@ class TestCalendarCacheIdentity:
             second.delete("abs(rid) = 2")
         got = ds.connect().open_table(str(root)).to_arrow().sort_by("rid").column("dt")
         assert dt.date(1, 1, 1) in got.to_pylist()
+
+
+class TestKernelCompression:
+    """A2: the kernel's writer wrote UNCOMPRESSED Parquet (OPTIMIZE grew tables 2-4x)."""
+
+    @staticmethod
+    def _codecs(path: str, since: int) -> set[str]:
+        dtb = deltalake.DeltaTable(path)
+        older = set(deltalake.DeltaTable(path, version=since).file_uris())
+        out = set()
+        for uri in dtb.file_uris():
+            if uri in older:
+                continue
+            meta = pq.ParquetFile(uri.removeprefix("file://")).metadata
+            out |= {
+                meta.row_group(g).column(c).compression
+                for g in range(meta.num_row_groups)
+                for c in range(meta.num_columns)
+            }
+        return out
+
+    def _early_rows(self, n: int, base: int = 0) -> Any:
+        # Early dates send the write to the kernel.
+        return pa.table(
+            {
+                "id": pa.array(range(base, base + n), pa.int64()),
+                "d": pa.array([dt.date(1000, 1, 1)] * n),
+                "s": pa.array([f"row-{i % 97}-payload" for i in range(n)]),
+            }
+        )
+
+    def test_kernel_writes_snappy_and_optimize_does_not_grow_the_table(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = str(tmp_path / "t")
+        t = ds.connect().write_table(path, self._early_rows(1000))
+        for i in range(1, 5):
+            t.append(self._early_rows(1000, i * 1000))
+        before = sum(
+            pathlib.Path(u.removeprefix("file://")).stat().st_size
+            for u in deltalake.DeltaTable(path).file_uris()
+        )
+        assert self._codecs(path, 0) == {"SNAPPY"}
+        version = deltalake.DeltaTable(path).version()
+        t.optimize()
+        assert self._codecs(path, version) == {"SNAPPY"}
+        after = sum(
+            pathlib.Path(u.removeprefix("file://")).stat().st_size
+            for u in deltalake.DeltaTable(path).file_uris()
+        )
+        assert after <= before
+
+    def test_table_codec_property_is_honored(self, tmp_path: pathlib.Path) -> None:
+        path = str(tmp_path / "t")
+        t = ds.connect().write_table(path, self._early_rows(10))
+        t.set_properties({"delta.parquet.compression.codec": "zstd"})
+        version = deltalake.DeltaTable(path).version()
+        t.append(self._early_rows(10, 10))
+        assert self._codecs(path, version) == {"ZSTD"}

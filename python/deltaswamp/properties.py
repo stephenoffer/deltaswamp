@@ -183,7 +183,17 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
             True,
             "UniForm metadata generation is a Databricks-side job",
         ),
-        _prop("delta.parquet.compression.codec", _RJ, _RJ, _UN),
+        # Stored by set_properties() through the kernel's metadata commit; the
+        # kernel's writer then compresses every data file it writes with it.
+        _prop(
+            "delta.parquet.compression.codec",
+            _RJ,
+            _RJ,
+            _UN,
+            False,
+            "the kernel writes data files with this codec (snappy when unset; lzo, "
+            "which arrow-rs cannot write, as snappy); delta-rs writes snappy",
+        ),
         # Real Delta keys that delta-rs rejects ("Error parsing property");
         # the kernel's metadata path stores them for Databricks to act on.
         _prop(

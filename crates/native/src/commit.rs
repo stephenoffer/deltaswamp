@@ -36,6 +36,7 @@ use unity_catalog_delta_rest_client::{ClientConfig, UCUpdateTableRestClient};
 use crate::error::{NativeError, Result};
 use crate::partition;
 use crate::runtime;
+use delta_kernel::parquet::basic::Compression;
 
 /// The engine every binding uses.
 ///
@@ -258,6 +259,7 @@ pub fn write(
     // Clone before the transaction consumes it; the overwrite path needs to
     // scan the same snapshot to learn which files to remove.
     let scan_source = snapshot.clone();
+    let codec = crate::writer::codec_for(&snapshot);
     let partition_columns = snapshot
         .table_configuration()
         .logical_partition_columns()
@@ -295,6 +297,7 @@ pub fn write(
         &partition_columns,
         &table_schema,
         batches,
+        codec,
     )?;
 
     // UCCommitter looks up the current Tokio handle and bridges its HTTP calls
@@ -337,6 +340,7 @@ pub(crate) fn stage_batches(
     partition_columns: &[String],
     table_schema: &delta_kernel::schema::SchemaRef,
     batches: Vec<arrow::array::RecordBatch>,
+    codec: Compression,
 ) -> Result<()> {
     let write_state = txn.write_state()?;
     let mut staged = Vec::new();
@@ -344,8 +348,12 @@ pub(crate) fn stage_batches(
         let write_context = write_state.unpartitioned_write_context()?;
         for batch in batches {
             let data = ArrowEngineData::new(batch);
-            let metadata =
-                runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
+            let metadata = runtime::block_on(crate::writer::write_parquet(
+                engine,
+                &data,
+                &write_context,
+                codec,
+            ))?;
             staged.push(metadata);
         }
     } else {
@@ -355,8 +363,12 @@ pub(crate) fn stage_batches(
             {
                 let write_context = write_state.partitioned_write_context(group.values)?;
                 let data = ArrowEngineData::new(group.data);
-                let metadata =
-                    runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
+                let metadata = runtime::block_on(crate::writer::write_parquet(
+                    engine,
+                    &data,
+                    &write_context,
+                    codec,
+                ))?;
                 staged.push(metadata);
             }
         }
@@ -384,6 +396,7 @@ pub(crate) fn stage_stream(
     partition_columns: &[String],
     table_schema: &delta_kernel::schema::SchemaRef,
     batches: impl Iterator<Item = Result<Vec<arrow::array::RecordBatch>>>,
+    codec: Compression,
 ) -> Result<()> {
     type Write = tokio::task::JoinHandle<DeltaResult<Box<dyn delta_kernel::EngineData>>>;
     let write_state = txn.write_state()?;
@@ -424,7 +437,7 @@ pub(crate) fn stage_stream(
                     // The writer that marks the footer with the Spark version,
                     // as every other write here uses: without it Databricks
                     // read a compacted file's early dates shifted.
-                    crate::writer::write_parquet(&engine, &data, &context).await
+                    crate::writer::write_parquet(&engine, &data, &context, codec).await
                 });
                 inflight.push_back((handle, bytes));
                 inflight_bytes += bytes;
@@ -1115,6 +1128,7 @@ fn write_files_tracked(
         .logical_partition_columns()
         .to_vec();
     let table_schema = snapshot.schema();
+    let codec = crate::writer::codec_for(&snapshot);
     let table_root = snapshot.table_root().to_string();
     let metadata_id = snapshot.table_configuration().metadata().id().to_string();
     // Built with the same committer the coordinator will use: a catalog-managed
@@ -1148,8 +1162,12 @@ fn write_files_tracked(
         let write_context = write_state.unpartitioned_write_context()?;
         for batch in batches {
             let data = ArrowEngineData::new(batch);
-            let metadata =
-                runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
+            let metadata = runtime::block_on(crate::writer::write_parquet(
+                engine,
+                &data,
+                &write_context,
+                codec,
+            ))?;
             record(add_metadata_batch(metadata)?)?;
         }
     } else {
@@ -1159,8 +1177,12 @@ fn write_files_tracked(
             {
                 let write_context = write_state.partitioned_write_context(group.values)?;
                 let data = ArrowEngineData::new(group.data);
-                let metadata =
-                    runtime::block_on(crate::writer::write_parquet(engine, &data, &write_context))?;
+                let metadata = runtime::block_on(crate::writer::write_parquet(
+                    engine,
+                    &data,
+                    &write_context,
+                    codec,
+                ))?;
                 record(add_metadata_batch(metadata)?)?;
             }
         }
