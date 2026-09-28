@@ -437,6 +437,8 @@ def _implemented() -> frozenset[Operation]:
         ops |= {Operation.OPTIMIZE, Operation.ZORDER}
     if _native_has("vacuum", "commit_raw"):
         ops.add(Operation.VACUUM)
+    if _native_has("log_cleanup"):
+        ops.add(Operation.CLEANUP_METADATA)
     if _native_has("restore", "commit_raw", "metadata_json"):
         ops.add(Operation.RESTORE)
     if _native_has("path_clone", "commit_raw", "files", "metadata_json"):
@@ -651,6 +653,8 @@ class KernelEngine:
         if operation is Operation.VACUUM:
             # Their own gates: see _vacuum_capability and _restore_capability.
             return self._vacuum_capability(table, shape)
+        if operation is Operation.CLEANUP_METADATA:
+            return self._cleanup_capability(table)
         if operation is Operation.RESTORE:
             return self._restore_capability(table, shape)
 
@@ -3847,6 +3851,82 @@ class KernelEngine:
             )
         shown = {key: path for key, path, _ in doomed}
         return sorted(shown[key] for key in deleted)
+
+    # ------------------------------------------------------------ log cleanup
+
+    def _cleanup_capability(self, table: ResolvedTable) -> Capability:
+        """Expired log cleanup, planned by the kernel (crates/native/src/logclean.rs).
+
+        It commits nothing and deletes only log files below a checkpoint every
+        retained version is read from, so no feature that governs data or
+        schema binds it: the tables delta-rs cannot open for writing (in-commit
+        timestamps among them) are served. A catalog's log is its own, and
+        `checkpointProtection` restricts which history may go.
+        """
+        reason = None
+        if table.is_catalog_managed:
+            reason = (
+                "the table is catalog-managed: Unity Catalog owns its log, and cleans it up itself"
+            )
+        elif "checkpointProtection" in table.effective_writer_features:
+            reason = (
+                "the table has checkpointProtection: its history before "
+                "delta.requireCheckpointProtectionBeforeVersion may only be truncated as a "
+                "whole (DROP FEATURE ... TRUNCATE HISTORY), by a writer supporting every "
+                "feature it ever had"
+            )
+        else:
+            unknown = sorted(
+                name
+                for name in table.effective_reader_features | table.effective_writer_features
+                if feature_from_wire(name) is None
+            )
+            if unknown:
+                reason = (
+                    "the table carries table features nothing here recognizes ("
+                    + ", ".join(unknown)
+                    + "), and one could restrict which log files may be removed"
+                )
+        if reason is not None:
+            return Capability(
+                Operation.CLEANUP_METADATA, ok=False, reason=reason, remedy=SQL_FALLBACK_REMEDY
+            )
+        return Capability(Operation.CLEANUP_METADATA, ok=True, engine=self.kind)
+
+    def cleanup_metadata(self, table: ResolvedTable) -> None:
+        """Delete log files older than `delta.logRetentionDuration` (30 days by default).
+
+        Only below the newest checkpoint committed before the retention
+        boundary, so every retained version still reads: commit, checksum,
+        checkpoint and compacted files, and the sidecars no retained v2
+        checkpoint references. A commit's time is its in-commit timestamp where
+        the table has them, else its file's modification time (see
+        crates/native/src/logclean.rs). Runs regardless of
+        `delta.enableExpiredLogCleanup`, as delta-rs's does.
+        """
+        import time
+
+        capability = self._cleanup_capability(table)
+        if not capability.ok:
+            raise UnreachableTableError(
+                "clean up the log", capability.reason, capability.remedy or None
+            )
+        _enter_native("clean up the log")
+        snapshot = self.snapshot(table, write=True)
+        cutoff = int(time.time() * 1000) - int(snapshot.log_retention_ms)
+        with translating(EngineKind.KERNEL, "cleanup_metadata"):
+            _, deleted, failed = snapshot.cleanup_log(cutoff)
+        if deleted and table.location is not None:
+            self.forget(table.location)
+        if failed:
+            key, message = failed[0]
+            raise EngineLimitError(
+                "clean up the log",
+                f"{len(failed)} log file(s) were not deleted (e.g. {key}: {message}); "
+                f"{len(deleted)} older ones were, and the log still reads from its oldest "
+                "remaining checkpoint",
+                "check the credential's delete permission and run cleanup_metadata again",
+            )
 
     def _commit_info_only(
         self,

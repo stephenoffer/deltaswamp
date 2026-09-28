@@ -288,8 +288,8 @@ See docs/usage.md, "Security notes".
   gets "a Delta table already exists there".
 - `wasb://` and `wasbs://` locations are refused; use `abfss://`.
 - A path table with a GCS OAuth bearer token in `storage_options` is served by
-  the kernel only: history, MERGE and log cleanup, which only delta-rs
-  implements, are refused on it.
+  the kernel only: history and MERGE, which only delta-rs implements, are
+  refused on it.
 
 - `convert_to_delta` refuses a hive-partitioned directory whose partition
   values are escaped (`region=a%20b`): delta-rs records those paths unencoded
@@ -312,6 +312,17 @@ See docs/usage.md, "Security notes".
   `MissingDataFileError` unless `ignore_missing_files=True`. Refused up front
   (`can("restore", target=n)`) across a change of column-mapping mode,
   partition columns or table id, or to a version needing a dropped feature.
+- Expired log cleanup (`cleanup_metadata()`) is planned by the kernel on
+  every table it reads: it deletes commit, `.crc`, checkpoint (classic,
+  multi-part, v2) and compacted log files older than
+  `delta.logRetentionDuration` only below the newest checkpoint committed
+  before the retention boundary, so every retained version still reads, and
+  sidecars no retained v2 checkpoint references. A commit's time is its
+  in-commit timestamp where the table has them (delta-rs refused those
+  tables), else its file's modification time made monotonic. It never
+  touches `_staged_commits/`, and refuses catalog-managed tables and
+  `checkpointProtection`. delta-rs serves it only where the kernel cannot
+  read the table.
 - Adding a NOT NULL column is refused on every engine, as Databricks refuses
   it: add it nullable, backfill, then `set_not_null()`.
 - On a kernel-only table without deletion vectors, DML is a whole-table

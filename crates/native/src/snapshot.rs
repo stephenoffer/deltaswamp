@@ -725,6 +725,49 @@ impl PySnapshot {
         Ok(py.detach(|| crate::vacuum::delete(self.store()?, self.inner.table_root(), keys))?)
     }
 
+    /// `delta.logRetentionDuration` in milliseconds, as the kernel parses it,
+    /// or Delta's default (30 days) when the table does not set it.
+    #[getter]
+    fn log_retention_ms(&self) -> u64 {
+        self.inner
+            .table_properties()
+            .log_retention_duration
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(crate::logclean::DEFAULT_LOG_RETENTION_MS)
+    }
+
+    /// Clean up the log below the newest checkpoint committed at or before
+    /// `cutoff_ms` (see `crate::logclean`). Returns `(kept_checkpoint,
+    /// deleted, failed)`: the checkpoint the retained history starts from,
+    /// the keys deleted (relative to the table root) and `(key, error)` for
+    /// each that was not. `dry_run` deletes nothing and returns the plan.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (cutoff_ms, dry_run = false))]
+    fn cleanup_log(
+        &self,
+        py: Python<'_>,
+        cutoff_ms: i64,
+        dry_run: bool,
+    ) -> PyResult<(Option<u64>, Vec<String>, Vec<(String, String)>)> {
+        Ok(py.detach(
+            || -> Result<(Option<u64>, Vec<String>, Vec<(String, String)>)> {
+                let store = self.store()?;
+                let plan = crate::logclean::plan(
+                    &self.inner,
+                    self.engine.as_ref(),
+                    store.clone(),
+                    cutoff_ms,
+                )?;
+                if dry_run {
+                    return Ok((plan.kept_checkpoint, plan.keys, Vec::new()));
+                }
+                let (deleted, failed) =
+                    crate::logclean::delete(store, self.inner.table_root(), plan.keys)?;
+                Ok((plan.kept_checkpoint, deleted, failed))
+            },
+        )?)
+    }
+
     /// Of the data and deletion-vector files `adds` (add actions as JSON)
     /// reference, the ones missing from storage, as URLs.
     fn missing_files(&self, py: Python<'_>, adds: Vec<String>) -> PyResult<Vec<String>> {

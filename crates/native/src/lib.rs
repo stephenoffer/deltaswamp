@@ -13,6 +13,7 @@ mod dml;
 mod error;
 mod files;
 mod functions;
+mod logclean;
 mod partition;
 mod predicate;
 mod rebase;
@@ -99,6 +100,9 @@ pub const FEATURES: &[&str] = &[
     // `absolute_deletion_vector` and `copy_objects`: shallow and deep clones
     // of path tables.
     "path_clone",
+    // `cleanup_log`: expired log cleanup below a retained checkpoint, by
+    // commit timestamps (in-commit timestamps where the table has them).
+    "log_cleanup",
 ];
 
 #[pyfunction]

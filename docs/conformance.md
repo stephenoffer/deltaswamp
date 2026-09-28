@@ -143,7 +143,7 @@ serve.
 | `clone` | kernel, sql | kernel: path table to a path (a raw version 0 over the source's files); Databricks for catalog tables |
 | `convert` | deltars | kernel has no CONVERT TO DELTA |
 | `generate` | deltars | kernel has no manifest generation |
-| `cleanup_metadata` | deltars | delta-rs removes log files older than delta.logRetentionDuration |
+| `cleanup_metadata` | kernel, deltars | the kernel deletes log files older than delta.logRetentionDuration below a checkpoint every retained version reads from, by in-commit timestamps where the table has them, v2 checkpoints' sidecars included; delta-rs where the kernel cannot read the table |
 | `analyze` | sql | Databricks-only (ANALYZE TABLE ... COMPUTE [DELTA] STATISTICS) |
 | `sync_iceberg` | sql | Databricks-only (MSCK REPAIR TABLE ... SYNC METADATA regenerates UniForm Iceberg metadata) |
 | `refresh` | sql | Databricks-only (REFRESH of a materialized view or streaming table) |

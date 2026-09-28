@@ -17,7 +17,7 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
-"path_clone". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
+"path_clone", "log_cleanup". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -393,6 +393,24 @@ class Snapshot:
 
     def delete_files(self, keys: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
         """Delete `keys` from `vacuum_plan` under the root: (deleted, [(key, error)])."""
+
+    @property
+    def log_retention_ms(self) -> int:
+        """`delta.logRetentionDuration` in ms, or Delta's default (30 days) if unset."""
+
+    def cleanup_log(
+        self, cutoff_ms: int, dry_run: bool = False
+    ) -> tuple[int | None, list[str], list[tuple[str, str]]]:
+        """Delete the log below the newest checkpoint committed at or before `cutoff_ms`.
+
+        Commit, checksum, checkpoint and compacted files below that checkpoint,
+        and sidecars no retained v2 checkpoint references that are older than
+        the cutoff. Commit times are in-commit timestamps where the table has
+        them, else monotonized file modification times. Returns
+        `(kept_checkpoint, deleted_keys, [(key, error)])`; `dry_run` returns
+        the plan. Refuses a catalog-managed table and checkpointProtection.
+        Requires "log_cleanup".
+        """
 
     def missing_files(self, adds: list[str]) -> list[str]:
         """URLs of the data and deletion-vector files `adds` (JSON) name that are gone."""

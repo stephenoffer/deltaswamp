@@ -229,9 +229,12 @@ def test_cleanup_and_log_compaction_of_a_clustered_table(conn: Any, tmp_path: Pa
 
 
 @needs_native
-def test_cleanup_is_still_refused_on_in_commit_timestamps(conn: Any, tmp_path: Path) -> None:
+def test_cleanup_of_in_commit_timestamps_is_served_by_the_kernel(conn: Any, tmp_path: Path) -> None:
+    """delta-rs refuses the table; the kernel cleans up by in-commit timestamps."""
     path = _make(conn, tmp_path, {"delta.enableInCommitTimestamps": "true"})
-    assert not conn.table(path).can("cleanup_metadata").ok
+    assert conn.table(path).can("cleanup_metadata").engine is Engine.KERNEL
+    conn.table(path).cleanup_metadata()
+    assert conn.table(path).to_arrow().num_rows == 6
 
 
 def test_history_exemptions_do_not_leak_into_writes() -> None:

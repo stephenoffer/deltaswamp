@@ -859,8 +859,11 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(
             Operation.CLEANUP_METADATA,
-            (_D,),
-            "delta-rs removes log files older than delta.logRetentionDuration",
+            (_K, _D),
+            "the kernel deletes log files older than delta.logRetentionDuration below a "
+            "checkpoint every retained version reads from, by in-commit timestamps where the "
+            "table has them, v2 checkpoints' sidecars included; delta-rs where the kernel "
+            "cannot read the table",
         ),
         _op(
             Operation.PUBLISH, (_K,), "Snapshot::publish; only kernel implements staged->published"

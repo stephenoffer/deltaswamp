@@ -141,7 +141,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | Checkpoint | all | delta-rs, kernel | the kernel checkpoints catalog-managed tables, publishing first |
 | Version checksums (`.crc`) | DBR, Spark, kernel | kernel, delta-rs | written after every commit where the previous one is at most 100 versions back (or the log is short); delta-rs writes none itself (delta-rs#4190) |
 | Log compaction | Spark, delta-rs | delta-rs | kernel's writer is a stub |
-| Expired log cleanup | all | delta-rs | `Table.cleanup_metadata()` |
+| Expired log cleanup | all | kernel, delta-rs | `Table.cleanup_metadata()`. The kernel deletes log files older than `delta.logRetentionDuration` below the newest checkpoint committed before the boundary (so every retained version reads), v2 sidecars nothing retained references included, by in-commit timestamps where the table has them; catalog-managed tables and `checkpointProtection` are refused. delta-rs where the kernel cannot read the table |
 | Publish staged commits | kernel | kernel | required on catalog-managed tables |
 | ANALYZE (DELTA) STATISTICS | DBR | warehouse | |
 | REORG PURGE / UPGRADE UNIFORM | DBR, Spark | warehouse | |
