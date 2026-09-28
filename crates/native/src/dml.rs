@@ -554,6 +554,15 @@ pub fn commit_dml(
                 } else {
                     with_num_records(&batch, &paths, &unsized_files)?
                 };
+                // The kernel widens by parsing the stats into a
+                // serde_json::Value and writing it back, which turns every
+                // number into an f64: a DECIMAL(38,18) max of
+                // 12345678901234567890.123456789012345678 came back as
+                // 1.2345678901234567e+19, below the real value, and
+                // Databricks skipped the file for `dec = <that value>`.
+                // Stats already wide are kept verbatim, so they are widened
+                // here, textually.
+                let batch = with_wide_stats(&batch)?;
                 dv_files.push(Ok(FilteredEngineData::try_new(
                     Box::new(ArrowEngineData::new(batch)),
                     update,
@@ -905,6 +914,85 @@ fn with_num_records(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+/// `batch` (scan files) with `"tightBounds":false` in every file's stats,
+/// every other value kept as the log spells it.
+fn with_wide_stats(batch: &RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let index = schema.index_of("stats")?;
+    let original = batch.column(index);
+    let stats = arrow::compute::cast(original, &arrow::datatypes::DataType::Utf8)?;
+    let stats = stats
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| NativeError::Invalid("scan-file stats are not strings".to_string()))?;
+    let widened: StringArray = stats
+        .iter()
+        .map(|value| value.map(|s| wide_stats(s).unwrap_or_else(|| s.to_string())))
+        .collect();
+    let widened = arrow::compute::cast(&widened, original.data_type())?;
+    let mut columns = batch.columns().to_vec();
+    columns[index] = widened;
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// `stats` (one add's JSON stats) with `tightBounds` false, or None when it
+/// is not a JSON object (the kernel then reports it). Each value is copied as
+/// raw JSON text, so no number goes through a float.
+fn wide_stats(stats: &str) -> Option<String> {
+    use serde::de::{Deserializer, MapAccess, Visitor};
+    use serde_json::value::RawValue;
+
+    struct Entries(Vec<(String, Box<RawValue>)>);
+    impl<'de> serde::Deserialize<'de> for Entries {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Entries;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Entries, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some(entry) = map.next_entry::<String, Box<RawValue>>()? {
+                        out.push(entry);
+                    }
+                    Ok(Entries(out))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+
+    const TIGHT_BOUNDS: &str = "tightBounds";
+    let Entries(entries) = serde_json::from_str(stats).ok()?;
+    let mut out = String::from("{");
+    let mut seen = false;
+    for (key, value) in &entries {
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::to_string(key).ok()?);
+        out.push(':');
+        if key == TIGHT_BOUNDS {
+            seen = true;
+            out.push_str("false");
+        } else {
+            out.push_str(value.get());
+        }
+    }
+    if !seen {
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push_str("\"tightBounds\":false");
+    }
+    out.push('}');
+    Some(out)
+}
+
 /// Write a new, uniquely named file under the table root.
 fn put_new_file(
     engine: &SharedEngine,
@@ -985,6 +1073,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn widened_stats_keep_every_number_as_written() {
+        let exact = r#"{"numRecords":3,"minValues":{"dec":-12345678901234567890.123456789012345678,"big":-9007199254740995},"maxValues":{"dec":12345678901234567890.123456789012345678,"f":1e300},"nullCount":{"dec":0},"tightBounds":true}"#;
+        assert_eq!(
+            wide_stats(exact).unwrap(),
+            exact.replace(r#""tightBounds":true"#, r#""tightBounds":false"#)
+        );
+        assert_eq!(
+            wide_stats(r#"{"numRecords":1, "maxValues":{"d":0.10000000000000000001}}"#).unwrap(),
+            r#"{"numRecords":1,"maxValues":{"d":0.10000000000000000001},"tightBounds":false}"#
+        );
+        assert_eq!(wide_stats("{}").unwrap(), r#"{"tightBounds":false}"#);
+        assert_eq!(wide_stats("[1]"), None);
+        assert_eq!(wide_stats("not json"), None);
+    }
 
     #[test]
     fn dv_file_names_follow_the_protocol_derivation() {
