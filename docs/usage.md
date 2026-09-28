@@ -1004,22 +1004,73 @@ creds.redacted()  # safe to log
 ```
 
 Credential *providers* are picklable; credentials are not, and pickling one
-raises `TypeError`. Pickling a provider, or a `Table` holding one, carries the
-catalog configuration the driver resolved, which for a token-authenticated
-workspace includes the token, so a worker can re-vend. A pickled `Connection`
-carries only what `connect()` was given: an explicit `token=` or `config=`
-travels, but authentication the SDK found in the environment or
-`~/.databrickscfg` does not, so a worker needs its own. Distributed plans ship
-no catalog credentials by default; see "Distributed reads and writes" above.
+raises `TypeError`. A pickled provider, catalog, `Table` or `Connection` carries
+the catalog configuration the driver resolved (host, auth type, client id) but
+no literal secret: no PAT, no OAuth client secret, whether it came from
+`token=` or from the environment. A worker's SDK re-derives auth from its own
+environment (`DATABRICKS_TOKEN`, a profile, cloud-native auth).
+`connect(ship_credentials=True)` pickles the secrets too, for workers that have
+no auth of their own, and so does a plan made with `ship_catalog_auth=True`.
+Distributed plans ship no catalog credentials by default; see "Distributed
+reads and writes" above.
 
-databricks-sdk logs every response body at DEBUG. deltaswamp installs a filter
-on the `databricks.sdk` logger that replaces the secret fields of vended
-credentials and OAuth tokens (`secret_access_key`, `session_token`,
-`sas_token`, `oauth_token`, `access_token`, ...) with `**REDACTED**`, so turning
-on DEBUG does not write them to the log. A handler that reads records from
-another logger the SDK uses is not covered. Azure
-user-delegation SAS is scoped to a path, so credentials are keyed by table, and
-Azure always gets an explicit endpoint.
+databricks-sdk logs every request and response at DEBUG. deltaswamp redacts
+the records of the `databricks.sdk` logger and all its children: any field
+whose name marks a secret, whatever the separators (`secret_access_key`,
+`s3.secret-access-key`, `adls.sas-token.<host>`, `gcs.oauth2.token`,
+`aad_token`, `access_token`, ...), `Authorization` and cookie header lines
+(`debug_headers=True`), and presigned-URL signatures (`sig=`,
+`X-Amz-Signature=`, ...) become `**REDACTED**`. Azure user-delegation SAS is
+scoped to a path, so credentials are keyed by table, and Azure always gets an
+explicit endpoint.
+
+## Security notes
+
+What deltaswamp refuses, and why, when the input comes from someone else --
+another writer of a table's log, a catalog entry, a sharing server:
+
+* **SQL text is one expression.** A predicate, SET or INSERT value, MERGE ON
+  or clause condition, replaceWhere, CHECK constraint, or a generation or
+  DEFAULT expression copied into warehouse DDL must be exactly one Spark SQL
+  expression: literals closed, parentheses balanced, no `;`, no comment, no
+  top-level `,`, nothing trailing. Malformed text raises `PredicateError`
+  before any engine sees it; delta-rs used to act on a prefix of it
+  (`id = 1) AND (...` deleted every `id = 1` row). The kernel MERGE evaluates
+  its clauses in a sandboxed DuckDB (no file or network access, no
+  extensions, configuration locked), one statement per execute.
+  `Connection.sql(engine="duckdb")` is a plain local DuckDB with file and
+  network access, by design: never build that SQL from untrusted input.
+* **Credentials go only where you configured them.** An Azure location
+  derives its endpoint only under Azure Storage's domains (`core.windows.net`
+  and its private-link aliases, `core.chinacloudapi.cn`,
+  `core.usgovcloudapi.net`, `core.cloudapi.de`, `fabric.microsoft.com`); any
+  other host needs `azure_storage_endpoint` named by you, and a location in
+  another account than `azure_storage_account_name` is refused. Vended R2
+  keys go only to `*.r2.cloudflarestorage.com`. S3 and GCS endpoints come from
+  your options or the cloud's own, never from a location. The OSS Unity Catalog
+  client drops `Authorization` on a redirect to another origin, refuses a
+  redirect from https to http, and warns when a token goes to a plain-http
+  catalog that is not on this machine. A name part of `.` or `..` is encoded in
+  REST paths.
+* **A table reads only its own files.** A data file or deletion vector whose
+  log path resolves outside the table root (`../x`, `%2E%2E/x`, another prefix
+  or bucket) is refused by the kernel reads and by compaction.
+* **Creating a table never adopts other files.** `create_table` and
+  `write_table` refuse a directory that already holds files a Delta table does
+  not leave behind (as Spark refuses a non-empty location), and a managed
+  table's staging location on this machine's filesystem is refused unless the
+  catalog runs on this machine. A full VACUUM deletes only orphans named like
+  Delta files (`*.parquet`, `deletion_vector_*.bin`) and warns about the rest.
+* **Delta Sharing downloads go to public https hosts.** A presigned URL must
+  be https and must not resolve to a private, loopback, link-local or metadata
+  address; every redirect hop is checked the same way. A local development
+  server opts in with `DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS=1`.
+
+Dependency hygiene is the deployer's: the Python dependencies have lower bounds
+only (`deltalake`, `duckdb`, `databricks-sdk`, ...), and the sandbox settings
+and error texts this library relies on can change in a new major version.
+Pinning upper bounds in your environment, a hash-pinned lock file for CI, and
+`pip-audit` plus `cargo audit` / `cargo deny` in CI are recommended.
 
 ## SQL fallback
 

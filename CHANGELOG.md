@@ -82,6 +82,42 @@ First release.
   keyword, data that is not a table) is `InvalidArgumentError`, no longer an
   `UnreachableTableError` that read as "no engine can serve this".
 
+### Security
+
+See docs/usage.md, "Security notes".
+
+- Every SQL fragment forwarded to an engine (predicates, SET/INSERT values,
+  MERGE ON and conditions, replaceWhere, CHECK constraints, generation and
+  DEFAULT expressions in warehouse DDL) must be exactly one expression;
+  malformed text raises `PredicateError` before routing. delta-rs acted on a
+  prefix of `id = 1) AND (...` and deleted more rows.
+- The kernel MERGE evaluates its clauses in a sandboxed DuckDB, one statement
+  per execute: a SET value could read local files and an ON condition could
+  run another statement.
+- Azure endpoints are derived only under Azure Storage's domains, and only
+  for the account the options name; other hosts need an explicit
+  `azure_storage_endpoint`. The connection's SAS or AAD token went to any
+  host a location named. Vended R2 keys go only to Cloudflare.
+- Kernel reads and compaction refuse data files and deletion vectors outside
+  the table root (`../`, `%2E%2E/`, another prefix or bucket).
+- `create_table` / `write_table` refuse a directory holding non-Delta files,
+  a managed table's staging location on local disk is refused unless the
+  catalog is local, and a full VACUUM deletes only Delta-named orphans. A
+  default VACUUM deleted every unrelated file in such a directory.
+- The OSS UC client keeps its token on the catalog's origin across redirects,
+  refuses https-to-http redirects, and warns on a plain-http remote catalog.
+- Delta Sharing downloads require https to public addresses, checked on
+  connect and on every redirect (`DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS=1`
+  for a local server).
+- The Databricks SDK DEBUG log redaction covers hyphenated and nested secret
+  fields, Authorization headers, URL signatures and child loggers.
+- Pickled providers, catalogs, tables and connections carry no PAT or client
+  secret unless `connect(ship_credentials=True)` or a plan's
+  `ship_catalog_auth=True` asks for them. **Breaking:** a worker now needs
+  Databricks auth of its own (for example `DATABRICKS_TOKEN`), even when the
+  driver passed `token=`.
+- `.` and `..` name parts are percent-encoded in Unity Catalog REST paths.
+
 ### Known limits
 
 - `INTERVAL DAY TO SECOND` columns read as `duration[us]` and year-month

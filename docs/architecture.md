@@ -152,9 +152,10 @@ each worker vends its own credential for its own slice.
 Providers are picklable and credentials are not: `Credentials` raises
 `TypeError` when pickled, and only a plan's `ShippedCredentials` carries one on
 purpose. A provider's `__getstate__` drops the live client, the cached
-credential and the lock. It keeps the catalog configuration, which for a
-token-authenticated workspace includes the token; that is why plans do not
-ship providers unless asked.
+credential and the lock. It keeps the catalog configuration (host, auth
+type, client id) but no literal secret, so a worker's SDK re-derives auth
+from its own environment; `connect(ship_credentials=True)` and a plan's
+`ship_catalog_auth=True` pickle the token or client secret too.
 
 Vending is per-table with no batch endpoint. Discovery therefore makes one
 `ListTables` call per schema rather than one lookup per table.
