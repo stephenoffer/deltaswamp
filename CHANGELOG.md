@@ -141,7 +141,9 @@ First release.
   nothing. delta-kernel refuses any write to a table with the feature; these
   commit past that refusal, and past its refusal of `generatedColumns` where
   no column is generated, so legacy writer 3 to 5 tables (every change-feed
-  and column-mapped table delta-rs created) take kernel writes too. A
+  and column-mapped table delta-rs created) take kernel writes too, and an
+  ALTER that moves one to table features alongside a feature delta-rs cannot
+  write (clustering, type widening) is no longer refused as stranding it. A
   constraint DuckDB cannot evaluate as Databricks does is refused up front.
 - `append` and `overwrite` with `schema_mode="merge"` through the kernel, on
   the tables delta-rs cannot write and on column-mapped ones (delta-rs cannot

@@ -340,7 +340,7 @@ def _strands_legacy_table(
 
     implied = set(_LEGACY_WRITER.get(writer, ()))
     added = _features_added(operation, shape) - implied
-    if added and _writes(implied | added, "kernel"):
+    if added and _writes(implied | added, "kernel", table):
         # Writer 3 implies no more than the kernel writes (checkConstraints
         # included, enforced here), so it goes on writing the table.
         return None
@@ -352,7 +352,7 @@ def _strands_legacy_table(
     )
     if not unwritable:
         return None
-    kept = ", ".join(n for n in sorted(implied) if not _writes({n}, "kernel"))
+    kept = ", ".join(n for n in sorted(implied) if not _writes({n}, "kernel", table))
     return (
         f"the table is at the legacy writer version {writer}, and turning on "
         f"{', '.join(unwritable)} moves it to table features that must keep listing {kept} "
@@ -363,9 +363,20 @@ def _strands_legacy_table(
     )
 
 
-def _writes(features: set[str], engine: str) -> bool:
-    """Whether `engine` (``kernel`` or ``deltars``) writes a table listing `features`."""
-    for name in features:
+def _writes(features: set[str], engine: str, table: ResolvedTable | None = None) -> bool:
+    """Whether `engine` (``kernel`` or ``deltars``) writes a table listing `features`.
+
+    With `table`, as the kernel writes that table: `generatedColumns` binds
+    none of its writes where no column is generated (they commit past the
+    kernel's refusal of it; see `engine.kernel._CHECKED_FEATURES`).
+    """
+    unused: set[str] = set()
+    if engine == "kernel" and table is not None and not table.has_generated_columns:
+        from .engine.kernel import _native_has
+
+        if _native_has("check_constraints"):
+            unused.add("generatedColumns")
+    for name in features - unused:
         feature = feature_from_wire(name)
         if feature is None or getattr(FEATURE_SUPPORT[feature], f"{engine}_write") is Support.NO:
             return False
@@ -388,11 +399,11 @@ def _strands_feature_table(
     if not added:
         return None
     after = current | added
-    if not (_writes(current, "kernel") or _writes(current, "deltars")):
+    if not (_writes(current, "kernel", table) or _writes(current, "deltars")):
         return None
-    if _writes(after, "kernel") or _writes(after, "deltars"):
+    if _writes(after, "kernel", table) or _writes(after, "deltars"):
         return None
-    kernel_blocks = sorted(n for n in after if not _writes({n}, "kernel"))
+    kernel_blocks = sorted(n for n in after if not _writes({n}, "kernel", table))
     deltars_blocks = sorted(n for n in after if not _writes({n}, "deltars"))
     return (
         f"turning on {', '.join(sorted(added))} would leave no local engine able to write the "

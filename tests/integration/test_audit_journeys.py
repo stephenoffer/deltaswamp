@@ -14,6 +14,7 @@ pa = pytest.importorskip("pyarrow")
 pytest.importorskip("deltalake")
 ds = pytest.importorskip("deltaswamp")
 
+from deltaswamp.capability import Engine  # noqa: E402
 from deltaswamp.errors import (  # noqa: E402
     ChangeFeedSchemaChangeError,
     DeltaSwampError,
@@ -222,8 +223,10 @@ def _legacy_cdf_table(conn: Any, path: str) -> Any:
 class TestNoAlterStrandsALegacyTable:
     """One ALTER moved a writer-4 change-feed table to writer 7 listing
     checkConstraints and generatedColumns (as Databricks lists them), which the
-    kernel refuses, plus a feature delta-rs cannot write: no local engine could
-    append to it again."""
+    kernel refused, plus a feature delta-rs cannot write: no local engine could
+    append to it again. The kernel now writes past both where no constraint
+    fails and no column is generated, so the change is taken; a table whose
+    column really is generated is still refused it."""
 
     @pytest.mark.parametrize(
         "alter, shape",
@@ -233,27 +236,45 @@ class TestNoAlterStrandsALegacyTable:
             ("add_feature", {"features": ["typeWidening"]}),
         ],
     )
-    def test_refused_before_anything_is_committed(
+    def test_the_kernel_goes_on_writing_the_table(
         self, conn: Any, tmp_path: Any, alter: str, shape: dict[str, Any]
     ) -> None:
-        from deltaswamp.errors import UnreachableTableError
-
         path = str(tmp_path / "t")
         t = _legacy_cdf_table(conn, path)
         verdict = t.can(alter, **shape)
-        assert not verdict.ok
-        assert "no local engine could write" in verdict.reason
-        with pytest.raises(UnreachableTableError, match="no local engine could write"):
-            if alter == "cluster_by":
-                t.cluster_by(["city"])
-            elif alter == "set_properties":
-                t.set_properties(shape["properties"])
-            else:
-                t.add_feature(shape["features"])
+        assert verdict.ok, verdict
+        if alter == "cluster_by":
+            t.cluster_by(["city"])
+        elif alter == "set_properties":
+            t.set_properties(shape["properties"])
+        else:
+            t.add_feature(shape["features"])
         t = conn.open_table(path)
-        assert t.protocol() == (1, 4)
-        t.append(pa.table({"id": [2], "city": ["b"]}))
-        assert t.count() == 2
+        assert t.protocol()[1] == 7
+        assert {"checkConstraints", "generatedColumns"} <= set(t.features())
+        data = pa.table({"id": [2], "city": ["b"]})
+        assert t.can("append", data=data).engine is Engine.KERNEL
+        t.append(data)
+        assert conn.open_table(path).count() == 2
+
+    def test_refused_where_a_column_is_generated(self, conn: Any, tmp_path: Any) -> None:
+        import os
+
+        from deltaswamp.errors import UnreachableTableError
+
+        from tests.contract.tables import BY_NAME
+
+        path = str(tmp_path / "t")
+        os.makedirs(path)
+        BY_NAME["generated"].build(conn, path)
+        t = conn.open_table(path)
+        before = t.version
+        verdict = t.can("cluster_by", columns=["id"])
+        assert not verdict.ok
+        assert "no local engine able to write" in verdict.reason
+        with pytest.raises(UnreachableTableError, match="no local engine able to write"):
+            t.cluster_by(["id"])
+        assert conn.open_table(path).version == before
 
     def test_a_feature_delta_rs_writes_is_still_allowed(self, conn: Any, tmp_path: Any) -> None:
         path = str(tmp_path / "t")
