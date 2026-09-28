@@ -643,3 +643,56 @@ class TestKernelStreamFailures:
         monkeypatch.setattr(KernelEngine, "snapshot", racing)
         with pytest.raises(MetadataChangedError):
             t.delete("id = 1")
+
+
+class TestCatalogRecheck:
+    """D10: the read-time catalog re-check."""
+
+    def _handle(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+        import deltaswamp.table as table_module
+
+        from tests.integration.test_audit_live5 import _catalog_table
+
+        monkeypatch.setattr(table_module, "_NAME_RECHECK_SECONDS", 0.0)
+        conn = ds.connect("file://")
+        path = str(tmp_path / "t")
+        conn.create_table(path, pa.schema([("id", pa.int64())])).append(
+            pa.table({"id": pa.array([1], pa.int64())})
+        )
+        return _catalog_table(conn, path)
+
+    def test_a_revoked_privilege_surfaces_on_read(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deltaswamp.errors import PreflightError
+
+        t, catalog = self._handle(tmp_path, monkeypatch)
+        assert pa.table(t.to_arrow()).num_rows == 1
+
+        def denied(ref: Any) -> Any:
+            raise PreflightError(f"access to {ref} was denied", denied=True)
+
+        catalog.resolve = denied
+        with pytest.raises(PreflightError, match="denied"):
+            t.to_arrow()
+
+    def test_a_catalog_that_does_not_answer_is_still_tolerated(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deltaswamp.errors import PreflightError
+
+        t, catalog = self._handle(tmp_path, monkeypatch)
+
+        def throttled(ref: Any) -> Any:
+            raise PreflightError("the workspace is throttling")
+
+        catalog.resolve = throttled
+        assert pa.table(t.to_arrow()).num_rows == 1
+
+    def test_the_recheck_clock_does_not_travel(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        t, _ = self._handle(tmp_path, monkeypatch)
+        t.to_arrow()
+        assert "_named_checked_at" in t.__dict__
+        assert "_named_checked_at" not in t.__getstate__()

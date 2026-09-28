@@ -296,7 +296,15 @@ class CredentialError(DeltaSwampError):
 
 
 class PreflightError(DeltaSwampError):
-    """A required workspace/metastore prerequisite is not satisfied."""
+    """A required workspace/metastore prerequisite is not satisfied.
+
+    `denied` is True when the catalog refused the principal (its credentials
+    rejected, or a privilege missing), as opposed to failing to answer.
+    """
+
+    def __init__(self, *args: object, denied: bool = False) -> None:
+        super().__init__(*args)
+        self.denied = denied
 
 
 class CommitConflictError(DeltaSwampError):

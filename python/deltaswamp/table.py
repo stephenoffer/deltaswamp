@@ -42,6 +42,7 @@ from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
     SQL_FALLBACK_REMEDY,
     CorruptTableError,
+    CredentialError,
     DeltaSwampError,
     EngineFallbackWarning,
     EngineLimitError,
@@ -884,6 +885,14 @@ class Table:
         self._refresh_commit_tail(before_write=True)
         self._named_checked_at = now
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        # A time.monotonic() reading, which means nothing on another host: a
+        # handle shipped to a Ray worker whose clock started later skipped
+        # the catalog re-check until the worker's uptime passed the driver's.
+        state.pop("_named_checked_at", None)
+        return state
+
     def _refresh_commit_tail(self, *, before_write: bool = False) -> None:
         """Re-read a catalog-managed table's ratified commits from the catalog.
 
@@ -901,7 +910,12 @@ class Table:
             if before_write:
                 raise
             return
-        except DeltaSwampError:
+        except DeltaSwampError as exc:
+            if getattr(exc, "denied", False) or isinstance(exc, CredentialError):
+                # A revoked privilege or rejected credentials: reading on at
+                # the location resolved earlier would serve a principal the
+                # catalog now refuses.
+                raise
             # The call that got us here succeeded; a re-open reads the tail.
             return
         recreated = any(
