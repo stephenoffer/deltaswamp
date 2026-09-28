@@ -104,3 +104,36 @@ def test_new_files_get_lowercase_prefixes(tmp_path: Any) -> None:
     prefixes = {p.split("/", 1)[0] for p in _live_paths(path) if "/" in p}
     assert prefixes
     assert all(p == p.lower() for p in prefixes), prefixes
+
+
+@pytest.mark.parametrize(
+    ("properties", "engine"),
+    [
+        ({"delta.columnMapping.mode": "name"}, Engine.DELTARS),
+        (
+            {"delta.columnMapping.mode": "name", "delta.enableInCommitTimestamps": "true"},
+            Engine.KERNEL,
+        ),
+    ],
+    ids=["deltars", "kernel"],
+)
+def test_repair_keeps_a_live_file_listed_in_another_case(
+    tmp_path: Any, properties: dict[str, str], engine: Engine
+) -> None:
+    if not _case_insensitive(tmp_path):
+        pytest.skip("the filesystem is case-sensitive")
+    path = tmp_path / "t"
+    conn = ds.connect()
+    t = conn.create_table(str(path), pa.schema([("id", pa.int64())]), properties=properties)
+    for i in range(8):
+        t.append(pa.table({"id": [i]}))
+    moved = _relist_in_other_case(path)
+    gone = next(p for p in _live_paths(path) if p != moved)
+    (path / gone).unlink()
+    t = conn.table(str(path))
+    assert t.can("repair").engine is engine
+    assert t.repair(dry_run=True)["files_removed"] == [gone]
+    t.repair()
+    assert moved in _live_paths(path)
+    assert gone not in _live_paths(path)
+    assert conn.table(str(path)).to_arrow().num_rows == 7

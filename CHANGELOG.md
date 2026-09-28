@@ -176,7 +176,10 @@ First release.
   against the log exactly and deleted a live `nt/x.parquet` listed as
   `nT/x.parquet`. The kernel now matches regardless of case, a delta-rs
   VACUUM deletes only what the kernel's plan also deletes, and new files get
-  lowercase prefixes.
+  lowercase prefixes. FSCK REPAIR had the same fault on both engines,
+  reporting such a file missing and committing its removal: the kernel now
+  asks the filesystem about a file its store cannot find, and a delta-rs
+  repair that names a file still on disk is done by the kernel instead.
 
 ### Security
 

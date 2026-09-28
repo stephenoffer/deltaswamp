@@ -587,6 +587,15 @@ pub fn missing(store: Arc<DynObjectStore>, root: &Url, urls: Vec<Url>) -> Result
                 let location = child(&root_path, &key)?;
                 match store.head(&location).await {
                     Ok(_) => Ok(None),
+                    // A case-insensitive filesystem (macOS and Windows by
+                    // default) holds `nt/x` as `nT/x` once another file
+                    // created the directory that way; the local store then
+                    // reports the live file missing. The filesystem is asked.
+                    Err(delta_kernel::object_store::Error::NotFound { .. })
+                        if url.to_file_path().is_ok_and(|path| path.exists()) =>
+                    {
+                        Ok(None)
+                    }
                     Err(delta_kernel::object_store::Error::NotFound { .. }) => {
                         Ok(Some(url.to_string()))
                     }

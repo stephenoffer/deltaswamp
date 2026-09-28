@@ -1593,8 +1593,34 @@ class DeltaRsEngine:
             )
 
     def repair(self, table: ResolvedTable, **kwargs: Any) -> dict[str, Any]:
+        """FSCK REPAIR: remove the log's adds whose files are missing from storage.
+
+        On a local filesystem delta-rs's dry run is checked against the OS
+        first. A case-insensitive filesystem (macOS and Windows by default)
+        lists `nt/` as `nT/` once another file created it that way, and
+        delta-rs then reported a live `nt/x.parquet` missing and committed
+        its removal. If any file it names is on disk, the kernel repairs
+        instead, asking the filesystem itself about every file it cannot find.
+        """
         _commit_kwargs(kwargs)
-        result: dict[str, Any] = self._open(table, write=True).repair(**kwargs)
+        dt = self._open(table, write=True)
+        root = _local_root(table.location)
+        if root is not None:
+            from urllib.parse import unquote
+
+            probe: dict[str, Any] = dt.repair(dry_run=True)
+            present = [
+                path
+                for path in probe.get("files_removed") or []
+                if os.path.exists(os.path.join(root, unquote(path)))
+            ]
+            if present:
+                from .kernel import KernelEngine
+
+                kernel = guard(EngineKind.KERNEL, KernelEngine(storage_options=self._base_options))
+                repaired: dict[str, Any] = kernel.repair(table, **kwargs)
+                return repaired
+        result: dict[str, Any] = dt.repair(**kwargs)
         return result
 
     # ---------------------------------------------------------------- schema
@@ -2090,6 +2116,17 @@ def _delta_file_name(path: str) -> bool:
     """
     name = path.rstrip("/").rsplit("/", 1)[-1].lower()
     return name.endswith(".parquet") or bool(re.fullmatch(r"deletion_vector_[0-9a-f-]+\.bin", name))
+
+
+def _local_root(location: str | None) -> str | None:
+    """The table root as a local filesystem path, or None for any other store."""
+    if not location:
+        return None
+    if location.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+
+        return unquote(urlparse(location).path)
+    return location if "://" not in location else None
 
 
 def _table_relative(paths: list[str], location: str, *, full: bool = True) -> list[str]:
