@@ -51,6 +51,17 @@ class _Counting:
 # --------------------------------------------------------------- the cache
 
 
+def _pad_to(commit: str, size: int) -> None:
+    """Pad a commit file with JSON whitespace (before its last newline) to `size` bytes."""
+    with open(commit, "rb") as f:
+        body = f.read()
+    missing = size - len(body)
+    assert missing >= 0, (len(body), size)
+    stripped = body.rstrip(b"\n")
+    with open(commit, "wb") as f:
+        f.write(stripped + b" " * missing + body[len(stripped) :])
+
+
 class TestRecreatedAtTheSamePath:
     def test_pinned_version_reads_the_new_table(self, conn: Any, tmp_path: Any) -> None:
         # r4 #1: open_table(p, version=1) on the re-created table returned the
@@ -73,13 +84,20 @@ class TestRecreatedAtTheSamePath:
         path = str(tmp_path / "t")
         conn.create_table(path, pa.schema([("a", pa.int64())]))
         conn.open_table(path).append(pa.table({"a": [1, 2, 3]}))
-        assert conn.open_table(path).count() == 3
         commit = os.path.join(path, "_delta_log", "00000000000000000001.json")
+        # Two commits of the same size, made so: the writer's own commits vary
+        # by a byte or two (commitInfo's execution_time_ms), which made the
+        # sizes differ in most runs and the check this tests go unexercised.
+        # JSON allows the whitespace padding either one out to the size.
+        size = os.stat(commit).st_size + 256
+        _pad_to(commit, size)
+        assert conn.open_table(path).count() == 3
         before = os.stat(commit)
         shutil.rmtree(os.path.join(path, "_delta_log"))
         other = ds.connect()
         other.create_table(path, pa.schema([("b", pa.int64())]))
         other.open_table(path).append(pa.table({"b": [7, 8, 9]}))
+        _pad_to(commit, size)
         assert os.stat(commit).st_size == before.st_size
         os.utime(commit, ns=(before.st_atime_ns, before.st_mtime_ns))
         fresh = conn.open_table(path)
