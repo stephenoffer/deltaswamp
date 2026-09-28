@@ -281,3 +281,84 @@ class TestForeignFilesInTheTableRoot:
             _refuse_local_catalog_location(Remote(), "/home/u/Documents")
         _refuse_local_catalog_location(Local(), "file:///tmp/uc/t")
         _refuse_local_catalog_location(Remote(), "s3://bucket/t")
+
+
+def _serve(handler: Any) -> Any:
+    import http.server
+    import threading
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+class TestOssUcRedirects:
+    """SEC-C2 / SEC-C5: the OSS UC token followed redirects to other origins."""
+
+    def test_the_token_is_not_forwarded_to_another_origin(self) -> None:
+        import http.server
+
+        from deltaswamp.catalog.ossuc import _request
+
+        seen: list[Any] = []
+
+        class Other(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                seen.append(self.headers.get("Authorization"))
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        other = _serve(Other)
+        port = other.server_address[1]
+
+        class Catalog(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", f"http://localhost:{port}/moved")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        catalog = _serve(Catalog)
+        try:
+            base = f"http://127.0.0.1:{catalog.server_address[1]}"
+            assert _request(base, "/api/2.1/unity-catalog/catalogs", "tok-SECRET") == {}
+        finally:
+            other.shutdown()
+            catalog.shutdown()
+        assert seen == [None]
+
+    def test_a_downgrade_to_http_is_refused(self) -> None:
+        import urllib.error
+        import urllib.request
+
+        from deltaswamp.catalog.ossuc import _AuthSafeRedirect
+
+        request = urllib.request.Request("https://uc.example.com/api")
+        request.add_header("Authorization", "Bearer tok")
+        with pytest.raises(urllib.error.HTTPError, match="https to http"):
+            _AuthSafeRedirect().redirect_request(
+                request, None, 302, "Found", {}, "http://uc.example.com/api"
+            )
+        same = _AuthSafeRedirect().redirect_request(
+            request, None, 302, "Found", {}, "https://uc.example.com/api/v2"
+        )
+        assert same.get_header("Authorization") == "Bearer tok"
+
+    def test_a_token_over_plain_http_warns(self) -> None:
+        from deltaswamp.catalog import ossuc
+
+        ossuc._WARNED_PLAIN_HTTP.discard("http://uc.example.com")
+        with pytest.warns(UserWarning, match="plain http"):
+            ossuc._warn_plain_http("http://uc.example.com/api/2.1")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            ossuc._warn_plain_http("http://localhost:8080/api/2.1")

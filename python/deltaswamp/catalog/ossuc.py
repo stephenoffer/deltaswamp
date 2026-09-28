@@ -142,6 +142,70 @@ class UnityCatalogHTTPError(PreflightError):
         return (type(self), (str(self), self.status), self.__dict__)
 
 
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    port = parsed.port or {"http": 80, "https": 443}.get(scheme)
+    return scheme, (parsed.hostname or "").lower(), port
+
+
+class _AuthSafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirects that never carry the bearer token to another origin.
+
+    urllib's default handler copies every non-content header onto the
+    redirected request, so a 30x from the catalog (or a proxy in front of it)
+    to another host delivered ``Authorization: Bearer <token>`` there, and it
+    followed https to http. The token is dropped on any change of scheme, host
+    or port, and a downgrade to http is refused.
+    """
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Any:
+        old, new = _origin(req.full_url), _origin(newurl)
+        if old[0] == "https" and new[0] != "https":
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                f"refusing a redirect from https to {new[0]}: {newurl}",
+                headers,
+                fp,
+            )
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and old != new:
+            for name in list(redirected.headers):
+                if name.lower() == "authorization":
+                    del redirected.headers[name]
+        return redirected
+
+
+_OPENER = urllib.request.build_opener(_AuthSafeRedirect())
+
+
+def _open(request: Any, timeout: float) -> Any:
+    return _OPENER.open(request, timeout=timeout)
+
+
+#: Base URLs already warned about sending a token over plain http.
+_WARNED_PLAIN_HTTP: set[str] = set()
+
+
+def _warn_plain_http(url: str) -> None:
+    scheme, host, _ = _origin(url)
+    if scheme != "http" or host in ("localhost", "127.0.0.1", "::1"):
+        return
+    key = f"{scheme}://{host}"
+    if key in _WARNED_PLAIN_HTTP:
+        return
+    _WARNED_PLAIN_HTTP.add(key)
+    warnings.warn(
+        f"the Unity Catalog token is sent to {key} over plain http, where anyone on the "
+        "network path can read it; use an https:// catalog URL",
+        UserWarning,
+        stacklevel=4,
+    )
+
+
 def _request(
     base_url: str,
     path: str,
@@ -163,9 +227,10 @@ def _request(
     if data is not None:
         request.add_header("Content-Type", "application/json")
     if token:
+        _warn_plain_http(url)
         request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open(request, timeout) as response:
             text = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         try:

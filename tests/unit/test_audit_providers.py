@@ -274,6 +274,12 @@ class TestOssUnityCatalog:
             return Response(text.encode())
 
         monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+        # The client opens through its own redirect-safe opener.
+        from deltaswamp.catalog import ossuc as _ossuc
+
+        monkeypatch.setattr(
+            _ossuc, "_open", lambda request, timeout: urlopen(request, timeout=timeout)
+        )
 
     def test_plain_text_delete_answer_is_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._serve(monkeypatch, 200, "200 OK")
