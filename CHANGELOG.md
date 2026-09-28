@@ -121,6 +121,15 @@ First release.
   Other writes, tables without deletion vectors and catalog-managed tables
   still refuse, and `can()` agrees.
 
+- `clone(target)` of a path table to a storage path is written by the kernel,
+  with no warehouse (delta-rs#2456): version 0 with the source's protocol,
+  metadata and clustering, a `CLONE` commit naming the source and its
+  version, and the source's files by absolute URL (deletion vectors made
+  absolute) for a shallow clone, or copies of them for `shallow=False`.
+  VACUUM of a path shallow clone is refused. The direct engines do not read a
+  shallow clone (their reads stay confined to the table root); Spark and
+  Databricks do.
+
 ### Security
 
 See docs/usage.md, "Security notes".

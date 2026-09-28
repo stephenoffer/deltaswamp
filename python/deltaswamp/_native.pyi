@@ -16,7 +16,7 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options",
-"write_checksum", "incremental_files". Gate on this
+"write_checksum", "incremental_files", "path_clone". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
 
@@ -152,6 +152,22 @@ def probe_put_if_absent(table_root: str, options: dict[str, str] | None = None) 
     deletes it: False if the second put succeeded (the store ignores the
     condition) or the store has no conditional put at all.
     """
+
+def absolute_deletion_vector(table_root: str, descriptor: str) -> str:
+    """A deletion-vector descriptor (JSON) of a file under `table_root`, made absolute.
+
+    A relative (`u`) vector becomes a `p` one with the vector file's full URL;
+    an inline or absolute one is returned unchanged. For shallow clones.
+    """
+
+def copy_objects(
+    source_root: str,
+    target_root: str,
+    paths: list[str],
+    source_options: dict[str, str] | None = None,
+    target_options: dict[str, str] | None = None,
+) -> int:
+    """Copy `paths` (relative, URL-encoded) from one table root to another; bytes copied."""
 
 def commit_raw(
     table_root: str,

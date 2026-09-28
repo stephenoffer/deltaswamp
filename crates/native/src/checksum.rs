@@ -69,6 +69,9 @@ pub fn write(snapshot: &SnapshotRef, engine: &dyn Engine, always: bool) -> bool 
                 Err(_) => {}
             }
         }
+        if snapshot.version() == 0 {
+            return first_commit(snapshot, engine).unwrap_or(false);
+        }
         carry_forward(snapshot, engine).unwrap_or(false)
     }));
     attempt.unwrap_or(false)
@@ -156,6 +159,78 @@ fn carry_forward(snapshot: &SnapshotRef, engine: &dyn Engine) -> crate::Result<b
             crc.remove("inCommitTimestampOpt");
         }
     }
+    let body = serde_json::to_vec(&Value::Object(crc))
+        .map_err(|e| crate::NativeError::Invalid(format!("could not serialize a checksum: {e}")))?;
+    Ok(storage.put(&target, body.into(), false).is_ok())
+}
+
+/// The checksum of version 0, counted from its own actions.
+///
+/// The kernel counts only operations it knows (CREATE TABLE, WRITE, ...), so
+/// a table whose first commit is a CLONE -- every live file added at once --
+/// had none. Version 0 holds the whole state, so the counts are its adds.
+fn first_commit(snapshot: &SnapshotRef, engine: &dyn Engine) -> crate::Result<bool> {
+    use serde_json::{json, Map, Value};
+
+    let log = snapshot.table_root().join("_delta_log/")?;
+    let commit = log.join(&format!("{:020}.json", 0))?;
+    let target = log.join(&format!("{:020}.crc", 0))?;
+    let storage = engine.storage_handler();
+    let Some(Ok(bytes)) = storage.read_files(vec![(commit, None)])?.next() else {
+        return Ok(false);
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut crc = Map::new();
+    let (mut files, mut size) = (0u64, 0u64);
+    let (mut domains, mut txns) = (Vec::new(), Vec::new());
+    let mut ict = None;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(Value::Object(action)) = serde_json::from_str::<Value>(line) else {
+            return Ok(false);
+        };
+        if let Some(add) = action.get("add") {
+            let Some(bytes) = add.get("size").and_then(Value::as_u64) else {
+                return Ok(false); // a size the spec requires is missing
+            };
+            files += 1;
+            size += bytes;
+        } else if action.contains_key("remove") || action.contains_key("cdc") {
+            return Ok(false);
+        } else if let Some(metadata) = action.get("metaData") {
+            crc.insert("metadata".into(), metadata.clone());
+        } else if let Some(protocol) = action.get("protocol") {
+            crc.insert("protocol".into(), protocol.clone());
+        } else if let Some(domain) = action.get("domainMetadata") {
+            if domain.get("removed").and_then(Value::as_bool) != Some(true) {
+                domains.push(domain.clone());
+            }
+        } else if let Some(txn) = action.get("txn") {
+            txns.push(txn.clone());
+        } else if let Some(info) = action.get("commitInfo") {
+            ict = info.get("inCommitTimestamp").cloned();
+        }
+    }
+    if !crc.contains_key("metadata") || !crc.contains_key("protocol") {
+        return Ok(false);
+    }
+    let ict_enabled = crc["metadata"]
+        .get("configuration")
+        .and_then(|c| c.get("delta.enableInCommitTimestamps"))
+        .and_then(Value::as_str)
+        == Some("true");
+    match ict {
+        Some(ts) => {
+            crc.insert("inCommitTimestampOpt".into(), ts);
+        }
+        None if ict_enabled => return Ok(false),
+        None => {}
+    }
+    crc.insert("tableSizeBytes".into(), json!(size));
+    crc.insert("numFiles".into(), json!(files));
+    crc.insert("numMetadata".into(), json!(1));
+    crc.insert("numProtocol".into(), json!(1));
+    crc.insert("setTransactions".into(), Value::Array(txns));
+    crc.insert("domainMetadata".into(), Value::Array(domains));
     let body = serde_json::to_vec(&Value::Object(crc))
         .map_err(|e| crate::NativeError::Invalid(format!("could not serialize a checksum: {e}")))?;
     Ok(storage.put(&target, body.into(), false).is_ok())

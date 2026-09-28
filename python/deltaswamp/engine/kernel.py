@@ -434,7 +434,25 @@ def _implemented() -> frozenset[Operation]:
         ops.add(Operation.CHECKPOINT)
     if _native_has(*_COMPACTION_NATIVE):
         ops |= {Operation.OPTIMIZE, Operation.ZORDER}
+    if _native_has("path_clone", "commit_raw", "files", "metadata_json"):
+        ops.add(Operation.CLONE)
     return frozenset(ops)
+
+
+def is_storage_path(target: Any) -> bool:
+    """Whether a CLONE target names a storage location rather than a catalog table."""
+    import os
+
+    return isinstance(target, str) and ("://" in target or os.path.isabs(target))
+
+
+#: Writer features a clone written here cannot carry over: row tracking's
+#: per-file baseRowId and defaultRowCommitVersion are not in the file listing
+#: a clone is built from, and a catalog-managed clone's commits would need the
+#: catalog to ratify them.
+_CLONE_BLOCKERS: frozenset[str] = frozenset(
+    {"rowTracking", "catalogManaged", "catalogOwned-preview"}
+)
 
 
 class KernelEngine:
@@ -584,6 +602,12 @@ class KernelEngine:
         unreachable = location_refusal(table.location)
         if unreachable is not None:
             return Capability(operation, ok=False, reason=unreachable)
+
+        if operation is Operation.CLONE:
+            reason = self._clone_refusal(table, **shape)
+            if reason is not None:
+                return Capability(operation, ok=False, reason=reason, remedy=SQL_FALLBACK_REMEDY)
+            return Capability(operation, ok=True, engine=self.kind)
 
         if operation not in READ_OPERATIONS and not table.is_catalog_managed:
             unsafe = write_refusal(table.location, self._base_options, table.credential_provider)
@@ -1504,6 +1528,192 @@ class KernelEngine:
         """The raw commit file of `version` (published commits only)."""
         texts = self.snapshot(table, version=int(version)).commit_log(int(version) - 1)
         return "".join(text for _v, text in texts)
+
+    # ----------------------------------------------------------------- clone
+
+    def _clone_refusal(self, table: ResolvedTable, **shape: Any) -> str | None:
+        """Why the kernel cannot CLONE `table` to `shape["target"]`, or None."""
+        target = shape.get("target")
+        if target is not None and not is_storage_path(target):
+            return (
+                "the target is a catalog table name; the kernel clones to a storage path "
+                "(s3://..., abfss://..., /local/dir), and only the warehouse registers one"
+            )
+        if shape.get("replace"):
+            return "CREATE OR REPLACE ... CLONE into a path is not implemented here"
+        blockers = sorted(_CLONE_BLOCKERS & (table.features | table.effective_writer_features))
+        if table.is_catalog_managed and "catalogManaged" not in blockers:
+            blockers.append("catalogManaged")
+        if blockers:
+            return f"the table has {', '.join(blockers)}, which a clone written here cannot carry"
+        if shape.get("shallow", True) and (
+            table.credential_provider is not None or table.is_shallow_clone
+        ):
+            # The clone's readers need the source's files, and a vended
+            # credential is scoped to the source table: no reader of the clone
+            # could be given one, and VACUUM on the source would not know the
+            # clone holds its files.
+            return (
+                "the table's storage is reached with credentials the catalog scopes to it, "
+                "so a shallow clone's readers could not read the source files it references"
+            )
+        return None
+
+    def clone(
+        self,
+        table: ResolvedTable,
+        target: str,
+        *,
+        shallow: bool = True,
+        replace: bool = False,
+        if_not_exists: bool = False,
+        version: int | None = None,
+        timestamp: Any = None,
+    ) -> dict[str, Any]:
+        """CLONE a path table to a path: version 0 of a new table over the source's files.
+
+        Shallow: the new table's adds name the source's data files (and
+        deletion vectors) by absolute URL, so nothing is copied; VACUUM of
+        the clone is refused, since it would delete files the source owns.
+        Deep: every live data and deletion-vector file is copied under the
+        target first, and the adds keep their relative paths. Either way the
+        protocol, the metadata (under a new table id) and the clustering
+        domain are carried over, and the commit records `CLONE` with the
+        source and its version, as Databricks' does.
+        """
+        import json
+        import os
+        import time
+        import uuid
+
+        import pyarrow as pa
+
+        from deltaswamp import _native
+
+        reason = self._clone_refusal(table, target=target, shallow=shallow, replace=replace)
+        if reason is not None:
+            raise UnreachableTableError("clone the table", reason, SQL_FALLBACK_REMEDY)
+        if replace and if_not_exists:
+            raise InvalidArgumentError("replace and if_not_exists are mutually exclusive")
+        if "://" not in target:
+            target = os.path.abspath(target)
+        target_options = store_options(engine_options(self._base_options, None, target))
+        try:
+            existing = _native.Snapshot.resolve(target, options=target_options or None)
+        except Exception:
+            existing = None
+        if existing is not None:
+            if if_not_exists:
+                return {"source_table_size": 0, "source_num_of_files": 0, "num_copied_files": 0}
+            raise UnreachableTableError(
+                "clone the table",
+                f"a Delta table already exists at {target} (version {existing.version})",
+                "clone to a new location, or pass if_not_exists=True to keep it",
+            )
+        snapshot = self.snapshot(table, version=version, timestamp=timestamp)
+        root = str(snapshot.table_root)
+        root = root if root.endswith("/") else root + "/"
+        files = pa.table(snapshot.files()).to_pylist()
+        if not shallow and any("://" in f["path"] for f in files):
+            raise UnreachableTableError(
+                "deep clone the table",
+                "some of its files are another table's, referenced by absolute path (it is "
+                "a shallow clone), which a deep clone written here does not copy",
+                "deep clone the table it was cloned from",
+            )
+        now = int(time.time() * 1000)
+        adds, copies = [], []
+        for f in files:
+            dv = f["deletion_vector"]
+            path = f["path"]
+            if shallow:
+                path = path if "://" in path else root + path
+                if dv is not None:
+                    dv = _native.absolute_deletion_vector(root, dv)
+            else:
+                copies.append(path)
+                if dv is not None and json.loads(dv).get("storageType") == "u":
+                    absolute = json.loads(_native.absolute_deletion_vector(root, dv))
+                    copies.append(absolute["pathOrInlineDv"][len(root) :])
+            add: dict[str, Any] = {
+                "path": path,
+                "partitionValues": dict(f["partition_values"] or []),
+                "size": int(f["size"]),
+                "modificationTime": int(f["modification_time"] or now),
+                "dataChange": True,
+            }
+            if f["stats"] is not None:
+                add["stats"] = f["stats"]
+            if dv is not None:
+                add["deletionVector"] = json.loads(dv)
+            adds.append({"add": add})
+        size = sum(int(f["size"]) for f in files)
+        copied = 0
+        if copies:
+            source_options = self._options(table, write=False)
+            copied = int(
+                _native.copy_objects(
+                    root,
+                    target,
+                    sorted(set(copies)),
+                    source_options=source_options or None,
+                    target_options=target_options or None,
+                )
+            )
+        metadata = json.loads(snapshot.metadata_json())
+        metadata["id"] = str(uuid.uuid4())
+        metadata["createdTime"] = now
+        metrics = {
+            "sourceTableSize": str(size),
+            "sourceNumOfFiles": str(len(files)),
+            "numRemovedFiles": "0",
+            "numCopiedFiles": str(0 if shallow else len(copies)),
+            "removedFilesSize": "0",
+            "copiedFilesSize": str(copied),
+        }
+        info = {
+            "timestamp": now,
+            "operation": "CLONE",
+            "operationParameters": {
+                "source": root.rstrip("/"),
+                "sourceVersion": str(int(snapshot.version)),
+                "isShallow": "true" if shallow else "false",
+            },
+            "operationMetrics": metrics,
+            "engineInfo": _engine_info(),
+            "isBlindAppend": False,
+            "txnId": str(uuid.uuid4()),
+        }
+        actions: list[dict[str, Any]] = [
+            {"commitInfo": info},
+            {"protocol": json.loads(snapshot.protocol_json())},
+            {"metaData": metadata},
+        ]
+        clustering = snapshot.domain_metadata(CLUSTERING_DOMAIN)
+        if clustering is not None:
+            actions.append(
+                {
+                    "domainMetadata": {
+                        "domain": CLUSTERING_DOMAIN,
+                        "configuration": clustering,
+                        "removed": False,
+                    }
+                }
+            )
+        actions.extend(adds)
+        with translating(EngineKind.KERNEL, "commit the clone"):
+            _native.commit_raw(
+                target, 0, [json.dumps(a) for a in actions], options=target_options or None
+            )
+        write_checksum(target, target_options, 0)
+        return {
+            "source_table_size": size,
+            "source_num_of_files": len(files),
+            "num_removed_files": 0,
+            "num_copied_files": 0 if shallow else len(copies),
+            "removed_files_size": 0,
+            "copied_files_size": copied,
+        }
 
     def _txn_won_race(self, snapshot: Any, table: ResolvedTable, txn: Any) -> bool:
         if txn is None:
@@ -2883,7 +3093,8 @@ class KernelEngine:
             )
         elif read_version is not None:
             raise UnreachableTableError(
-                "delete from a past version", self.need_refusal(frozenset({"pinned_read"}), table)
+                "delete from a past version",
+                self.need_refusal(frozenset({"pinned_read"}), table) or "",
             )
         else:
             result = self._rewrite(
@@ -2992,7 +3203,8 @@ class KernelEngine:
             )
         elif read_version is not None:
             raise UnreachableTableError(
-                "update from a past version", self.need_refusal(frozenset({"pinned_read"}), table)
+                "update from a past version",
+                self.need_refusal(frozenset({"pinned_read"}), table) or "",
             )
         else:
             result = self._rewrite(

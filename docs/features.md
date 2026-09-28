@@ -144,7 +144,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | Publish staged commits | kernel | kernel | required on catalog-managed tables |
 | ANALYZE (DELTA) STATISTICS | DBR | warehouse | |
 | REORG PURGE / UPGRADE UNIFORM | DBR, Spark | warehouse | |
-| CLONE (shallow, deep) | DBR, Spark | warehouse | |
+| CLONE (shallow, deep) | DBR, Spark | kernel, warehouse | the kernel clones a path table to a path (delta-rs#2456): shallow with absolute-path adds and vectors, deep by copying; catalog targets and catalog-scoped credentials need the warehouse. A shallow clone is for Spark and Databricks: the direct engines read only files under a table's root |
 | CONVERT TO DELTA | DBR, Spark, delta-rs | delta-rs | |
 | Symlink manifests | Spark, delta-rs | delta-rs | |
 | Predictive optimization | DBR | — | server-side scheduling; `Table.info()` reports whether it is on |

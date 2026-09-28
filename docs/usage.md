@@ -706,6 +706,31 @@ t.refresh()  # a materialized view or streaming table
 t.cluster_by("auto")
 ```
 
+A path table cloned to a storage path needs no warehouse: the kernel writes
+the clone's version 0 itself (delta-rs#2456).
+
+```python
+t = conn.table("s3://bucket/orders")
+t.clone("s3://bucket/orders_dev")  # shallow: references orders' files
+t.clone("s3://bucket/orders_copy", shallow=False)  # deep: copies them
+t.clone("s3://bucket/orders_v12", version=12)
+```
+
+The clone carries the source's protocol, metadata (under a new table id) and
+clustering, and its commit is a `CLONE` naming the source and its version, as
+Databricks writes one. A shallow clone's add actions name the source's data
+files and deletion vectors by absolute URL, which Spark and Databricks read;
+this library's own engines read only files under a table's root (a log must
+not reach other data with the connection's credentials), so they refuse to
+read it -- clone deep to read it here. `vacuum(dry_run=False)` on a shallow
+clone is refused, since it would treat the source's files as its own; vacuum
+the source, which keeps the files its live versions reference. A deep clone
+copies every live data file and deletion vector, then keeps their relative
+paths. Refused (and left to Databricks' CLONE): a catalog table name as the
+target, `replace=True`, a source whose storage the catalog reaches with
+credentials scoped to it, and tables with row tracking or catalog-managed
+commits.
+
 ## Maintenance
 
 ```python
@@ -760,7 +785,8 @@ the lite run removed, because delta-rs keeps their tombstones in the log.
 
 Three operations refuse rather than misbehave:
 
-- `vacuum` on a shallow clone, which borrows the source's files.
+- `vacuum` on a shallow clone, which borrows the source's files (a catalog's
+  shallow clone, or a path table whose live files are another table's).
 - `restore` through delta-rs on a table with deletion vectors, where delta-rs
   reports success and leaves the rows deleted.
 - OPTIMIZE and VACUUM on UC managed tables. Databricks forbids them from

@@ -322,3 +322,104 @@ def test_pinned_dml_is_still_refused_where_it_cannot_be_checked(conn: Any, tmp_p
     for op in ("overwrite", "optimize"):
         assert not pinned.can(op).ok
     assert conn.table(path).count() == 3
+
+
+# ------------------------------------------------- #12 clones of path tables
+
+
+def _commit0(path: str) -> list[dict[str, Any]]:
+    with open(os.path.join(path, "_delta_log", f"{0:020}.json")) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _source(conn: Any, path: str) -> Any:
+    conn.write_table(
+        path,
+        pa.table({"id": [1, 2, 3], "p": ["a", "b", "a"]}),
+        partition_by=["p"],
+        properties={"delta.enableDeletionVectors": "true"},
+    )
+    conn.table(path).append(pa.table({"id": [4], "p": ["b"]}))
+    conn.table(path).delete("id = 1")  # a deletion vector
+    return conn.table(path)
+
+
+def test_a_shallow_clone_of_a_path_table_references_the_source_files(
+    conn: Any, tmp_path: Any
+) -> None:
+    """delta-rs#2456: CLONE of a path table needed Databricks."""
+    from deltaswamp._native import Snapshot
+
+    src = _source(conn, str(tmp_path / "src"))
+    target = str(tmp_path / "clone")
+    cap = src.can("clone", target=target)
+    assert cap.ok and cap.engine is Engine.KERNEL
+    result = src.clone(target)
+    assert result["source_num_of_files"] == 3 and result["num_copied_files"] == 0
+    assert sorted(os.listdir(target)) == ["_delta_log"]  # nothing copied
+    actions = _commit0(target)
+    info = actions[0]["commitInfo"]
+    assert info["operation"] == "CLONE"
+    assert info["operationParameters"]["isShallow"] == "true"
+    assert info["operationParameters"]["sourceVersion"] == str(src.version)
+    assert info["operationParameters"]["source"].endswith("/src")
+    adds = [a["add"] for a in actions if "add" in a]
+    root = str(Snapshot.resolve(src.location).table_root)
+    source_files = {
+        root + p for p in pa.table(Snapshot.resolve(src.location).files())["path"].to_pylist()
+    }
+    assert {a["path"] for a in adds} == source_files
+    dvs = [a["deletionVector"] for a in adds if "deletionVector" in a]
+    assert dvs and all(
+        d["storageType"] == "p" and d["pathOrInlineDv"].startswith(root) for d in dvs
+    )
+    for d in dvs:
+        assert os.path.exists(d["pathOrInlineDv"].removeprefix("file://"))
+    meta = next(a["metaData"] for a in actions if "metaData" in a)
+    assert meta["partitionColumns"] == ["p"]
+    assert meta["id"] != json.loads(Snapshot.resolve(src.location).metadata_json())["id"]
+    assert f"{0:020}.crc" in _log(target)
+    # VACUUM of the clone would delete the source's files.
+    clone = conn.table(target)
+    cap = clone.can("vacuum", dry_run=False)
+    assert not cap.ok and "shallow clone" in (cap.reason or "")
+    from deltaswamp.errors import UnreachableTableError
+
+    with pytest.raises(UnreachableTableError, match="shallow clone"):
+        clone.vacuum(dry_run=False, retention_hours=0)
+    assert sorted(src.to_arrow().column("id").to_pylist()) == [2, 3, 4]
+
+
+def test_a_deep_clone_copies_the_files_and_reads_as_the_source(conn: Any, tmp_path: Any) -> None:
+    src = _source(conn, str(tmp_path / "src"))
+    past = src.version - 1
+    target = str(tmp_path / "deep")
+    result = src.clone(target, shallow=False)
+    assert result["num_copied_files"] == 4  # three data files and a vector
+    clone = conn.table(target)
+    assert sorted(clone.to_arrow().column("id").to_pylist()) == [2, 3, 4]
+    assert clone.history()[0]["operation"] == "CLONE"
+    assert _crc(target, 0)["numFiles"] == 3
+    clone.append(pa.table({"id": [9], "p": ["a"]}))
+    assert sorted(src.to_arrow().column("id").to_pylist()) == [2, 3, 4]
+    old = src.clone(str(tmp_path / "old"), shallow=False, version=past)
+    assert old["source_num_of_files"] == 3
+    assert sorted(conn.table(str(tmp_path / "old")).to_arrow().column("id").to_pylist()) == [
+        1,
+        2,
+        3,
+        4,
+    ]
+
+
+def test_clone_refuses_what_it_cannot_write(conn: Any, tmp_path: Any) -> None:
+    from deltaswamp.errors import UnreachableTableError
+
+    src = _source(conn, str(tmp_path / "src"))
+    target = str(tmp_path / "c")
+    src.clone(target)
+    with pytest.raises(UnreachableTableError, match="already exists"):
+        src.clone(target)
+    assert src.clone(target, if_not_exists=True)["num_copied_files"] == 0
+    assert not src.can("clone", target="main.sales.copy").ok  # a catalog name
+    assert not src.can("clone", target=str(tmp_path / "r"), replace=True).ok

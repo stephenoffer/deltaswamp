@@ -140,7 +140,7 @@ serve.
 | `log_compaction` | deltars | kernel's log_compaction_writer is a no-op stub (kernel#2337) |
 | `publish` | kernel | Snapshot::publish; only kernel implements staged->published |
 | `reorg` | sql | Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM) |
-| `clone` | sql | Databricks-only (shallow and deep CLONE) |
+| `clone` | kernel, sql | kernel: path table to a path (a raw version 0 over the source's files); Databricks for catalog tables |
 | `convert` | deltars | kernel has no CONVERT TO DELTA |
 | `generate` | deltars | kernel has no manifest generation |
 | `cleanup_metadata` | deltars | delta-rs removes log files older than delta.logRetentionDuration |

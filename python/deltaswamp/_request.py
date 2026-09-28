@@ -135,6 +135,21 @@ def refusal(table: Table, request: Request) -> Capability | None:
                 remedy="drop the constraints first (drop_constraint()), or write the data as "
                 "a new table (write_table() at another location)",
             )
+    if request.operation is Operation.VACUUM and request.shape.get("dry_run") is False:
+        borrowed = _borrowed_files(table)
+        if borrowed:
+            # The catalog says when a table is a shallow clone; a path table's
+            # log is the only witness. VACUUM there would treat the source's
+            # files as the clone's own.
+            return Capability(
+                request.asked,
+                ok=False,
+                reason=f"the table is a shallow clone: {borrowed} of its live files belong to "
+                "another table (referenced by absolute path), and vacuuming it risks deleting "
+                "data the source still owns",
+                remedy="vacuum the source table; a deep clone (clone(..., shallow=False)) "
+                "owns its files",
+            )
     if version is not None and request.operation in PINNED_DML:
         verdict = table._connection.router.capability(
             request.operation, table._enrich(), needs=request.needs, **request.shape
@@ -159,6 +174,22 @@ def refusal(table: Table, request: Request) -> Capability | None:
         "latest version",
         remedy="open the table without version= to write to it",
     )
+
+
+def _borrowed_files(table: Table) -> int:
+    """How many of the table's live files are another table's, by absolute path."""
+    from .capability import Engine
+
+    kernel = table._connection.router.engines.get(Engine.KERNEL)
+    if kernel is None or table._resolved.location is None or not hasattr(kernel, "snapshot"):
+        return 0
+    try:
+        import pyarrow as pa
+
+        paths = pa.table(kernel.snapshot(table._resolved).files()).column("path").to_pylist()
+    except Exception:
+        return 0
+    return sum(1 for p in paths if "://" in p)
 
 
 def _replace_keeps(table: Table) -> str:

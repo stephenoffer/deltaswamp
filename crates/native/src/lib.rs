@@ -84,6 +84,9 @@ pub const FEATURES: &[&str] = &[
     "write_checksum",
     // `incremental_files(base_version)`: the file diff between two versions.
     "incremental_files",
+    // `absolute_deletion_vector` and `copy_objects`: shallow and deep clones
+    // of path tables.
+    "path_clone",
 ];
 
 #[pyfunction]
@@ -137,6 +140,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_table, m)?)?;
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::absolute_deletion_vector, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::copy_objects, m)?)?;
     m.add_function(wrap_pyfunction!(functions::probe_put_if_absent, m)?)?;
     m.add_function(wrap_pyfunction!(functions::validate_retry_options, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;

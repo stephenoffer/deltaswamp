@@ -3989,6 +3989,9 @@ class Table:
             Operation.VACUUM,
             {"retention_hours": retention_hours, "dry_run": dry_run, "lite": lite, **kwargs},
         )
+        refused = refusal(self, request)
+        if refused is not None:
+            raise UnreachableTableError("vacuum", refused.reason or "", refused.remedy)
         result = self._route(request).vacuum(
             self._resolved, retention_hours=retention_hours, dry_run=dry_run, lite=lite, **kwargs
         )
@@ -4486,7 +4489,16 @@ class Table:
         return result
 
     def clone(self, target: str, **kwargs: Any) -> dict[str, Any]:
-        """CLONE. Databricks-only, so it needs the SQL fallback."""
+        """CLONE (`shallow=True` by default; `version=`/`timestamp=` clone a past one).
+
+        A path table cloned to a storage path is written here, by the kernel
+        (delta-rs#2456): version 0 of a new table with the source's protocol
+        and metadata and a CLONE commit naming the source and its version. A
+        shallow clone's adds name the source's files by absolute URL; a deep
+        clone copies them first. Anything else -- a catalog name as the
+        target, a source whose storage is reached with catalog-scoped
+        credentials -- is Databricks' CLONE through the SQL fallback.
+        """
         _check_options(
             "clone",
             kwargs,
