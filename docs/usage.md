@@ -368,6 +368,12 @@ t.replace(df)  # new contents and schema (RTAS)
 t.append(df, txn=("nightly-load", batch_id))  # idempotent
 ```
 
+Each returns an `OperationResult` (a dict): the `version` it committed and the
+`num_files`, `num_rows` and `num_bytes` it added (`num_removed_files` too),
+read back from the commit, plus `.engine`. A write skipped because its `txn`
+was already committed has `skipped=True` and no `version`. The warehouse
+reports neither, so a write it served carries only `.engine`.
+
 `txn=(app_id, version)` makes an append exactly-once, as Spark's
 `txnAppId`/`txnVersion` do: an append whose version is at or below the last
 one committed under `app_id` is skipped, and `t.txn_version(app_id)` says

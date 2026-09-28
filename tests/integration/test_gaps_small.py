@@ -107,3 +107,35 @@ def test_a_checksum_carried_over_a_metadata_commit_keeps_the_file_stats(
     files, size = _live_totals(conn.table(path))
     assert (_crc(path, v + 1)["numFiles"], _crc(path, v + 1)["tableSizeBytes"]) == (files, size)
 
+
+# ------------------------------------------------------- #15 write results
+
+
+@pytest.mark.parametrize("kind", [Engine.DELTARS, Engine.KERNEL])
+def test_append_and_overwrite_return_what_they_committed(kind: Engine, tmp_path: Any) -> None:
+    """delta-rs#3952: both returned None, so a pipeline could not log what it wrote."""
+    import deltaswamp as ds
+
+    conn = _only(kind)
+    path = str(tmp_path / "t")
+    ds.connect().write_table(path, pa.table({"a": [1, 2]}))
+    t = conn.table(path)
+    appended = t.append(pa.table({"a": [3, 4, 5]}))
+    assert isinstance(appended, ds.OperationResult)
+    assert appended.engine == kind.value
+    assert appended["version"] == conn.table(path).version
+    assert (appended["num_files"], appended["num_rows"]) == (1, 3)
+    assert appended["num_bytes"] > 0
+    replaced = t.overwrite(pa.table({"a": [7]}))
+    assert replaced["version"] == appended["version"] + 1
+    assert (replaced["num_files"], replaced["num_rows"], replaced["num_removed_files"]) == (1, 1, 2)
+
+
+def test_a_skipped_write_says_so(conn: Any, tmp_path: Any) -> None:
+    path = str(tmp_path / "t")
+    conn.write_table(path, pa.table({"a": [1]}))
+    t = conn.table(path)
+    first = t.append(pa.table({"a": [2]}), txn=("job", 1))
+    again = t.append(pa.table({"a": [2]}), txn=("job", 1))
+    assert first["num_rows"] == 1 and "skipped" not in first
+    assert again["skipped"] and again["num_rows"] == 0 and "version" not in again

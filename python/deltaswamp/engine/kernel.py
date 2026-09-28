@@ -1418,6 +1418,11 @@ class KernelEngine:
         self._maybe_checkpoint(table, version, snapshot)
         return version
 
+    def commit_text(self, table: ResolvedTable, version: int) -> str:
+        """The raw commit file of `version` (published commits only)."""
+        texts = self.snapshot(table, version=int(version)).commit_log(int(version) - 1)
+        return "".join(text for _v, text in texts)
+
     def _txn_won_race(self, snapshot: Any, table: ResolvedTable, txn: Any) -> bool:
         if txn is None:
             return False

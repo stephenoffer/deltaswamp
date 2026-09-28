@@ -65,6 +65,12 @@ First release.
   `num_files_added`, `num_files_removed`, `version`; `num_removed_files` and
   `num_restored_files` for RESTORE), plus `.engine`. Code comparing a result
   for exact equality with a dict needs to compare the keys it cares about.
+- `append`, `overwrite` and `replace` return an `OperationResult` too, where
+  they returned None (delta-rs#3952): `version` committed, `num_files`,
+  `num_rows` and `num_bytes` added, `num_removed_files`, and `.engine`, read
+  back from the commit on the kernel and delta-rs. A write the call skipped
+  (a `txn` already committed, an empty dynamic overwrite) has `skipped=True`,
+  zero counts and no `version`. Through the warehouse only `.engine` is known.
 
 - One error-translation boundary around every engine: nothing but a
   `DeltaSwampError` reaches a caller, from a call or later from the stream or

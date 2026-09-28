@@ -3021,8 +3021,9 @@ class Table:
         commit_metadata: dict[str, Any] | None = None,
         txn: tuple[str, int] | None = None,
         max_commit_retries: int | None = None,
-    ) -> None:
-        """Append data.
+    ) -> _results.OperationResult:
+        """Append data. Returns an `OperationResult`: the `version` committed and
+        the `num_files`, `num_rows` and `num_bytes` it added, plus `engine`.
 
         `schema_mode="merge"` widens the table schema to fit the data, and
         routes as MERGE_SCHEMA rather than a plain append.
@@ -3044,9 +3045,10 @@ class Table:
         _check_txn(txn)
         data = _write_data(data)
         if txn is not None and self._already_committed(txn):
-            return
+            return _results.nothing_written()
         raw = data
         self._check_cdf_columns(data, schema_mode, "append")
+        outcome: dict[str, Any] = {}
         for attempt in range(_REALIGN_ATTEMPTS):
             data = self._align(raw, schema_mode)
             request = self._request(
@@ -3065,7 +3067,8 @@ class Table:
 
             def write(data: Any = data, request: Request = request) -> None:
                 engine = self._route(request)
-                engine.append(
+                outcome["engine"] = getattr(engine, "kind", None)
+                outcome["raw"] = engine.append(
                     self._resolved,
                     self._variant_input(engine, data),
                     schema_mode=schema_mode,
@@ -3093,6 +3096,52 @@ class Table:
                 ):
                     raise
         self._invalidate()
+        return self._write_result(outcome)
+
+    def _write_result(self, outcome: dict[str, Any]) -> _results.OperationResult:
+        """The result of the append or overwrite `outcome` records (see `_results.write`)."""
+        if "raw" not in outcome:
+            return _results.nothing_written()  # a lost race won by this very txn
+        raw = outcome["raw"]
+        version = raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+        if isinstance(raw, dict):
+            version = raw.get("version")
+        engine = outcome.get("engine")
+        totals = None if version is None else self._commit_totals(engine, version)
+        return _results.write(raw, engine, totals)
+
+    def _commit_totals(self, kind: Any, version: int) -> dict[str, Any] | None:
+        """What commit `version` added and removed, read back from its log file.
+
+        Neither engine reports it: delta-rs returns nothing, the kernel the
+        version (delta-rs#3952). None when the commit cannot be read (a
+        catalog's unpublished commit, an engine that cannot read one).
+        """
+        engine = self._connection.router.engines.get(kind) if kind is not None else None
+        read = getattr(engine, "commit_text", None)
+        if read is None or version < 1:
+            return None
+        try:
+            text = read(self._resolved, int(version))
+            actions = [json.loads(line) for line in text.splitlines() if line.strip()]
+        except Exception:
+            return None
+        totals: dict[str, Any] = {"num_files": 0, "num_bytes": 0, "num_removed_files": 0}
+        rows: int | None = 0
+        for action in actions:
+            add, remove = action.get("add"), action.get("remove")
+            if add is not None and add.get("dataChange", True):
+                totals["num_files"] += 1
+                totals["num_bytes"] += int(add.get("size") or 0)
+                try:
+                    records = json.loads(add.get("stats") or "{}").get("numRecords")
+                except (ValueError, AttributeError):
+                    records = None
+                rows = None if rows is None or records is None else rows + int(records)
+            elif remove is not None and remove.get("dataChange", True):
+                totals["num_removed_files"] += 1
+        totals["num_rows"] = rows
+        return totals
 
     def _check_cdf_columns(self, data: Any, schema_mode: str | None, what: str) -> None:
         """Refuse a schema-evolving write that adds a column the change feed reserves.
@@ -3161,8 +3210,9 @@ class Table:
         commit_metadata: dict[str, Any] | None = None,
         txn: tuple[str, int] | None = None,
         max_commit_retries: int | None = None,
-    ) -> None:
-        """Replace data.
+    ) -> _results.OperationResult:
+        """Replace data. Returns an `OperationResult`, as `append` does (with
+        `num_removed_files` too).
 
         With `predicate`, replaces only matching rows (`replaceWhere`). With
         `partition_overwrite="dynamic"`, replaces exactly the partitions present
@@ -3192,7 +3242,7 @@ class Table:
         _check_txn(txn)
         data = _write_data(data)
         if txn is not None and self._already_committed(txn):
-            return
+            return _results.nothing_written()
         if (
             partition_overwrite == "dynamic"
             and predicate is None
@@ -3202,7 +3252,7 @@ class Table:
             # Spark's dynamic mode replaces the partitions present in the
             # data; an empty batch names none, so it changes nothing. It used
             # to raise, failing any pipeline whose batch happened to be empty.
-            return
+            return _results.nothing_written()
         raw = data
         self._check_cdf_columns(data, schema_mode, "overwrite")
         data = self._align(raw, schema_mode)
@@ -3218,6 +3268,7 @@ class Table:
         }
         from .errors import CommitConflictError
 
+        outcome: dict[str, Any] = {}
         for attempt in range(_REALIGN_ATTEMPTS):
             request = self._request(Operation.OVERWRITE, options, data)
             refused = refusal(self, request)
@@ -3229,7 +3280,8 @@ class Table:
 
             def write(data: Any = data, request: Request = request) -> None:
                 engine = self._route(request)
-                engine.overwrite(
+                outcome["engine"] = getattr(engine, "kind", None)
+                outcome["raw"] = engine.overwrite(
                     self._resolved,
                     self._variant_input(engine, data),
                     predicate=predicate,
@@ -3249,6 +3301,7 @@ class Table:
                 # Lost to a writer that committed this very txn: already done.
                 if txn is None or not self._txn_landed(txn):
                     raise
+                outcome.pop("raw", None)
                 break
             except Exception as exc:
                 # A concurrent ADD COLUMN between aligning and writing: nothing
@@ -3259,6 +3312,7 @@ class Table:
                     raise
                 data = self._align(raw, schema_mode)
         self._invalidate()
+        return self._write_result(outcome)
 
     def _backfilled(self, write: Any, data: Any = None) -> Any:
         """Run a commit; on a catalog's backfill demand, publish and retry once.
@@ -3293,10 +3347,10 @@ class Table:
                 ) from exc
             return write()
 
-    def replace(self, data: Any, **kwargs: Any) -> None:
+    def replace(self, data: Any, **kwargs: Any) -> _results.OperationResult:
         """Replace the table's contents and schema. REPLACE TABLE / RTAS."""
         _check_options("replace", kwargs, _REPLACE_OPTIONS)
-        self.overwrite(data, schema_mode="overwrite", **kwargs)
+        return self.overwrite(data, schema_mode="overwrite", **kwargs)
 
     def _already_committed(self, txn: tuple[str, int]) -> bool:
         """True if `txn` was already committed, so the write should be skipped.

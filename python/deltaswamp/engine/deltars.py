@@ -540,6 +540,41 @@ class DeltaRsEngine:
             dt = DeltaTable(uri, version=version, storage_options=options)
         return dt
 
+    def _checksum(self, table: ResolvedTable, version: int | None = None) -> None:
+        """Write the `.crc` delta-rs leaves out, for the commit just made; best effort.
+
+        See `kernel.write_checksum`. A catalog-managed table is the catalog's
+        writer's to checksum (delta-rs cannot write one anyway).
+        """
+        if table.location is None or table.is_catalog_managed:
+            return
+        from .kernel import write_checksum
+
+        try:
+            options = self._storage_options(table, write=True)
+        except Exception:
+            return
+        write_checksum(table.location, options, version)
+
+    def commit_text(self, table: ResolvedTable, version: int) -> str:
+        """The raw commit file of `version`, read through the native extension.
+
+        delta-rs has no call that returns one commit's actions; the native
+        snapshot reads it with the same storage options.
+        """
+        from .kernel import _enter_native
+
+        _enter_native("read a commit")
+        from deltaswamp._native import Snapshot
+
+        assert table.location is not None
+        snapshot = Snapshot.resolve(
+            table.location,
+            options=self._storage_options(table, write=False) or None,
+            version=int(version),
+        )
+        return "".join(text for _v, text in snapshot.commit_log(int(version) - 1))
+
     # ------------------------------------------------------------------- read
 
     def scan(

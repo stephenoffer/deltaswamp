@@ -114,3 +114,34 @@ def restore(raw: Any, engine: Any) -> OperationResult:
             "num_restored_files": _int(_first(r, "num_restored_files", "numRestoredFile")),
         },
     )
+
+
+def write(raw: Any, engine: Any, commit: dict[str, Any] | None) -> OperationResult:
+    """APPEND and OVERWRITE: the version committed and what it added.
+
+    `raw` is what the engine returned (the kernel and delta-rs: the version;
+    others: nothing); `commit` the totals read back from that version's
+    commit file, when it could be read. None as a whole means the call wrote
+    nothing (a txn already committed, an empty dynamic overwrite).
+    """
+    r = raw if isinstance(raw, dict) else {}
+    version = raw if isinstance(raw, int) and not isinstance(raw, bool) else r.get("version")
+    c = commit or {}
+    return OperationResult(
+        raw,
+        engine,
+        {
+            "version": _int(version),
+            "num_files": _int(c.get("num_files")),
+            "num_rows": _int(c.get("num_rows")),
+            "num_bytes": _int(c.get("num_bytes")),
+            "num_removed_files": _int(c.get("num_removed_files")),
+        },
+    )
+
+
+def nothing_written() -> OperationResult:
+    """A write the call skipped: nothing committed, so no version."""
+    return OperationResult(
+        {}, None, {"num_files": 0, "num_rows": 0, "num_bytes": 0, "skipped": True}
+    )
