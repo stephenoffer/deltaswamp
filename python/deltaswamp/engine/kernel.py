@@ -2940,12 +2940,12 @@ class KernelEngine:
             level = (fresh.table_properties() or {}).get("delta.isolationLevel", "")
             if level.lower() == "serializable" and not compaction:
                 return None
-            metadata_changed = fresh.metadata_json() != read.metadata_json()
+            metadata_changed = not _same_json(fresh.metadata_json(), read.metadata_json())
             if metadata_changed and compaction:
                 return None  # planned again from the new layout
             if metadata_changed:
                 raise _MetadataMoved(int(fresh.version))
-            if fresh.protocol_json() != read.protocol_json():
+            if not _same_json(fresh.protocol_json(), read.protocol_json()):
                 return None
 
             def vectors(snapshot: Any) -> dict[str, Any]:
@@ -3267,8 +3267,8 @@ class KernelEngine:
         while True:
             snapshot = self.snapshot(table, write=True)
             if read is not None and (
-                snapshot.protocol_json() != read.protocol_json()
-                or snapshot.metadata_json() != read.metadata_json()
+                not _same_json(snapshot.protocol_json(), read.protocol_json())
+                or not _same_json(snapshot.metadata_json(), read.metadata_json())
             ):
                 # A concurrent protocol or metadata change (row tracking
                 # enabled, a feature the kernel cannot write) won the race;
@@ -6028,6 +6028,21 @@ def _pyarrow_codec(name: Any) -> str:
     if lowered in ("lz4_raw", "lz4raw"):
         return "lz4"
     return "snappy"
+
+
+def _same_json(a: str, b: str) -> bool:
+    """Whether two protocol or metaData actions are the same action.
+
+    Compared parsed: a snapshot loaded through a version checksum spells the
+    action's fields in another order than one replayed from the log, and the
+    text comparison took every concurrent commit for a metadata change.
+    """
+    if a == b:
+        return True
+    try:
+        return bool(json.loads(a) == json.loads(b))
+    except (TypeError, ValueError):
+        return False
 
 
 class _MetadataMoved(Exception):

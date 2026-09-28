@@ -200,6 +200,12 @@ First release.
   repair that names a file still on disk is done by the kernel instead.
   `generate()` refuses partitions that differ only by case (`p=US`, `p=us`)
   on such a filesystem, where their manifests overwrote each other.
+- A kernel DELETE, UPDATE or MERGE that loses a race rebases over the winner
+  again when the table has version checksums: a snapshot loaded through a
+  `.crc` spells the metaData fields in another order than one replayed from
+  the log, and the conflict check compared the text, so every concurrent
+  commit looked like a metadata change (`MetadataChangedError`; 18 of 24
+  concurrent MERGEs on a row-tracked table failed).
 - One timestamp -> version resolver for every engine and call (`scan`,
   `to_arrow`, `restore`, `cdf` bounds, `cleanup_metadata`), by commit times as
   Delta assigns them: the in-commit timestamp, and before those are enabled
