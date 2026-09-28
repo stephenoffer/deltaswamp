@@ -147,7 +147,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | REORG PURGE / UPGRADE UNIFORM | DBR, Spark | warehouse | |
 | CLONE (shallow, deep) | DBR, Spark | kernel, warehouse | the kernel clones a path table to a path (delta-rs#2456): shallow with absolute-path adds and vectors, deep by copying; catalog targets and catalog-scoped credentials need the warehouse. A shallow clone is for Spark and Databricks: the direct engines read only files under a table's root |
 | CONVERT TO DELTA | DBR, Spark, delta-rs | delta-rs | |
-| Symlink manifests | Spark, delta-rs | delta-rs | |
+| Symlink manifests | Spark, delta-rs | delta-rs, kernel | `Table.generate()`. The kernel writes them as Spark does for the tables delta-rs cannot open for writing (clustering, row tracking, in-commit timestamps, type widening, defaults): a manifest per Hive-escaped partition directory listing decoded absolute paths, stale partitions' manifests deleted. Deletion vectors and column mapping are refused, as Spark refuses them |
 | Predictive optimization | DBR | — | server-side scheduling; `Table.info()` reports whether it is on |
 | Auto optimize / auto compaction | DBR | — | writer-side behavior of Databricks; stored as properties only |
 

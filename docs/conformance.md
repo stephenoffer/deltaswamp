@@ -142,7 +142,7 @@ serve.
 | `reorg` | sql | Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM) |
 | `clone` | kernel, sql | kernel: path table to a path (a raw version 0 over the source's files); Databricks for catalog tables |
 | `convert` | deltars | kernel has no CONVERT TO DELTA |
-| `generate` | deltars | kernel has no manifest generation |
+| `generate` | deltars, kernel | delta-rs for tables it can open for writing; the kernel's file listing for the rest (clustering, row tracking, in-commit timestamps, type widening, defaults). Deletion vectors and column mapping are refused, as Spark refuses them |
 | `cleanup_metadata` | kernel, deltars | the kernel deletes log files older than delta.logRetentionDuration below a checkpoint every retained version reads from, by in-commit timestamps where the table has them, v2 checkpoints' sidecars included; delta-rs where the kernel cannot read the table |
 | `analyze` | sql | Databricks-only (ANALYZE TABLE ... COMPUTE [DELTA] STATISTICS) |
 | `sync_iceberg` | sql | Databricks-only (MSCK REPAIR TABLE ... SYNC METADATA regenerates UniForm Iceberg metadata) |

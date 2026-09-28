@@ -439,6 +439,8 @@ def _implemented() -> frozenset[Operation]:
         ops.add(Operation.VACUUM)
     if _native_has("log_cleanup"):
         ops.add(Operation.CLEANUP_METADATA)
+    if _native_has("symlink_manifest"):
+        ops.add(Operation.GENERATE)
     if _native_has("restore", "commit_raw", "metadata_json"):
         ops.add(Operation.RESTORE)
     if _native_has("path_clone", "commit_raw", "files", "metadata_json"):
@@ -655,6 +657,8 @@ class KernelEngine:
             return self._vacuum_capability(table, shape)
         if operation is Operation.CLEANUP_METADATA:
             return self._cleanup_capability(table)
+        if operation is Operation.GENERATE:
+            return self._generate_capability(table)
         if operation is Operation.RESTORE:
             return self._restore_capability(table, shape)
 
@@ -3927,6 +3931,65 @@ class KernelEngine:
                 "remaining checkpoint",
                 "check the credential's delete permission and run cleanup_metadata again",
             )
+
+    # -------------------------------------------------------- symlink manifest
+
+    #: Features whose files a symlink manifest cannot describe, and why. Spark
+    #: refuses GENERATE on both (DELTA_UNSUPPORTED_GENERATE_WITH_DELETION_VECTORS,
+    #: and column mapping as unsupported for manifest generation).
+    _MANIFEST_BLOCKERS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("deletionVectors", "manifest readers would return the rows deletion vectors remove"),
+        ("columnMapping", "manifest readers would see physical column names"),
+    )
+
+    def _generate_capability(self, table: ResolvedTable) -> Capability:
+        """GENERATE symlink_format_manifest, from the kernel's file listing.
+
+        It commits nothing and lists only live files, so no feature that
+        governs writes binds it: the tables delta-rs cannot open for writing
+        (clustering, row tracking, in-commit timestamps, type widening, column
+        defaults) are served.
+        """
+        reason = None
+        if table.is_catalog_managed:
+            reason = (
+                "the table is catalog-managed: Unity Catalog owns its storage, and it refuses "
+                "files written there by external engines"
+            )
+        else:
+            mode = str(table.properties.get("delta.columnMapping.mode", "none")).strip().lower()
+            active = set(table.features) - {"columnMapping"}
+            if mode in ("name", "id"):
+                active.add("columnMapping")
+            reason = next(
+                (
+                    f"the table uses {feature}, and {why}"
+                    for feature, why in self._MANIFEST_BLOCKERS
+                    if feature in active
+                ),
+                None,
+            )
+        if reason is not None:
+            return Capability(Operation.GENERATE, ok=False, reason=reason)
+        return Capability(Operation.GENERATE, ok=True, engine=self.kind)
+
+    def generate(self, table: ResolvedTable) -> None:
+        """Write symlink format manifests for engines that read them (Presto, Athena).
+
+        As Spark's GENERATE writes them (crates/native/src/manifest.rs):
+        `_symlink_format_manifest/manifest`, or one per partition directory,
+        each listing the absolute paths of the live files; the manifests of
+        partitions with no files left are deleted.
+        """
+        capability = self._generate_capability(table)
+        if not capability.ok:
+            raise UnreachableTableError(
+                "generate a symlink manifest", capability.reason, capability.remedy or None
+            )
+        _enter_native("generate a symlink manifest")
+        snapshot = self.snapshot(table, write=True)
+        with translating(EngineKind.KERNEL, "generate"):
+            snapshot.write_symlink_manifest()
 
     def _commit_info_only(
         self,

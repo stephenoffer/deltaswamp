@@ -17,7 +17,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
-"path_clone", "log_cleanup". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
+"path_clone", "log_cleanup",
+"symlink_manifest". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -410,6 +411,16 @@ class Snapshot:
         `(kept_checkpoint, deleted_keys, [(key, error)])`; `dry_run` returns
         the plan. Refuses a catalog-managed table and checkpointProtection.
         Requires "log_cleanup".
+        """
+
+    def write_symlink_manifest(self) -> list[str]:
+        """Write `_symlink_format_manifest/[<partition>/]manifest` for the live files.
+
+        As Spark writes them: one decoded absolute path per line, a manifest
+        per Hive-escaped partition directory (an empty one for an empty
+        unpartitioned table), and the manifests of partitions with no files
+        deleted. Returns the manifests written, relative to the table root.
+        Requires "symlink_manifest".
         """
 
     def missing_files(self, adds: list[str]) -> list[str]:

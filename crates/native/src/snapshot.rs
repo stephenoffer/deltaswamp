@@ -768,6 +768,13 @@ impl PySnapshot {
         )?)
     }
 
+    /// Write the symlink format manifests of this snapshot (see
+    /// `crate::manifest`), deleting those of partitions with no files.
+    /// Returns the manifests written, relative to the table root.
+    fn write_symlink_manifest(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| crate::manifest::write(&self.inner, self.engine.as_ref(), self.store()?))?)
+    }
+
     /// Of the data and deletion-vector files `adds` (add actions as JSON)
     /// reference, the ones missing from storage, as URLs.
     fn missing_files(&self, py: Python<'_>, adds: Vec<String>) -> PyResult<Vec<String>> {

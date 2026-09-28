@@ -845,7 +845,13 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(Operation.REPAIR, (_D, _S), "kernel has no FSCK"),
         _op(Operation.CONVERT, (_D,), "kernel has no CONVERT TO DELTA"),
-        _op(Operation.GENERATE, (_D,), "kernel has no manifest generation"),
+        _op(
+            Operation.GENERATE,
+            (_D, _K),
+            "delta-rs for tables it can open for writing; the kernel's file listing for the "
+            "rest (clustering, row tracking, in-commit timestamps, type widening, defaults). "
+            "Deletion vectors and column mapping are refused, as Spark refuses them",
+        ),
         _op(
             Operation.CHECKPOINT,
             (_D, _K),
@@ -969,8 +975,12 @@ OPERATION_FEATURE_BLOCKERS: dict[tuple[Engine, Operation], frozenset[TableFeatur
     (Engine.DELTARS, Operation.ADD_COLUMN): frozenset({TableFeature.COLUMN_MAPPING}),
     # A symlink manifest lists whole Parquet files: readers of one would return
     # rows a deletion vector removed, and see physical column names. Spark
-    # refuses both; delta-rs writes the manifest regardless.
+    # refuses both; delta-rs writes the manifest regardless. The kernel's
+    # GENERATE refuses them itself too.
     (Engine.DELTARS, Operation.GENERATE): frozenset(
+        {TableFeature.DELETION_VECTORS, TableFeature.COLUMN_MAPPING}
+    ),
+    (Engine.KERNEL, Operation.GENERATE): frozenset(
         {TableFeature.DELETION_VECTORS, TableFeature.COLUMN_MAPPING}
     ),
 }

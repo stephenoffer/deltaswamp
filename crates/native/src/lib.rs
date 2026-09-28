@@ -14,6 +14,7 @@ mod error;
 mod files;
 mod functions;
 mod logclean;
+mod manifest;
 mod partition;
 mod predicate;
 mod rebase;
@@ -103,6 +104,8 @@ pub const FEATURES: &[&str] = &[
     // `cleanup_log`: expired log cleanup below a retained checkpoint, by
     // commit timestamps (in-commit timestamps where the table has them).
     "log_cleanup",
+    // `write_symlink_manifest`: GENERATE symlink_format_manifest.
+    "symlink_manifest",
 ];
 
 #[pyfunction]

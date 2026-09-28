@@ -323,6 +323,14 @@ See docs/usage.md, "Security notes".
   touches `_staged_commits/`, and refuses catalog-managed tables and
   `checkpointProtection`. delta-rs serves it only where the kernel cannot
   read the table.
+- `generate()` (symlink format manifests) on the tables delta-rs cannot open
+  for writing -- clustering, row tracking, in-commit timestamps, type
+  widening, column defaults -- is written by the kernel as Spark writes it:
+  `_symlink_format_manifest/[<partition>/]manifest` with Hive-escaped
+  partition directories and one decoded absolute path per line, and the
+  manifests of partitions with no files deleted. It was refused. Tables with
+  deletion vectors or column mapping stay refused on every engine, as Spark
+  refuses them.
 - Adding a NOT NULL column is refused on every engine, as Databricks refuses
   it: add it nullable, backfill, then `set_not_null()`.
 - On a kernel-only table without deletion vectors, DML is a whole-table
