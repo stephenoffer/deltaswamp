@@ -3647,6 +3647,11 @@ class Table:
             zorder_by = [zorder_by]
         if zorder_by:
             self._check_zorder(list(zorder_by))
+        sort_by = kwargs.get("sort_by")
+        if isinstance(sort_by, str) and sort_by:
+            self._check_zorder([sort_by])
+        elif isinstance(sort_by, list | tuple) and sort_by:
+            self._check_zorder(list(sort_by))
         engine = self._route(
             self._request(
                 Operation.OPTIMIZE,
@@ -4667,6 +4672,9 @@ _OPTIMIZE_OPTIONS = _COMMIT_OPTIONS | {
     "max_temp_directory_size",
     "min_commit_interval",
     "writer_properties",
+    "min_file_size",
+    "sort_by",
+    "min_cube_size",
 }
 _VACUUM_OPTIONS = _COMMIT_OPTIONS | {"enforce_retention_duration", "keep_versions"}
 _RESTORE_OPTIONS = _COMMIT_OPTIONS | {"ignore_missing_files", "protocol_downgrade_allowed"}

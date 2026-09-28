@@ -867,13 +867,13 @@ class TestEnforcementIsNotBypassed:
         plan.commit([plan.write(pa.table({"id": [9], "city": ["z"]}))])
         assert conn.open_table(path).to_arrow().num_rows == 4
 
-    def test_row_tracking_refuses_overwrite_before_workers_run(self, conn: Any) -> None:
+    def test_row_tracking_takes_a_distributed_overwrite(self, conn: Any) -> None:
         """A kernel overwrite removes every visible file in the same commit.
 
-        Kernel 0.28 refuses a commit that stages removes on a row-tracked table,
-        because it cannot preserve the ids of what it removes -- and it refuses
-        at commit, after the data files exist. Appends are unaffected: they
-        stage no removes, and the kernel assigns fresh ids.
+        Kernel 0.28 refuses a commit that stages removes on a row-tracked
+        table, at commit, after the data files exist; the overwrite (this one
+        distributed) stages them by hand, and was refused up front until it
+        did. The new rows get fresh ids.
         """
         import os
         import tempfile
@@ -889,8 +889,9 @@ class TestEnforcementIsNotBypassed:
         plan.commit([plan.write(pa.table({"id": [1]}))])
         assert conn.open_table(location).to_arrow().num_rows == 1, "append still works"
 
-        with pytest.raises(UnreachableTableError, match=r"row ids|rowTracking"):
-            conn.open_table(location).plan_write(mode="overwrite")
+        plan = conn.open_table(location).plan_write(mode="overwrite")
+        plan.commit([plan.write(pa.table({"id": [7, 8]}))])
+        assert sorted(conn.open_table(location).to_arrow().column("id").to_pylist()) == [7, 8]
 
     def test_deletion_vectors_do_not_block_an_overwrite(self, conn: Any) -> None:
         """Only row tracking rules removes out; a DV table overwrites normally."""
