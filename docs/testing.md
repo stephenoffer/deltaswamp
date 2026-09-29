@@ -63,6 +63,7 @@ resolution, vending, then reads and writes.
 | SQL fallback | warns when it serves a request |
 | Lifecycle | exists, list, drop |
 | Conformance sweep | walks the whole schema and checks every claim against reality |
+| Distributed plans | a pickled `plan_scan` / `plan_changes` read in a separate process with no Databricks auth (managed, deletion-vector, change-feed and catalog-managed tables); `plan_write` on a managed table written or refused at planning (`tests/live/test_live_ray_tooling.py`) |
 
 Each test creates what it needs under a random name and drops it afterward,
 even when it fails. Anything your workspace cannot verify is skipped with a
@@ -109,7 +110,13 @@ columns, constraints, v2 checkpoints, liquid clustering, interval-2
 checkpoints with log compaction, a legacy table plain delta-rs created, a
 (1,4) change-feed table, all of those features together, a VARIANT table
 Databricks created, kernel deletion-vector DML on 38-digit decimals, nested
-ARRAY<TIMESTAMP>, and early dates through every write path. A history writes
+ARRAY<TIMESTAMP>, and early dates through every write path. Six more cover the
+distributed write paths, each writing from pickled plans with merged
+fragments: identity columns (Databricks-created, values reserved per task,
+Databricks inserting on top), `checkpointProtection`, user domain metadata,
+distributed overwrites of a change-feed table, a table created by
+`Connection.plan_write`, and generated columns, invariants and defaults
+computed on workers. A history writes
 through the kernel and delta-rs, transactionally and distributed, runs DML
 through each engine, DDL, OPTIMIZE, Z-ORDER, RESTORE, checkpoints, log
 compaction, VACUUM and metadata cleanup. For every case it asserts:
@@ -145,19 +152,15 @@ DELTASWAMP_TEST_INTEROP=1 DELTASWAMP_TEST_INTEROP_SHAPES=plain,dv,cdf \
 ```
 
 Cases run in the background, six at a time (`DELTASWAMP_TEST_INTEROP_WORKERS`),
-and each test waits for its case; all 26 cases (about 570 tests) take about
-12 minutes. The suite creates no tables: everything lives on one volume with a
+and each test waits for its case; all 32 cases (about 690 tests) take under
+an hour, most of it warehouse time. The suite creates no tables: everything lives on one volume with a
 random name (`dsi_...`), dropped at the end of the session even when tests
 fail.
 
 Open bugs are marked `xfail(strict=True)` on the one check they break
 (`Case.known` in `tests/live/interop.py`), so a fix turns the test into an
-unexpected pass, and the suite fails until the mark comes off. Open at the
-time of writing: NaN in DOUBLE columns of unpartitioned tables (the footer and
-delta-rs stats leave NaN out, so Databricks prunes those files), decimal
-bounds after kernel deletion-vector DML, reading ARRAY<TIMESTAMP> Databricks
-wrote as INT96, MERGE of a NULL ARRAY<VARIANT> element, and the
-`table_changes()` schema for a range that ends before a later ADD COLUMN.
+unexpected pass, and the suite fails until the mark comes off. None is open
+at the time of writing.
 
 A PAT cannot be refreshed, so anything that outlives it stops with what looks
 like an authentication error. Use OAuth M2M in production.

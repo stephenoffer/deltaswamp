@@ -71,6 +71,37 @@ First release.
 - Distributed reads (`plan_scan`, `to_ray_dataset`) and writes (`plan_write`),
   shipping a short-lived storage credential by default, or the picklable
   credential provider (`ship_catalog_auth=True`) so workers vend their own.
+- The Delta tooling for Ray Data `read_delta` / `write_delta`
+  (docs/ray-data.md, scenario by scenario):
+  - Workers read planned splits with no log listing or replay and no catalog
+    call; each split carries its file's scan row. Catalog-managed snapshots are
+    cached by the catalog's answer. `plan_changes()` plans the change feed as
+    runs of whole commits. `to_ray_dataset()` no longer reads the whole table
+    on the driver unless `allow_driver_read=True`.
+  - Distributed commits are idempotent: the driver reads only the commits
+    since the write for the job's files and returns a landed version instead
+    of committing twice. `WritePlan.abort()` deletes a job's files, and
+    `commit()` calls it after a failure that certainly committed nothing.
+    `merge_fragments()` combines fragments on workers, and `commit()` takes
+    any iterable. Catalog-managed appends retry by default.
+  - Credentials refresh inside the native object store (a slot read on every
+    AWS, Azure and GCS request), so a long scan or write outlives any one
+    credential. `credential_source=` and `CredentialBroker` refresh workers
+    without shipping catalog secrets; providers are shared per process. S3
+    keys get their bucket's region.
+  - `plan_write` vends the write credential when it plans:
+    `ExternalWriteNotAllowedError` names `EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE`
+    and the ways out.
+  - Kernel writes, local and distributed, through `checkpointProtection`,
+    generated columns, invariants, literal defaults and identity columns
+    (`plan_write(identity_tasks=)` reserves one block per task). User domain
+    metadata through `plan_write(domain_metadata=)`. Distributed overwrites of
+    change-data-feed tables.
+  - `Connection.plan_write(name, schema=...)` creates the table at commit,
+    with its data, and undoes the create when the job fails.
+  - On catalog-managed tables, DML rebases over concurrent appends by
+    re-reading the catalog's tail, and OPTIMIZE, Z-ORDER, RESTORE and VACUUM
+    (`allow_catalog_managed=True`) commit through the catalog.
 - Hand-offs to DuckDB, Polars and Daft, and cross-catalog SQL through
   `Connection.sql`.
 
@@ -485,12 +516,10 @@ See docs/usage.md, "Security notes".
 - Commits the kernel writes, including distributed ones, record empty
   `operationParameters`: delta_kernel 0.28 overwrites whatever the engine
   supplies. `isBlindAppend` still tells an append from an overwrite.
-- A MERGE on a change-data-feed table whose last NOT MATCHED clause has a
-  condition is refused on delta-rs (1.6.5 inserts an all-NULL row per rejected
-  source row) and needs the SQL fallback.
-- DELETE/UPDATE/replaceWhere SQL beyond the kernel's predicate grammar
-  (arithmetic, function calls) needs delta-rs or the warehouse, so on a
-  catalog-managed table it needs the SQL fallback.
+- With deltalake 1.6.5, a MERGE on a change-data-feed table whose last NOT
+  MATCHED clause has a condition is refused on delta-rs (it inserts an all-NULL
+  row per rejected source row) and needs the SQL fallback. deltalake 1.6.6
+  fixed it, and the refusal applies only to older versions.
 - The change feed and history of a catalog-managed table need the warehouse,
   which only a Databricks connection has: `allow_sql_fallback=True` is refused
   on OSS Unity Catalog, Hive Metastore, Glue, Delta Sharing and path
@@ -512,16 +541,25 @@ See docs/usage.md, "Security notes".
 - Databricks managed Iceberg (`USING ICEBERG`) takes appends through the
   Iceberg REST endpoint; overwrites need the warehouse, because the endpoint
   takes one snapshot per commit.
-- Incremental reads without a change feed are not built.
 - Databricks allowlists which connectors may write through the Unity Catalog
   Delta API, so writes to managed tables go through the SQL fallback until
   deltaswamp is registered. Reads are unaffected.
 - Idempotent writes are checked against the last committed version before
   writing, so a concurrent writer can still commit in between.
 - Identity and default columns are created only through Databricks (a catalog
-  name with the SQL fallback); locally both engines refuse them, since neither
-  assigns the values. Generated columns are created by delta-rs, which
-  evaluates them; the kernel refuses to create or write them.
+  name with the SQL fallback); generated columns are created by delta-rs. Once
+  a table has them, the kernel writes it, computing and checking the values;
+  DELETE, UPDATE and MERGE there stay with delta-rs or the warehouse.
+- A new table created by `Connection.plan_write` is two commits: an empty
+  version 0, then the data. A driver that dies between them leaves an empty
+  table; a managed table's staging allocation cannot be released.
+- delta-kernel-rs 0.28 holds an overwrite's removes (without statistics) in
+  memory until the commit.
+- A kernel MERGE reads its source and candidate files into memory; past
+  `KernelEngine.dml_max_bytes` (4 GiB) it is refused rather than running out
+  of memory.
+- Operations delta-rs serves take a static credential for their duration: it
+  cannot read the refreshing credential slot.
 - Tables written through delta-rs keep no min/max statistics for decimal
   columns of more than 15 digits (or structs holding one): delta-rs would log
   them as rounded doubles, which Databricks trusts for data skipping. Files

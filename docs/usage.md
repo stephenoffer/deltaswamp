@@ -629,15 +629,17 @@ generated or identity columns); and the aliases default to `source` and
 
 Without deletion vectors, delta-rs serves DML as copy-on-write, rewriting the
 Parquet files that hold matching rows. On a table only the kernel can write,
-`delete`, `update` and predicate overwrites then fall back to rewriting the
-whole table in one commit, bounded by `KernelEngine.rewrite_max_bytes` (1 GiB
-by default; a row-tracked table gets a rewrite of the touched files instead),
-with the same SQL as on the deletion-vector path. On a table with the change data feed enabled, the kernel serves only
-DELETE, because UPDATE and MERGE need CDC files it cannot write. delta-rs
-1.6.5 inserts an all-NULL row for each source row a conditional
-`when_not_matched_insert` rejects on such a table, so that MERGE is refused
-there (and goes to the warehouse when the fallback is on); make the last NOT
-MATCHED clause unconditional, filtering the source first, to keep it local.
+`delete`, `update` and predicate overwrites do the same: the kernel rewrites
+only the files that hold matching rows, keeping row ids on row-tracked tables,
+with the same SQL as on the deletion-vector path, and refuses a rewrite that
+would read more than `KernelEngine.dml_max_bytes` (4 GiB). On a table with the
+change data feed enabled, the kernel serves only DELETE, because UPDATE and
+MERGE need CDC files it cannot write. deltalake 1.6.5 inserts an all-NULL row
+for each source row a conditional `when_not_matched_insert` rejects on such a
+table, so with that version the MERGE is refused there (and goes to the
+warehouse when the fallback is on); make the last NOT MATCHED clause
+unconditional, filtering the source first, to keep it local. deltalake 1.6.6
+fixed it, and the MERGE runs on delta-rs.
 
 ### Spark SQL on the direct engines
 
@@ -1029,7 +1031,8 @@ Databricks as it stands.
 
 `plan_scan` and `plan_write` split the work between a driver and its workers.
 Everything is decided on the driver, so a refusal arrives before any compute
-is spent.
+is spent. [Ray Data](ray-data.md) maps each Ray Data `read_delta` /
+`write_delta` scenario to what serves it.
 
 ```python
 plan = t.plan_scan(columns=["id"], predicate="day >= '2026-09-01'")
@@ -1042,17 +1045,44 @@ version = plan.commit(fragments)  # driver: every fragment in one commit
 ```
 
 `WritePlan` and `ScanPlan` are picklable, and what crosses a process boundary
-carries the table's short-lived, table-scoped *storage* credential (vended on
-the driver when the plan is pickled) and its expiry -- never the catalog's
-credentials (a PAT, an OAuth client secret, a UC bearer token) and never the
-catalog itself. The driver's own plan object keeps full catalog access, so
-`commit()` runs on the driver; a worker's copy cannot commit. A worker whose
-shipped credential is within a minute of expiry raises `CredentialError`
-saying to re-plan on the driver. For jobs that outlive the credential, plan
-with `ship_catalog_auth=True` to ship the catalog's credential provider instead,
-so workers re-vend on their own -- at the cost of the catalog token travelling
-in every task payload. `to_ray_dataset()` is built on `plan_scan`, and
-catalog-managed tables work too: the commit goes through the catalog's committer.
+carries the table's short-lived, table-scoped *storage* credential and its
+expiry -- never the catalog's credentials (a PAT, an OAuth client secret, a UC
+bearer token) and never the catalog itself. The driver's own plan object keeps
+full catalog access, so `commit()` runs on the driver; a worker's copy cannot
+commit. `to_ray_dataset()` is built on `plan_scan`, and catalog-managed tables
+work too: the commit goes through the catalog's committer.
+
+`plan_write` vends the write credential on the driver when it plans, so a
+table Unity Catalog will not vend write credentials for is refused there, not
+on the first worker: `ExternalWriteNotAllowedError` for a managed table
+without catalog commits (`EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE`), naming the
+ways out.
+
+A plan's credential lasts as long as the catalog made it (about an hour on
+Databricks; `plan.credential_expires_at` says when). The native object store
+reads the credential on every request, so a refresh reaches a scan or a write
+already under way. Workers get fresh credentials in one of two ways:
+
+- `credential_source=`: a picklable callable ``source(table_id, operation)``
+  that reaches a `deltaswamp.credentials.CredentialBroker` on the driver (with
+  Ray, in an actor; the broker's docstring has the pattern). Workers ask it
+  ahead of expiry, once per process, and no catalog secret leaves the driver.
+- `ship_catalog_auth=True`: the plan carries the catalog's credential
+  provider, token included, and each worker process vends its own (once per
+  process, not per task).
+
+With neither, a worker whose credential is within a minute of expiry raises
+`CredentialError` saying to re-plan, and planning warns
+(`CredentialExpiryWarning`) when the credential has less than half an hour
+left.
+
+```python
+from deltaswamp.credentials import CredentialBroker
+
+broker = CredentialBroker()
+broker.add(t)  # on the driver
+plan = t.plan_scan(credential_source=broker)  # in one process; see the docstring for Ray
+```
 
 A read task touches only its own files. Each split carries its file's scan row
 and the plan the table's protocol and metadata, so a worker neither lists nor
@@ -1088,8 +1118,10 @@ refused, and `allow_concurrent_overwrite=True` is how you say last-writer-wins.
 Where a catalog does arbitrate and rejects the commit, the fragments stay valid
 -- they describe data files, which carry no version -- so the same fragments can
 be committed again against a fresh snapshot, which `retries=` does for tables
-this library commits itself (an append on a path table retries by default, as
-`Table.append` does: up to 15 times, with a jittered backoff between attempts).
+this library commits itself. An append retries by default, as `Table.append`
+does: up to 15 times, with a jittered backoff between attempts, on path tables
+and on catalog-managed tables planned through their catalog, where each
+attempt re-reads the catalog's commit tail.
 
 A concurrent change to the schema, the partition columns, column mapping or a
 CHECK constraint is the exception (adding a nullable column is not: the new
@@ -1120,12 +1152,94 @@ exists. Enabling change data feed alone puts a table at version 4.
 | Table | Distributed write |
 |---|---|
 | writer version 1-2 (plain legacy) | yes |
-| writer version 3-6 (legacy CDF, legacy column mapping) | no: the version implies `checkConstraints` |
+| writer version 3-6 (legacy CDF, legacy column mapping) | yes: the implied `checkConstraints` is checked here, on the workers |
 | writer version 7 (feature-based) | yes, for the features the kernel writes |
 
-At version 7, change data feed, column mapping, row tracking, in-commit
-timestamps, deletion vectors and type widening all write fine. DELETE, UPDATE,
-MERGE and maintenance run on the driver.
+Change data feed, column mapping, row tracking, in-commit timestamps, deletion
+vectors, type widening, liquid clustering, `checkpointProtection`, CHECK
+constraints, generated and identity columns, invariants and literal defaults
+all write. UniForm (IcebergCompat V1/V2) and geospatial columns are refused
+when the write is planned. DELETE, UPDATE, MERGE and maintenance run on the
+driver.
+
+### When a job fails
+
+Every fragment must reach `commit()` or `abort()`: until then its files are
+durable but belong to no version.
+
+- `commit()` deletes the job's files itself after a failure that certainly
+  committed nothing: a concurrent schema change (`MetadataChangedError`), a
+  guarded overwrite whose table moved, a conflict on every attempt.
+  `abort_on_failure=False` keeps them.
+- After a failure whose outcome is unknown (a timeout, a 5xx from the
+  catalog), nothing is deleted. Commit the same fragments again: a commit that
+  already landed is found in the commits since the write, and its version is
+  returned rather than committing twice. The check reads only those commits,
+  never the table's whole file list.
+- `plan.abort(fragments)` deletes the files of a job you give up on -- a Ray
+  datasink's ``on_write_failed``. It refuses files a commit already
+  references, and deletes only paths under the table root.
+
+Fragments are Arrow IPC bytes. `merge_fragments(fragments)` concatenates
+them, so workers can combine theirs before they reach the driver, and
+`commit()` takes any iterable, merging as fragments arrive; driver memory stays
+proportional to the job's files.
+
+```python
+from deltaswamp.distributed import merge_fragments
+
+try:
+    version = plan.commit(fragments)
+except ds.errors.TransientCommitError:
+    version = plan.commit(fragments)  # safe: a landed commit returns its version
+```
+
+### Computed columns and domains
+
+A worker fills a column's literal DEFAULT when a batch leaves it out, computes
+generated columns in DuckDB (`deltaswamp[duckdb]`) and checks given ones, and
+evaluates CHECK constraints and invariants, all before it writes a file. A
+DEFAULT only Databricks can evaluate (``current_timestamp()``) is refused at
+planning unless `supplies_defaults=True` promises every batch carries it.
+
+Identity columns need values that no two workers share. `plan_write` reserves
+them when it plans, in a metadata-only commit, and each task numbers its rows
+from a slot of its own:
+
+```python
+plan = t.plan_write(identity_tasks=64, identity_rows_per_task=1 << 20)
+fragment = plan.write(block, task_index=ctx.task_idx)  # slot ctx.task_idx
+```
+
+Values a task does not use are a gap, which Delta allows. A GENERATED ALWAYS
+column with nothing reserved is refused at planning; `identity_tasks=0` is for
+data that gives every value of a GENERATED BY DEFAULT column.
+
+`plan_write(domain_metadata={"myapp.watermark": "..."})` sets user domain
+metadata in the job's commit, beside its rows; `delta.*` domains and tables
+without the domainMetadata feature are refused at planning.
+
+### Creating the table in the job
+
+`Connection.plan_write(name, schema=..., mode=...)` plans a write whether or
+not the table exists. For a new table nothing is visible until the commit:
+workers write under the table's location, and `commit()` creates the table and
+commits the job's files. A path or external table is written as an empty
+version 0 and then the data (an external one is registered after its data is
+in); a managed one is staged when planned and registered by the commit. A
+failed or aborted job deletes its files and undoes the create. If another
+writer creates the table while the job runs, `error` and `overwrite` fail,
+`ignore` keeps theirs, and `append` joins it when the layout matches.
+
+```python
+plan = conn.plan_write("main.sales.orders_2026", schema=schema, mode="error")
+```
+
+It takes the save mode and `create_table`'s layout arguments (`location`,
+`partition_by`, `cluster_by`, `properties`, `comment`), plus `txn`,
+`commit_metadata`, `ship_catalog_auth` and `supplies_defaults`. Identity
+reservations, domain metadata and `credential_source` need an existing table's
+`Table.plan_write`.
 
 ## Asking what is possible
 
@@ -1217,13 +1331,15 @@ exponential backoff and no publish will wedge the table.
 ## Credentials
 
 Unity Catalog vends short-lived, per-table storage credentials. They expire
-on their own clock, separate from the catalog token the SDK refreshes, and are
-re-vended between operations. A single scan that streams past its
-credential's lifetime can still fail. `plan_scan()` splits the read, but by
-default every worker uses the one storage credential the driver vended when
-the plan was pickled; a job that runs longer than that credential lives needs
-`plan_scan(ship_catalog_auth=True)`, so each worker re-vends its own.
-[Architecture](architecture.md#credentials) has the details.
+on their own clock, separate from the catalog token the SDK refreshes. The
+kernel's object store reads its credential on every request, and deltaswamp
+refreshes it ahead of expiry, so a single long scan or write keeps working.
+Vended S3 keys get their bucket's own region, not the metastore's, and never
+go to an `AWS_ENDPOINT_URL` from the environment. Distributed plans refresh
+on workers through `credential_source=` or `ship_catalog_auth=True` (see
+"Distributed reads and writes"); tables served by delta-rs get a static
+credential per operation. [Architecture](architecture.md#credentials) has the
+details.
 
 ```python
 creds = t.credentials()  # or credentials(write=True)
@@ -1338,9 +1454,11 @@ reached.
   false (short decimal literals are DOUBLEs), and a DOUBLE divided by zero is
   infinity rather than an error; DuckDB upper-cases `ß` to `ẞ`; neither
   raises on INT overflow where Spark's ANSI mode does.
-- DML on a kernel-only table without deletion vectors is a bounded whole-table
-  rewrite, and MERGE there needs the warehouse. With deletion vectors enabled,
-  UPDATE and MERGE on a change-data-feed table need the warehouse too.
+- DML on a kernel-only table without deletion vectors rewrites the files it
+  touches, and MERGE reads its source and candidate files into memory; both
+  are refused past `KernelEngine.dml_max_bytes` (4 GiB) rather than running
+  out of memory. UPDATE and MERGE on a change-data-feed table need the
+  warehouse, since the kernel cannot write CDC files.
 - The change feed of a catalog-managed table needs the warehouse.
 - delta-rs reads pre-1582 dates and timestamps from Spark's legacy-calendar
   files unrebased (2-10 days off); the kernel rebases them. Ancient timestamps
@@ -1352,8 +1470,8 @@ reached.
   SET values cannot be bounded, count as holding such values: they go to the
   kernel, and are refused where it cannot serve them (a MERGE into a table
   without deletion vectors, `writer_properties=`).
-- Distributed planning is kernel-only; tables served by other engines are read
-  on the driver.
+- Distributed planning is kernel-only. For a table only another engine can
+  read, `to_ray_dataset()` raises unless `allow_driver_read=True`.
 - A MERGE with `merge_schema=True` whose SET or INSERT assigns a column the
   source does not have (closing an SCD2 row) is refused on delta-rs, which
   fails it, and needs the SQL fallback; the kernel MERGE does not evolve the
@@ -1365,9 +1483,10 @@ reached.
   generatedColumns, as Databricks keeps them, which the kernel cannot write,
   so no local engine could write the table afterwards.
 - Identity and default columns are created only through Databricks (a catalog
-  name with the SQL fallback); locally both engines refuse them, since neither
-  assigns the values. Generated columns are created by delta-rs, which
-  evaluates them; the kernel refuses to create or write them.
+  name with the SQL fallback); generated columns are created by delta-rs. Once
+  a table has them, the kernel writes it (appends, overwrites, distributed
+  writes), computing and checking the values; DELETE, UPDATE and MERGE there
+  stay with delta-rs or the warehouse.
 - Tables written through delta-rs keep no min/max statistics for decimal
   columns of more than 15 digits (or structs holding one): delta-rs would log
   them as rounded doubles, which Databricks trusts for data skipping. Files
