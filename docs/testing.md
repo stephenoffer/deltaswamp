@@ -132,7 +132,8 @@ compaction, VACUUM and metadata cleanup. For every case it asserts:
   version Databricks committed as Databricks does, and appends on top in a way
   Databricks reads back;
 - (d) `table_changes()` equals `cdf()` on change-data-feed tables, over the
-  whole feed, the last few commits, and Databricks' own writes;
+  whole feed, the last few commits, the kernel's own UPDATE, DELETE and MERGE
+  (the CDC files it writes), and Databricks' own writes;
 - (e) selective predicates (`=`, `<`, `>`, `>=`, `IS NULL` on the smallest,
   median and largest value of every leaf column, struct fields included)
   return the same rows on Databricks as deltaswamp reads, grouped by type:
