@@ -46,6 +46,9 @@ pub struct PySnapshot {
     /// can prove the log it was built from is still the one in storage. None
     /// when it was not asked for or storage gives no strong change token.
     identity: Option<String>,
+    /// Built by `planned` from a driver's protocol and metadata, with no log
+    /// behind it: it reads only the files a plan hands it (`scan_rows=`).
+    planned: bool,
 }
 
 /// A strong identity for the commit file `snapshot` ends at, or None.
@@ -280,6 +283,15 @@ impl PySnapshot {
 }
 
 impl PySnapshot {
+    /// The error for a log read on a `planned` snapshot, which has no log.
+    fn planned_refusal(&self, what: &str) -> PyErr {
+        NativeError::Invalid(format!(
+            "cannot {what}: this snapshot was built from a scan plan and has no log behind \
+             it; resolve the table to do that"
+        ))
+        .into()
+    }
+
     /// The object store this snapshot's engine reads through.
     fn store(&self) -> Result<Arc<delta_kernel::object_store::DynObjectStore>> {
         self.engine
@@ -345,6 +357,73 @@ impl PySnapshot {
             inner,
             engine,
             identity,
+            planned: false,
+        })
+    }
+
+    /// A snapshot of `table_root` at `version`, built from the protocol and
+    /// metadata a driver planned with, without reading the log.
+    ///
+    /// A worker reads planned files through it: `scan(files=..., scan_rows=...)`
+    /// with the scan rows `files(scan_rows=True)` listed on the driver. No log
+    /// listing, no replay, no catalog tail -- so a read task costs only its
+    /// own files, and a catalog-managed table still reads after the staged
+    /// commits it was planned from were published and removed. Everything
+    /// else that reads the log is refused on it.
+    #[staticmethod]
+    #[pyo3(signature = (table_root, version, protocol_json, metadata_json, options = None))]
+    fn planned(
+        py: Python<'_>,
+        table_root: &str,
+        version: u64,
+        protocol_json: &str,
+        metadata_json: &str,
+        options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        use delta_kernel::actions::{Metadata, Protocol};
+        use delta_kernel::log_segment::LogSegment;
+        use delta_kernel::log_segment_files::LogSegmentFiles;
+        use delta_kernel::path::ParsedLogPath;
+        use delta_kernel::table_configuration::TableConfiguration;
+        use delta_kernel::FileMeta;
+
+        let url = Self::table_root_url(table_root)?;
+        let options = options.unwrap_or_default();
+        let invalid = |what: &str, e: serde_json::Error| {
+            NativeError::Invalid(format!("the planned {what} is not valid JSON: {e}"))
+        };
+        let protocol: Protocol =
+            serde_json::from_str(protocol_json).map_err(|e| invalid("protocol", e))?;
+        let metadata: Metadata =
+            serde_json::from_str(metadata_json).map_err(|e| invalid("metadata", e))?;
+        let (inner, engine) = py.detach(|| -> Result<(SnapshotRef, SharedEngine)> {
+            let engine = commit::new_engine(store::build_store(&url, &options)?);
+            let config = TableConfiguration::try_new(metadata, protocol, url.clone(), version)?;
+            // The segment names the planned version's commit so the snapshot
+            // is well formed; nothing reads it (see `scan`'s scan_rows).
+            let log_root = url.join("_delta_log/").map_err(NativeError::from)?;
+            let location = log_root
+                .join(&format!("{version:020}.json"))
+                .map_err(NativeError::from)?;
+            let commit = ParsedLogPath::try_from(FileMeta {
+                location,
+                last_modified: 0,
+                size: 0,
+            })?
+            .ok_or_else(|| NativeError::Invalid("no commit path for the version".into()))?;
+            let files = LogSegmentFiles {
+                ascending_commit_files: vec![commit.clone()],
+                latest_commit_file: Some(commit),
+                ..Default::default()
+            };
+            let segment = LogSegment::try_new(files, log_root, Some(version), None)?;
+            Ok((Arc::new(Snapshot::new(segment, config)?), engine))
+        })?;
+        Ok(Self {
+            inner,
+            engine,
+            identity: None,
+            planned: true,
         })
     }
 
@@ -419,6 +498,7 @@ impl PySnapshot {
             inner,
             engine,
             identity,
+            planned: false,
         })
     }
 
@@ -532,6 +612,7 @@ impl PySnapshot {
         row_ids = false,
         file_groups = None,
         row_tracking = false,
+        scan_rows = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn scan(
@@ -544,7 +625,19 @@ impl PySnapshot {
         row_ids: bool,
         file_groups: Option<Vec<usize>>,
         row_tracking: bool,
+        scan_rows: Option<Vec<String>>,
     ) -> PyResult<PyRecordBatchReader> {
+        if scan_rows.is_some() && (row_positions || file_groups.is_some() || row_tracking) {
+            return Err(NativeError::Invalid(
+                "scan_rows=... reads planned files only; it takes no row_positions, \
+                 file_groups or row_tracking"
+                    .to_string(),
+            )
+            .into());
+        }
+        if self.planned && scan_rows.is_none() {
+            return Err(self.planned_refusal("scan without the planned scan rows"));
+        }
         if row_tracking && file_groups.is_none() && !row_positions {
             return Err(NativeError::Invalid(
                 "row_tracking=True takes file_groups=... or row_positions=True".to_string(),
@@ -657,6 +750,19 @@ impl PySnapshot {
                     reader
                 });
             }
+            if let Some(rows) = scan_rows {
+                let reader = KernelBatchReader::try_new_planned(
+                    &scan,
+                    engine,
+                    &crate::scan::PlannedFiles(rows),
+                    files,
+                )?;
+                return Ok(if only_partitions {
+                    reader.without_column(crate::scan::ROW_COUNT_COLUMN)
+                } else {
+                    reader
+                });
+            }
             let reader = match files {
                 Some(files) => KernelBatchReader::try_new_restricted(
                     &scan,
@@ -682,11 +788,30 @@ impl PySnapshot {
     /// (map, keyed by *physical* name under column mapping), `stats` (raw JSON),
     /// `deletion_vector` (JSON descriptor or null) and `num_records`.
     /// `tags=True` adds `tags`, each add's tags as a JSON object.
-    #[pyo3(signature = (predicate = None, tags = false))]
-    fn files(&self, py: Python<'_>, predicate: Option<String>, tags: bool) -> PyResult<PyTable> {
+    ///
+    /// `scan_rows=True` adds `scan_row`, each file's kernel scan row as JSON:
+    /// what a worker passes back to `scan(scan_rows=...)` to read the file with
+    /// no log replay.
+    #[pyo3(signature = (predicate = None, tags = false, scan_rows = false))]
+    fn files(
+        &self,
+        py: Python<'_>,
+        predicate: Option<String>,
+        tags: bool,
+        scan_rows: bool,
+    ) -> PyResult<PyTable> {
+        if self.planned {
+            return Err(self.planned_refusal("list its files"));
+        }
         let batch = py.detach(|| -> Result<arrow::array::RecordBatch> {
             let predicate = parse_predicate(predicate.as_deref(), self.inner.schema().as_ref())?;
-            files::list_files(self.inner.clone(), self.engine.as_ref(), predicate, tags)
+            files::list_files(
+                self.inner.clone(),
+                self.engine.as_ref(),
+                predicate,
+                tags,
+                scan_rows,
+            )
         })?;
         let schema = batch.schema();
         PyTable::try_new(vec![batch], schema)

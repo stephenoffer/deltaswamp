@@ -132,6 +132,9 @@ pub const FEATURES: &[&str] = &[
     // monotonic before in-commit timestamps), which every timestamp lookup
     // resolves against.
     "commit_timestamps",
+    // `files(scan_rows=True)`, `Snapshot.planned` and `scan(scan_rows=)`: a
+    // worker reads planned files with no log listing or replay.
+    "planned_scan",
 ];
 
 #[pyfunction]

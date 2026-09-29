@@ -17,6 +17,16 @@
 //! transform, per-file batch order -- is exactly what `execute` does, so a
 //! restricted scan over every file equals the full scan.
 //!
+//! A *planned* scan ([`KernelBatchReader::try_new_planned`]) reads files a
+//! driver already planned. Each file's scan row (the kernel's own scan-row
+//! shape: path, size, deletion vector, partition values, row-tracking
+//! constants) travels with the work, and the worker hands those rows to the
+//! kernel's `scan_metadata_from` at the snapshot's own version. That reads no
+//! log: the kernel only derives each file's physical->logical transform for
+//! this scan's projection, so a worker reads its files without listing or
+//! replaying the log -- on a catalog-managed table, even after the staged
+//! commits the plan was built from were published and removed.
+//!
 //! A *positional* scan ([`KernelBatchReader::try_new_positional`]) is the same
 //! restricted read with each surviving row tagged by its data file's log path
 //! and its physical row index within that file. Those two values are exactly
@@ -167,6 +177,50 @@ impl CommitVersions {
     }
 }
 
+/// Scan rows a driver planned, as JSON objects in the kernel's scan-row
+/// schema (see `files::scan_row_json`), for a worker to read with no log
+/// replay.
+#[derive(Clone, Debug)]
+pub struct PlannedFiles(pub Vec<String>);
+
+type MetadataIter = Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>;
+
+/// The scan metadata a read goes through: the log's, or the planned rows'.
+///
+/// Planned rows go through `scan_metadata_from` at the snapshot's own
+/// version, which takes them as already-reconciled scan metadata (no log
+/// I/O) and derives each file's transform for this scan with the same code
+/// the log replay runs, so the rows read exactly as a full scan reads them.
+fn scan_metadata_source(
+    scan: &Scan,
+    engine: &dyn Engine,
+    planned: Option<&PlannedFiles>,
+) -> Result<MetadataIter> {
+    let Some(PlannedFiles(rows)) = planned else {
+        return Ok(Box::new(scan.scan_metadata(engine)?));
+    };
+    use arrow::array::StringArray;
+    let text = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "scan_row",
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )])),
+        vec![Arc::new(StringArray::from_iter_values(rows.iter()))],
+    )?;
+    let parsed = engine.json_handler().parse_json(
+        Box::new(ArrowEngineData::new(text)),
+        delta_kernel::scan::scan_row_schema(),
+    )?;
+    let version = scan.snapshot().version();
+    // Collected: the kernel's iterator is not Send, and it holds only the
+    // task's own files, already in memory.
+    let metadata: Vec<DeltaResult<ScanMetadata>> = scan
+        .scan_metadata_from(engine, version, vec![parsed], None)?
+        .collect();
+    Ok(Box::new(metadata.into_iter()))
+}
+
 impl KernelBatchReader {
     /// This reader with the top-level column `name` removed from its schema
     /// and from every batch (row counts are kept).
@@ -193,6 +247,20 @@ impl KernelBatchReader {
 
     pub fn try_new(scan: &Scan, engine: Arc<dyn Engine>) -> Result<Self> {
         let iter = scan.execute(engine)?;
+        Self::from_parts(scan.logical_schema().as_ref(), iter)
+    }
+
+    /// Read the planned files (every one, or those in `paths`) with no log
+    /// replay; see [`PlannedFiles`].
+    pub fn try_new_planned(
+        scan: &Scan,
+        engine: Arc<dyn Engine>,
+        planned: &PlannedFiles,
+        paths: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let metadata = scan_metadata_source(scan, engine.as_ref(), Some(planned))?;
+        let iter =
+            RestrictedScan::with_metadata(scan, engine, metadata, paths, false, false, None)?;
         Self::from_parts(scan.logical_schema().as_ref(), iter)
     }
 
@@ -550,6 +618,28 @@ impl RestrictedScan {
         dictionary: bool,
         commit_versions: Option<CommitVersions>,
     ) -> Result<Self> {
+        let metadata = scan_metadata_source(scan, engine.as_ref(), None)?;
+        Self::with_metadata(
+            scan,
+            engine,
+            metadata,
+            order,
+            tag_path,
+            dictionary,
+            commit_versions,
+        )
+    }
+
+    /// [`RestrictedScan::new`] over the given scan metadata.
+    fn with_metadata(
+        scan: &Scan,
+        engine: Arc<dyn Engine>,
+        metadata: MetadataIter,
+        order: Option<Vec<String>>,
+        tag_path: bool,
+        dictionary: bool,
+        commit_versions: Option<CommitVersions>,
+    ) -> Result<Self> {
         let paths = order.as_ref().map(|o| o.iter().cloned().collect());
         let prefetch = order.is_some();
         let physical_schema = scan.physical_schema().clone();
@@ -567,7 +657,7 @@ impl RestrictedScan {
             None => physical_schema.clone(),
         };
         Ok(Self {
-            metadata: Box::new(scan.scan_metadata(engine.as_ref())?),
+            metadata,
             engine,
             table_root: scan.snapshot().table_root().clone(),
             physical_schema,

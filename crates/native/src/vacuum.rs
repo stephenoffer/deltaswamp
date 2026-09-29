@@ -381,7 +381,7 @@ pub fn plan(
     let root_path = Path::from_url_path(root.path()).map_err(path_error)?;
     let mut referenced = Referenced::default();
 
-    let live = files::list_files(snapshot.clone(), engine, None, false)?;
+    let live = files::list_files(snapshot.clone(), engine, None, false, false)?;
     let paths = arrow::compute::cast(
         live.column_by_name("path")
             .ok_or_else(|| NativeError::Invalid("file listing has no path".into()))?,

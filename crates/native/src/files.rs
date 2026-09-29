@@ -37,21 +37,32 @@ fn missing(name: &str) -> NativeError {
 
 /// One row per live data file, with optional predicate-based file skipping.
 ///
-/// With `tags`, a last column `tags` holds each add's tags as a JSON object.
+/// With `tags`, a column `tags` holds each add's tags as a JSON object. With
+/// `scan_rows`, a last column `scan_row` holds each file's kernel scan row as
+/// JSON (see [`scan_row_json`]): what a worker reads the file by.
 pub fn list_files(
     snapshot: SnapshotRef,
     engine: &dyn Engine,
     predicate: Option<Predicate>,
     tags: bool,
+    scan_rows: bool,
 ) -> Result<RecordBatch> {
     // Struct stats are requested only so the kernel reads a checkpoint's
     // `stats_parsed` and re-serializes it into `stats`. With the default
     // (JSON only) a checkpoint written with writeStatsAsJson=false -- every
     // Databricks managed table -- listed every file with no statistics.
+    // A scan plan (`scan_rows`) needs no statistics of its own, and parsing
+    // every file's into structs was most of planning's memory: it keeps the
+    // log's JSON only. File skipping is the same either way.
+    let stats = if scan_rows {
+        StatsOptions::json_only()
+    } else {
+        StatsOptions::all()
+    };
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate.map(Arc::new))
-        .with_stats(StatsOptions::all())
+        .with_stats(stats)
         .without_row_transforms()
         .build()?;
 
@@ -65,11 +76,11 @@ pub fn list_files(
             .collect();
         let selected = filter_record_batch(&batch, &mask)?;
         if selected.num_rows() > 0 {
-            batches.push(project(&selected, tags)?);
+            batches.push(project(&selected, tags, scan_rows)?);
         }
     }
 
-    let schema = schema_for(tags);
+    let schema = schema_for(tags, scan_rows);
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -99,18 +110,23 @@ pub fn output_schema() -> Arc<Schema> {
     ]))
 }
 
-fn schema_for(tags: bool) -> Arc<Schema> {
+fn schema_for(tags: bool, scan_rows: bool) -> Arc<Schema> {
     let schema = output_schema();
-    if !tags {
+    if !tags && !scan_rows {
         return schema;
     }
     let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-    fields.push(Field::new("tags", DataType::Utf8, true));
+    if tags {
+        fields.push(Field::new("tags", DataType::Utf8, true));
+    }
+    if scan_rows {
+        fields.push(Field::new("scan_row", DataType::Utf8, false));
+    }
     Arc::new(Schema::new(fields))
 }
 
 /// Reshape one selected scan-metadata batch into the listing schema.
-fn project(batch: &RecordBatch, with_tags: bool) -> Result<RecordBatch> {
+fn project(batch: &RecordBatch, with_tags: bool, scan_rows: bool) -> Result<RecordBatch> {
     let column = |name: &str| {
         batch
             .column_by_name(name)
@@ -157,7 +173,81 @@ fn project(batch: &RecordBatch, with_tags: bool) -> Result<RecordBatch> {
         };
         columns.push(Arc::new(tags));
     }
-    Ok(RecordBatch::try_new(schema_for(with_tags), columns)?)
+    if scan_rows {
+        columns.push(Arc::new(scan_row_json(batch)?));
+    }
+    Ok(RecordBatch::try_new(schema_for(with_tags, scan_rows), columns)?)
+}
+
+/// Each selected scan row as a JSON object in the kernel's scan-row schema,
+/// without its statistics: what `scan::PlannedFiles` hands back to the kernel
+/// on a worker. Statistics are left out because the plan already skipped by
+/// them (a worker's scan keeps a file with none), and they are most of a
+/// row's size; the other fields decide how the file reads.
+pub fn scan_row_json(batch: &RecordBatch) -> Result<StringArray> {
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .cloned()
+            .ok_or_else(|| missing(name))
+    };
+    let path = arrow::compute::cast(&column("path")?, &DataType::Utf8)?;
+    let path = path.as_string::<i32>();
+    let size = arrow::compute::cast(&column("size")?, &DataType::Int64)?;
+    let size = size.as_primitive::<Int64Type>();
+    let modified = arrow::compute::cast(&column("modificationTime")?, &DataType::Int64)?;
+    let modified = modified.as_primitive::<Int64Type>();
+    let dv = column("deletionVector")?;
+    let dv = deletion_vector_json(
+        dv.as_struct_opt()
+            .ok_or_else(|| missing("deletionVector"))?,
+    )?;
+    let constants = column("fileConstantValues")?;
+    let constants = constants
+        .as_struct_opt()
+        .ok_or_else(|| missing("fileConstantValues"))?;
+    let field = |name: &str| {
+        constants
+            .column_by_name(name)
+            .cloned()
+            .ok_or_else(|| missing(&format!("fileConstantValues.{name}")))
+    };
+    let partitions = normalize_map(&field("partitionValues")?)?;
+    let base_row_id = arrow::compute::cast(&field("baseRowId")?, &DataType::Int64)?;
+    let base_row_id = base_row_id.as_primitive::<Int64Type>();
+    let commit_version =
+        arrow::compute::cast(&field("defaultRowCommitVersion")?, &DataType::Int64)?;
+    let commit_version = commit_version.as_primitive::<Int64Type>();
+    let mut out = StringBuilder::new();
+    for i in 0..batch.num_rows() {
+        let optional = |array: &Int64Array| -> serde_json::Value {
+            if array.is_null(i) {
+                serde_json::Value::Null
+            } else {
+                array.value(i).into()
+            }
+        };
+        let deletion_vector = if dv.is_null(i) {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(dv.value(i))
+                .map_err(|e| NativeError::Invalid(format!("bad deletion vector: {e}")))?
+        };
+        let row = serde_json::json!({
+            "path": path.value(i),
+            "size": size.value(i),
+            "modificationTime": optional(modified),
+            "deletionVector": deletion_vector,
+            "fileConstantValues": {
+                "partitionValues": map_json(&partitions, i)
+                    .unwrap_or_else(|| serde_json::json!({})),
+                "baseRowId": optional(base_row_id),
+                "defaultRowCommitVersion": optional(commit_version),
+            },
+        });
+        out.append_value(row.to_string());
+    }
+    Ok(out.finish())
 }
 
 /// Each add's `tags` map as a JSON object (null where it has none): what an

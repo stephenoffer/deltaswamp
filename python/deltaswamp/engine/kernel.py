@@ -1299,8 +1299,9 @@ class KernelEngine:
     def forget(self, location: str) -> None:
         """Drop every snapshot cached for the table at `location`."""
         with self._snapshots_lock:
-            for key in [k for k in self._snapshots if k[0] == location]:
-                self._snapshots.pop(key, None)
+            for cache in (self._snapshots, self._planned_snapshots):
+                for key in [k for k in cache if k[0] == location]:
+                    cache.pop(key, None)
 
     def _remember(self, key: tuple[Any, ...], snapshot: Any) -> None:
         if getattr(snapshot, "commit_identity", None) is None:
@@ -5140,7 +5141,7 @@ class KernelEngine:
 
         pa = _require("pyarrow", "pyarrow", "plan_scan")
 
-        from .base import DeletionVectorDescriptor, ScanSplit
+        from .base import DeletionVectorDescriptor, PlannedSnapshot, ScanSplit
 
         if not self.supports_distributed_scan:
             raise NotImplementedError(
@@ -5156,7 +5157,30 @@ class KernelEngine:
             if predicate
             else None
         )
-        files = pa.table(snapshot.files(predicate=skipping)).to_pylist()
+        # With each file's scan row and the snapshot's protocol and metadata,
+        # a worker reads its files without the log (`_planned_snapshot`).
+        planned = _native_has("planned_scan")
+        listing = (
+            snapshot.files(predicate=skipping, scan_rows=True)
+            if planned
+            else snapshot.files(predicate=skipping)
+        )
+        # Column by column, not a dict per file: statistics (most of the
+        # listing) are never turned into Python objects.
+        files = pa.table(listing).select(
+            ["path", "size", "partition_values", "deletion_vector"]
+            + (["scan_row"] if planned else [])
+        )
+        del listing
+        state = (
+            PlannedSnapshot(
+                version=int(snapshot.version),
+                protocol_json=snapshot.protocol_json(),
+                metadata_json=snapshot.metadata_json(),
+            )
+            if planned
+            else None
+        )
         # The log keys partition values by *physical* name, which under column
         # mapping is a `col-<uuid>`; splits report the logical column name.
         logical = {}
@@ -5164,9 +5188,18 @@ class KernelEngine:
             physical = (fld.metadata or {}).get(b"delta.columnMapping.physicalName")
             if physical is not None:
                 logical[physical.decode()] = fld.name
+        count = files.num_rows
+        rows = files.column("scan_row").to_pylist() if planned else [None] * count
+        version_planned = int(snapshot.version)
         splits = []
-        for f in files:
-            dv = f.get("deletion_vector")
+        for path, size, partition_values, dv, row in zip(
+            files.column("path").to_pylist(),
+            files.column("size").to_pylist(),
+            files.column("partition_values").to_pylist(),
+            files.column("deletion_vector").to_pylist(),
+            rows,
+            strict=True,
+        ):
             descriptor = None
             if dv:
                 raw = json.loads(dv)
@@ -5177,16 +5210,16 @@ class KernelEngine:
                     cardinality=int(raw.get("cardinality", 0)),
                     offset=raw.get("offset"),
                 )
-            partition_values = f.get("partition_values") or {}
-            if isinstance(partition_values, list):  # an Arrow map arrives as pairs
-                partition_values = dict(partition_values)
             splits.append(
                 ScanSplit(
-                    path=f["path"],
-                    size=int(f["size"]),
-                    partition_values={logical.get(k, k): v for k, v in partition_values.items()},
+                    path=path,
+                    size=int(size),
+                    # An Arrow map arrives as (key, value) pairs.
+                    partition_values={logical.get(k, k): v for k, v in partition_values or ()},
                     deletion_vector=descriptor,
-                    commit_version=int(snapshot.version),
+                    commit_version=version_planned,
+                    scan_row=row,
+                    planned=state,
                 )
             )
         return splits
@@ -5332,9 +5365,60 @@ class KernelEngine:
             )
         if versions:
             version = next(iter(versions))
-        snapshot = self.snapshot(table, version=version)
         paths = [s.path for s in splits]
+        planned = {getattr(s, "planned", None) for s in splits}
+        rows = [getattr(s, "scan_row", None) for s in splits]
+        if (
+            len(planned) == 1
+            and None not in planned
+            and None not in rows
+            and _native_has("planned_scan")
+        ):
+            # Planned with each file's scan row: read them with no log
+            # listing or replay, which also outlives staged commits the
+            # catalog has since published and removed.
+            state = next(iter(planned))
+            snapshot = self._planned_snapshot(table, state)
+            return _planned_read(snapshot, columns, predicate, files=paths, scan_rows=rows)
+        snapshot = self.snapshot(table, version=version)
         return _planned_read(snapshot, columns, predicate, files=paths)
+
+    #: Snapshots built from scan plans, kept per process: one per planned
+    #: version and store, reused by every read task of the plan that lands here.
+    _planned_snapshots: ClassVar[OrderedDict[tuple[Any, ...], Any]] = OrderedDict()
+
+    def _planned_snapshot(self, table: ResolvedTable, state: Any) -> Any:
+        """The snapshot `state` (a `PlannedSnapshot`) describes, without reading the log."""
+        from deltaswamp._native import Snapshot
+
+        _enter_native("read planned files with the kernel")
+        if table.location is None:
+            raise UnreachableTableError("open", "the table has no storage location", None)
+        options = self._options(table, write=False)
+        key = (
+            table.location,
+            state.version,
+            hash((state.protocol_json, state.metadata_json)),
+            _store_fingerprint(options),
+            table.table_id,
+        )
+        with self._snapshots_lock:
+            cached = self._planned_snapshots.get(key)
+            if cached is not None:
+                self._planned_snapshots.move_to_end(key)
+                return cached
+        snapshot = Snapshot.planned(
+            table.location,
+            state.version,
+            state.protocol_json,
+            state.metadata_json,
+            options=options,
+        )
+        with self._snapshots_lock:
+            self._planned_snapshots[key] = snapshot
+            while len(self._planned_snapshots) > self.snapshot_cache_size:
+                self._planned_snapshots.popitem(last=False)
+        return snapshot
 
 
 #: Table properties a restore keeps at their current values. Each records a
@@ -6431,11 +6515,18 @@ def _planned_read(
     predicate: str | None,
     *,
     files: list[str] | None = None,
+    scan_rows: list[str] | None = None,
 ) -> Any:
-    """Scan `snapshot`: files skipped by the predicate, rows filtered exactly."""
+    """Scan `snapshot`: files skipped by the predicate, rows filtered exactly.
+
+    `scan_rows` (with `files`) are the planned files' scan rows, read without
+    the log (see `KernelEngine._planned_snapshot`).
+    """
     from .. import predicate as sqlpred
 
-    extra = {} if files is None else {"files": files}
+    extra: dict[str, Any] = {} if files is None else {"files": files}
+    if scan_rows is not None:
+        extra["scan_rows"] = scan_rows
     if predicate is not None:
         _require_pyarrow("filter rows with a predicate on the kernel path")
         sql = _outside_grammar(predicate)
