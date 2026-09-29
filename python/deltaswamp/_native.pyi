@@ -638,6 +638,20 @@ class Snapshot:
         is as for `append`: every worker checked the rows it wrote.
         """
 
+    def commits_adding(self, after: int, paths: list[str]) -> list[tuple[int, int]]:
+        """`(version, n)` for each commit in `(after, version]` adding any of `paths`.
+
+        Reads only those commits, a catalog-managed table's ratified tail
+        included. Raises when one of them can no longer be read.
+        """
+
+    def delete_uncommitted(self, paths: list[str]) -> list[str]:
+        """Delete data files `write_files` wrote that no commit references.
+
+        Only relative paths under the table root; returns the ones that could
+        not be deleted, with why.
+        """
+
     def commit_dml(
         self,
         deletions: Any,

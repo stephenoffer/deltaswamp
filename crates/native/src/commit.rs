@@ -276,9 +276,10 @@ pub fn write(
         .map(|b| partition::conform_to_table(b, table_schema.as_ref(), &partition_columns))
         .collect::<Result<Vec<_>>>()?;
     let batches = partition::coalesce(batches)?;
-    // Remove everything the snapshot can see, in this same commit.
+    // Remove everything the snapshot can see, in this same commit. The rows
+    // below are written to fresh file names, so none can be among them.
     let removes = if overwrite {
-        overwrite_removes(&scan_source, &engine, &info)?
+        overwrite_removes(&scan_source, &engine, &info, &Default::default())?
     } else {
         Vec::new()
     };
@@ -1265,10 +1266,21 @@ impl RemovesByHand {
 /// Returned for kernel to stage, or, on a row-tracked table, staged by hand
 /// into `info` (the new rows get fresh ids from kernel, as a replaced
 /// table's rows should) and nothing returned.
+///
+/// Kernel holds every staged remove until the commit is written, so each scan
+/// batch is cut down as it arrives: rows the log replay deselected are dropped
+/// and `stats` is nulled. A remove's stats are optional, and they were most of
+/// what an overwrite of a table with millions of files held in memory.
+///
+/// A live file that is also among `adds` is refused. A commit that adds and
+/// removes one path is read differently by every reader (the kernel kept the
+/// file, delta-rs listed it, Spark's replay dropped it), and it only happens
+/// when fragments that already landed are committed again.
 fn overwrite_removes(
     snapshot: &SnapshotRef,
     engine: &SharedEngine,
     info: &CommitInfoPatch,
+    adds: &std::collections::HashSet<String>,
 ) -> Result<Vec<FilteredEngineData>> {
     let scan = snapshot.clone().scan_builder().build()?;
     let scan_metadata = runtime::block_on(async { scan.scan_metadata(engine.as_ref()) })?;
@@ -1279,20 +1291,66 @@ fn overwrite_removes(
     };
     let mut removes = Vec::new();
     for filtered in Transaction::scan_metadata_to_engine_data(scan_metadata) {
-        let filtered = filtered?;
+        let Some((batch, selected)) = compact_scan_rows(filtered?, adds)? else {
+            continue;
+        };
         match &builder {
-            Some(builder) => {
-                let selection = filtered.selection_vector();
-                let selected = (0..filtered.data().len())
-                    .map(|i| selection.get(i).copied().unwrap_or(true))
-                    .collect();
-                info.extra_actions
-                    .push(builder.of(filtered.data(), selected)?);
-            }
-            None => removes.push(filtered),
+            Some(builder) => info.extra_actions.push(builder.of(&batch, selected)?),
+            None => removes.push(FilteredEngineData::try_new(Box::new(batch), selected)?),
         }
     }
     Ok(removes)
+}
+
+/// A scan-metadata batch cut to its selected rows, with `stats` nulled; None
+/// when it selects nothing. Refuses a selected path that is in `adds`.
+fn compact_scan_rows(
+    filtered: FilteredEngineData,
+    adds: &std::collections::HashSet<String>,
+) -> Result<Option<(ArrowEngineData, Vec<bool>)>> {
+    use arrow::array::{new_null_array, Array, BooleanArray, StringArray};
+
+    let rows = filtered.data().len();
+    let (data, selection) = filtered.into_parts();
+    let mask: BooleanArray = (0..rows)
+        .map(|i| Some(selection.get(i).copied().unwrap_or(true)))
+        .collect();
+    if mask.true_count() == 0 {
+        return Ok(None);
+    }
+    let batch: arrow::array::RecordBatch = (*data
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .map_err(|_| NativeError::Invalid("scan metadata is not Arrow-backed".to_string()))?)
+    .into();
+    let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+    if !adds.is_empty() {
+        if let Some(paths) = batch.column_by_name("path") {
+            let paths = arrow::compute::cast(paths, &arrow::datatypes::DataType::Utf8)?;
+            if let Some(paths) = paths.as_any().downcast_ref::<StringArray>() {
+                for i in 0..paths.len() {
+                    if !paths.is_null(i) && adds.contains(paths.value(i)) {
+                        return Err(NativeError::Invalid(format!(
+                            "data file {:?} is already live in the table, so this overwrite \
+                             would add and remove it in one commit. An earlier commit of these \
+                             fragments landed; do not commit them again",
+                            paths.value(i)
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    let batch = match batch.schema().index_of("stats") {
+        Ok(index) => {
+            let mut columns = batch.columns().to_vec();
+            columns[index] = new_null_array(columns[index].data_type(), batch.num_rows());
+            arrow::array::RecordBatch::try_new(batch.schema(), columns)?
+        }
+        Err(_) => batch,
+    };
+    let selected = vec![true; batch.num_rows()];
+    Ok(Some((ArrowEngineData::new(batch), selected)))
 }
 
 /// Milliseconds since the epoch, for a remove's `deletionTimestamp`.
@@ -1672,11 +1730,22 @@ pub fn commit_files(
     let restated = !Arc::ptr_eq(&snapshot, &scan_source);
     let table_root = snapshot.table_root().to_string();
     let metadata_id = snapshot.table_configuration().metadata().id().to_string();
+    // Decode and check every fragment before adding any, so a bad one cannot
+    // leave a half-built transaction behind. Each is dropped once decoded.
+    let mut seen = std::collections::HashSet::new();
+    let mut decoded = Vec::new();
+    for fragment in fragments {
+        for batch in ipc_to_batches(&fragment, &table_root, &metadata_id)? {
+            refuse_duplicate_paths(&batch, &mut seen)?;
+            decoded.push(batch);
+        }
+    }
     let removes = if overwrite {
-        overwrite_removes(&scan_source, &engine, &info)?
+        overwrite_removes(&scan_source, &engine, &info, &seen)?
     } else {
         Vec::new()
     };
+    drop(seen);
     let mut transaction = begin_transaction(
         snapshot,
         &engine,
@@ -1689,17 +1758,6 @@ pub fn commit_files(
     )?;
     for filtered in removes {
         transaction.remove_files(filtered);
-    }
-
-    // Decode and check every fragment before adding any, so a bad one cannot
-    // leave a half-built transaction behind.
-    let mut seen = std::collections::HashSet::new();
-    let mut decoded = Vec::new();
-    for fragment in &fragments {
-        for batch in ipc_to_batches(fragment, &table_root, &metadata_id)? {
-            refuse_duplicate_paths(&batch, &mut seen)?;
-            decoded.push(batch);
-        }
     }
     for batch in decoded {
         transaction.add_files(Box::new(ArrowEngineData::new(batch)));

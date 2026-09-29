@@ -14,6 +14,7 @@ mod dml;
 mod error;
 mod files;
 mod functions;
+mod landed;
 mod logclean;
 mod manifest;
 mod partition;
@@ -100,6 +101,10 @@ pub const FEATURES: &[&str] = &[
     "write_checksum",
     // `incremental_files(base_version)`: the file diff between two versions.
     "incremental_files",
+    // `commits_adding`/`delete_uncommitted`: whether a distributed write's
+    // files landed, from the commits since it was planned, and removing
+    // them when they did not.
+    "uncommitted_files",
     // `absolute_deletion_vector` and `copy_objects`: shallow and deep clones
     // of path tables.
     "path_clone",

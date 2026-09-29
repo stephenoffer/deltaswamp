@@ -1262,6 +1262,29 @@ impl PySnapshot {
         Ok(version)
     }
 
+    /// `(version, n)` for each commit after `after` (up to this snapshot)
+    /// that adds any of `paths`, `n` being how many. Reads only those commits,
+    /// a catalog-managed table's ratified tail included; raises when one of
+    /// them can no longer be read.
+    fn commits_adding(
+        &self,
+        py: Python<'_>,
+        after: u64,
+        paths: Vec<String>,
+    ) -> PyResult<Vec<(u64, usize)>> {
+        Ok(py.detach(|| {
+            crate::landed::commits_adding(&self.inner, self.engine.as_ref(), after, &paths)
+        })?)
+    }
+
+    /// Delete data files `write_files` wrote that no commit references.
+    ///
+    /// The caller settles that they are unreferenced (`commits_adding`).
+    /// Returns the paths that could not be deleted, with why.
+    fn delete_uncommitted(&self, py: Python<'_>, paths: Vec<String>) -> PyResult<Vec<String>> {
+        Ok(py.detach(|| crate::landed::delete_uncommitted(&self.inner, &self.engine, &paths))?)
+    }
+
     /// Commit row-level DML as deletion vectors, the way Databricks writes it.
     ///
     /// `deletions` is an Arrow stream with columns `path` and `row_index`: the
