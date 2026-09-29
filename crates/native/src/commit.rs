@@ -959,6 +959,9 @@ pub struct CommitInfoPatch {
     /// (`Transaction::with_domain_metadata`; kernel refuses `delta.*` domains
     /// and a table without the domainMetadata feature).
     pub domains: Option<std::collections::HashMap<String, String>>,
+    /// Commit as the table's version 0, merged with this template version 0
+    /// (see [`VersionZeroCommitter`]); the snapshot is the template's.
+    pub create_template: Option<Arc<Vec<String>>>,
 }
 
 /// Actions a commit writes beside the ones kernel builds, taken by the
@@ -1225,6 +1228,183 @@ impl Committer for PatchingCommitter {
     }
 }
 
+/// Commits a transaction begun on a *template* version 0 as the table's own
+/// version 0: the template's protocol, metaData and domains, with the
+/// transaction's commitInfo, adds and row-tracking domain, in one
+/// put-if-absent of `_delta_log/00000000000000000000.json`.
+///
+/// A table created by a distributed write is then never visible without its
+/// data. The kernel builds the transaction against the template, as the
+/// workers wrote against it, so row ids, in-commit timestamps and physical
+/// column names are the template's; it numbers the commit 1, which is what
+/// this committer reports back (its post-commit snapshot is in memory only,
+/// and the caller does not use it), while the file written is version 0.
+/// Each add's `defaultRowCommitVersion` is written as 0 accordingly.
+struct VersionZeroCommitter {
+    template: Arc<Vec<String>>,
+}
+
+impl Committer for VersionZeroCommitter {
+    fn commit(
+        &self,
+        engine: &dyn delta_kernel::Engine,
+        actions: delta_kernel::DeltaResultIterator<'_, FilteredEngineData>,
+        commit_metadata: delta_kernel::committer::CommitMetadata,
+    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+        use delta_kernel::committer::CommitResponse;
+
+        let mut domains = std::collections::HashSet::new();
+        let mut batches = Vec::new();
+        for item in actions {
+            batches.push(at_version_zero(item?, &mut domains)?);
+        }
+        // The template's actions, less its commitInfo (the transaction's
+        // stands) and any domain the transaction sets itself.
+        let mut lines = Vec::new();
+        for line in self.template.iter() {
+            let action: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| delta_kernel::Error::generic(format!("template action: {e}")))?;
+            if action.get("commitInfo").is_some() {
+                continue;
+            }
+            let domain = action
+                .get("domainMetadata")
+                .and_then(|d| d.get("domain"))
+                .and_then(|d| d.as_str());
+            if domain.is_some_and(|d| domains.contains(d)) {
+                continue;
+            }
+            lines.push(line.as_str());
+        }
+        if !lines.is_empty() {
+            let strings = arrow::array::StringArray::from(lines);
+            let batch = arrow::array::RecordBatch::try_new(
+                Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("json", arrow::datatypes::DataType::Utf8, false),
+                ])),
+                vec![Arc::new(strings)],
+            )?;
+            let parsed = engine.json_handler().parse_json(
+                Box::new(ArrowEngineData::new(batch)),
+                delta_kernel::actions::get_commit_schema().clone(),
+            )?;
+            batches.push(FilteredEngineData::with_all_rows_selected(parsed));
+        }
+        let zero = commit_metadata
+            .table_root()
+            .join(&format!("_delta_log/{:020}.json", 0))?;
+        match engine.json_handler().write_json_file(
+            &zero,
+            Box::new(batches.into_iter().map(Ok)),
+            false,
+        ) {
+            Ok(size) => Ok(CommitResponse::Committed {
+                file_meta: delta_kernel::FileMeta::new(
+                    commit_metadata.published_commit_path()?,
+                    commit_metadata.in_commit_timestamp(),
+                    size,
+                ),
+            }),
+            Err(delta_kernel::Error::FileAlreadyExists(_)) => Ok(CommitResponse::Conflict {
+                version: commit_metadata.version(),
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        false
+    }
+
+    fn publish(
+        &self,
+        _engine: &dyn delta_kernel::Engine,
+        _publish_metadata: delta_kernel::committer::PublishMetadata,
+    ) -> DeltaResult<()> {
+        Ok(())
+    }
+}
+
+/// `data` as version 0 writes it: every add's `defaultRowCommitVersion` 0.
+/// The domains it sets are added to `domains`.
+fn at_version_zero(
+    data: FilteredEngineData,
+    domains: &mut std::collections::HashSet<String>,
+) -> DeltaResult<FilteredEngineData> {
+    use arrow::array::{Array, Int64Array, StringArray, StructArray};
+    use arrow::datatypes::Field;
+
+    let (data, selection) = data.into_parts();
+    if data
+        .as_ref()
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()
+        .is_none()
+    {
+        return FilteredEngineData::try_new(data, selection);
+    }
+    let batch: arrow::array::RecordBatch = (*data
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .map_err(|_| delta_kernel::Error::generic("action data is not Arrow"))?)
+    .into();
+    let selected = |i: usize| selection.is_empty() || selection.get(i).copied().unwrap_or(true);
+    if let Some(dm) = batch
+        .column_by_name("domainMetadata")
+        .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+    {
+        if let Some(names) = dm
+            .column_by_name("domain")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        {
+            for i in 0..dm.len() {
+                if selected(i) && dm.is_valid(i) && names.is_valid(i) {
+                    domains.insert(names.value(i).to_string());
+                }
+            }
+        }
+    }
+    let Ok(index) = batch.schema().index_of("add") else {
+        return FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection);
+    };
+    let Some(add) = batch.column(index).as_any().downcast_ref::<StructArray>() else {
+        return FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection);
+    };
+    let arrow::datatypes::DataType::Struct(fields) = add.data_type().clone() else {
+        unreachable!("a StructArray has a struct type");
+    };
+    let Some(position) = fields
+        .iter()
+        .position(|f| f.name() == "defaultRowCommitVersion")
+    else {
+        return FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection);
+    };
+    let column = add.column(position);
+    let zeros: Int64Array = (0..column.len())
+        .map(|i| column.is_valid(i).then_some(0i64))
+        .collect();
+    let mut columns = add.columns().to_vec();
+    columns[position] = arrow::compute::cast(&zeros, column.data_type())?;
+    let patched = StructArray::try_new(fields, columns, add.nulls().cloned())?;
+    let mut outer: Vec<arrow::datatypes::FieldRef> =
+        batch.schema().fields().iter().cloned().collect();
+    outer[index] = Arc::new(Field::new(
+        "add",
+        patched.data_type().clone(),
+        outer[index].is_nullable(),
+    ));
+    let mut outer_columns = batch.columns().to_vec();
+    outer_columns[index] = Arc::new(patched);
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            outer,
+            batch.schema().metadata().clone(),
+        )),
+        outer_columns,
+    )?;
+    FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection)
+}
+
 // ---------------------------------------------------------------- row tracking
 
 /// The `remove` actions of a commit on a row-tracked table, built here.
@@ -1469,9 +1649,19 @@ pub(crate) fn begin_transaction(
     commit_metadata: Option<std::collections::HashMap<String, String>>,
     info: CommitInfoPatch,
 ) -> Result<Transaction> {
-    let committer: Box<dyn Committer> = match uc {
-        Some(config) => config.committer()?,
-        None => Box::new(FileSystemCommitter::new()),
+    let committer: Box<dyn Committer> = match (uc, &info.create_template) {
+        (Some(_), Some(_)) => {
+            return Err(NativeError::Invalid(
+                "a table created with its data commits version 0 to storage itself; a \
+                 catalog-managed table's version 0 goes through the catalog's create flow"
+                    .to_string(),
+            ))
+        }
+        (None, Some(template)) => Box::new(VersionZeroCommitter {
+            template: template.clone(),
+        }),
+        (Some(config), None) => config.committer()?,
+        (None, None) => Box::new(FileSystemCommitter::new()),
     };
     let domains = info.domains.clone();
     // Always patched: even an empty patch puts `inCommitTimestamp` first.
@@ -1815,6 +2005,12 @@ pub fn commit_files(
     info: CommitInfoPatch,
     constraints_checked: crate::restate::Checked,
 ) -> Result<u64> {
+    let creating = info.create_template.is_some();
+    if creating && (overwrite || snapshot.version() != 0) {
+        return Err(NativeError::Invalid(
+            "a table created with its data is an append to its template version 0".to_string(),
+        ));
+    }
     let scan_source = snapshot.clone();
     let restatement = crate::restate::Restatement {
         constraints_checked,
@@ -1857,7 +2053,39 @@ pub fn commit_files(
         transaction.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
+    if creating {
+        return finish_create(transaction, &engine, &table_root);
+    }
     finish_commit_as(transaction, &engine, restated)
+}
+
+/// Commit a transaction whose [`VersionZeroCommitter`] writes version 0.
+///
+/// The kernel's post-commit snapshot numbers the commit 1 and is not used:
+/// the checksum is counted from version 0 read back from storage.
+fn finish_create(txn: Transaction, engine: &SharedEngine, table_root: &str) -> Result<u64> {
+    match runtime::block_on(async { txn.commit(engine.as_ref()) }) {
+        Ok(CommitResult::CommittedTransaction(_)) => {
+            if let Ok(reread) = Snapshot::builder_for(table_root)
+                .at_version(0)
+                .build(engine.as_ref())
+            {
+                crate::checksum::write_best_effort(&reread, engine.as_ref());
+            }
+            Ok(0)
+        }
+        Ok(CommitResult::ConflictedTransaction(_)) => Err(NativeError::CommitConflict(
+            "the table's version 0 already exists: it was created before this commit \
+             (by this write's earlier attempt, or by another writer)"
+                .to_string(),
+        )),
+        Ok(CommitResult::RetryableTransaction(_)) => Err(NativeError::Retryable(
+            "the create failed with a retryable I/O error; nothing was written, so the same \
+             fragments may be committed again"
+                .to_string(),
+        )),
+        Err(err) => Err(classify_kernel_commit_error(err)),
+    }
 }
 
 /// Refuse a data file that is added twice in one commit.

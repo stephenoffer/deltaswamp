@@ -5891,8 +5891,14 @@ class KernelEngine:
         version: int | None = None,
         table_identity: str | None = None,
         domain_metadata: dict[str, str] | None = None,
+        create_template: list[str] | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
+
+        `create_template` (a table not created yet, resolved from its template
+        version 0): commit the files *as* version 0, the template's protocol
+        and metaData with them, in one put-if-absent; a table already there
+        raises `CommitConflictError`.
 
         Every fragment lands at a single version, so a distributed write is
         atomic: a reader sees all of it or none of it. With `version`, the
@@ -5907,7 +5913,15 @@ class KernelEngine:
             raise NotImplementedError(
                 "the installed native extension cannot commit externally written files"
             )
-        domains = {"domain_metadata": dict(domain_metadata)} if domain_metadata else {}
+        domains: dict[str, Any] = (
+            {"domain_metadata": dict(domain_metadata)} if domain_metadata else {}
+        )
+        if create_template is not None:
+            if not _native_has("create_with_data"):
+                raise NotImplementedError(
+                    "the installed native extension cannot create a table with its data"
+                )
+            domains["create_template"] = list(create_template)
         snapshot = self.snapshot(table, version=version, write=True)
         _refuse_other_table(snapshot, table_identity, "commit these fragments", committing=True)
         # On the snapshot the commit is built on, like the txn check below: a
@@ -5946,7 +5960,8 @@ class KernelEngine:
                 **_value_flags(snapshot),
                 **domains,
             )
-        self._maybe_checkpoint(table, committed, snapshot)
+        if create_template is None:
+            self._maybe_checkpoint(table, committed, snapshot)
         return committed
 
     def commits_adding(
