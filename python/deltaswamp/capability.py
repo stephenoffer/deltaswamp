@@ -280,7 +280,9 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _Y,
             _Y,
             "kernel is nominally Supported but fails any write when invariants are "
-            "actually present in the schema; route those writes to delta-rs",
+            "actually present in the schema; appends and overwrites here evaluate them "
+            "in DuckDB (as CHECK constraints) and commit past the refusal; other writes "
+            "go to delta-rs",
         ),
         _row(
             TableFeature.CHECK_CONSTRAINTS,
@@ -299,20 +301,25 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             TableFeature.GENERATED_COLUMNS,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _Y,
-            "delta-rs evaluates generated columns via DataFusion; kernel refuses to write "
-            "(it checkpoints and checksums the table, which computes no value)",
+            "delta-rs evaluates generated columns via DataFusion; kernel refuses to write. "
+            "Appends and overwrites here (distributed ones included) compute a left-out "
+            "generated column in DuckDB and check a given one, and commit past the "
+            "refusal; DML goes to delta-rs",
         ),
         _row(
             TableFeature.IDENTITY_COLUMNS,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _N,
-            "delta-rs has the enum variant but it is commented out of writer_features",
+            "delta-rs has the enum variant but it is commented out of writer_features. "
+            "Appends and overwrites here generate values above the high-water mark, "
+            "moved in the same commit (a distributed write reserves a block when it is "
+            "planned); DML goes to the warehouse",
             "delta-rs#3249",
         ),
         _row(TableFeature.IN_COMMIT_TIMESTAMP, _W, _Y, _Y, _Y, _N, "", "delta-rs#3253"),
@@ -524,12 +531,13 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             TableFeature.CHECKPOINT_PROTECTION,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _N,
-            "Databricks DBR 16.3, added when a table feature is dropped. Ignoring it "
-            "during metadata cleanup can delete the checkpoint that makes a downgraded "
-            "table readable.",
+            "Databricks DBR 16.3, added when a table feature is dropped. It binds only "
+            "metadata cleanup, which could otherwise delete the checkpoint that makes a "
+            "downgraded table readable: expired log cleanup refuses it, and every other "
+            "kernel write commits past the kernel's refusal of the Unknown feature",
             "delta-rs#4462",
         ),
         _row(

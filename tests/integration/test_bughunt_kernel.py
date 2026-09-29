@@ -214,19 +214,25 @@ class TestSupports:
         assert table.protocol().min_writer_version == writer
         assert sorted(table.to_pyarrow_table().column("id").to_pylist()) == [1, 2]
 
-    def test_legacy_writer_6_refuses_data_writes(self, tmp_path: Any) -> None:
+    def test_legacy_writer_6_without_an_identity_column_takes_data_writes(
+        self, tmp_path: Any
+    ) -> None:
+        """Writer version 6 implies identityColumns for any table; with no column
+        declaring one there is no value to generate, and the write commits past
+        the kernel's refusal (as generatedColumns does at 4)."""
         path = write(
             str(tmp_path / "legacy"),
             pa.table({"id": [1]}),
             configuration={"delta.minWriterVersion": "6"},
         )
-        verdict = KernelEngine().supports(Operation.APPEND, resolved(path))
-        assert not verdict.ok
-        assert "identityColumns" in verdict.reason
+        engine = KernelEngine()
+        assert engine.supports(Operation.APPEND, resolved(path)).ok
+        engine.append(resolved(path), pa.table({"id": [2]}))
+        from deltalake import DeltaTable
 
-    @pytest.mark.parametrize(
-        "op", [Operation.DELETE, Operation.UPDATE, Operation.OVERWRITE, Operation.REPLACE_WHERE]
-    )
+        assert DeltaTable(path).protocol().min_writer_version == 6
+
+    @pytest.mark.parametrize("op", [Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE])
     def test_cdf_enabled_refuses_removing_writes(self, tmp_path: Any, op: Operation) -> None:
         path = kernel_table(
             str(tmp_path / "t"),
@@ -249,16 +255,19 @@ class TestSupports:
         assert not verdict.ok
         assert "append-only" in verdict.reason
 
-    def test_schema_invariants_refuse_writes(self, tmp_path: Any) -> None:
+    def test_schema_invariants_refuse_rewrites_but_not_appends(self, tmp_path: Any) -> None:
         field = pa.field(
             "id",
             pa.int64(),
             metadata={"delta.invariants": json.dumps({"expression": {"expression": "id > 0"}})},
         )
         path = write(str(tmp_path / "inv"), pa.table({"id": [1]}, schema=pa.schema([field])))
-        verdict = KernelEngine().supports(Operation.APPEND, resolved(path))
+        engine = KernelEngine()
+        # An append evaluates the invariant over its rows (engine/values.py).
+        assert engine.supports(Operation.APPEND, resolved(path)).ok
+        verdict = engine.supports(Operation.DELETE, resolved(path))
         assert not verdict.ok
-        assert "invariants" in verdict.reason
+        assert "invariant" in verdict.reason
 
 
 class _FakeCredentials:

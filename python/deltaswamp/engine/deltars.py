@@ -351,6 +351,10 @@ class DeltaRsEngine:
                 return Capability(operation, ok=False, reason=f"{reason}; {remedy}", remedy=remedy)
 
         if writing and table.has_iceberg_compat:
+            uniform = (
+                "iceberg"
+                in str(table.properties.get("delta.universalFormat.enabledFormats", "")).lower()
+            )
             return Capability(
                 operation,
                 ok=False,
@@ -359,6 +363,10 @@ class DeltaRsEngine:
                     "MSCK REPAIR TABLE ... SYNC METADATA afterwards to regenerate Iceberg "
                     "metadata, which only Databricks can run -- so the Iceberg view would "
                     "silently go stale"
+                    if uniform
+                    else "the table carries an IcebergCompat feature, which binds how every "
+                    "file is written (field ids, no deletion vectors on some versions) and "
+                    "which delta-rs does not implement"
                 ),
                 remedy="perform this write from Databricks, or enable the SQL fallback",
             )

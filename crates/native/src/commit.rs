@@ -955,6 +955,10 @@ pub struct CommitInfoPatch {
     pub extra_actions: ExtraActions,
     /// Written as the `tags` of every `add` (kernel writes none).
     pub add_tags: Option<std::collections::HashMap<String, String>>,
+    /// User domain metadata the commit sets, domain -> configuration
+    /// (`Transaction::with_domain_metadata`; kernel refuses `delta.*` domains
+    /// and a table without the domainMetadata feature).
+    pub domains: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Actions a commit writes beside the ones kernel builds, taken by the
@@ -976,10 +980,6 @@ impl ExtraActions {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.0.lock().map(|v| v.is_empty()).unwrap_or(true)
-    }
-
     fn take(&self) -> Vec<FilteredEngineData> {
         self.0
             .lock()
@@ -989,13 +989,6 @@ impl ExtraActions {
 }
 
 impl CommitInfoPatch {
-    fn is_empty(&self) -> bool {
-        self.operation_parameters.is_none()
-            && self.blind_append.is_none()
-            && self.add_tags.is_none()
-            && self.extra_actions.is_empty()
-    }
-
     /// `data` with the patched fields, when it is the `commitInfo` action.
     fn apply(&self, data: FilteredEngineData) -> DeltaResult<FilteredEngineData> {
         use arrow::array::{Array, ArrayRef, BooleanArray, StructArray};
@@ -1064,6 +1057,19 @@ impl CommitInfoPatch {
                 Field::new("isBlindAppend", DataType::Boolean, true),
                 Arc::new(BooleanArray::from(vec![blind; rows])),
             );
+        }
+        // `inCommitTimestamp` first, as the protocol has Spark write it (and
+        // as this library's own metadata commits do): kernel 0.28 puts it
+        // after `timestamp`, and a caller's commit metadata before both.
+        if let Some(i) = fields
+            .iter()
+            .position(|f| f.name() == "inCommitTimestamp")
+            .filter(|i| *i > 0)
+        {
+            let field = fields.remove(i);
+            fields.insert(0, field);
+            let column = columns.remove(i);
+            columns.insert(0, column);
         }
         let patched = StructArray::try_new(fields.into(), columns, info.nulls().cloned())?;
         let mut outer: Vec<arrow::datatypes::FieldRef> =
@@ -1364,7 +1370,12 @@ fn overwrite_removes(
 ) -> Result<Vec<FilteredEngineData>> {
     let scan = snapshot.clone().scan_builder().build()?;
     let scan_metadata = runtime::block_on(async { scan.scan_metadata(engine.as_ref()) })?;
-    let builder = if RemovesByHand::needed(snapshot) {
+    // On a change-data-feed table too: kernel 0.28 refuses any data commit
+    // with both adds and removes there (it cannot tell an overwrite from an
+    // UPDATE, which needs CDC files). An overwrite needs none -- readers take
+    // a commit without CDC files as its removes' rows deleted and its adds'
+    // rows inserted, as Spark writes one -- so its removes are staged here.
+    let builder = if RemovesByHand::needed(snapshot) || change_data_feed(snapshot) {
         Some(RemovesByHand::new(engine, now_millis(), true)?)
     } else {
         None
@@ -1462,14 +1473,12 @@ pub(crate) fn begin_transaction(
         Some(config) => config.committer()?,
         None => Box::new(FileSystemCommitter::new()),
     };
-    let committer: Box<dyn Committer> = if info.is_empty() {
-        committer
-    } else {
-        Box::new(PatchingCommitter {
-            inner: committer,
-            info,
-        })
-    };
+    let domains = info.domains.clone();
+    // Always patched: even an empty patch puts `inCommitTimestamp` first.
+    let committer: Box<dyn Committer> = Box::new(PatchingCommitter {
+        inner: committer,
+        info,
+    });
     let mut transaction = snapshot.transaction(committer, engine.as_ref())?;
     // Kernel leaves column defaults to the connector and refuses to write
     // until told they are handled. They are: every batch passes through
@@ -1487,6 +1496,11 @@ pub(crate) fn begin_transaction(
     }
     if let Some(metadata) = commit_metadata {
         transaction = apply_commit_metadata(transaction, metadata)?;
+    }
+    let mut domains: Vec<(String, String)> = domains.unwrap_or_default().into_iter().collect();
+    domains.sort();
+    for (domain, configuration) in domains {
+        transaction = transaction.with_domain_metadata(domain, configuration);
     }
     Ok(transaction)
 }
@@ -1613,7 +1627,7 @@ pub fn write_files(
     engine: SharedEngine,
     batches: Vec<arrow::array::RecordBatch>,
     uc: Option<UcCommitConfig>,
-    constraints_checked: bool,
+    constraints_checked: crate::restate::Checked,
 ) -> std::result::Result<Vec<u8>, Box<WriteFilesError>> {
     let root = snapshot.table_root().clone();
     let mut written = Vec::new();
@@ -1799,7 +1813,7 @@ pub fn commit_files(
     txn: Option<(String, i64)>,
     commit_metadata: Option<std::collections::HashMap<String, String>>,
     info: CommitInfoPatch,
-    constraints_checked: bool,
+    constraints_checked: crate::restate::Checked,
 ) -> Result<u64> {
     let scan_source = snapshot.clone();
     let restatement = crate::restate::Restatement {
@@ -1905,7 +1919,7 @@ fn refuse_duplicate_paths(
 fn checksummed(committed: CommittedTransaction, engine: &SharedEngine, restated: bool) -> u64 {
     let version = committed.commit_version();
     if let Some(snapshot) = committed.post_commit_snapshot() {
-        if restated || row_tracked(snapshot) {
+        if restated || row_tracked(snapshot) || change_data_feed(snapshot) {
             let reread = Snapshot::builder_for(snapshot.table_root().as_str())
                 .at_version(version)
                 .build(engine.as_ref());
@@ -1917,6 +1931,16 @@ fn checksummed(committed: CommittedTransaction, engine: &SharedEngine, restated:
         }
     }
     version
+}
+
+/// Whether the table enables the change data feed, where an overwrite's
+/// removes are staged by hand ([`overwrite_removes`]) and so, as on a
+/// row-tracked table, kernel's post-commit snapshot does not count them.
+fn change_data_feed(snapshot: &SnapshotRef) -> bool {
+    snapshot
+        .metadata_configuration()
+        .get("delta.enableChangeDataFeed")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 /// Whether the table supports the rowTracking writer feature.

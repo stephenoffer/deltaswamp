@@ -118,15 +118,15 @@ def test_add_feature_takes_the_calls_argument(conn: Any, tmp_path: Any) -> None:
 
 
 def test_plan_write_can_be_asked(conn: Any, tmp_path: Any) -> None:
-    # C3: plan_write needs distributed_write, which only the kernel has; on a
-    # change-data-feed table the kernel does not write, can("append") said ok
-    # and plan_write refused.
+    # C3: plan_write needs distributed_write, which only the kernel has; where
+    # the kernel does not write, can("append") said ok and plan_write refused.
+    # An append-only table refuses a distributed overwrite.
     path = str(tmp_path / "t")
-    conn.write_table(path, pa.table({"id": [1]}), properties={"delta.enableChangeDataFeed": "true"})
+    conn.write_table(path, pa.table({"id": [1]}), properties={"delta.appendOnly": "true"})
     t = conn.open_table(path)
     assert t.can("append").ok
     verdict = t.can("plan_write", mode="overwrite")
-    assert not verdict.ok and "distributed_write" in verdict.reason
+    assert not verdict.ok and "append-only" in verdict.reason
     with pytest.raises(UnreachableTableError):
         t.plan_write(mode="overwrite")
 

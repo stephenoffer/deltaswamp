@@ -19,8 +19,9 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "restore", "commit_actions", "row_tracking_compaction", "add_tags", "write_checksum",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
-"commit_timestamps", "credential_slots", "planned_scan". Gate on this list, not `hasattr`, so a
-stale build refuses cleanly.
+"commit_timestamps", "credential_slots", "planned_scan", "values_checked",
+"checkpoint_protection", "domain_metadata". Gate on this list, not `hasattr`, so a stale build
+refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -604,6 +605,8 @@ class Snapshot:
         metadata: str | None = None,
         protocol: str | None = None,
         constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
+        domain_metadata: dict[str, str] | None = None,
     ) -> int:
         """Append Arrow data as one transaction; returns the committed version.
 
@@ -640,10 +643,22 @@ class Snapshot:
         id. `constraints_checked` ("check_constraints") says the caller
         evaluated every CHECK constraint over every row written; the kernel
         refuses a table with the checkConstraints feature otherwise.
+        `values_checked` ("values_checked") names the other value features the
+        caller stood in for over every row -- ``generatedColumns`` (computed
+        or checked), ``identityColumns`` (generated within the high-water
+        mark) and ``invariants`` -- which the kernel refuses too; an unknown
+        name is a ValueError. A table's ``checkpointProtection``
+        ("checkpoint_protection") is set aside for every commit.
+        `domain_metadata` ("domain_metadata") sets user domains, domain ->
+        configuration, in the same commit.
         """
 
     def write_files(
-        self, data: Any, uc: UcCommitConfig | None = None, constraints_checked: bool = False
+        self,
+        data: Any,
+        uc: UcCommitConfig | None = None,
+        constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
     ) -> bytes:
         """Write data files without committing; returns opaque fragment bytes.
 
@@ -651,7 +666,7 @@ class Snapshot:
         exactly as in `append`. The files are durable when this returns but
         belong to no version until `commit_files` accepts them, so a coordinator
         that abandons the write leaves them behind as garbage.
-        `constraints_checked` is as for `append`.
+        `constraints_checked` and `values_checked` are as for `append`.
         """
 
     def commit_files(
@@ -666,13 +681,16 @@ class Snapshot:
         operation_parameters: dict[str, str] | None = None,
         blind_append: bool | None = None,
         constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
+        domain_metadata: dict[str, str] | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
 
         Every fragment lands at a single version, so a distributed write is
         atomic. `overwrite` removes every file visible in this snapshot in the
-        same commit. Raises the same errors as `append`. `constraints_checked`
-        is as for `append`: every worker checked the rows it wrote.
+        same commit. Raises the same errors as `append`. `constraints_checked`,
+        `values_checked` and `domain_metadata` are as for `append`: every
+        worker checked the rows it wrote.
         """
 
     def commits_adding(self, after: int, paths: list[str]) -> list[tuple[int, int]]:

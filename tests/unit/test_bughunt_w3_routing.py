@@ -325,8 +325,9 @@ def test_kernel_checkpoints_past_invariants(kernel_only: Any, tmp_path: Path) ->
     t.checkpoint()
     protocol = _checkpoint_protocol(p, 1)
     assert (protocol["minReaderVersion"], protocol["minWriterVersion"]) == (1, 2)
-    # A write is still refused: the kernel would not enforce the invariant.
-    assert not t.can("append").ok
+    # A write is served too: the kernel paths evaluate the invariant over the
+    # rows they write (engine/values.py), where kernel 0.28 itself refused.
+    assert t.can("append").ok
 
 
 def test_kernel_checkpoint_refuses_unwritable_writer_features() -> None:

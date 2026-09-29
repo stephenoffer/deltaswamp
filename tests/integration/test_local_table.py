@@ -509,18 +509,25 @@ class TestUnmodelledWriterFeatures:
     def test_an_unmodelled_feature_blocks_even_a_metadata_commit(
         self, conn: Any, path: str
     ) -> None:
-        """checkpointProtection governs which checkpoints may be removed.
+        """collations changes what a string column means.
 
         The kernel has no variant for it at all, so it cannot know what the
         feature requires of a commit. A metadata-only commit was allowed through
         because it writes no data, which is the wrong test: writing blind to a
-        table whose rules you cannot read risks corrupting history.
+        table whose rules you cannot read risks corrupting it.
         """
-        t = self._with_writer_feature(conn, path, "checkpointProtection")
+        t = self._with_writer_feature(conn, path, "collations")
         for op in (Operation.APPEND, Operation.ADD_COLUMN, Operation.SET_PROPERTIES):
             verdict = t.can(op)
             assert not verdict.ok, f"{op.value} should be refused"
-            assert "checkpointProtection" in verdict.reason
+            assert "collations" in verdict.reason
+
+    def test_checkpoint_protection_binds_only_log_cleanup(self, conn: Any, path: str) -> None:
+        """Modelled now: it says which history may be deleted, and nothing else."""
+        t = self._with_writer_feature(conn, path, "checkpointProtection")
+        for op in (Operation.APPEND, Operation.ADD_COLUMN, Operation.SET_PROPERTIES):
+            assert t.can(op).ok, op.value
+        assert not t.can(Operation.CLEANUP_METADATA).ok
 
     def test_a_modelled_feature_still_allows_a_metadata_commit(self, conn: Any, path: str) -> None:
         """identityColumns is understood; the kernel just cannot write data for it.
@@ -530,7 +537,8 @@ class TestUnmodelledWriterFeatures:
         needlessly refuse half the DDL surface.
         """
         t = self._with_writer_feature(conn, path, "identityColumns")
-        assert not t.can(Operation.APPEND).ok
+        # No column is an identity column, so an append has none to generate.
+        assert t.can(Operation.APPEND).ok
         assert t.can(Operation.ADD_COLUMN).ok
 
 
@@ -662,14 +670,14 @@ class TestDistributedWrite:
                             "minReaderVersion": 3,
                             "minWriterVersion": 7,
                             "readerFeatures": [],
-                            "writerFeatures": ["checkpointProtection"],
+                            "writerFeatures": ["collations"],
                         }
                     }
                 )
                 + "\n"
             )
         before = len(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
-        with pytest.raises(UnreachableTableError, match="checkpointProtection"):
+        with pytest.raises(UnreachableTableError, match="collations"):
             conn.open_table(path).plan_write()
         after = len(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
         assert after == before, "a refused plan must not have written anything"
@@ -843,10 +851,22 @@ class TestEnforcementIsNotBypassed:
         assert table.can(Operation.APPEND).engine is Engine.DELTARS
         assert table.can(Operation.SCAN).engine is Engine.KERNEL, "reads are unaffected"
 
-    def test_a_distributed_write_is_refused_at_plan_time(self, conn: Any, amounts: str) -> None:
+    def test_a_distributed_write_enforces_it_on_the_worker(self, conn: Any, amounts: str) -> None:
+        """The workers evaluate the invariant over their rows before any file is
+        written (engine/values.py), where the kernel failed after writing them."""
+        import glob
+        import os
+
+        from deltaswamp.errors import InvalidArgumentError
+
         self._with_invariant(conn, amounts)
-        with pytest.raises(UnreachableTableError, match="invariant"):
-            conn.open_table(amounts).plan_write()
+        plan = conn.open_table(amounts).plan_write()
+        before = set(glob.glob(os.path.join(amounts, "*.parquet")))
+        with pytest.raises(InvalidArgumentError, match="invariant"):
+            plan.write(pa.table({"id": [3], "amt": [-1]}))
+        assert set(glob.glob(os.path.join(amounts, "*.parquet"))) == before
+        plan.commit([plan.write(pa.table({"id": [3], "amt": [4]}))])
+        assert conn.open_table(amounts).to_arrow().num_rows == 2
 
     def test_the_invariant_is_still_enforced(self, conn: Any, amounts: str) -> None:
         self._with_invariant(conn, amounts)
@@ -1012,7 +1032,7 @@ class TestTheKernelWritePathIsVersionBound:
         with pytest.raises(UnreachableTableError) as caught:
             conn.open_table(location).plan_write()
         message = str(caught.value)
-        assert "neither names nor uses generatedColumns" in message
+        assert "checkConstraints" in message
         assert "neither names nor uses checkConstraints" not in message, (
             "the table really has a constraint; saying otherwise sends the reader astray"
         )

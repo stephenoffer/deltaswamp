@@ -300,6 +300,16 @@ _IMPLEMENTED: frozenset[Operation] = frozenset(
 
 _SHREDDING: frozenset[str] = frozenset({"variantShredding", "variantShredding-preview"})
 
+#: Writes that compute generated and identity values and check invariants over
+#: the rows they write (`values.ValueWriter`): they only add rows, so nothing
+#: they write was generated before.
+_VALUE_WRITES: frozenset[Operation] = frozenset({Operation.APPEND, Operation.OVERWRITE})
+
+#: The features `_VALUE_WRITES` stand in for.
+_VALUE_FEATURES: frozenset[TableFeature] = frozenset(
+    {TableFeature.GENERATED_COLUMNS, TableFeature.IDENTITY_COLUMNS, TableFeature.INVARIANTS}
+)
+
 
 #: Features that block even a metadata-only commit written here: their
 #: semantics live in the schema or the log in ways this path does not model.
@@ -311,9 +321,6 @@ _METADATA_BLOCKERS: frozenset[TableFeature] = frozenset(
         TableFeature.CATALOG_OWNED_PREVIEW,
         TableFeature.ADAPTIVE_METADATA_PREVIEW,
         TableFeature.GEOSPATIAL,
-        # Governs which checkpoints may be removed; readable, but a commit
-        # written without modelling it can corrupt history.
-        TableFeature.CHECKPOINT_PROTECTION,
     }
 )
 
@@ -445,9 +452,10 @@ def _dml_info(operation: str, predicate: str | None, snapshot: Any) -> dict[str,
 
 
 #: What a checked kernel write commits past (`crate::restate`): CHECK
-#: constraints, which the write evaluates, and generatedColumns where no
-#: column is generated (legacy writer versions 4 to 6 imply it regardless).
-_CHECKED_FEATURES = frozenset({"checkConstraints", "generatedColumns"})
+#: constraints, which the write evaluates, and generatedColumns and
+#: identityColumns where no column is generated or an identity column
+#: (legacy writer versions 4 to 6 imply them regardless).
+_CHECKED_FEATURES = frozenset({"checkConstraints", "generatedColumns", "identityColumns"})
 
 
 def _carries_check_constraints(snapshot: Any) -> bool:
@@ -475,6 +483,55 @@ def _constraint_check(snapshot: Any, what: str) -> tuple[Any, dict[str, Any]]:
     if constraints:
         check = ConstraintCheck(constraints, _arrow_schema(snapshot), what=what)
     return check, {"constraints_checked": True}
+
+
+def _table_values(snapshot: Any) -> Any:
+    """The generated columns, identity columns and invariants `snapshot`'s schema declares."""
+    from .values import TableValues
+
+    try:
+        return TableValues.of(json.loads(snapshot.metadata_json())["schemaString"])
+    except Exception:
+        return TableValues()
+
+
+def _value_flags(snapshot: Any) -> dict[str, Any]:
+    """The native arguments that say a write on `snapshot` computed and checked
+    every value constraint (`_value_check`), as the commit of its files repeats them."""
+    flags: dict[str, Any] = {}
+    if _native_has("check_constraints") and _carries_check_constraints(snapshot):
+        flags["constraints_checked"] = True
+    features = _table_values(snapshot).features()
+    if features and _native_has("values_checked"):
+        flags["values_checked"] = features
+    return flags
+
+
+def _value_check(
+    snapshot: Any, what: str, *, identity: dict[str, Any] | None = None
+) -> tuple[Any, dict[str, Any]]:
+    """What a kernel data write on `snapshot` runs over its rows, and the native
+    arguments that say it ran.
+
+    `_constraint_check` where the schema declares no generated or identity
+    column and no invariant. Otherwise a `values.ValueWriter` that also fills
+    in and checks those (identity values drawn from `identity`, name ->
+    `IdentityBlock`) and literal defaults, with ``values_checked=`` naming the
+    features it stood in for.
+    """
+    values = _table_values(snapshot)
+    if not values or not _native_has("values_checked"):
+        return _constraint_check(snapshot, what)
+    from .constraints import table_constraints
+    from .values import ValueWriter
+
+    constraints = (
+        table_constraints(snapshot.table_properties())
+        if _carries_check_constraints(snapshot)
+        else {}
+    )
+    writer = ValueWriter(values, _arrow_schema(snapshot), constraints, what=what, identity=identity)
+    return writer, _value_flags(snapshot)
 
 
 def _native_has(*features: str) -> bool:
@@ -1012,10 +1069,22 @@ class KernelEngine:
             write_blockers: list[str] = []
             usage_blockers: list[str] = []
             metadata_only = operation in METADATA_OPERATIONS
+            # A plain append or overwrite computes generated and identity
+            # values and checks invariants over its rows (`values`); the
+            # other writes rewrite or update rows, and leave those tables to
+            # delta-rs or the warehouse.
+            computes_values = operation in _VALUE_WRITES and _native_has("values_checked")
+            value_features: list[str] = []
             for name in table.effective_writer_features:
                 feature = feature_from_wire(name)
                 if feature is None:
                     write_blockers.append(f"{name} (unrecognized writer feature)")
+                elif feature is TableFeature.CHECKPOINT_PROTECTION and _native_has(
+                    "checkpoint_protection"
+                ):
+                    # Binds only log cleanup, which refuses it itself; every
+                    # commit here is written past the kernel's refusal of it.
+                    continue
                 elif metadata_only:
                     # A metadata-only commit writes no data, so features that
                     # govern data (constraints, generated and identity columns)
@@ -1034,6 +1103,13 @@ class KernelEngine:
                         support.kernel_read is Support.NO and support.kernel_write is Support.NO
                     )
                     if feature in _METADATA_BLOCKERS or unmodelled:
+                        write_blockers.append(name)
+                elif feature in _VALUE_FEATURES and computes_values:
+                    value_features.append(name)
+                elif feature is TableFeature.IDENTITY_COLUMNS and _native_has("values_checked"):
+                    # Refused only where a column really is an identity column
+                    # (legacy writer version 6 implies the feature for any table).
+                    if self._declares_identity(table):
                         write_blockers.append(name)
                 elif feature in _USAGE_GATED:
                     flag, why = _USAGE_GATED[feature]
@@ -1061,8 +1137,15 @@ class KernelEngine:
                         unenforceable = enforcement_refusal(table_constraints(table.properties))
                         if unenforceable is not None:
                             usage_blockers.append(unenforceable)
-                elif FEATURE_SUPPORT[feature].kernel_write is Support.NO:
+                elif (
+                    FEATURE_SUPPORT[feature].kernel_write is Support.NO
+                    or feature is TableFeature.GENERATED_COLUMNS
+                ):
                     write_blockers.append(name)
+            if value_features and not write_blockers:
+                value_refusal = self._value_refusal(table)
+                if value_refusal is not None:
+                    usage_blockers.append(value_refusal)
             if write_blockers:
                 return Capability(
                     operation,
@@ -1927,6 +2010,32 @@ class KernelEngine:
             import pyarrow as pa
 
             data = pa.table(_as_record_batch_reader(data))
+        generates_identity = False
+        # Only a table whose protocol has the feature is read for it here (a
+        # legacy writer version 6 implies it).
+        if _native_has("values_checked") and ("identityColumns" in table.effective_writer_features):
+            values = _table_values(self.snapshot(table, write=True))
+            if values.identity:
+                import pyarrow as pa
+
+                # Identity values are reserved by the commit that writes them,
+                # so the rows are counted first (the native write holds them
+                # all in memory anyway), and a lost race re-stages them.
+                data = pa.table(_as_record_batch_reader(data))
+                generates_identity = bool(values.generates_identity(data.column_names))
+                if generates_identity and evolve:
+                    raise UnreachableTableError(
+                        "append with schema_mode='merge' to a table with identity columns",
+                        "the commit would change the schema and reserve identity values at once",
+                        "append without schema_mode, or evolve the schema first",
+                    )
+                if generates_identity and table.is_catalog_managed:
+                    raise UnreachableTableError(
+                        "generate identity values for a catalog-managed table",
+                        "reserving them changes the table's metadata, which the catalog "
+                        "refuses from external writers after version 0",
+                        SQL_FALLBACK_REMEDY,
+                    )
         replayable = (
             hasattr(data, "to_reader")
             and not overwrite
@@ -1953,10 +2062,25 @@ class KernelEngine:
                             f"concurrent writer (the table records version {last}); "
                             "this batch is already in the table",
                         )
-                check, checked = _constraint_check(snapshot, "the data")
                 reader = _as_record_batch_reader(data)
                 info = _write_info(snapshot, overwrite=overwrite)
                 evolution: dict[str, Any] = {}
+                blocks = None
+                if generates_identity:
+                    from .values import reserve_identity
+
+                    rows = data.num_rows
+                    missing = _table_values(snapshot).generates_identity(reader.schema.names)
+                    change, blocks = reserve_identity(
+                        self._state_of(snapshot), dict.fromkeys(missing, rows)
+                    )
+                    if change.metadata is not None:
+                        # The new high-water mark commits with the rows that use
+                        # it, as Spark commits it: a concurrent writer conflicts
+                        # and the retry reserves above the winner's.
+                        evolution["metadata"] = json.dumps(change.metadata, separators=(",", ":"))
+                        info = {**info, "blind_append": False}
+                check, checked = _value_check(snapshot, "the data", identity=blocks)
                 if evolve:
                     change = meta.merge_schema(self._state_of(snapshot), reader.schema)
                     if change.metadata is not None:
@@ -2588,20 +2712,30 @@ class KernelEngine:
             )
         cdf = str(table.properties.get("delta.enableChangeDataFeed", "false")).lower() == "true"
         dv_delete = operation is Operation.DELETE and self._dv_path(table)
-        if cdf and operation not in _ADDING_OPS and not dv_delete:
+        if (
+            cdf
+            and operation not in _ADDING_OPS
+            and operation is not Operation.OVERWRITE
+            and not dv_delete
+        ):
             # A DELETE through deletion vectors is exempt: its commit adds no
             # data, and change-feed readers derive the deleted rows from the
-            # difference between each file's old and new vector.
+            # difference between each file's old and new vector. So is a full
+            # overwrite: it removes whole files and adds whole files, and the
+            # protocol has readers take a commit without CDC files as its
+            # removes' rows deleted and its adds' rows inserted.
             return Capability(
                 operation,
                 ok=False,
                 reason="the table has the change data feed enabled, and the kernel cannot "
                 "write the CDC files a commit that removes data must carry",
             )
-        if table.has_generated_columns:
+        computes_values = operation in _VALUE_WRITES and _native_has("values_checked")
+        if table.has_generated_columns and not computes_values:
             # Normally refused by the generatedColumns feature itself; this
             # covers the tables an earlier create left with the expressions but
             # not the feature, where the kernel wrote whatever it was given.
+            # A plain append or overwrite computes and checks them (`values`).
             return Capability(
                 operation,
                 ok=False,
@@ -2609,7 +2743,11 @@ class KernelEngine:
                 "kernel writer neither computes nor checks",
                 remedy="write through delta-rs, which evaluates them",
             )
-        if (writer == 2 or "invariants" in table.writer_features) and self._has_invariants(table):
+        if (
+            not computes_values
+            and (writer == 2 or "invariants" in table.writer_features)
+            and self._has_invariants(table)
+        ):
             return Capability(
                 operation,
                 ok=False,
@@ -2628,6 +2766,51 @@ class KernelEngine:
         checkpoint holds the table's own protocol and metadata from the log.
         """
         return _native_has("value_constrained_checkpoint")
+
+    def domain_metadata_refusal(self, table: ResolvedTable, domains: dict[Any, Any]) -> str | None:
+        """Why a write cannot set these user domains in its commit, if it cannot.
+
+        The protocol reserves `delta.*` domains for the table features that
+        own them (clustering, row tracking), and a writer sets a domain only on
+        a table that supports `domainMetadata`.
+        """
+        if not _native_has("domain_metadata"):
+            return "the installed native extension cannot write domain metadata"
+        for domain, configuration in domains.items():
+            if not isinstance(domain, str) or not domain:
+                return f"a domain name must be a non-empty string, not {domain!r}"
+            if domain.lower().startswith("delta."):
+                return (
+                    f"domain {domain!r} is a system domain: delta.* domains belong to the "
+                    "table features that define them"
+                )
+            if not isinstance(configuration, str):
+                return (
+                    f"domain {domain!r} needs its configuration as a string, not {configuration!r}"
+                )
+        if "domainMetadata" not in table.effective_writer_features:
+            return (
+                "the table does not support the domainMetadata writer feature; add it first "
+                "(t.set_properties({'delta.feature.domainMetadata': 'supported'}))"
+            )
+        return None
+
+    def _value_refusal(self, table: ResolvedTable) -> str | None:
+        """Why an append or overwrite cannot compute and check the table's generated
+        and identity columns and invariants here, if it cannot (`values`)."""
+        try:
+            snapshot = self.snapshot(table)
+            refusal: str | None = _table_values(snapshot).refusal(_arrow_schema(snapshot))
+            return refusal
+        except Exception as exc:
+            return f"the table's schema could not be read to evaluate its column values: {exc}"
+
+    def _declares_identity(self, table: ResolvedTable) -> bool:
+        """Whether a column of the table is an identity column (True when unknown)."""
+        try:
+            return bool(_table_values(self.snapshot(table)).identity)
+        except Exception:
+            return True
 
     def _has_invariants(self, table: ResolvedTable) -> bool:
         import json
@@ -4270,6 +4453,40 @@ class KernelEngine:
     def set_properties(self, table: ResolvedTable, properties: dict[str, str], **_: Any) -> int:
         return self._commit_metadata(table, lambda s: meta.set_properties(s, properties))
 
+    def reserve_identity(
+        self, table: ResolvedTable, counts: dict[str, int]
+    ) -> tuple[int, dict[str, Any]]:
+        """Move identity columns' high-water marks past `counts` new values each,
+        in a metadata-only commit, before a distributed write generates them.
+
+        Returns the commit's version and each column's `values.IdentityBlock`.
+        The values are the write's alone: every later writer, Databricks
+        included, generates above the new mark. Workers then fill their rows
+        from disjoint slots of the blocks, and the data commit changes no
+        metadata, so it rebases over concurrent appends like any other. A
+        write that never commits leaves a gap in the column's values, which
+        Delta allows (identity values are unique, not consecutive).
+        """
+        from .values import reserve_identity
+
+        if table.is_catalog_managed:
+            raise UnreachableTableError(
+                "reserve identity values on a catalog-managed table",
+                "the reservation changes the table's metadata, which the catalog refuses "
+                "from external writers after version 0",
+                SQL_FALLBACK_REMEDY,
+            )
+        reserved: dict[str, Any] = {}
+
+        def mutate(state: Any) -> Any:
+            change, blocks = reserve_identity(state, counts)
+            reserved.clear()
+            reserved.update(blocks)
+            return change
+
+        version = self._commit_metadata(table, mutate)
+        return version, dict(reserved)
+
     def unset_properties(
         self, table: ResolvedTable, keys: list[str], *, if_exists: bool = True
     ) -> int:
@@ -5531,6 +5748,7 @@ class KernelEngine:
         *,
         version: int | None = None,
         table_identity: str | None = None,
+        identity: dict[str, Any] | None = None,
     ) -> bytes:
         """Write data files for `table` without committing them.
 
@@ -5545,7 +5763,9 @@ class KernelEngine:
         to be listed again for every call; the commit still refuses fragments
         whose layout the table has since left. `table_identity` is the metaData
         id the write was planned against: a table re-created at the same path
-        is refused here rather than written for.
+        is refused here rather than written for. `identity` maps each identity
+        column the data leaves out to the `values.IdentityBlock` of values this
+        call may use, reserved when the write was planned.
         """
         if not self.supports_distributed_write:
             raise NotImplementedError(
@@ -5557,8 +5777,9 @@ class KernelEngine:
         snapshot = self.snapshot(table, version=version, write=True, fresh=False)
         _refuse_other_table(snapshot, table_identity, "write files for this plan")
         # The commit refuses fragments written under constraints the table no
-        # longer has (they are part of the layout stamped below).
-        check, checked = _constraint_check(snapshot, "the data")
+        # longer has (they are part of the layout stamped below). Generated,
+        # identity and default values are computed here, on the worker.
+        check, checked = _value_check(snapshot, "the data", identity=identity)
         uc = self._uc_commit_config(table, staging=True)
         if check is None:
             result: bytes = snapshot.write_files(_as_record_batch_reader(data), uc=uc, **checked)
@@ -5585,6 +5806,7 @@ class KernelEngine:
         commit_metadata: dict[str, Any] | None = None,
         version: int | None = None,
         table_identity: str | None = None,
+        domain_metadata: dict[str, str] | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
 
@@ -5593,12 +5815,15 @@ class KernelEngine:
         commit is built on that snapshot, so it conflicts if the table has
         moved past it -- what a guarded overwrite needs. The snapshot is read
         from storage, never reused from the cache, and must be the table
-        `table_identity` (the planned metaData id) names.
+        `table_identity` (the planned metaData id) names. `domain_metadata`
+        (domain -> configuration) is set in the same commit
+        (`domain_metadata_refusal` settled it when the write was planned).
         """
         if not self.supports_distributed_write:
             raise NotImplementedError(
                 "the installed native extension cannot commit externally written files"
             )
+        domains = {"domain_metadata": dict(domain_metadata)} if domain_metadata else {}
         snapshot = self.snapshot(table, version=version, write=True)
         _refuse_other_table(snapshot, table_identity, "commit these fragments", committing=True)
         # On the snapshot the commit is built on, like the txn check below: a
@@ -5630,10 +5855,12 @@ class KernelEngine:
                 txn=txn,
                 commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
                 **_write_info(snapshot, overwrite=overwrite),
-                # Every worker checked its rows against the constraints of the
-                # layout the fragments carry, which `_refuse_changed_layout`
-                # held to this snapshot's.
-                **_constraint_check(snapshot, "the data")[1],
+                # Every worker checked its rows against the constraints (and
+                # computed the generated and identity values) of the layout
+                # the fragments carry, which `_refuse_changed_layout` held to
+                # this snapshot's.
+                **_value_flags(snapshot),
+                **domains,
             )
         self._maybe_checkpoint(table, committed, snapshot)
         return committed

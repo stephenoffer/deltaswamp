@@ -187,7 +187,7 @@ pub fn commit_dml(
     txn: Option<(String, i64)>,
     commit_metadata: Option<HashMap<String, String>>,
     data_change: bool,
-    constraints_checked: bool,
+    constraints_checked: crate::restate::Checked,
     info: commit::CommitInfoPatch,
 ) -> Result<DmlOutcome> {
     let deletions: HashMap<String, RoaringTreemap> = deletions
@@ -455,18 +455,17 @@ pub fn commit_dml(
     // A compaction commits on the table's own snapshot with the features
     // that only constrain the values a commit writes set aside; see
     // `compaction_snapshot`. A DML whose caller checked the table's CHECK
-    // constraints over the rows it writes sets those aside alike; see
+    // constraints over the rows it writes sets those aside alike, and a
+    // table's `checkpointProtection` is set aside for any; see
     // `crate::restate`.
     let committing = if !data_change {
         compaction_snapshot(&snapshot)?
-    } else if constraints_checked {
+    } else {
         let checked = crate::restate::Restatement {
-            constraints_checked: true,
+            constraints_checked,
             ..Default::default()
         };
         crate::restate::writing_snapshot(&snapshot, &engine, &checked, &info)?
-    } else {
-        snapshot.clone()
     };
     let restated = !Arc::ptr_eq(&committing, &snapshot);
     let mut transaction = commit::begin_transaction(
