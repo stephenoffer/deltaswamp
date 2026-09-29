@@ -53,7 +53,7 @@ Several values in one cell are a routing chain, tried in order.
 | Time travel by version | all | kernel, delta-rs, warehouse | |
 | Time travel by timestamp | all | kernel, delta-rs, warehouse | one resolver for both direct engines: in-commit timestamps, else file times made monotonic, as Databricks resolves them |
 | Change data feed | DBR, Spark, delta-rs, kernel | kernel, delta-rs, sharing, warehouse | kernel first; delta-rs reads past the last version and predicates the kernel cannot parse; by version or timestamp |
-| CDF on catalog-managed tables | DBR | warehouse | the kernel's TableChanges takes no catalog tail |
+| CDF on catalog-managed tables | DBR | kernel, warehouse | read from the commits of a snapshot resolved with the catalog's tail (`engine/log_changes.py`): each commit's CDC files, else its adds and removes with deletion-vector pairs resolved, as TableChanges derives them; `plan_changes()` too |
 | History | all | delta-rs, iceberg, warehouse | |
 | Detail / protocol / properties | all | kernel, delta-rs, warehouse | |
 | File listing with stats | Spark, delta-rs, kernel | delta-rs, kernel | `Table.files()` |
@@ -61,7 +61,7 @@ Several values in one cell are a routing chain, tried in order.
 | Views, MVs, metric views, row-filtered tables | DBR | warehouse | vending refuses them; only the warehouse can evaluate them |
 | Shallow clones | DBR, Spark | warehouse | absolute paths into the source defeat credential scoping |
 | Distributed scan | Spark, kernel | kernel | `plan_scan()` / `to_ray_dataset()`; per-file splits pinned to a version, each carrying the kernel's scan row, so workers read with no log listing or replay and no catalog call. See [Ray Data](ray-data.md) |
-| Distributed change feed | Spark | kernel | `plan_changes()`: runs of whole commits per split; refused on catalog-managed tables |
+| Distributed change feed | Spark | kernel | `plan_changes()`: runs of whole commits per split; catalog-managed tables included, their workers reading the unpublished commits from the staged files the plan names |
 | Incremental / streaming read | DBR, Spark | native over CDF | `Table.changes()` follows the change feed version by version; `changes(..., include_snapshot=True)` first yields the table at the start version as inserts |
 | Incremental read without CDF (rows added since a version) | kernel | kernel | `Table.added_since(version)` reads the files the kernel's incremental scan lists as added; refused when the range removed files, unless `only_appends=True` |
 
@@ -82,7 +82,7 @@ Several values in one cell are a routing chain, tried in order.
 | DML on catalog-managed tables | DBR | kernel (deletion vectors), warehouse | DELETE/UPDATE/replaceWhere/MERGE as deletion vectors through UCCommitter; row ids kept on row-tracked tables. Without deletion vectors, a copy-on-write of the touched files, bounded by `dml_max_bytes`. A commit that loses a race re-reads the catalog's tail and rebases over blind appends |
 | Deletion-vector authoring | DBR, Spark | kernel | bitmaps computed here, written in the protocol's file format, committed through the kernel's DV update; a second DELETE unions with the existing vector; files left empty are removed |
 | Row-id preservation on DELETE / UPDATE / MERGE / replaceWhere | DBR, Spark | kernel | updated rows' ids are written to the table's materialized row-id column; a copy-on-write rewrite also writes the kept rows' ids and commit versions to the materialized columns, and inserted rows get fresh ids above the high-water mark. Removes (staged by hand, as kernel 0.28 refuses them there) and re-adds carry each file's `baseRowId` and `defaultRowCommitVersion` |
-| DML + CDF | DBR, Spark | kernel (DELETE), delta-rs, warehouse | a deletion-vector DELETE needs no CDC files; UPDATE and MERGE on a CDF table need CDC files the kernel cannot write |
+| DML + CDF | DBR, Spark | kernel, delta-rs, warehouse | UPDATE, MERGE, replaceWhere and copy-on-write DELETE write CDC files under `_change_data/` (`update_preimage`/`update_postimage`, `delete`, `insert`) and commit `cdc` actions beside the data; a deletion-vector DELETE needs none. Catalog-managed tables included |
 | Row-level concurrency | DBR | — | a Databricks conflict-detection feature |
 | Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction, rebased and retried, idempotent after a lost response; `abort()` deletes the files of a write that cannot commit. Catalog-managed tables included. See [Ray Data](ray-data.md) |
 | COPY INTO / Auto Loader | DBR | warehouse (`Connection.sql(engine="warehouse")`) | ingestion, not table access |
@@ -207,8 +207,6 @@ writes through it and refuses only history truncation.
 
 | Gap | Blocker |
 |---|---|
-| UPDATE, MERGE and replaceWhere on a change-data-feed table the kernel alone can write | the kernel cannot write CDC files, and those commits need them; DELETE through deletion vectors does not |
-| CDF on catalog-managed tables outside Databricks | the kernel's `TableChanges` takes no catalog commit tail |
 | Databricks server-side behavior (predictive optimization, auto compaction, row-level concurrency, Photon, CLUSTER BY AUTO) | these are things a Databricks cluster does, not table formats; the warehouse fallback is the only way in |
 | UniForm metadata generation outside Databricks | Databricks-only |
 | Managed-table creation and catalog-managed commits on Databricks | Databricks allowlists which connectors may write through the UC Delta API, by User-Agent |

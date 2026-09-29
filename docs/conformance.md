@@ -109,6 +109,24 @@ it removes and adds whole files, which readers take as deletes and inserts
 without CDC files, as Spark writes it (kernel 0.28 refuses any commit with
 both, so the removes are staged beside its actions).
 
+UPDATE, MERGE, replaceWhere and a copy-on-write DELETE on a change-data-feed
+table say what changed, as Spark's do: the commit carries CDC files under
+`_change_data/` (the changed rows in the table's physical layout, plus
+`_change_type`: `update_preimage`, `update_postimage`, `delete`, `insert`) as
+`cdc` actions, which readers take instead of the commit's adds and removes.
+Kernel 0.28 writes none and refuses a commit that adds and removes on such a
+table; the files are written by the native extension (`change_files.rs`) and
+the kernel's check runs against the table's metadata with the feed set aside,
+which is never written. A DELETE through deletion vectors writes none: readers
+derive its rows from the old and new vectors.
+
+The kernel's TableChanges cannot open a catalog-managed table (it lists the
+log itself and builds its snapshots without the catalog's say), so that
+table's feed is read from the commits of a snapshot resolved with the
+catalog's tail (`engine/log_changes.py`), the ratified-but-unpublished ones
+from their staged files. It returns what TableChanges returns, shape for shape
+(`tests/integration/test_log_change_feed.py`).
+
 Unknown feature names must not raise. The kernel tolerates unknown writer-only
 features when reading, and so must deltaswamp, or the first table to adopt a
 newer feature becomes unreadable.

@@ -264,7 +264,10 @@ the kernel serves MERGE on tables delta-rs cannot write, and every DML on a
 row-tracked table: the kept rows bring their row ids and commit versions, which
 go to the materialized columns, so a file rewrite changes neither. A DELETE commit adds
 no data, so it needs no CDC files on a change-data-feed table: readers derive
-the deleted rows from the old and new vectors.
+the deleted rows from the old and new vectors. Every other DML commit on such a
+table carries its change rows as CDC files (`change_files.rs`): a MERGE
+classifies them as it evaluates its clauses, the others from what they remove
+and write, read before the commit while the files are live.
 
 ## Distributed reads and writes
 
@@ -354,10 +357,6 @@ from the registry one. Mixing them yields two kernels and two incompatible
 
 ## Not built
 
-- CDC files. UPDATE and MERGE through the kernel on a change-data-feed table
-  would need them; DELETE through deletion vectors does not.
-- The change feed of a catalog-managed table. The kernel's `TableChanges`
-  lists the log itself and would miss unpublished commits.
 - Databricks server-side behavior: predictive optimization, auto compaction,
   row-level concurrency, UniForm metadata generation. The
   [feature map](features.md) shows how each is reached.

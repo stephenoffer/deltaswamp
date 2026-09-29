@@ -99,6 +99,11 @@ First release.
     change-data-feed tables.
   - `Connection.plan_write(name, schema=...)` creates the table at commit,
     with its data, and undoes the create when the job fails.
+  - The change feed of a catalog-managed table, on the driver and through
+    `plan_changes()`, read from the commits of a snapshot resolved with the
+    catalog's tail: no warehouse. UPDATE, MERGE, replaceWhere and
+    copy-on-write DELETE on change-data-feed tables write CDC files and `cdc`
+    actions through the kernel, path and catalog-managed tables alike.
   - On catalog-managed tables, DML rebases over concurrent appends by
     re-reading the catalog's tail, and OPTIMIZE, Z-ORDER, RESTORE and VACUUM
     (`allow_catalog_managed=True`) commit through the catalog.
@@ -483,9 +488,6 @@ See docs/usage.md, "Security notes".
   own domain); Databricks reclusters such files on its next OPTIMIZE. On a
   row-tracked table the kernel's post-commit snapshot and checksum delta do
   not count the removes the native commit stages itself; nothing reads them.
-- The kernel cannot write CDC files, so UPDATE and MERGE on a change-data-feed
-  table it alone can write need the SQL fallback. DELETE through deletion
-  vectors needs none.
 - The change feed fails when the range crosses an incompatible schema change
   (a dropped, renamed or retyped column), with `ChangeFeedSchemaChangeError`
   naming the version. Start the range at the change, or read it through the
@@ -520,8 +522,8 @@ See docs/usage.md, "Security notes".
   MATCHED clause has a condition is refused on delta-rs (it inserts an all-NULL
   row per rejected source row) and needs the SQL fallback. deltalake 1.6.6
   fixed it, and the refusal applies only to older versions.
-- The change feed and history of a catalog-managed table need the warehouse,
-  which only a Databricks connection has: `allow_sql_fallback=True` is refused
+- The history of a catalog-managed table needs the warehouse, which only a
+  Databricks connection has: `allow_sql_fallback=True` is refused
   on OSS Unity Catalog, Hive Metastore, Glue, Delta Sharing and path
   connections, where those operations are refused without that remedy.
 - Delta Sharing has no split planning: `plan_scan()` and `to_ray_dataset()`
