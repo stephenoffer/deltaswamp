@@ -20,8 +20,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
 "commit_timestamps", "credential_slots", "planned_scan", "values_checked",
-"checkpoint_protection", "domain_metadata", "deferred_create". Gate on this list, not
-`hasattr`, so a stale build refuses cleanly.
+"checkpoint_protection", "domain_metadata", "deferred_create", "create_with_data". Gate on
+this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -716,8 +716,13 @@ class Snapshot:
         constraints_checked: bool = False,
         values_checked: list[str] | None = None,
         domain_metadata: dict[str, str] | None = None,
+        create_template: list[str] | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
+
+        With `create_template` (the snapshot is a table's template version 0),
+        the commit *is* version 0: the template's actions and the files, in
+        one put-if-absent. Raises CommitConflictError when version 0 exists.
 
         Every fragment lands at a single version, so a distributed write is
         atomic. `overwrite` removes every file visible in this snapshot in the

@@ -92,11 +92,13 @@ class TestPathTable:
         assert {p.split("/")[0] for p in _parquet(path)} == {"region=eu", "region=us"}
         assert not conn.table_exists(path)
 
-        assert plan.commit(fragments) == 1
+        # One commit: the table's version 0 holds its data, so no reader ever
+        # sees it empty.
+        assert plan.commit(fragments) == 0
         table = conn.table(path)
         assert _ids(table) == [1, 2, 3]
         assert list(table._enrich().partition_columns) == ["region"]
-        assert _log(path) == [f"{0:020}.json", f"{1:020}.json"]
+        assert _log(path) == [f"{0:020}.json"]
         # The template is gone once the table is there.
         assert _pending(path) == []
         assert not os.path.exists(os.path.join(path, "_deltaswamp_pending"))
@@ -131,14 +133,14 @@ class TestPathTable:
         path = str(tmp_path / "t")
         plan = conn.plan_write(path, schema=SCHEMA)
         fragments = _worker_write(plan, _rows([1, 2]))
-        assert plan.commit(fragments) == 1
-        assert plan.commit(fragments) == 1
+        assert plan.commit(fragments) == 0
+        assert plan.commit(fragments) == 0
         assert _ids(conn.table(path)) == [1, 2]
 
-    def test_a_version_zero_that_landed_is_not_published_again(
+    def test_an_unknown_outcome_is_settled_by_committing_again(
         self, conn: Any, tmp_path: Any, monkeypatch: Any
     ) -> None:
-        """Version 0 landed, then the data commit's outcome was lost: commit again."""
+        """The create's outcome was lost: commit again, and nothing lands twice."""
         path = str(tmp_path / "t")
         plan = conn.plan_write(path, schema=SCHEMA)
         fragments = _worker_write(plan, _rows([1, 2]))
@@ -152,7 +154,7 @@ class TestPathTable:
         # Nothing deleted, as the outcome was unknown.
         assert _parquet(path)
         monkeypatch.undo()
-        assert plan.commit(fragments) == 1
+        assert plan.commit(fragments) == 0
         assert _ids(conn.table(path)) == [1, 2]
 
     def test_a_worker_copy_cannot_commit_or_abort(self, conn: Any, tmp_path: Any) -> None:
@@ -172,6 +174,122 @@ class TestPathTable:
         assert b"_Creator" not in pickle.dumps(plan)
 
 
+def _v0_actions(path: str) -> list[dict[str, Any]]:
+    with open(os.path.join(path, "_delta_log", f"{0:020}.json")) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+class TestOneCommit:
+    """Version 0 carries the table and its data; everything the kernel derives agrees."""
+
+    def test_row_tracking_numbers_the_rows_at_version_zero(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "rt")
+        properties = {"delta.enableRowTracking": "true", "delta.enableInCommitTimestamps": "true"}
+        plan = conn.plan_write(path, schema=SCHEMA, properties=properties)
+        assert plan.commit(_worker_write(plan, _rows([1, 2]), _rows([3], "us"))) == 0
+        actions = _v0_actions(path)
+        # In-commit timestamp first, as the protocol has Spark write it.
+        assert next(iter(actions[0])) == "commitInfo"
+        assert next(iter(actions[0]["commitInfo"])) == "inCommitTimestamp"
+        adds = [a["add"] for a in actions if "add" in a]
+        assert {a["defaultRowCommitVersion"] for a in adds} == {0}
+        bases = sorted(a["baseRowId"] for a in adds)
+        assert bases[0] == 0 and len(set(bases)) == len(bases)
+        domains = [a["domainMetadata"] for a in actions if "domainMetadata" in a]
+        rt = [d for d in domains if d["domain"] == "delta.rowTracking"]
+        assert len(rt) == 1
+        assert json.loads(rt[0]["configuration"])["rowIdHighWaterMark"] == 2
+        assert sum(1 for a in actions if "protocol" in a) == 1
+        assert sum(1 for a in actions if "metaData" in a) == 1
+        # And a later append continues the numbering.
+        conn.table(path).append(_rows([4]))
+        assert _ids(conn.table(path)) == [1, 2, 3, 4]
+
+    def test_clustering_and_column_mapping_land_in_version_zero(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        path = str(tmp_path / "cl")
+        plan = conn.plan_write(
+            path,
+            schema=SCHEMA,
+            cluster_by=["region"],
+            properties={"delta.columnMapping.mode": "name"},
+        )
+        assert plan.commit(_worker_write(plan, _rows([1, 2]))) == 0
+        actions = _v0_actions(path)
+        domains = [a["domainMetadata"]["domain"] for a in actions if "domainMetadata" in a]
+        assert domains.count("delta.clustering") == 1
+        assert _ids(conn.table(path)) == [1, 2]
+
+    def test_identity_values_are_reserved_in_version_zero(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "id")
+        md = {
+            "delta.identity.start": "100",
+            "delta.identity.step": "10",
+            "delta.identity.allowExplicitInsert": "false",
+        }
+        schema = pa.schema([pa.field("id", pa.int64(), metadata=md), ("region", pa.string())])
+        plan = conn.plan_write(path, schema=schema, identity_tasks=2, identity_rows_per_task=5)
+        worker = pickle.loads(pickle.dumps(plan))
+        fragments = [
+            worker.write(pa.table({"region": ["a", "b"]}), task_index=0),
+            worker.write(pa.table({"region": ["c"]}), task_index=1),
+        ]
+        assert plan.commit(fragments) == 0
+        # One commit: the reservation is version 0's own high-water mark.
+        assert _log(path) == [f"{0:020}.json"]
+        meta = next(a["metaData"] for a in _v0_actions(path) if "metaData" in a)
+        field = json.loads(meta["schemaString"])["fields"][0]
+        assert field["metadata"]["delta.identity.highWaterMark"] == 100 + 10 * (2 * 5 - 1)
+        ids = sorted(r["id"] for r in conn.table(path).to_arrow().to_pylist())
+        assert ids == [100, 110, 150]
+        # Later appends number above the reservation.
+        conn.table(path).append(pa.table({"region": ["d"]}))
+        assert max(r["id"] for r in conn.table(path).to_arrow().to_pylist()) == 200
+
+    def test_generated_always_without_identity_tasks_is_refused_at_planning(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        path = str(tmp_path / "id")
+        md = {"delta.identity.start": "1", "delta.identity.step": "1"}
+        schema = pa.schema([pa.field("id", pa.int64(), metadata=md), ("region", pa.string())])
+        with pytest.raises(UnreachableTableError, match="GENERATED ALWAYS"):
+            conn.plan_write(path, schema=schema)
+        assert not os.path.exists(os.path.join(path, "_deltaswamp_pending")) or not _pending(path)
+        assert _log(path) == []
+
+    def test_domain_metadata_lands_in_version_zero(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "dm")
+        plan = conn.plan_write(
+            path,
+            schema=SCHEMA,
+            properties={"delta.feature.domainMetadata": "supported"},
+            domain_metadata={"myapp.watermark": '{"at": 7}'},
+        )
+        assert plan.commit(_worker_write(plan, _rows([1]))) == 0
+        domains = {
+            a["domainMetadata"]["domain"]: a["domainMetadata"]["configuration"]
+            for a in _v0_actions(path)
+            if "domainMetadata" in a
+        }
+        assert domains["myapp.watermark"] == '{"at": 7}'
+
+    def test_an_existing_table_takes_the_same_arguments(self, conn: Any, tmp_path: Any) -> None:
+        path = str(tmp_path / "t")
+        conn.create_table(path, SCHEMA, properties={"delta.feature.domainMetadata": "supported"})
+        plan = conn.plan_write(path, domain_metadata={"myapp.x": "1"}, identity_tasks=0)
+        assert plan.create is None
+        assert plan.commit(_worker_write(plan, _rows([1]))) == 1
+
+    def test_an_empty_job_creates_the_empty_table_in_one_commit(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        path = str(tmp_path / "e")
+        plan = conn.plan_write(path, schema=SCHEMA)
+        assert plan.commit([]) == 0
+        assert [a for a in _v0_actions(path) if "add" in a] == []
+
+
 class TestNothingLeftBehind:
     def test_abort_deletes_the_files_and_the_template(self, conn: Any, tmp_path: Any) -> None:
         path = str(tmp_path / "t")
@@ -185,7 +303,7 @@ class TestNothingLeftBehind:
         assert not conn.table_exists(path)
         # And the name is free for the retry.
         again = conn.plan_write(path, schema=SCHEMA, mode="error")
-        assert again.commit(_worker_write(again, _rows([7]))) == 1
+        assert again.commit(_worker_write(again, _rows([7]))) == 0
 
     def test_a_certain_failure_undoes_the_create(
         self, conn: Any, tmp_path: Any, monkeypatch: Any
@@ -277,8 +395,8 @@ class TestAnotherCreator:
         second = conn.plan_write(path, schema=SCHEMA, mode="append")
         a = _worker_write(first, _rows([1, 2]))
         b = _worker_write(second, _rows([3]))
-        assert first.commit(a) == 1
-        assert second.commit(b) == 2
+        assert first.commit(a) == 0
+        assert second.commit(b) == 1
         assert _ids(conn.table(path)) == [1, 2, 3]
         assert _pending(path) == []
 
@@ -413,6 +531,13 @@ class TestManaged:
             uc_conn.plan_write("main.sales.orders", schema=SCHEMA, ship_catalog_auth=True)
 
 
+class _Source:
+    """A picklable credential source, as a Ray actor handle would be wrapped."""
+
+    def __call__(self, table_id: str, operation: str) -> Any:
+        raise AssertionError("not asked in this test")
+
+
 class TestExternal:
     def test_registered_after_its_data_is_in(self, uc_conn: Any, uc: Any, tmp_path: Any) -> None:
         location = f"file://{tmp_path / 'ext'}"
@@ -422,7 +547,8 @@ class TestExternal:
         assert "main.sales.ext" not in uc.tables
         fragments = _worker_write(plan, _rows([1, 2]), _rows([3], "us"))
         assert "main.sales.ext" not in uc.tables
-        assert plan.commit(fragments) == 1
+        assert plan.commit(fragments) == 0
+        assert _log(location) == [f"{0:020}.json"]
 
         table = uc_conn.table("main.sales.ext")
         assert _ids(table) == [1, 2, 3]
@@ -430,7 +556,7 @@ class TestExternal:
         assert info.table_type == "EXTERNAL"
         assert info.partition_columns == ("region",)
         # Committing again finds both the data and the registration there.
-        assert plan.commit(fragments) == 1
+        assert plan.commit(fragments) == 0
 
     def test_a_failed_registration_names_the_location(
         self, uc_conn: Any, uc: Any, tmp_path: Any, monkeypatch: Any
@@ -451,6 +577,25 @@ class TestExternal:
         registered = uc_conn.register_table("main.sales.ext", location)
         assert _ids(registered) == [1]
         assert uc_conn.register_table("main.sales.ext", location).count() == 1
+
+    def test_a_credential_source_is_asked_by_the_location(
+        self, uc_conn: Any, uc: Any, tmp_path: Any
+    ) -> None:
+        from deltaswamp.credentials import CredentialBroker
+
+        location = f"file://{tmp_path / 'ext'}"
+        broker = CredentialBroker()
+        plan = uc_conn.plan_write(
+            "main.sales.ext", schema=SCHEMA, location=location, credential_source=_Source()
+        )
+        key = broker.add(plan)
+        assert key == f"path:{location}"
+        worker = pickle.loads(pickle.dumps(plan))
+        assert worker.table.credential_provider.table_id == key
+        assert broker.vend(key, "READ_WRITE")
+        # Portable for a broker in another process (an actor).
+        assert pickle.loads(pickle.dumps(CredentialBroker.portable(plan))).credential_key == key
+        plan.abort(_worker_write(plan, _rows([1])))
 
     def test_abort_leaves_nothing(self, uc_conn: Any, uc: Any, tmp_path: Any) -> None:
         location = f"file://{tmp_path / 'ext'}"

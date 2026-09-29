@@ -1412,7 +1412,9 @@ def _for_workers(table: Any, *, write: bool, source: Any = None) -> Any:
         identity = get_identity()
     shipped = ShippedCredentials(
         credentials,
-        getattr(provider, "table_id", None),
+        # What `credential_source` is asked by: the table id, or where a
+        # table the write creates has none yet, the provider's own key.
+        getattr(provider, "table_id", None) or getattr(provider, "credential_key", None),
         workspace_url,
         source=source,
         identity=identity,

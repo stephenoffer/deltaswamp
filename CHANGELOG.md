@@ -104,7 +104,15 @@ First release.
     metadata through `plan_write(domain_metadata=)`. Distributed overwrites of
     change-data-feed tables.
   - `Connection.plan_write(name, schema=...)` creates the table at commit,
-    with its data, and undoes the create when the job fails.
+    with its data, and undoes the create when the job fails. A path or
+    external table is one commit: version 0 holds the job's files. It takes
+    every `Table.plan_write` argument; identity values for a new table are
+    reserved in its version 0.
+  - `create_table` declares identity and literal-default columns locally
+    (version 0 composed with the feature and typed identity metadata).
+    Generated identity values follow Delta Spark: the next value after the
+    high-water mark rounded to the start + k * step sequence, a mark before
+    the start ignored, explicit BY DEFAULT values leaving the mark alone.
   - On catalog-managed tables, DML rebases over concurrent appends by
     re-reading the catalog's tail, and OPTIMIZE, Z-ORDER, RESTORE and VACUUM
     (`allow_catalog_managed=True`) commit through the catalog.
@@ -552,13 +560,18 @@ See docs/usage.md, "Security notes".
   deltaswamp is registered. Reads are unaffected.
 - Idempotent writes are checked against the last committed version before
   writing, so a concurrent writer can still commit in between.
-- Identity and default columns are created only through Databricks (a catalog
-  name with the SQL fallback); generated columns are created by delta-rs. Once
-  a table has them, the kernel writes it, computing and checking the values;
-  DELETE, UPDATE and MERGE there stay with delta-rs or the warehouse.
-- A new table created by `Connection.plan_write` is two commits: an empty
-  version 0, then the data. A driver that dies between them leaves an empty
-  table; a managed table's staging allocation cannot be released.
+- Generated columns are created by delta-rs; identity and literal-default
+  columns are created locally, except through the kernel's own create of a
+  catalog-managed table. Once a table has them, the kernel writes it,
+  computing and checking the values; DELETE, UPDATE and MERGE there stay with
+  delta-rs or the warehouse.
+- A managed table created by `Connection.plan_write` is two commits: version 0
+  is written to the staging location at planning (the catalog vends that
+  location's credential once, and OSS Unity Catalog re-vends only by table
+  name), then the data commits through the catalog after it registers the
+  table. A driver that dies between the two leaves an empty table; the
+  staging allocation cannot be released. Path and external tables are one
+  commit.
 - delta-kernel-rs 0.28 holds an overwrite's removes (without statistics) in
   memory until the commit.
 - A kernel MERGE reads its source and candidate files into memory; past

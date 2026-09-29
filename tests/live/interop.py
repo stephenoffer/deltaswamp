@@ -1269,6 +1269,62 @@ def h_identity(b: Builder) -> None:
     maintenance(b, restore_to=None)
 
 
+def h_identity_local(b: Builder) -> None:
+    """Identity columns deltaswamp declares itself: `create_table` puts version 0
+    (a table-features protocol, typed identity metadata), then local and
+    distributed writes; Databricks reads the table and inserts on top."""
+    b.gen = _flat
+    always = {
+        "delta.identity.start": "1",
+        "delta.identity.step": "1",
+        "delta.identity.allowExplicitInsert": "false",
+    }
+    by_default = {
+        "delta.identity.start": "1000",
+        "delta.identity.step": "10",
+        "delta.identity.allowExplicitInsert": "true",
+    }
+    schema = pa.schema(
+        [
+            pa.field("idn", pa.int64(), metadata=always),
+            pa.field("idd", pa.int64(), metadata=by_default),
+            *_flat(0, 1).schema,
+        ]
+    )
+    b.step(
+        "create",
+        lambda t: b.conn.create_table(
+            b.path, schema, properties={"delta.enableDeletionVectors": "true"}
+        ),
+        expect="ok",
+    )
+    b.step("append", lambda t: t.append(b.gen(0)), expect="ok")
+    b.step("append_kernel", lambda t: t.append(b.gen(100)), via="kernel", expect="ok")
+    b.step(
+        "append_by_default_given",
+        lambda t: t.append(
+            b.gen(50, 3).append_column("idd", pa.array([-11, -12, -13], pa.int64()))
+        ),
+        expect="ok",
+    )
+    b.step(
+        "given_always_value",
+        lambda t: t.append(b.gen(60, 1).append_column("idn", pa.array([5], pa.int64()))),
+        expect="refused",
+    )
+    b.step(
+        "distributed_identity",
+        _distributed_merged(
+            [b.gen(500, 6), b.gen(600, 6), b.gen(700, 4)],
+            identity_tasks=3,
+            identity_rows_per_task=100,
+        ),
+        expect="ok",
+    )
+    b.step("append_after", lambda t: t.append(b.gen(800, 5)), expect="ok")
+    maintenance(b, restore_to=None)
+
+
 def _identity_problems(values: dict[str, list[Any]], where: str) -> list[str]:
     out = []
     for col, got in values.items():
@@ -1284,6 +1340,24 @@ def c_identity(ctx: Context, b: Builder, rel: str, uri: str) -> list[str]:
     """Identity values stay unique across deltaswamp's writes and Databricks',
     including a distributed write on what Databricks left and an INSERT by
     Databricks after it (which only a covering high-water mark keeps apart)."""
+    return _identity_check(ctx, b, rel, uri, BY_ID["identity-databricks_created"])
+
+
+def c_identity_local(ctx: Context, b: Builder, rel: str, uri: str) -> list[str]:
+    """`c_identity` on a table deltaswamp created: Databricks must accept the
+    identity declaration as written (types, protocol) and number its INSERTs
+    above every value deltaswamp generated."""
+    problems = _identity_check(ctx, b, rel, uri, BY_ID["identity-local_created"])
+    for col, kind in (("idn", "ALWAYS"), ("idd", "BY DEFAULT")):
+        described = " ".join(
+            str(v) for row in ctx.warehouse.rows(f"SHOW CREATE TABLE {dref(uri)}") for v in row
+        )
+        if f"{col} BIGINT GENERATED {kind} AS IDENTITY" not in described:
+            problems.append(f"Databricks does not describe {col} as GENERATED {kind} AS IDENTITY")
+    return problems
+
+
+def _identity_check(ctx: Context, b: Builder, rel: str, uri: str, case: Any) -> list[str]:
     cols = ["idn", "idd"]
     problems = _identity_problems(
         {c: _read(b.root / "pre").column(c).to_pylist() for c in cols}, "deltaswamp's table"
@@ -1320,7 +1394,7 @@ def c_identity(ctx: Context, b: Builder, rel: str, uri: str) -> list[str]:
     problems += _identity_problems(
         {c: _read(local).column(c).to_pylist() for c in cols}, "deltaswamp reading Databricks'"
     )
-    diff = compare_many(ctx, BY_ID["identity-databricks_created"], [("x", ref, _read(local), ())])
+    diff = compare_many(ctx, case, [("x", ref, _read(local), ())])
     if not diff["x"].ok:
         problems.append(diff["x"].explain())
     return problems
@@ -1830,6 +1904,15 @@ CASES: list[Case] = [
         generated=frozenset({"idn", "idd"}),
         drop_on_append=frozenset({"idn", "idd"}),
         checks={"identity-unique": c_identity},
+    ),
+    Case(
+        "identity",
+        "local_created",
+        h_identity_local,
+        _FLAT_STATS,
+        generated=frozenset({"idn", "idd"}),
+        drop_on_append=frozenset({"idn", "idd"}),
+        checks={"identity-unique": c_identity_local},
     ),
     Case(
         "checkpoint_protection",

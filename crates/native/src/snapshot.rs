@@ -1423,6 +1423,7 @@ impl PySnapshot {
         constraints_checked = false,
         values_checked = None,
         domain_metadata = None,
+        create_template = None,
     ))]
     fn commit_files(
         &self,
@@ -1439,6 +1440,7 @@ impl PySnapshot {
         constraints_checked: bool,
         values_checked: Option<Vec<String>>,
         domain_metadata: Option<HashMap<String, String>>,
+        create_template: Option<Vec<String>>,
     ) -> PyResult<u64> {
         let constraints_checked =
             crate::restate::Checked::from_args(constraints_checked, values_checked)?;
@@ -1457,6 +1459,7 @@ impl PySnapshot {
                     operation_parameters,
                     blind_append,
                     domains: domain_metadata,
+                    create_template: create_template.map(Arc::new),
                     ..Default::default()
                 },
                 constraints_checked,

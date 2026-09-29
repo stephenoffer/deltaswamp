@@ -1536,6 +1536,10 @@ class Connection:
         commit_metadata: dict[str, Any] | None = None,
         ship_catalog_auth: bool = False,
         supplies_defaults: bool = False,
+        credential_source: Any = None,
+        identity_tasks: int | None = None,
+        identity_rows_per_task: int = 1 << 31,
+        domain_metadata: dict[str, str] | None = None,
     ) -> Any:
         """Plan a distributed write to `name`, creating the table at commit if it is not there.
 
@@ -1569,6 +1573,13 @@ class Connection:
         `plan.write(batch)` there, and `plan.commit(fragments)` here.
         ``ship_catalog_auth=True`` is refused for a catalog table that does not
         exist yet: there is no table to vend credentials for until the commit.
+
+        `identity_tasks`, `identity_rows_per_task`, `domain_metadata` and
+        `credential_source` are `Table.plan_write`'s. For a table this write
+        creates, the identity values are reserved in its version 0 (its
+        high-water mark), with no commit of their own; a `credential_source`
+        for a new external table is asked by the table's location (a
+        `CredentialBroker` serves it once given the plan: ``broker.add(plan)``).
         """
         from ._create import plan_create_write
 
@@ -1586,6 +1597,10 @@ class Connection:
             commit_metadata=commit_metadata,
             ship_catalog_auth=ship_catalog_auth,
             supplies_defaults=supplies_defaults,
+            credential_source=credential_source,
+            identity_tasks=identity_tasks,
+            identity_rows_per_task=identity_rows_per_task,
+            domain_metadata=domain_metadata,
         )
 
     def convert_to_delta(self, location: str, **kwargs: Any) -> Table:

@@ -26,7 +26,6 @@ they fit its layout; each of the three deletes the files it does not commit.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import uuid
@@ -59,14 +58,26 @@ class _PathCredentialProvider:
     vends when the plan is pickled (`distributed._for_workers`), never this.
     """
 
-    def __init__(self, catalog: Any, location: str) -> None:
+    def __init__(self, catalog: Any, location: str, portable: bool = False) -> None:
         self._catalog = catalog
         self._location = location
         self._credentials: Any = None
+        self._portable = portable
 
     @property
     def table_id(self) -> str | None:
         return None
+
+    @property
+    def credential_key(self) -> str:
+        """What a plan's `credential_source` is asked by, as a table has no id yet."""
+        return f"path:{self._location}"
+
+    def portable(self) -> _PathCredentialProvider:
+        """A copy that pickles, catalog secrets included (`CredentialBroker.portable`)."""
+        from .credentials.databricks import shipping
+
+        return _PathCredentialProvider(shipping(self._catalog), self._location, portable=True)
 
     def credentials(self, operation: Any = None) -> Any:
         from .credentials.base import DEFAULT_REFRESH_MARGIN_SECONDS
@@ -80,6 +91,8 @@ class _PathCredentialProvider:
         self._credentials = None
 
     def __reduce__(self) -> Any:
+        if self._portable:
+            return (_PathCredentialProvider, (self._catalog, self._location, True))
         # It holds the catalog, and with it the catalog's token.
         raise TypeError(
             "a creating write's path credential provider stays on the driver; "
@@ -102,6 +115,10 @@ def plan_create_write(
     commit_metadata: dict[str, Any] | None,
     ship_catalog_auth: bool,
     supplies_defaults: bool,
+    credential_source: Any = None,
+    identity_tasks: int | None = None,
+    identity_rows_per_task: int = 1 << 31,
+    domain_metadata: dict[str, str] | None = None,
 ) -> WritePlan | None:
     """`Connection.plan_write` (see there)."""
     from .connection import _check_existing_layout
@@ -115,6 +132,12 @@ def plan_create_write(
         "commit_metadata": commit_metadata,
         "ship_catalog_auth": ship_catalog_auth,
         "supplies_defaults": supplies_defaults,
+        "credential_source": credential_source,
+        "domain_metadata": domain_metadata,
+    }
+    identity: dict[str, Any] = {
+        "identity_tasks": identity_tasks,
+        "identity_rows_per_task": identity_rows_per_task,
     }
     if conn.table_exists(name):
         if mode == "error":
@@ -127,7 +150,7 @@ def plan_create_write(
             return None
         table = conn.table(name)
         _check_existing_layout(table, name, partition_by, properties)
-        existing: WritePlan = table.plan_write(mode=mode, **planned)
+        existing: WritePlan = table.plan_write(mode=mode, **planned, **identity)
         return existing
     if schema is None:
         raise InvalidArgumentError(
@@ -142,7 +165,12 @@ def plan_create_write(
             "commit registers it there is no table to vend credentials for. Workers get a "
             "storage credential vended on the driver; plan again with the default"
         )
-    layout = {"partition_by": partition_by, "cluster_by": cluster_by, "properties": properties}
+    layout = {
+        "partition_by": partition_by,
+        "cluster_by": cluster_by,
+        "properties": properties,
+        "identity": (identity_tasks, identity_rows_per_task),
+    }
     if ref.kind is RefKind.PATH:
         creator = _plan_path(conn, name, ref, schema, location, layout, comment)
     elif location is not None:
@@ -178,13 +206,15 @@ def _plan_path(
     _refuse_foreign_files(name, conn.storage_options)
     resolved = FilesystemCatalog().resolve(ref)
     assert resolved.location is not None
+    v0, reserved = _reserved_in_v0(_composed_v0(conn, schema, layout, comment), *layout["identity"])
     return _Creator(
         kind="path",
         name=name,
         ref=ref,
         location=resolved.location,
         provider=None,
-        v0=_composed_v0(conn, schema, layout, comment),
+        v0=v0,
+        identity_reserved=reserved,
     )
 
 
@@ -206,15 +236,17 @@ def _plan_external(
     _refuse_foreign_files(
         location, store_options(engine_options(conn.storage_options, secrets, location))
     )
+    v0, reserved = _reserved_in_v0(_composed_v0(conn, schema, layout, comment), *layout["identity"])
     return _Creator(
         kind="external",
         name=name,
         ref=ref,
         location=location,
         provider=provider,
-        v0=_composed_v0(conn, schema, layout, comment),
+        v0=v0,
         catalog=catalog,
         comment=comment,
+        identity_reserved=reserved,
     )
 
 
@@ -251,6 +283,7 @@ def _plan_managed(
         layout["properties"],
         comment,
     )
+    actions, reserved = _reserved_in_v0(actions, *layout["identity"])
     options = store_options(
         engine_options(conn.storage_options, staging.storage_options, staging.location)
     )
@@ -282,6 +315,7 @@ def _plan_managed(
         comment=comment,
         finalize_request=request,
         table_id=staging.table_id,
+        identity_reserved=reserved,
     )
 
 
@@ -330,6 +364,39 @@ def _composed_v0(
                             f"creating it wrote {sorted(action)} after version 0",
                         )
     return actions
+
+
+def _reserved_in_v0(v0: list[str], tasks: int | None, rows_per_task: int) -> tuple[list[str], Any]:
+    """Version 0 with the job's identity values reserved in it, and the reservation.
+
+    A table the write creates has generated nothing, so the job's block of
+    each identity column starts at the column's start, and version 0 itself
+    records the high-water mark past it: no commit of its own, as
+    `Table.plan_write` needs on an existing table. The reservation is
+    ``((0, blocks), slots)``, or ``((), 0)`` when the write reserves none.
+    """
+    from .engine import metadata as meta
+    from .engine.values import _identity_spec, reserve_identity
+    from .table import identity_reservation
+
+    actions = [json.loads(line) for line in v0]
+    metadata = next(a["metaData"] for a in actions if "metaData" in a)
+    protocol = next(a["protocol"] for a in actions if "protocol" in a)
+    fields = json.loads(metadata["schemaString"]).get("fields") or []
+    identity = {
+        f["name"]: _identity_spec(f["name"], f.get("metadata") or {})
+        for f in fields
+        if any(str(k).startswith("delta.identity.") for k in f.get("metadata") or {})
+    }
+    if not identity_reservation(identity, tasks, rows_per_task):
+        return v0, ((), 0)
+    assert tasks is not None
+    state = meta.TableState(version=0, protocol=protocol, metadata=metadata)
+    change, reserved = reserve_identity(state, dict.fromkeys(identity, tasks * rows_per_task))
+    metadata["schemaString"] = change.metadata["schemaString"]
+    blocks = tuple((n, b.first, b.step, b.count) for n, b in sorted(reserved.items()))
+    lines = [json.dumps(a, separators=(",", ":")) for a in actions]
+    return lines, ((0, blocks), tasks)
 
 
 def _metadata_id(actions: list[str]) -> str:
@@ -383,6 +450,8 @@ class _Creator:
     mode: str = "append"
     plan_id: str = ""
     connection: Any = None
+    #: The identity values version 0 reserves for the job (`_reserved_in_v0`).
+    identity_reserved: Any = ((), 0)
 
     # ------------------------------------------------------------ planning
 
@@ -406,7 +475,9 @@ class _Creator:
 
         # Every check a write into the table would get -- features, defaults,
         # txn, commit_metadata -- on the table as it will be.
-        plan: WritePlan = Table(conn, pending).plan_write(mode="append", **planned)
+        plan: WritePlan = Table(conn, pending).plan_write(
+            mode="append", _identity_reserved=self.identity_reserved, **planned
+        )
         return replace(plan, version=0, table_identity=_metadata_id(self.v0), create=self)
 
     def discard(self) -> None:
@@ -445,10 +516,15 @@ class _Creator:
         retries: int,
         abort_on_failure: bool,
     ) -> int:
-        if self.kind == "managed":
-            target = self._finalized(plan, collected, abort_on_failure)
-        else:
-            target = self._published(plan, collected, abort_on_failure)
+        if self.kind != "managed":
+            return self._created(
+                plan,
+                collected,
+                operation=operation,
+                retries=retries,
+                abort_on_failure=abort_on_failure,
+            )
+        target = self._finalized(plan, collected, abort_on_failure)
         if isinstance(target, int):
             return target  # another writer's table, which this write did not join
         version = self._commit_data(
@@ -463,20 +539,83 @@ class _Creator:
             self._register(target)
         return version
 
-    def _published(
-        self, plan: WritePlan, collected: list[bytes], abort_on_failure: bool
-    ) -> WritePlan | int:
-        """Publish version 0 of a path or external table; the plan to commit the files with."""
-        from . import _native
+    def _created(
+        self,
+        plan: WritePlan,
+        collected: list[bytes],
+        *,
+        operation: str,
+        retries: int,
+        abort_on_failure: bool,
+    ) -> int:
+        """Create a path or external table as one commit: version 0 with the job's files.
 
-        # Already there when it conflicts: this plan's, committed before, or
-        # another writer's -- told apart by its metaData id below.
-        with contextlib.suppress(_native.CommitConflictError):
-            _native.commit_raw(self.location, 0, self.v0, options=self._options())
+        No reader ever sees the table without its data. When version 0 is
+        already there, its metaData id says whose: this plan's (an earlier
+        attempt whose answer was lost, which committed the files with it) or
+        another writer's, which the mode decides about (`_joined`).
+        """
+        from . import _native
+        from .distributed import _unknown_outcome
+        from .errors import DeltaSwampError, TransientCommitError
+
+        def published() -> bool:
+            return bool(_native.create_published(self.location, options=self._options()))
+
+        # A table already there is settled first: the template's view of the
+        # location would read that table's log as if it were its own.
+        if not published():
+            try:
+                version: int = plan.engine.commit_files(
+                    plan.table,
+                    collected,
+                    operation="CREATE TABLE AS SELECT",
+                    txn=plan.txn,
+                    commit_metadata=plan.commit_metadata,
+                    table_identity=plan.table_identity,
+                    domain_metadata=plan.domain_metadata,
+                    create_template=self.v0,
+                )
+            except TransientCommitError as exc:
+                # Unknown outcome: committing again finds version 0 and settles it.
+                _unknown_outcome(exc)
+                raise
+            except DeltaSwampError:
+                if not published():
+                    # Nothing at version 0: a failure that committed nothing,
+                    # and no table can reference the files.
+                    if abort_on_failure:
+                        self._abort_files(plan, collected)
+                        self.discard()
+                    raise
+                # Version 0 appeared meanwhile: settled below, by whose it is.
+            else:
+                self._forget_template(plan)
+                if self.kind == "external":
+                    self._register(replace(plan, version=version))
+                return version
         target = self._opened(plan)
-        if target.table_identity != _metadata_id(self.v0):
-            return self._joined(plan, target, collected, abort_on_failure)
-        return target
+        if target.table_identity == _metadata_id(self.v0):
+            # This plan's own version 0, from an attempt whose answer was
+            # lost: it was written with the files.
+            self._forget_template(target)
+            if self.kind == "external":
+                self._register(target)
+            return 0
+        joined = self._joined(plan, target, collected, abort_on_failure)
+        if isinstance(joined, int):
+            return joined  # another writer's table, which this write did not join
+        version = self._commit_data(
+            joined,
+            collected,
+            operation=operation,
+            retries=retries,
+            abort_on_failure=abort_on_failure,
+        )
+        self._forget_template(joined)
+        if self.kind == "external":
+            self._register(joined)
+        return version
 
     def _finalized(
         self, plan: WritePlan, collected: list[bytes], abort_on_failure: bool
@@ -673,6 +812,18 @@ class _Creator:
     def abort(self, plan: WritePlan, collected: list[bytes]) -> int:
         """Delete the job's files and undo the create where nothing else landed."""
         target = self._current(plan)
+        if (
+            self.kind != "managed"
+            and getattr(target.table, "pending_commit", None) is None
+            and target.table_identity == _metadata_id(self.v0)
+        ):
+            # This plan's version 0 is there, and it was written with the
+            # files: the write succeeded.
+            raise UnreachableTableError(
+                "abort these fragments",
+                "their files were committed: they are in version 0 of the table this write created",
+                "keep them; the write succeeded",
+            )
         deleted = self._abort_files(target, collected, raising=True)
         if target is not plan and target.table_identity == _metadata_id(self.v0):
             self._undo(target)

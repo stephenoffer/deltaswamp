@@ -42,9 +42,23 @@ __all__ = ["CredentialBroker"]
 
 
 def _provider_of(table: Any) -> Any:
-    """The credential provider of a Table, a ResolvedTable, or a provider."""
+    """The credential provider of a Table, a ResolvedTable, a plan or a provider.
+
+    A plan's is its table's: for a write that creates its table (a
+    `Connection.plan_write` of a name not there yet), the only place the
+    provider of the table-to-be lives.
+    """
+    planned = getattr(table, "table", None)
+    if hasattr(planned, "credential_provider"):
+        table = planned
     resolved = getattr(table, "_resolved", table)
     return getattr(resolved, "credential_provider", resolved)
+
+
+def _key_of(provider: Any) -> str | None:
+    """What workers ask for `provider`'s table by: its id, else its own key."""
+    key = getattr(provider, "table_id", None) or getattr(provider, "credential_key", None)
+    return str(key) if key else None
 
 
 class CredentialBroker:
@@ -77,14 +91,18 @@ class CredentialBroker:
         provider = _provider_of(table)
         if provider is None:
             raise CredentialError("this table has no credential provider: nothing to broker")
+        portable = getattr(provider, "portable", None)
+        if callable(portable):
+            return portable()
         return shipping(provider)
 
     def add(self, table: Any) -> str:
-        """Serve `table`'s credentials (a Table, a ResolvedTable or a provider).
+        """Serve `table`'s credentials (a Table, a ResolvedTable, a plan or a provider).
 
-        Returns the key workers ask by: the UC table id. Given a warehouse
-        plan, or the `portable()` fetcher of one, serves its result links
-        under ``sql-statement:<statement id>`` instead.
+        Returns the key workers ask by: the UC table id, or for a table a
+        planned write creates, the key its provider names (its location).
+        Given a warehouse plan, or the `portable()` fetcher of one, serves its
+        result links under ``sql-statement:<statement id>`` instead.
         """
         from ..warehouse_scan import STATEMENT_KEY_PREFIX
 
@@ -97,15 +115,15 @@ class CredentialBroker:
                 self._providers[statement_key] = fetcher
             return statement_key
         provider = _provider_of(table)
-        key = getattr(provider, "table_id", None)
+        key = _key_of(provider) if provider is not None else None
         if provider is None or not key:
             raise CredentialError(
-                "only a catalog table with a table id can be brokered; this one has "
-                "no credential provider or no id"
+                "only a catalog table with a table id (or a table a planned write "
+                "creates) can be brokered; this one has no credential provider or no id"
             )
         with self._lock:
-            self._providers[str(key)] = provider
-        return str(key)
+            self._providers[key] = provider
+        return key
 
     def vend(self, table_id: str, operation: str = Operation.READ.value) -> dict[str, Any]:
         """A fresh storage credential for `table_id`, as plain data."""

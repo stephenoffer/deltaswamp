@@ -1245,22 +1245,28 @@ without the domainMetadata feature are refused at planning.
 `Connection.plan_write(name, schema=..., mode=...)` plans a write whether or
 not the table exists. For a new table nothing is visible until the commit:
 workers write under the table's location, and `commit()` creates the table and
-commits the job's files. A path or external table is written as an empty
-version 0 and then the data (an external one is registered after its data is
-in); a managed one is staged when planned and registered by the commit. A
-failed or aborted job deletes its files and undoes the create. If another
-writer creates the table while the job runs, `error` and `overwrite` fail,
-`ignore` keeps theirs, and `append` joins it when the layout matches.
+commits the job's files. A path or external table is created in one commit --
+version 0 holds the protocol, the metadata and the job's files, with row ids,
+in-commit timestamps and clustering as a write would give them -- so no reader
+ever sees it empty (an external one is registered once its data is in). A
+managed one is staged when planned, with its version 0, and registered by the
+commit, which then commits the files through the catalog: the catalog vends the
+staging location's credential once, when it allocates the table, so version 0
+cannot wait for the job. A failed or aborted job deletes its files and undoes
+the create. If another writer creates the table while the job runs, `error`
+and `overwrite` fail, `ignore` keeps theirs, and `append` joins it when the
+layout matches.
 
 ```python
 plan = conn.plan_write("main.sales.orders_2026", schema=schema, mode="error")
 ```
 
 It takes the save mode and `create_table`'s layout arguments (`location`,
-`partition_by`, `cluster_by`, `properties`, `comment`), plus `txn`,
-`commit_metadata`, `ship_catalog_auth` and `supplies_defaults`. Identity
-reservations, domain metadata and `credential_source` need an existing table's
-`Table.plan_write`.
+`partition_by`, `cluster_by`, `properties`, `comment`), plus every argument of
+`Table.plan_write`. For a new table, `identity_tasks` reserves the values in
+version 0 itself (its high-water mark), and a `credential_source` for a new
+external table is asked by the table's location: `broker.add(plan)` serves it
+(`CredentialBroker.portable(plan)` for a broker in another process).
 
 ## Asking what is possible
 
@@ -1504,9 +1510,12 @@ reached.
   locally: the upgraded protocol keeps listing checkConstraints and
   generatedColumns, as Databricks keeps them, which the kernel cannot write,
   so no local engine could write the table afterwards.
-- Identity and default columns are created only through Databricks (a catalog
-  name with the SQL fallback); generated columns are created by delta-rs. Once
-  a table has them, the kernel writes it (appends, overwrites, distributed
+- Identity and literal-default columns are created locally (path and external
+  tables: version 0 is composed here, the feature and typed identity metadata
+  included; managed tables through the catalog's staging flow); generated
+  columns are created by delta-rs. A catalog-managed table created by the
+  kernel's own create path cannot declare identity or default columns. Once a
+  table has them, the kernel writes it (appends, overwrites, distributed
   writes), computing and checking the values; DELETE, UPDATE and MERGE there
   stay with delta-rs or the warehouse.
 - Tables written through delta-rs keep no min/max statistics for decimal

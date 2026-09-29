@@ -167,6 +167,9 @@ pub const FEATURES: &[&str] = &[
     // created by a distributed write, resolved by workers from a template
     // version 0 before it exists, and undone if its data never lands.
     "deferred_create",
+    // `commit_files(create_template=)`: a created table's version 0 written
+    // with the job's files in one put-if-absent (`commit::VersionZeroCommitter`).
+    "create_with_data",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.

@@ -97,17 +97,25 @@ class TestGeneratedAndIdentityColumnsAtCreate:
         with pytest.raises(InvalidArgumentError):
             t.append(pa.table({"id": [4], "g": [99]}))
 
-    def test_identity_columns_are_refused_locally(self, conn: Any, tmp_path: Any) -> None:
+    def test_identity_columns_are_created_with_their_feature(
+        self, conn: Any, tmp_path: Any
+    ) -> None:
+        """LW-2: the metadata never lands without identityColumns, which gives it meaning."""
+        import json
+
         md = {
             "delta.identity.start": "1",
             "delta.identity.step": "1",
             "delta.identity.allowExplicitInsert": "false",
         }
         schema = pa.schema([pa.field("id", pa.int64(), metadata=md), ("v", pa.string())])
-        for props in (None, {"delta.enableDeletionVectors": "true"}):
-            with pytest.raises(UnreachableTableError, match="identity"):
-                conn.create_table(str(tmp_path / "t"), schema, properties=props)
-        assert not os.path.exists(tmp_path / "t" / "_delta_log")
+        for i, props in enumerate((None, {"delta.enableDeletionVectors": "true"})):
+            path = tmp_path / f"t{i}"
+            conn.create_table(str(path), schema, properties=props)
+            with open(path / "_delta_log" / "00000000000000000000.json") as f:
+                actions = [json.loads(line) for line in f]
+            protocol = next(a["protocol"] for a in actions if "protocol" in a)
+            assert "identityColumns" in protocol["writerFeatures"]
 
 
 class TestDecimalStats:
