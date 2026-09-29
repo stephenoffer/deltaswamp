@@ -1617,9 +1617,11 @@ class Table:
         if not (is_pandas or is_polars or stream or isinstance(data, (pa.Table, pa.RecordBatch))):
             return data
         resolved = self._enrich()
-        # A left-out generated or identity column is the engine's to compute.
-        if resolved.writer_features & {"generatedColumns", "identityColumns"}:
-            return data
+        # A left-out generated or identity column is the engine's to compute,
+        # and is never filled here (`computed` below). The table's other
+        # columns are aligned as on any table: returning early left a literal
+        # DEFAULT unfilled, and `_default_needs` then refused every direct
+        # engine a write the kernel serves.
         try:
             target = self.schema()
         except DeltaSwampError:

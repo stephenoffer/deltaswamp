@@ -237,6 +237,54 @@ class TestGeneratedColumnsAndInvariants:
         verdict = conn.open_table(path).can("update")
         assert "kernel" not in (verdict.engine.value if verdict.ok and verdict.engine else "")
 
+    @pytest.mark.parametrize("identity", [False, True])
+    def test_an_append_fills_a_literal_default_beside_computed_columns(
+        self, conn: Any, tmp_path: Any, identity: bool
+    ) -> None:
+        """A local append to a table with a generated (or identity) column and a
+        literal DEFAULT was refused by every engine ("does not support
+        sql_column_defaults"), while a distributed write filled the default."""
+        path = str(tmp_path / "t")
+        features = ["generatedColumns", "allowColumnDefaults"]
+        fields = [
+            _long("v"),
+            _long("g", **{"delta.generationExpression": "v * 2"}),
+            {
+                "name": "dflt",
+                "type": "string",
+                "nullable": True,
+                "metadata": {"CURRENT_DEFAULT": "'x'"},
+            },
+        ]
+        if identity:
+            features.append("identityColumns")
+            fields.append(
+                _long(
+                    "idn",
+                    **{
+                        "delta.identity.start": 1,
+                        "delta.identity.step": 1,
+                        "delta.identity.allowExplicitInsert": False,
+                    },
+                )
+            )
+        _write_log(
+            path, {"minReaderVersion": 1, "minWriterVersion": 7, "writerFeatures": features}, fields
+        )
+        conn.open_table(path).append(pa.table({"v": [1, 2]}))
+        plan = conn.open_table(path).plan_write(**({"identity_tasks": 1} if identity else {}))
+        plan.commit(
+            [_worker(plan).write(pa.table({"v": [3]}), **({"task_index": 0} if identity else {}))]
+        )
+        rows = conn.open_table(path).to_arrow().sort_by("v").to_pylist()
+        assert [(r["v"], r["g"], r["dflt"]) for r in rows] == [
+            (1, 2, "x"),
+            (2, 4, "x"),
+            (3, 6, "x"),
+        ]
+        if identity:
+            assert len({r["idn"] for r in rows}) == 3
+
 
 # ---------------------------------------------------------------- identity
 
