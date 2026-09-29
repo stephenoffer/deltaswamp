@@ -481,6 +481,32 @@ pub fn probe_put_if_absent(url: &Url, options: &HashMap<String, String>) -> Resu
     })
 }
 
+/// The entries directly under `url`: each child's name and whether it is a
+/// directory (a common prefix), through the store the kernel writes with.
+///
+/// For checks made before a table exists, such as refusing to create one in a
+/// directory that already holds other files. Listing through delta-rs there
+/// could not use a GCS bearer token or endpoint: it fell back to ambient
+/// credentials (the GCE metadata server, which timed out off GCP) and so
+/// listed nothing, or listed as a different principal.
+pub fn list_directory(url: &Url, options: &HashMap<String, String>) -> Result<Vec<(String, bool)>> {
+    use delta_kernel::object_store::path::Path;
+
+    let store = build_store(url, options)?;
+    let root = Path::from_url_path(url.path()).map_err(delta_kernel::object_store::Error::from)?;
+    let listing = crate::runtime::block_on(async { store.list_with_delimiter(Some(&root)).await })?;
+    let name = |p: &Path| p.filename().unwrap_or_default().to_string();
+    let mut entries: Vec<(String, bool)> = listing
+        .common_prefixes
+        .iter()
+        .map(|p| (name(p), true))
+        .chain(listing.objects.iter().map(|o| (name(&o.location), false)))
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
 /// Build a GCS store authenticated with a raw OAuth2 bearer token.
 fn build_gcs_with_bearer(
     url: &Url,
@@ -590,6 +616,27 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_directory_lists_its_files_and_subdirectories() {
+        let dir = std::env::temp_dir().join(format!("ds-list-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("_delta_log")).unwrap();
+        std::fs::create_dir_all(dir.join("p=1")).unwrap();
+        std::fs::write(dir.join("p=1").join("a.parquet"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.join("_delta_log").join("0.json"), b"x").unwrap();
+        let url = Url::from_directory_path(&dir).unwrap();
+        let listed = list_directory(&url, &HashMap::new()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                ("_delta_log".to_string(), true),
+                ("notes.txt".to_string(), false),
+                ("p=1".to_string(), true),
+            ]
+        );
     }
 
     #[test]

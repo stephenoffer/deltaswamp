@@ -137,6 +137,20 @@ pub fn probe_put_if_absent(
     Ok(py.detach(|| store::probe_put_if_absent(&url, &options))?)
 }
 
+/// The entries directly under `table_root` in its object store, as
+/// `(name, is_directory)` pairs; see `store::list_directory`.
+#[pyfunction]
+#[pyo3(signature = (table_root, options = None))]
+pub fn list_directory(
+    py: Python<'_>,
+    table_root: &str,
+    options: Option<HashMap<String, String>>,
+) -> PyResult<Vec<(String, bool)>> {
+    let url = PySnapshot::table_root_url(table_root)?;
+    let options = options.unwrap_or_default();
+    Ok(py.detach(|| store::list_directory(&url, &options))?)
+}
+
 /// Refuse retry storage options (`max_retries`, `retry_timeout`,
 /// `backoff_config.*`) that either engine would refuse or panic on.
 ///

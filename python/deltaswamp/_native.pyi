@@ -21,8 +21,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
 "commit_timestamps", "credential_slots", "planned_scan", "values_checked",
 "checkpoint_protection", "domain_metadata", "deferred_create", "create_with_data",
-"geospatial", "iceberg_compat_writes", "change_files", "log_change_feed". Gate on this list,
-not `hasattr`, so a stale build refuses cleanly.
+"geospatial", "iceberg_compat_writes", "change_files", "log_change_feed", "list_directory".
+Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -173,6 +173,15 @@ def set_credential_slot(
 
 def remove_credential_slot(slot: str) -> None:
     """Forget `slot`; stores built from it keep the credential they last saw."""
+
+def list_directory(
+    table_root: str, options: dict[str, str] | None = None
+) -> list[tuple[str, bool]]:
+    """The entries directly under `table_root`: ``(name, is_directory)``, sorted.
+
+    Through the store the kernel writes with, so a vended GCS bearer token, an
+    emulator endpoint or a credential slot applies as it does to the table.
+    """
 
 def probe_put_if_absent(table_root: str, options: dict[str, str] | None = None) -> bool:
     """Whether the store under `table_root` honours put-if-absent.

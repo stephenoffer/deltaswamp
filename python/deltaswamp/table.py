@@ -1083,7 +1083,10 @@ class Table:
         if self._enriched or self._resolved.location is None:
             return self._resolved
 
-        last_error: str | None = None
+        # Every engine's failure, kernel first: keeping only the last one let
+        # delta-rs's "cannot use this credential type" refusal hide the
+        # kernel's actual storage error (an expired token, a 403).
+        errors: list[tuple[EngineKind, str]] = []
         generation = getattr(self, "_generation", 0)
         for kind in (EngineKind.KERNEL, EngineKind.DELTARS):
             engine = self._connection.router.engines.get(kind)
@@ -1094,7 +1097,7 @@ class Table:
             except Exception as exc:
                 # Losing this is how a vending failure turns into an empty
                 # feature set and a confident, wrong "yes".
-                last_error = f"{type(exc).__name__}: {exc}"
+                errors.append((kind, f"{type(exc).__name__}: {exc}"))
                 continue
             # Checked before anything is cached: raising after the cache was
             # filled let the very next call read the re-created table as if
@@ -1120,6 +1123,11 @@ class Table:
             self._enriched = getattr(self, "_generation", 0) == generation
             return self._resolved
 
+        last_error: str | None = None
+        if len(errors) == 1:
+            last_error = errors[0][1]
+        elif errors:
+            last_error = "; ".join(f"{kind.value}: {message}" for kind, message in errors)
         if last_error is not None and self._version is not None:
             self._check_pinned_version_exists(last_error)
         # A failure is not cached: a transient vending or network error used to

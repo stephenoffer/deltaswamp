@@ -185,6 +185,9 @@ pub const FEATURES: &[&str] = &[
     // Writes to IcebergCompatV1/V2 tables, partition values materialized in
     // every data file as the features require (`restate::ICEBERG_COMPAT`).
     "iceberg_compat_writes",
+    // `list_directory`: a location's entries through the kernel's own store
+    // (its credential, endpoint and slot), before any table exists there.
+    "list_directory",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.
@@ -259,6 +262,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(functions::absolute_deletion_vector, m)?)?;
     m.add_function(wrap_pyfunction!(functions::copy_objects, m)?)?;
     m.add_function(wrap_pyfunction!(functions::probe_put_if_absent, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::list_directory, m)?)?;
     m.add_function(wrap_pyfunction!(functions::validate_retry_options, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
