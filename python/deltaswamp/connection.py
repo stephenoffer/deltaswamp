@@ -473,6 +473,31 @@ def _check_local_create_path(name: str) -> None:
         )
 
 
+def _list_natively(
+    location: str, options: Mapping[str, str] | None
+) -> list[tuple[str, bool]] | None:
+    """`location`'s entries through the kernel's store, or None if it cannot say.
+
+    The kernel writes the table, so its store (the credential, endpoint and
+    slot the write will use) is the one to ask. delta-rs cannot use a GCS
+    bearer token or endpoint: it fell back to ambient credentials, which off
+    GCP spent some ten seconds timing out on the metadata server and then
+    listed nothing, and on GCP listed as the machine's own service account.
+    """
+    from .engine.kernel import _native_has
+
+    if not _native_has("list_directory"):
+        return None
+    from . import _native
+    from ._storage import engine_options, store_options
+
+    kernel_options = store_options(engine_options(dict(options or {}), None, location))
+    try:
+        return [(name, is_dir) for name, is_dir in _native.list_directory(location, kernel_options)]
+    except Exception:
+        return None
+
+
 def _refuse_foreign_files(location: str, options: Mapping[str, str] | None = None) -> None:
     """Refuse to create a table where files that are not a Delta table already are.
 
@@ -495,20 +520,24 @@ def _refuse_foreign_files(location: str, options: Mapping[str, str] | None = Non
             return
         listed = [(e.name, e.is_dir()) for e in os.scandir(path)]
     else:
-        try:
-            import pyarrow.fs as pafs
-            from deltalake._internal import DeltaFileSystemHandler
+        listed_natively = _list_natively(location, options)
+        if listed_natively is not None:
+            listed = listed_natively
+        else:
+            try:
+                import pyarrow.fs as pafs
+                from deltalake._internal import DeltaFileSystemHandler
 
-            handler = DeltaFileSystemHandler(location, dict(options or {}))
-            infos = handler.get_file_info_selector("", True, False)
-        except Exception:
-            # Not listable with these credentials (or not at all): the create
-            # itself decides, as before.
-            return
-        listed = [
-            (str(i.path).rstrip("/").rsplit("/", 1)[-1], i.type == pafs.FileType.Directory)
-            for i in infos
-        ]
+                handler = DeltaFileSystemHandler(location, dict(options or {}))
+                infos = handler.get_file_info_selector("", True, False)
+            except Exception:
+                # Not listable with these credentials (or not at all): the
+                # create itself decides, as before.
+                return
+            listed = [
+                (str(i.path).rstrip("/").rsplit("/", 1)[-1], i.type == pafs.FileType.Directory)
+                for i in infos
+            ]
     entries = [
         name
         for name, is_dir in listed

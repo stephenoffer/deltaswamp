@@ -167,6 +167,9 @@ pub const FEATURES: &[&str] = &[
     // created by a distributed write, resolved by workers from a template
     // version 0 before it exists, and undone if its data never lands.
     "deferred_create",
+    // `list_directory`: a location's entries through the kernel's own store
+    // (its credential, endpoint and slot), before any table exists there.
+    "list_directory",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.
@@ -241,6 +244,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(functions::absolute_deletion_vector, m)?)?;
     m.add_function(wrap_pyfunction!(functions::copy_objects, m)?)?;
     m.add_function(wrap_pyfunction!(functions::probe_put_if_absent, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::list_directory, m)?)?;
     m.add_function(wrap_pyfunction!(functions::validate_retry_options, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
