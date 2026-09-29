@@ -15,6 +15,7 @@ import re
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from typing import Any, ClassVar
@@ -464,6 +465,42 @@ def _carries_check_constraints(snapshot: Any) -> bool:
     if int(writer) >= 7:
         return bool(_CHECKED_FEATURES & set(writers or ()))
     return int(writer) >= 3
+
+
+def _distinct_paths(deletions: Any) -> set[str]:
+    """The data files `deletions` (path, row_index) touch: an Arrow table's
+    `path` column, or the paths a `spill.Spill` tracked as it was written."""
+    distinct = getattr(deletions, "distinct", None)
+    if distinct is not None:
+        return {str(p) for p in distinct("path")}
+    return set(deletions.column("path").to_pylist())
+
+
+def _positions_by_file(reader: Any) -> Iterator[tuple[str, Any]]:
+    """`(path, row indexes)` runs of a reader of deletions listed file by file.
+
+    A file's positions may span batches, so a run is yielded as it ends;
+    only one file's positions are held at a time.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    current: str | None = None
+    rows: list[Any] = []
+    for batch in reader:
+        if batch.num_rows == 0:
+            continue
+        paths = batch.column("path")
+        indexes = batch.column("row_index")
+        for path in pc.unique(paths).to_pylist():
+            mine = indexes.filter(pc.equal(paths, path))
+            if path != current:
+                if current is not None:
+                    yield current, pa.chunked_array(rows, pa.int64()).combine_chunks()
+                current, rows = path, []
+            rows.append(pc.cast(mine, pa.int64()))
+    if current is not None:
+        yield current, pa.chunked_array(rows, pa.int64()).combine_chunks()
 
 
 def _constraint_check(snapshot: Any, what: str) -> tuple[Any, dict[str, Any]]:
@@ -2548,21 +2585,43 @@ class KernelEngine:
     #: take on. The rewrite holds the table in memory, so past this size the
     #: warehouse, or delta-rs on a table it can open, is the right tool.
     rewrite_max_bytes = 1 << 30
-    #: The most live data-file bytes a MERGE reads as candidate target rows,
-    #: or a copy-on-write DELETE/UPDATE/MERGE reads back from the files it
-    #: touches. Both are held in memory, so past this the operation is refused
-    #: before anything is read or written, rather than running out of memory.
-    dml_max_bytes = 4 << 30
+    #: An optional cap on the live data-file bytes a MERGE reads as candidate
+    #: target rows, or a copy-on-write DELETE/UPDATE/MERGE reads back from the
+    #: files it touches; past it the operation is refused before anything is
+    #: read or written. None (the default): no cap. Neither is held in memory
+    #: -- a MERGE's rows and a rewrite's go through `dml_spill_directory` --
+    #: so a cap bounds only disk use and running time.
+    dml_max_bytes: int | None = None
+    #: Where a kernel DML spills the rows it does not hold in memory: a
+    #: MERGE's target, source, output and deletion positions, and an UPDATE's
+    #: new rows. None: the system temp directory. It needs room for about as
+    #: much data as the operation reads.
+    dml_spill_directory: str | None = None
+    #: The rows (source plus candidate target, in memory) a kernel MERGE
+    #: evaluates at once. A larger MERGE whose ON condition equates keys is
+    #: split into buckets by the keys' hash, each about this size, spilled to
+    #: `dml_spill_directory` and evaluated one at a time.
+    dml_bucket_bytes = 256 << 20
+    #: The most buckets a MERGE is split into (one spill file per bucket and
+    #: side), whatever its size.
+    dml_max_buckets = 1024
+    #: Touched files a copy-on-write rewrite reads back at a time.
+    dml_rewrite_files = 8
+    #: Bytes of matched rows an UPDATE transforms at a time, before the new
+    #: rows go to the spill.
+    dml_chunk_bytes = 64 << 20
 
     def _refuse_oversized_read(self, what: str, snapshot: Any, **files: Any) -> None:
-        """Raise EngineLimitError when the files `what` would hold exceed `dml_max_bytes`.
+        """Raise EngineLimitError when the files `what` would read exceed `dml_max_bytes`.
 
         `files` selects them as `snapshot.files` does (`predicate=`), or
-        names them (`paths=`).
+        names them (`paths=`). Nothing is checked without a cap.
         """
         import pyarrow as pa
         import pyarrow.compute as pc
 
+        if self.dml_max_bytes is None:
+            return
         paths = files.pop("paths", None)
         listed = pa.table(snapshot.files(**files)).select(["path", "size"])
         if paths is not None:
@@ -2571,7 +2630,7 @@ class KernelEngine:
         if size > self.dml_max_bytes:
             raise EngineLimitError(
                 what,
-                f"it would read {size:,} bytes of data files into memory, above the "
+                f"it would read {size:,} bytes of data files, above the "
                 f"{self.dml_max_bytes:,}-byte limit",
                 "narrow the predicate (or the MERGE source's keys), run it on a table with "
                 "deletion vectors enabled, use ds.connect(..., allow_sql_fallback=True), or "
@@ -2960,7 +3019,6 @@ class KernelEngine:
         makes it conflict rather than be lost.
         """
         import pyarrow as pa
-        import pyarrow.compute as pc
 
         # A pinned handle reads at its version; the commit then conflicts with
         # the later ones and is rebased over them only where Delta's rules
@@ -2996,35 +3054,97 @@ class KernelEngine:
             _dml_row_filter(duck, reader.schema, str(predicate)) if duck is not None else None
         )
 
+        from .spill import SpillDirectory
+
         positions = [_FILE_COLUMN, _ROW_INDEX_COLUMN]
-        matched_batches = []
+        # An UPDATE's matched rows are transformed a chunk at a time and the
+        # new rows spilled, so the rows it rewrites are never all in memory.
+        spills = SpillDirectory(self.dml_spill_directory, "deltaswamp-update-")
+        updated: Any = None
+        matched_batches: list[Any] = []
+        matched_bytes = 0
+
+        def flush() -> None:
+            nonlocal updated, matched_bytes
+            if not matched_batches:
+                return
+            out = transform(pa.Table.from_batches(matched_batches))
+            matched_batches.clear()
+            matched_bytes = 0
+            if updated is None:
+                updated = spills.spill(out.schema, "updated")
+            updated.write(out)
+
         deletion_batches = []
         try:
-            for batch in reader:
-                if row_filter is not None and batch.num_rows:
-                    batch = row_filter(batch)
-                if batch.num_rows == 0:
-                    continue
-                deletion_batches.append(
-                    pa.record_batch(
-                        [batch.column(_FILE_COLUMN), batch.column(_ROW_INDEX_COLUMN)],
-                        names=["path", "row_index"],
+            try:
+                for batch in reader:
+                    if row_filter is not None and batch.num_rows:
+                        batch = row_filter(batch)
+                    if batch.num_rows == 0:
+                        continue
+                    deletion_batches.append(
+                        pa.record_batch(
+                            [batch.column(_FILE_COLUMN), batch.column(_ROW_INDEX_COLUMN)],
+                            names=["path", "row_index"],
+                        )
                     )
-                )
+                    if transform is not None:
+                        matched = batch.drop_columns(positions)
+                        matched_batches.append(matched)
+                        matched_bytes += matched.nbytes
+                        if matched_bytes >= self.dml_chunk_bytes:
+                            flush()
                 if transform is not None:
-                    matched_batches.append(batch.drop_columns(positions))
-        except sqlpred.PredicateError as exc:
-            if row_filter is None:
-                raise
-            raise _dml_data_error(f"the predicate {predicate!r}", exc) from exc
+                    flush()
+            except sqlpred.PredicateError as exc:
+                if row_filter is None:
+                    raise
+                raise _dml_data_error(f"the predicate {predicate!r}", exc) from exc
+            finally:
+                if row_filter is not None:
+                    row_filter.close()
+            return self._commit_dv_rows(
+                table,
+                snapshot,
+                schema,
+                deletion_batches,
+                updated.finish() if updated is not None else None,
+                operation=operation,
+                replacement=replacement,
+                predicate=predicate,
+                skipping=skipping,
+                txn=txn,
+                commit_metadata=commit_metadata,
+                engine_info=engine_info,
+            )
         finally:
-            if row_filter is not None:
-                row_filter.close()
-        touched = sum(b.num_rows for b in deletion_batches)
+            spills.close()
 
+    def _commit_dv_rows(
+        self,
+        table: ResolvedTable,
+        snapshot: Any,
+        schema: Any,
+        deletion_batches: list[Any],
+        updated: Any,
+        *,
+        operation: str,
+        replacement: Any,
+        predicate: str | None,
+        skipping: str | None,
+        txn: tuple[str, int] | None,
+        commit_metadata: dict[str, Any] | None,
+        engine_info: str | None,
+    ) -> dict[str, Any]:
+        """`_dv_dml`'s commit: the matched positions, and the rows that replace them."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        touched = sum(b.num_rows for b in deletion_batches)
         data = None
-        if transform is not None and matched_batches:
-            data = transform(pa.Table.from_batches(matched_batches))
+        if updated is not None and updated.num_rows:
+            data = updated
         elif replacement is not None:
             data_schema = pa.schema([f for f in schema])
             data = _conform(replacement, data_schema)
@@ -3132,21 +3252,30 @@ class KernelEngine:
         On a table without deletion vectors enabled the same change is written
         copy-on-write instead (`_as_file_rewrites`): every touched file is
         removed, and its surviving rows are written again with `data`.
+
+        `deletions` and `data` are Arrow tables, or rows too large to hold
+        (`spill.Spill`, `spill.Rows`): anything with `to_reader()`, read again
+        by each attempt, and streamed into the new files as they are written.
         """
         if deletions.num_rows and not self._dv_path(table):
             deletions, data, whole_files = self._as_file_rewrites(
                 table, snapshot, deletions, data, whole_files
             )
-        touched = set(deletions.column("path").to_pylist()) | set(whole_files or ())
+        touched = _distinct_paths(deletions) | set(whole_files or ())
         attempt = 0
         # Checked once: a rebase is refused over a commit that changed the
         # metadata, so every snapshot the commit is tried on has these
         # constraints.
         check, checked = _constraint_check(snapshot, f"the {operation}")
         if check is not None and data is not None:
-            check.check_table(data)
+            try:
+                for batch in data.to_reader():
+                    check.check(batch)
+            finally:
+                check.close()
         elif check is not None:
             check.close()
+        streamed = {"stream_data": True} if _native_has("dml_stream") else {}
         try:
             while True:
                 try:
@@ -3163,6 +3292,7 @@ class KernelEngine:
                             or None,
                             **_dml_info(operation, predicate, snapshot),
                             **checked,
+                            **streamed,
                         )
                     break
                 except CommitConflictError:
@@ -3204,36 +3334,30 @@ class KernelEngine:
         rows of `data` without an id (inserted ones) get a fresh one, as the
         protocol asks; an updated row brings its id, and its commit version is
         this commit's.
+
+        Nothing is held whole: the touched files are read back
+        `dml_rewrite_files` at a time, each with the deleted positions of
+        those files only, and the rows come out as a `spill.Rows` that each
+        commit attempt reads again. `deletions` must list each file's
+        positions together: a table is sorted here, and a `spill.Spill`
+        comes sorted by path (a MERGE writes it so).
         """
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        paths = sorted(set(deletions.column("path").to_pylist()))
+        from .spill import Rows
+
+        if isinstance(deletions, pa.Table):
+            deletions = deletions.sort_by([("path", "ascending"), ("row_index", "ascending")])
+        paths = sorted(_distinct_paths(deletions))
         self._refuse_oversized_read("copy-on-write rewrite on the kernel", snapshot, paths=paths)
         tracked = _row_tracking_enabled(table) and "rowTracking" in table.effective_writer_features
         extra = {"row_tracking": True} if tracked else {}
-        read = pa.table(snapshot.scan(files=paths, row_positions=True, **extra))
-        catalog = pa.array(paths, pa.string())
-
-        def keys(files: Any, rows: Any) -> Any:
-            # (file, physical row index) as one integer: the file's place in
-            # `paths` above the 40 bits a Parquet file's row count fits in.
-            ids = pc.cast(pc.index_in(pc.cast(files, pa.string()), value_set=catalog), pa.int64())
-            return pc.add(pc.shift_left(ids, 40), pc.cast(rows, pa.int64()))
-
-        gone = keys(deletions.column("path"), deletions.column("row_index"))
-        kept = read.filter(
-            pc.invert(
-                pc.is_in(
-                    keys(read.column(_FILE_COLUMN), read.column(_ROW_INDEX_COLUMN)),
-                    value_set=pc.unique(gone),
-                )
-            )
-        ).drop_columns([_FILE_COLUMN, _ROW_INDEX_COLUMN])
         carried = [_ROW_ID_COLUMN, _ROW_COMMIT_VERSION_COLUMN] if tracked else []
         schema = pa.schema(
             [*_arrow_schema(snapshot), *(pa.field(name, pa.int64()) for name in carried)]
         )
+        step = max(1, int(self.dml_rewrite_files))
 
         def conformed(part: Any) -> Any:
             columns = []
@@ -3245,10 +3369,57 @@ class KernelEngine:
                     columns.append(pa.nulls(part.num_rows, field.type))
             return pa.Table.from_arrays(columns, schema=schema)
 
-        parts = [conformed(kept)] + ([conformed(data)] if data is not None else [])
-        rewritten = pa.concat_tables(parts)
+        def produce() -> Iterator[Any]:
+            groups = _positions_by_file(deletions.to_reader())
+            pending = next(groups, None)
+            for start in range(0, len(paths), step):
+                chunk = paths[start : start + step]
+                catalog = pa.array(chunk, pa.string())
+
+                def keys(files: Any, rows: Any, catalog: Any = catalog) -> Any:
+                    # (file, physical row index) as one integer: the file's
+                    # place in the chunk above the 40 bits a Parquet file's
+                    # row count fits in.
+                    ids = pc.cast(
+                        pc.index_in(pc.cast(files, pa.string()), value_set=catalog), pa.int64()
+                    )
+                    return pc.add(pc.shift_left(ids, 40), pc.cast(rows, pa.int64()))
+
+                gone = []
+                for index, path in enumerate(chunk):
+                    while pending is not None and pending[0] < path:
+                        pending = next(groups, None)
+                    while pending is not None and pending[0] == path:
+                        base = pa.scalar(index << 40, pa.int64())
+                        gone.append(pc.add(pc.cast(pending[1], pa.int64()), base))
+                        pending = next(groups, None)
+                value_set = (
+                    pc.unique(pa.chunked_array(gone, pa.int64()).combine_chunks())
+                    if gone
+                    else pa.array([], pa.int64())
+                )
+                read = pa.RecordBatchReader.from_stream(
+                    snapshot.scan(files=chunk, row_positions=True, **extra)
+                )
+                for batch in read:
+                    if batch.num_rows == 0:
+                        continue
+                    drop = pc.is_in(
+                        keys(batch.column(_FILE_COLUMN), batch.column(_ROW_INDEX_COLUMN)),
+                        value_set=value_set,
+                    )
+                    kept = pa.Table.from_batches([batch]).filter(pc.invert(drop))
+                    kept = kept.drop_columns([_FILE_COLUMN, _ROW_INDEX_COLUMN])
+                    if kept.num_rows:
+                        yield from conformed(kept).to_batches()
+            if data is not None:
+                for batch in data.to_reader():
+                    if batch.num_rows:
+                        yield from conformed(pa.Table.from_batches([batch])).to_batches()
+
         files = sorted(set(paths) | set(whole_files or ()))
-        return deletions.slice(0, 0), rewritten if rewritten.num_rows else None, files
+        empty = pa.table({"path": pa.array([], pa.string()), "row_index": pa.array([], pa.int64())})
+        return empty, Rows(schema, produce), files
 
     #: Re-commits of a DELETE/UPDATE/MERGE that lost to writers which left
     #: every file it touched alone and added nothing it should have read.

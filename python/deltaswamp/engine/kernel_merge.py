@@ -38,10 +38,22 @@ parsed for `target.col = source.col` conjuncts, and the target is skipped
 with `col IN (<the source's values>)`, which the ON condition implies, so no
 file holding a match can be skipped. A NOT MATCHED BY SOURCE clause needs
 every target row, and turns skipping off.
+
+A MERGE larger than memory runs in buckets, as Spark shuffles one. When the ON
+condition equates target and source keys, the source and the target rows it
+may match are hash-partitioned by those keys into local spill files
+(`KernelEngine.dml_spill_directory`), and the clauses are evaluated one bucket
+at a time: a row can match only rows of its own bucket, so each bucket is a
+complete MERGE of its rows, and only one is ever in memory. A source given as
+a RecordBatchReader or a pyarrow dataset is streamed into the buckets, never
+held whole. Without such keys, or when it fits in one bucket, the MERGE runs
+at once, in memory.
 """
 
 from __future__ import annotations
 
+import itertools
+import math
 from typing import Any
 
 from ..errors import EngineLimitError, InvalidArgumentError, UnreachableTableError
@@ -60,6 +72,10 @@ _POS_FILE = "__deltaswamp_pos_file"
 _POS_INDEX = "__deltaswamp_pos_row_index"
 #: The most distinct join-key values turned into a skipping IN-list.
 _SKIP_VALUES_LIMIT = 10_000
+#: Rows hashed into buckets at once, and each bucket's rows buffered before
+#: they are written to its spill (see `KernelMerger._partition`).
+_HASH_ROWS = 65_536
+_PART_BYTES = 8 << 20
 
 
 def _quote(name: str) -> str:
@@ -109,7 +125,17 @@ class KernelMerger:
             )
         self._engine = engine
         self._table = table
-        self._source = pa.table(source) if not isinstance(source, pa.Table) else source
+        #: A source too large to hold is streamed (a reader, a pyarrow
+        #: dataset), read once into the MERGE's spill; anything else is an
+        #: Arrow table from the start, as it always was.
+        self._source_stream: Any = None
+        if isinstance(source, pa.RecordBatchReader) or _is_dataset(source):
+            self._source_stream = source
+            self._source_schema = source.schema
+        else:
+            table_source = pa.table(source) if not isinstance(source, pa.Table) else source
+            self._source_table = table_source
+            self._source_schema = table_source.schema
         self._predicate = predicate
         #: SQL DuckDB cannot be made to evaluate as Spark does, found while the
         #: clauses were added; raised at execute, before anything is read or
@@ -196,7 +222,6 @@ class KernelMerger:
     # -------------------------------------------------------------- execution
 
     def execute(self) -> dict[str, Any]:
-        import duckdb
         import pyarrow as pa
 
         if not self._clauses:
@@ -216,17 +241,105 @@ class KernelMerger:
             if kind != "not_matched"
         )
 
-        skipping = self._skipping(schema)
-        engine._refuse_oversized_read(
-            "merge on the kernel",
-            snapshot,
-            **({"predicate": skipping} if skipping is not None else {}),
+        from .spill import SpillDirectory
+
+        with SpillDirectory(engine.dml_spill_directory, "deltaswamp-merge-") as spills:
+            source = self._numbered_source(spills)
+            skipping = self._skipping(schema, source)
+            engine._refuse_oversized_read(
+                "merge on the kernel",
+                snapshot,
+                **({"predicate": skipping} if skipping is not None else {}),
+            )
+            extra = {"row_ids": True} if row_ids else {}
+            keys = self._bucket_keys(schema)
+            scan = pa.RecordBatchReader.from_stream(
+                snapshot.scan(predicate=skipping, row_positions=True, **extra)
+            )
+            # The first batch sizes the buckets, then goes back in front: the
+            # scan is read once, lazily.
+            first = next((b for b in scan if b.num_rows), None)
+            rest = pa.RecordBatchReader.from_batches(
+                scan.schema, itertools.chain([first] if first is not None else [], scan)
+            )
+            buckets = self._bucket_count(snapshot, skipping, source, keys, first)
+            if buckets == 1:
+                target = rest.read_all()
+                deletions, data, metrics = self._run(
+                    target, _as_table(source, self._numbered_schema()), schema, row_ids
+                )
+            else:
+                deletions, data, metrics = self._run_bucketed(
+                    spills, rest, source, schema, row_ids, keys, buckets
+                )
+
+            if deletions.num_rows == 0 and (data is None or data.num_rows == 0):
+                return {**metrics, "version": int(snapshot.version)}
+            result_version = engine._commit_dv_changes(
+                table,
+                snapshot,
+                deletions,
+                data,
+                operation="MERGE",
+                # The rows read are the ones this bounds, so only files it keeps
+                # can hold a row a concurrent MERGE added that this one must see.
+                read_predicate=skipping,
+                predicate=self._predicate,
+                **self._passthrough,
+            )
+            return {**metrics, "version": int(result_version)}
+
+    # ------------------------------------------------------------ the source
+
+    def _numbered_schema(self) -> Any:
+        import pyarrow as pa
+
+        return pa.schema([*self._source_schema, pa.field(_SRC_ROW, pa.int64())])
+
+    def _numbered_source(self, spills: Any) -> Any:
+        """The source with each row's number (`_SRC_ROW`) beside it: an Arrow
+        table, or for a streamed source a spill read once from the stream."""
+        import pyarrow as pa
+
+        if self._source_stream is None:
+            source = self._source_table
+            return source.append_column(_SRC_ROW, pa.array(range(source.num_rows), pa.int64()))
+        stream = self._source_stream
+        reader = (
+            stream if isinstance(stream, pa.RecordBatchReader) else stream.scanner().to_reader()
         )
-        extra = {"row_ids": True} if row_ids else {}
-        target = pa.table(snapshot.scan(predicate=skipping, row_positions=True, **extra))
-        source = self._source.append_column(
-            _SRC_ROW, pa.array(range(self._source.num_rows), pa.int64())
-        )
+        schema = self._numbered_schema()
+        # Held while it fits in one bucket, which a small MERGE's source
+        # always does; spilled from the batch that passes it.
+        held: list[Any] = []
+        held_bytes = 0
+        spill = None
+        numbered = 0
+        for batch in reader:
+            if batch.num_rows == 0:
+                continue
+            rows = pa.array(range(numbered, numbered + batch.num_rows), pa.int64())
+            numbered += batch.num_rows
+            batch = pa.RecordBatch.from_arrays([*batch.columns, rows], schema=schema)
+            if spill is not None:
+                spill.write(batch)
+                continue
+            held.append(batch)
+            held_bytes += batch.nbytes
+            if held_bytes > int(self._engine.dml_bucket_bytes):
+                spill = spills.spill(schema, "source")
+                for part in held:
+                    spill.write(part)
+                held.clear()
+        if spill is None:
+            return pa.Table.from_batches(held, schema=schema)
+        return spill.finish()
+
+    # ------------------------------------------------------------ evaluation
+
+    def _run(self, target: Any, source: Any, schema: Any, row_ids: bool) -> tuple[Any, Any, Any]:
+        """The clauses over `target` and `source`, both in memory: (deletions, data, metrics)."""
+        import duckdb
 
         from .dialect import install_duckdb_macros
 
@@ -248,7 +361,7 @@ class KernelMerger:
             con.register("__target", target)
             con.register("__source", source)
             con.execute("SET lock_configuration = true")
-            result = self._evaluate(con, schema, target, row_ids)
+            deletions, data, metrics = self._evaluate(con, schema, target, row_ids)
         except (
             duckdb.ParserException,
             duckdb.BinderException,
@@ -270,25 +383,194 @@ class KernelMerger:
             raise InvalidArgumentError(f"the MERGE failed evaluating its clauses: {exc}") from exc
         finally:
             con.close()
-        deletions, data, metrics = result
+        metrics["num_source_rows"] = source.num_rows
+        return deletions, data, metrics
 
-        if deletions.num_rows == 0 and (data is None or data.num_rows == 0):
-            return {**metrics, "version": int(snapshot.version)}
-        result_version = engine._commit_dv_changes(
-            table,
-            snapshot,
-            deletions,
-            data,
-            operation="MERGE",
-            # The rows read are the ones this bounds, so only files it keeps
-            # can hold a row a concurrent MERGE added that this one must see.
-            read_predicate=skipping,
-            predicate=self._predicate,
-            **self._passthrough,
+    def _run_bucketed(
+        self,
+        spills: Any,
+        scan: Any,
+        source: Any,
+        schema: Any,
+        row_ids: bool,
+        keys: list[tuple[str, str, Any]],
+        buckets: int,
+    ) -> tuple[Any, Any, Any]:
+        """The MERGE a bucket at a time: source and target rows partitioned by
+        the hash of their join keys, each bucket evaluated on its own."""
+        import pyarrow as pa
+
+        hasher = _BucketHasher(buckets)
+        try:
+            source_parts = self._partition(
+                spills,
+                "s",
+                _batches(source),
+                self._numbered_schema(),
+                hasher,
+                [(name, common) for _, name, common in keys],
+            )
+            target_parts = self._partition(
+                spills,
+                "t",
+                scan,
+                scan.schema,
+                hasher,
+                [(name, common) for name, _, common in keys],
+            )
+        finally:
+            hasher.close()
+
+        deletions: list[Any] = []
+        data = None
+        totals: dict[str, int] = {}
+        for bucket in range(buckets):
+            target_part, source_part = target_parts[bucket], source_parts[bucket]
+            if target_part.num_rows == 0 and source_part.num_rows == 0:
+                continue
+            done, out, metrics = self._run(
+                _as_table(target_part, target_part.schema),
+                _as_table(source_part, source_part.schema),
+                schema,
+                row_ids,
+            )
+            target_part.close()
+            source_part.close()
+            deletions.append(done)
+            if out is not None and out.num_rows:
+                if data is None:
+                    data = spills.spill(out.schema, "data")
+                data.write(out)
+            for key, value in metrics.items():
+                totals[key] = totals.get(key, 0) + int(value)
+        deletion_schema = pa.schema([("path", pa.string()), ("row_index", pa.int64())])
+        deleted = (
+            pa.concat_tables([d.cast(deletion_schema) for d in deletions])
+            if deletions
+            else deletion_schema.empty_table()
         )
-        return {**metrics, "version": int(result_version)}
+        return deleted, data.finish() if data is not None else None, totals
 
-    def _skipping(self, schema: Any) -> str | None:
+    def _partition(
+        self,
+        spills: Any,
+        prefix: str,
+        batches: Any,
+        schema: Any,
+        hasher: _BucketHasher,
+        keys: list[tuple[str, Any]],
+    ) -> list[Any]:
+        """`batches` split into one spill per bucket by the hash of `keys`.
+
+        A scan yields small batches, so they are hashed a few thousand rows
+        at a time and each bucket's rows are buffered to `_PART_BYTES`
+        before they are written: a spill of many tiny row groups is slow to
+        write and to read back.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        parts = [spills.spill(schema, f"{prefix}{i}") for i in range(hasher.buckets)]
+        buffered: list[list[Any]] = [[] for _ in range(hasher.buckets)]
+        sizes = [0] * hasher.buckets
+
+        def write(index: int) -> None:
+            if buffered[index]:
+                parts[index].write(pa.Table.from_batches(buffered[index]))
+                buffered[index].clear()
+                sizes[index] = 0
+
+        def partition(held: list[Any]) -> None:
+            batch = pa.Table.from_batches(held).combine_chunks().to_batches()[0]
+            bucket = hasher(batch, keys)
+            for index in range(hasher.buckets):
+                part = batch.filter(pc.equal(bucket, index))
+                if part.num_rows:
+                    buffered[index].append(part)
+                    sizes[index] += part.nbytes
+                    if sizes[index] >= _PART_BYTES:
+                        write(index)
+
+        held: list[Any] = []
+        rows = 0
+        for batch in batches:
+            if batch.num_rows == 0:
+                continue
+            held.append(batch)
+            rows += batch.num_rows
+            if rows >= _HASH_ROWS:
+                partition(held)
+                held, rows = [], 0
+        if held:
+            partition(held)
+        for index in range(hasher.buckets):
+            write(index)
+        return [part.finish() for part in parts]
+
+    def _bucket_keys(self, schema: Any) -> list[tuple[str, str, Any]]:
+        """(target column, source column, common type) for each key the ON
+        condition equates whose values hash alike on both sides; [] if none."""
+        from .. import predicate as sqlpred
+
+        try:
+            node = sqlpred.parse(self._predicate)
+        except Exception:
+            return []
+        conjuncts = list(node.args) if node.op == "and" else [node]
+        target, source = self._target_alias.lower(), self._source_alias.lower()
+        targets = {f.name.lower(): f.name for f in schema}
+        sources = {name.lower(): name for name in self._source_schema.names}
+        keys = []
+        for part in conjuncts:
+            if part.op != "eq" or len(part.args) != 2:
+                continue
+            sides = {}
+            for arg in part.args:
+                if isinstance(arg, sqlpred.Column) and len(arg.path) == 2:
+                    sides[arg.path[0].lower()] = arg.path[1].lower()
+            if set(sides) != {target, source}:
+                continue
+            column, key = targets.get(sides[target]), sources.get(sides[source])
+            if column is None or key is None:
+                continue
+            common = _hash_type(schema.field(column).type, self._source_schema.field(key).type)
+            if common is not None:
+                keys.append((column, key, common))
+        return keys
+
+    def _bucket_count(
+        self,
+        snapshot: Any,
+        skipping: str | None,
+        source: Any,
+        keys: list[Any],
+        first: Any = None,
+    ) -> int:
+        """How many buckets keep each one near `KernelEngine.dml_bucket_bytes`.
+
+        The candidate target's size in memory is its row count (from the
+        files' statistics) times the bytes per row of the scan's `first`
+        batch: Parquet compresses repetitive data by far more than any fixed
+        ratio. Without statistics, four times the files' size.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        if not keys:
+            return 1
+        listed = pa.table(
+            snapshot.files(**({"predicate": skipping} if skipping is not None else {}))
+        ).select(["size", "num_records"])
+        target = 4 * int(pc.sum(listed.column("size")).as_py() or 0)
+        records = listed.column("num_records")
+        if first is not None and first.num_rows and records.null_count == 0:
+            per_row = first.nbytes / first.num_rows
+            target = max(target, int(per_row * int(pc.sum(records).as_py() or 0)))
+        size = target + int(getattr(source, "nbytes", 0) or 0)
+        wanted = math.ceil(size / max(1, int(self._engine.dml_bucket_bytes)))
+        return max(1, min(int(self._engine.dml_max_buckets), wanted))
+
+    def _skipping(self, schema: Any, source: Any = None) -> str | None:
         """A kernel skipping predicate the ON condition implies, or None.
 
         Only target rows some source row can match are read: each
@@ -301,7 +583,10 @@ class KernelMerger:
         """
         from .. import predicate as sqlpred
 
-        bounds = self._key_bounds(schema)
+        if source is None:
+            # The source as given: a streamed one is bounded once spilled.
+            source = getattr(self, "_source_table", None)
+        bounds = self._key_bounds(schema, source) if source is not None else []
         if not self._by_source_conditions:
             if not bounds:
                 return None
@@ -342,10 +627,9 @@ class KernelMerger:
 
         return walk(node)
 
-    def _key_bounds(self, schema: Any) -> list[str]:
+    def _key_bounds(self, schema: Any, rows: Any) -> list[str]:
         """``col IN (...)`` / ``col BETWEEN lo AND hi`` for each key the ON clause equates."""
         import pyarrow as pa
-        import pyarrow.compute as pc
 
         from .. import predicate as sqlpred
 
@@ -356,7 +640,7 @@ class KernelMerger:
         conjuncts = list(node.args) if node.op == "and" else [node]
         target, source = self._target_alias.lower(), self._source_alias.lower()
         targets = {f.name.lower(): f.name for f in schema}
-        sources = {name.lower(): name for name in self._source.column_names}
+        sources = {name.lower(): name for name in self._source_schema.names}
         parts: list[str] = []
         for part in conjuncts:
             if part.op != "eq" or len(part.args) != 2:
@@ -370,26 +654,24 @@ class KernelMerger:
             column, key = targets.get(sides[target]), sources.get(sides[source])
             if column is None or key is None:
                 continue
-            values = pc.unique(self._source.column(key).drop_null())
-            if len(values) == 0:
-                continue
-            if not _same_comparison_type(values.type, schema.field(column).type):
+            if not _same_comparison_type(
+                self._source_schema.field(key).type, schema.field(column).type
+            ):
                 # The ON clause compares with type coercion ('01' = 1 is
                 # true), while a bound cast to the target's type is 1 -> '1':
                 # the file holding '01' was skipped, its row read as
                 # unmatched, and the source row inserted a second time.
                 continue
-            try:
-                values = values.cast(schema.field(column).type)
-            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            found = _key_values(rows, key, schema.field(column).type)
+            if found is None:
                 continue
-            if len(values) > _SKIP_VALUES_LIMIT:
-                if pa.types.is_floating(values.type):
+            values, bounds = found
+            if values is not None and len(values) == 0:
+                continue
+            if values is None:
+                if pa.types.is_floating(schema.field(column).type):
                     continue  # NaN sorts above every bound; leave it unbounded
-                try:
-                    low, high = (v.as_py() for v in pc.min_max(values).values())
-                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-                    continue
+                low, high = bounds
                 ends = [_sql_literal(low), _sql_literal(high)]
                 if any(e is None for e in ends):
                     continue
@@ -524,7 +806,8 @@ class KernelMerger:
             )
             data = pa.concat_tables([_cast_to(o, target_schema, self._variants) for o in outputs])
         metrics = {
-            "num_source_rows": self._source.num_rows,
+            # Filled in by `_run` from the rows it was given.
+            "num_source_rows": 0,
             "num_target_rows_updated": counts["updated"],
             "num_target_rows_deleted": counts["deleted"],
             "num_target_rows_inserted": counts["inserted"],
@@ -549,7 +832,7 @@ class KernelMerger:
         if value is _DEFAULT:
             # A column named `default` wins over the keyword, as on Databricks.
             for alias, names in (
-                (self._source_alias, self._source.column_names),
+                (self._source_alias, self._source_schema.names),
                 (self._target_alias, schema.names),
             ):
                 named = [n for n in names if n.lower() == "default"]
@@ -602,7 +885,7 @@ class KernelMerger:
         warehouse would not have.
         """
         excluded = {str(c).lower() for c in except_cols}
-        sources = {n.lower(): n for n in self._source.column_names if n != _SRC_ROW}
+        sources = {n.lower(): n for n in self._source_schema.names if n != _SRC_ROW}
         missing = [c for c in columns if c.lower() not in sources and c.lower() not in excluded]
         if missing:
             raise InvalidArgumentError(
@@ -610,6 +893,160 @@ class KernelMerger:
                 f"{', '.join(missing)}; add them to the source, or spell the clause out"
             )
         return {c: sources[c.lower()] for c in columns if c.lower() not in excluded}
+
+
+def _is_dataset(source: Any) -> bool:
+    try:
+        import pyarrow.dataset as pads
+    except ImportError:  # pragma: no cover - pyarrow ships the module
+        return False
+    return isinstance(source, pads.Dataset)
+
+
+def _batches(rows: Any) -> Any:
+    """The record batches of an Arrow table or a `spill.Spill`."""
+    import pyarrow as pa
+
+    if isinstance(rows, pa.Table):
+        return rows.to_batches()
+    return rows.batches()
+
+
+def _as_table(rows: Any, schema: Any) -> Any:
+    """An Arrow table or a `spill.Spill` (small enough to hold) as a table."""
+    import pyarrow as pa
+
+    if isinstance(rows, pa.Table):
+        return rows
+    return pa.Table.from_batches(list(rows.batches()), schema=rows.schema)
+
+
+def _key_values(source: Any, key: str, target: Any) -> tuple[Any, Any] | None:
+    """The distinct non-null values of `source`'s `key`, cast to `target`:
+    ``(values, None)``, or ``(None, (low, high))`` past `_SKIP_VALUES_LIMIT`
+    of them. None when a value does not cast, or the bounds cannot be taken.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    failures = (pa.ArrowInvalid, pa.ArrowNotImplementedError)
+    if isinstance(source, pa.Table):
+        values = pc.unique(source.column(key).drop_null())
+        try:
+            values = values.cast(target)
+        except failures:
+            return None
+        if len(values) <= _SKIP_VALUES_LIMIT:
+            return values, None
+        try:
+            low, high = (v.as_py() for v in pc.min_max(values).values())
+        except failures:
+            return None
+        return None, (low, high)
+    # A spilled source, read batch by batch: the distinct values are kept
+    # only up to the limit, then just the running bounds.
+    uniques: list[Any] = []
+    held = 0
+    ends: list[Any] = []
+    over = False
+    for batch in source.batches():
+        column = batch.column(batch.schema.get_field_index(key)).drop_null()
+        if len(column) == 0:
+            continue
+        try:
+            column = column.cast(target)
+        except failures:
+            return None
+        if not over:
+            uniques.append(pc.unique(column))
+            held += len(uniques[-1])
+            if held > _SKIP_VALUES_LIMIT:
+                merged = pc.unique(pa.chunked_array(uniques, target).combine_chunks())
+                uniques, held = [merged], len(merged)
+                over = held > _SKIP_VALUES_LIMIT
+                if over:
+                    column = merged
+        if over:
+            try:
+                ends.extend(v for v in pc.min_max(column).values())
+            except failures:
+                return None
+    if not over:
+        if not uniques:
+            return pa.array([], target), None
+        return pc.unique(pa.chunked_array(uniques, target).combine_chunks()), None
+    try:
+        low, high = (
+            v.as_py() for v in pc.min_max(pa.array([e.as_py() for e in ends], target)).values()
+        )
+    except failures:
+        return None
+    return None, (low, high)
+
+
+def _hash_type(target: Any, source: Any) -> Any:
+    """The type both sides of a join key are hashed as, or None where equal
+    values could hash apart (the ON comparison coerces between the types, or
+    floats, where -0.0 = 0.0)."""
+    import pyarrow as pa
+
+    types = pa.types
+    if types.is_integer(target) and types.is_integer(source):
+        if pa.uint64() in (target, source):
+            return None
+        return pa.int64()
+    stringy = (types.is_string, types.is_large_string, lambda t: str(t) == "string_view")
+    if any(f(target) for f in stringy) and any(f(source) for f in stringy):
+        return pa.large_string()
+    if types.is_date(target) and types.is_date(source):
+        return pa.date32()
+    if types.is_boolean(target) and types.is_boolean(source):
+        return pa.bool_()
+    if (types.is_timestamp(target) or types.is_decimal(target)) and target == source:
+        return target
+    return None
+
+
+class _BucketHasher:
+    """The bucket of each row, from the hash of its join keys (DuckDB's `hash`,
+    over the keys cast to their common type, so equal keys meet)."""
+
+    def __init__(self, buckets: int) -> None:
+        import duckdb
+
+        self.buckets = buckets
+        # Only this module's own SQL runs here; locked down all the same.
+        self._con = duckdb.connect(
+            ":memory:",
+            config={
+                "enable_external_access": False,
+                "autoinstall_known_extensions": False,
+                "autoload_known_extensions": False,
+            },
+        )
+
+    def __call__(self, batch: Any, keys: list[tuple[str, Any]]) -> Any:
+        import pyarrow as pa
+
+        columns = {
+            f"k{i}": batch.column(batch.schema.get_field_index(name)).cast(common)
+            for i, (name, common) in enumerate(keys)
+        }
+        self._con.register("__keys", pa.table(columns))
+        try:
+            # `.arrow()` is a reader on DuckDB 1.4 and later (see `_fetch`).
+            hashed = pa.table(
+                self._con.execute(
+                    f"SELECT CAST(hash({', '.join(columns)}) % {self.buckets} AS BIGINT) AS b "
+                    "FROM __keys"
+                ).arrow()
+            )
+        finally:
+            self._con.unregister("__keys")
+        return hashed.column("b").combine_chunks()
+
+    def close(self) -> None:
+        self._con.close()
 
 
 def _fetch(con: Any, sql: str) -> Any:
