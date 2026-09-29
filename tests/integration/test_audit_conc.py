@@ -234,9 +234,10 @@ def _append_row(path: str, key: int) -> Any:
 @pytest.mark.parametrize(
     ("properties", "expected"),
     [
-        # The copy-on-write DELETE runs again on the new snapshot: ordered
-        # after the append, it deletes the appended row too.
-        ({}, [0, 1]),
+        # The copy-on-write DELETE rewrites only the files it read and is
+        # committed as read, as the vector DELETE is: WriteSerializable
+        # orders it before the append, whose rows it never read.
+        ({}, [0, 1, 7]),
         # The vector DELETE is committed as read: WriteSerializable orders it
         # before the append, whose rows it never read (Spark's rule).
         (DV, [0, 1, 7]),

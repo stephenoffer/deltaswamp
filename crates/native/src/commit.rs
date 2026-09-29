@@ -789,6 +789,86 @@ pub fn commit_raw(
     }
 }
 
+/// Commit `actions` (single-line JSON `add`, `remove`, `txn` or
+/// `domainMetadata` actions) on `snapshot`, through `uc` when given.
+///
+/// The raw-actions commit a catalog-managed table can take: [`commit_raw`]
+/// puts a published commit file, which on such a table would fork its
+/// history. The actions ride in a kernel transaction with no files of its
+/// own, so kernel writes the `commitInfo` (with the in-commit timestamp a
+/// catalog-managed table requires) and its committer stages and ratifies the
+/// commit, or reports the conflict when another writer took the version. A
+/// `metaData` or `protocol` action is refused: kernel's catalog committer
+/// refuses any change of either after version 0, and `commitInfo` is kernel's.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_actions(
+    snapshot: SnapshotRef,
+    engine: SharedEngine,
+    uc: Option<UcCommitConfig>,
+    actions: &[String],
+    engine_info: Option<String>,
+    operation: Option<String>,
+    operation_parameters: Option<std::collections::HashMap<String, String>>,
+    commit_metadata: Option<std::collections::HashMap<String, String>>,
+    blind_append: bool,
+) -> Result<u64> {
+    // No actions at all is a commitInfo-only version (VACUUM START/END).
+    let body = if actions.is_empty() {
+        String::new()
+    } else {
+        raw_commit_body(actions)?
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let parsed: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| NativeError::Invalid(format!("action {i} is not valid JSON: {e}")))?;
+        let name = parsed
+            .as_object()
+            .and_then(|o| o.keys().next())
+            .cloned()
+            .unwrap_or_default();
+        if !matches!(name.as_str(), "add" | "remove" | "txn" | "domainMetadata") {
+            return Err(NativeError::Invalid(format!(
+                "action {i} is a {name:?} action; only add, remove, txn and domainMetadata \
+                 actions can be committed this way (kernel writes the commitInfo, and a \
+                 metaData or protocol change is not a raw action)"
+            )));
+        }
+    }
+    let extra = ExtraActions::default();
+    if !lines.is_empty() {
+        let strings = arrow::array::StringArray::from(lines);
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("json", arrow::datatypes::DataType::Utf8, false),
+            ])),
+            vec![Arc::new(strings)],
+        )?;
+        let parsed = delta_kernel::Engine::json_handler(engine.as_ref()).parse_json(
+            Box::new(ArrowEngineData::new(batch)),
+            delta_kernel::actions::get_commit_schema().clone(),
+        )?;
+        extra.push(FilteredEngineData::with_all_rows_selected(parsed));
+    }
+    let info = CommitInfoPatch {
+        operation_parameters,
+        blind_append: Some(blind_append),
+        extra_actions: extra,
+        ..Default::default()
+    };
+    let transaction = begin_transaction(
+        snapshot,
+        &engine,
+        &uc,
+        engine_info,
+        operation,
+        None,
+        commit_metadata,
+        info,
+    )?;
+    finish_commit_as(transaction, &engine, false)
+}
+
 /// What a failed put-if-absent of commit `version` means.
 fn raw_put_error(
     err: delta_kernel::object_store::Error,

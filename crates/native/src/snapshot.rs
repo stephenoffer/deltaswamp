@@ -916,8 +916,10 @@ impl PySnapshot {
     ///
     /// What a DML that lost a commit race needs to apply Delta's conflict
     /// rules: whether each winning commit was a blind append, and which files
-    /// it added. Published commits only, so a catalog-managed table's
-    /// ratified tail is not covered; callers do not rebase those.
+    /// it added. A commit the snapshot's log segment holds is read from the
+    /// file it names -- on a catalog-managed table, the ratified but
+    /// unpublished `_delta_log/_staged_commits/<v>.<uuid>.json` -- and any
+    /// other from its published path.
     fn commit_log(&self, py: Python<'_>, after: u64) -> PyResult<Vec<(u64, String)>> {
         let end = self.inner.version();
         let root = self.inner.table_root().clone();
@@ -926,12 +928,22 @@ impl PySnapshot {
                 return Ok(Vec::new());
             }
             let versions: Vec<u64> = ((after + 1)..=end).collect();
+            let listed: std::collections::HashMap<u64, url::Url> = self
+                .inner
+                .log_segment()
+                .listed
+                .ascending_commit_files
+                .iter()
+                .map(|p| (p.version, p.location.location.clone()))
+                .collect();
             let urls = versions
                 .iter()
-                .map(|v| {
-                    root.join(&format!("_delta_log/{v:020}.json"))
+                .map(|v| match listed.get(v) {
+                    Some(url) => Ok((url.clone(), None)),
+                    None => root
+                        .join(&format!("_delta_log/{v:020}.json"))
                         .map(|url| (url, None))
-                        .map_err(|e| NativeError::Invalid(format!("bad commit path: {e}")))
+                        .map_err(|e| NativeError::Invalid(format!("bad commit path: {e}"))),
                 })
                 .collect::<Result<Vec<_>>>()?;
             let bytes = self.engine.storage_handler().read_files(urls)?;
@@ -1369,6 +1381,48 @@ impl PySnapshot {
     #[pyo3(signature = (uc = None))]
     fn publish(&self, py: Python<'_>, uc: Option<UcCommitConfig>) -> PyResult<u64> {
         let version = py.detach(|| commit::publish(self.inner.clone(), self.engine.clone(), uc))?;
+        Ok(version)
+    }
+
+    /// Commit raw `add`/`remove`/`txn`/`domainMetadata` actions on this
+    /// snapshot, through the catalog when `uc` is given; the new version.
+    ///
+    /// See `commit::commit_actions`: kernel writes the commitInfo, and a
+    /// concurrent commit of the next version raises CommitConflictError.
+    #[pyo3(signature = (
+        actions,
+        uc = None,
+        engine_info = None,
+        operation = None,
+        operation_parameters = None,
+        commit_metadata = None,
+        blind_append = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn commit_actions(
+        &self,
+        py: Python<'_>,
+        actions: Vec<String>,
+        uc: Option<UcCommitConfig>,
+        engine_info: Option<String>,
+        operation: Option<String>,
+        operation_parameters: Option<HashMap<String, String>>,
+        commit_metadata: Option<HashMap<String, String>>,
+        blind_append: bool,
+    ) -> PyResult<u64> {
+        let version = py.detach(|| {
+            commit::commit_actions(
+                self.inner.clone(),
+                self.engine.clone(),
+                uc,
+                &actions,
+                engine_info,
+                operation,
+                operation_parameters,
+                commit_metadata,
+                blind_append,
+            )
+        })?;
         Ok(version)
     }
 }

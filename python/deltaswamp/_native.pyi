@@ -16,7 +16,7 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
-"restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
+"restore", "commit_actions", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
 "path_clone", "row_tracking_dml", "check_constraints", "schema_evolution", "log_cleanup",
 "symlink_manifest", "fsck", "value_constrained_checkpoint", "commit_timestamps". Gate on
 this list, not `hasattr`, so a stale build refuses cleanly.
@@ -684,3 +684,21 @@ class Snapshot:
 
     def publish(self, uc: UcCommitConfig | None = None) -> int:
         """Publish ratified-but-unpublished commits into `_delta_log/`."""
+
+    def commit_actions(
+        self,
+        actions: list[str],
+        uc: UcCommitConfig | None = None,
+        engine_info: str | None = None,
+        operation: str | None = None,
+        operation_parameters: dict[str, str] | None = None,
+        commit_metadata: dict[str, str] | None = None,
+        blind_append: bool = False,
+    ) -> int:
+        """Commit raw add/remove/txn/domainMetadata actions on this snapshot; the new version.
+
+        Through the catalog when `uc` is given: kernel writes the commitInfo
+        (with its in-commit timestamp) and its committer ratifies the version.
+        Raises CommitConflictError when another writer took it first.
+        Requires "commit_actions".
+        """

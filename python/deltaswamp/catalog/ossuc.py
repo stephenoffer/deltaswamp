@@ -549,6 +549,7 @@ class OSSUnityCatalog:
         if resolved.is_catalog_managed:
             try:
                 resolved = self._with_catalog_commits(resolved, ref)
+                resolved = dataclasses.replace(resolved, commit_tail=self._fresh_commit_tail)
             except _Recreated as exc:
                 if _retried:
                     raise PreflightError(
@@ -578,6 +579,14 @@ class OSSUnityCatalog:
             ),
             table_uuid=table_id,
         )
+
+    def _fresh_commit_tail(self, resolved: ResolvedTable) -> ResolvedTable:
+        """`resolved` with its ratified commit tail read again (`ResolvedTable.commit_tail`)."""
+        try:
+            return self._with_catalog_commits(resolved, resolved.ref)
+        except _Recreated as exc:
+            # Reported by ResolvedTable.with_fresh_commit_tail as a re-created table.
+            return dataclasses.replace(resolved, table_id=str(exc), log_tail=())
 
     def _with_catalog_commits(self, resolved: ResolvedTable, ref: TableRef) -> ResolvedTable:
         path = self._delta_tables_path(ref, f"tables/{_q(ref.table or '')}")

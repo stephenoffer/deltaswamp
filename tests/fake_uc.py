@@ -279,8 +279,7 @@ class FakeUnityCatalog:
             version = int(update["commit"]["version"])
             if version != table.latest_version + 1:
                 return (
-                    f"commit version {version} is not the next version "
-                    f"({table.latest_version + 1})"
+                    f"commit version {version} is not the next version ({table.latest_version + 1})"
                 )
         return None
 

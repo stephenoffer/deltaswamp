@@ -88,6 +88,9 @@ pub const FEATURES: &[&str] = &[
     "vacuum",
     // `add_actions`/`missing_files`: RESTORE committed from the target's adds.
     "restore",
+    // `Snapshot.commit_actions`: raw add/remove actions committed through a
+    // kernel transaction, so through the catalog on a catalog-managed table.
+    "commit_actions",
     // Compactions and overwrites of row-tracked tables: removes staged by
     // hand, and `scan(row_tracking=True)` rows written back with their ids
     // and commit versions in the materialized columns.

@@ -217,6 +217,11 @@ class KernelMerger:
         )
 
         skipping = self._skipping(schema)
+        engine._refuse_oversized_read(
+            "merge on the kernel",
+            snapshot,
+            **({"predicate": skipping} if skipping is not None else {}),
+        )
         extra = {"row_ids": True} if row_ids else {}
         target = pa.table(snapshot.scan(predicate=skipping, row_positions=True, **extra))
         source = self._source.append_column(

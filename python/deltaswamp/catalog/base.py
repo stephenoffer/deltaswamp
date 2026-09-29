@@ -14,7 +14,7 @@ catalog:
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -239,6 +239,39 @@ class ResolvedTable:
     #: tables reached through a share, whose files are served as presigned URLs
     #: and are not addressable by a storage location at all.
     sharing_profile: str | None = field(default=None, repr=False)
+    #: Re-reads a catalog-managed table's ratified commit tail: a callable
+    #: taking this table and returning it with the catalog's current
+    #: `log_tail` and `max_catalog_version`. Set by the catalog that resolved
+    #: the table, so an engine can rebase a commit that lost a race to the
+    #: catalog's next version. Never pickled: it holds the catalog's client,
+    #: and a worker must not reach the catalog.
+    commit_tail: Any = field(default=None, repr=False, compare=False)
+
+    def __getstate__(self) -> list[Any]:
+        return [None if f.name == "commit_tail" else getattr(self, f.name) for f in fields(self)]
+
+    def __setstate__(self, state: list[Any]) -> None:
+        for f, value in zip(fields(self), state, strict=True):
+            object.__setattr__(self, f.name, value)
+
+    def with_fresh_commit_tail(self) -> ResolvedTable | None:
+        """This table with the catalog's commit tail re-read, or None if it cannot be.
+
+        None for a table that is not catalog-managed, or whose catalog left no
+        way to re-read it (a table unpickled on a worker). A table dropped and
+        re-created under the same name since is an error, not a fresh tail.
+        """
+        if not self.is_catalog_managed or self.commit_tail is None:
+            return None
+        fresh = self.commit_tail(self)
+        if self.table_id and fresh.table_id and self.table_id != fresh.table_id:
+            from ..errors import CorruptTableError
+
+            raise CorruptTableError(
+                f"{self.ref} was dropped and re-created since this operation read it "
+                f"(its table id is now {fresh.table_id!r}); run it again against the new table"
+            )
+        return fresh
 
     @property
     def features(self) -> frozenset[str]:

@@ -536,6 +536,7 @@ class DatabricksUnityCatalog:
 
         if resolved.is_catalog_managed or _advertises_catalog_managed(resolved.properties):
             resolved = self._with_catalog_commits(resolved)
+            resolved = dataclasses.replace(resolved, commit_tail=self._with_catalog_commits)
 
         return resolved
 
