@@ -329,22 +329,21 @@ class TestWrapper:
 # ------------------------------------------------------------------ r5rg items
 
 
-def test_a_conditional_last_insert_on_a_feed_table_is_refused_by_can(feed: Any) -> None:
+def test_can_and_the_call_agree_on_a_conditional_last_insert_on_a_feed_table(feed: Any) -> None:
     """r5rg M11: can("merge") named delta-rs, whose execute() then refused."""
+    from deltaswamp.capability import Engine
     from deltaswamp.engine.deltars import _null_rows_on_feed_merge
 
     conditional = [("when_not_matched_insert_all", "source.id > 1")]
-    if not _null_rows_on_feed_merge():
-        # delta-rs 1.6.6 serves it correctly: can() and the call agree on ok.
-        assert feed.can("merge", clauses=conditional).ok
-        return
     cap = feed.can("merge", clauses=conditional)
-    assert not cap.ok and "conditional WHEN NOT MATCHED" in cap.reason
-    assert feed.can("merge", clauses=["when_not_matched_insert_all"]).ok
+    assert cap.ok
+    if _null_rows_on_feed_merge():
+        # delta-rs would write an all-NULL row per rejected source row; the
+        # kernel, which writes the MERGE's CDC files, serves it instead.
+        assert cap.engine is Engine.KERNEL
     builder = feed.merge(pa.table({"id": [5]}), "target.id = source.id")
-    with pytest.raises(ds.UnreachableTableError, match="conditional WHEN NOT MATCHED"):
-        builder.when_not_matched_insert_all(predicate="source.id > 1").execute()
-    assert feed.count() == 3
+    builder.when_not_matched_insert_all(predicate="source.id > 1").execute()
+    assert feed.count() == 4
 
 
 def test_date_appends_into_a_column_widened_to_timestamp_ntz(conn: Any, tmp_path: Any) -> None:

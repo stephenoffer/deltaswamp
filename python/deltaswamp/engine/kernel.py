@@ -1224,9 +1224,13 @@ class KernelEngine:
                 remedy="read the source table directly, or use Compatibility Mode",
             )
 
-        if operation is Operation.CDF and table.is_catalog_managed:
-            # cdf() refuses these; claiming them here kept the router from
-            # diverting to an engine that can serve them.
+        if (
+            operation is Operation.CDF
+            and table.is_catalog_managed
+            and not _native_has("log_change_feed")
+        ):
+            # cdf() refuses these without the log reader; claiming them here
+            # kept the router from diverting to an engine that can serve them.
             return Capability(
                 operation,
                 ok=False,
@@ -1665,9 +1669,11 @@ class KernelEngine:
     ) -> Any:
         """The change data feed through the kernel's TableChanges.
 
-        Serves path tables delta-rs cannot open. It cannot serve a
-        catalog-managed table: TableChanges lists the log itself and takes no
-        catalog commit tail, so it would miss ratified-but-unpublished commits.
+        Serves path tables delta-rs cannot open. A catalog-managed table is
+        read from its commits instead (`log_changes`): TableChanges lists the
+        log itself and takes no catalog commit tail, so it would miss the
+        ratified-but-unpublished commits, and the kernel refuses to open the
+        table without the catalog's say.
         """
         from deltaswamp import _native
 
@@ -1678,11 +1684,12 @@ class KernelEngine:
                 f"read the change data feed with {', '.join(sorted(given))}",
                 "the kernel change feed does not implement these options",
             )
-        if table.is_catalog_managed:
+        if table.is_catalog_managed and not _native_has("log_change_feed"):
             raise UnreachableTableError(
                 "read the change data feed of a catalog-managed table",
                 "the kernel's TableChanges lists the log directly and takes no catalog "
-                "commit tail, so it would silently miss unpublished commits",
+                "commit tail, and the installed native extension predates the change feed "
+                "read from a catalog's commits",
                 "ds.connect(..., allow_sql_fallback=True) reads it with table_changes()",
             )
         # A path-resolved table carries no properties until it is enriched, so
@@ -1723,6 +1730,26 @@ class KernelEngine:
         )
 
         location = table.location
+
+        if table.is_catalog_managed:
+            stream = self._catalog_changes(
+                table,
+                starting_version,
+                ending_version,
+                starting_timestamp,
+                ending_timestamp,
+                read_columns,
+            )
+            if node is not None:
+                stream = sqlpred.filter_stream(stream, node)
+            if keep is not None:
+                import pyarrow as pa
+
+                have = pa.RecordBatchReader.from_stream(stream)
+                if list(have.schema.names) == keep:
+                    return have
+                return _project(have, keep)
+            return stream
 
         def changes(start: int | None) -> Any:
             return _native.table_changes(
@@ -1820,6 +1847,107 @@ class KernelEngine:
                 return have
             return _project(have, keep)
         return stream
+
+    def _catalog_changes(
+        self,
+        table: ResolvedTable,
+        starting_version: int | None,
+        ending_version: int | None,
+        starting_timestamp: Any,
+        ending_timestamp: Any,
+        columns: list[str] | None,
+    ) -> Any:
+        """A catalog-managed table's change feed, read from its commits.
+
+        The snapshots are resolved with the catalog's tail, so the commits it
+        ratified and has not published are read from their staged files; see
+        `log_changes`.
+        """
+        from .log_changes import LogChangeFeed
+
+        start, end = starting_version, ending_version
+        if starting_timestamp is not None or ending_timestamp is not None:
+            start, end = self._catalog_feed_versions(
+                table, starting_timestamp, ending_timestamp, start, end
+            )
+        end_snapshot = self.snapshot(table, version=end)
+        last = int(end_snapshot.version)
+        advance = start is None
+        start = 0 if start is None else int(start)
+        if start > last:
+            raise UnreachableTableError(
+                "read the change data feed",
+                f"version {start} is after the requested end, version {last}",
+            )
+        times = self.file_commit_times(table)
+        while True:
+            try:
+                feed = LogChangeFeed(
+                    end_snapshot, self.snapshot(table, version=start), start, columns, times
+                )
+                return feed.reader()
+            except UnreachableTableError as exc:
+                # No start given and the feed was switched on after version
+                # `start`: begin where it is on, as the kernel path does.
+                if advance and getattr(exc, "version", None) == start and start < last:
+                    start += 1
+                    continue
+                raise
+
+    def _catalog_feed_versions(
+        self,
+        table: ResolvedTable,
+        starting_timestamp: Any,
+        ending_timestamp: Any,
+        starting_version: int | None,
+        ending_version: int | None,
+    ) -> tuple[int | None, int | None]:
+        """A catalog-managed table's feed bounds by time, tail included.
+
+        Published commits resolve as a path table's do (`Snapshot.version_at`);
+        the ratified commits the catalog has not published are timed by their
+        in-commit timestamps, which every catalog-managed table carries.
+        """
+        latest = self.snapshot(table)
+        tail = sorted(entry.version for entry in table.log_tail)
+        stamps: list[tuple[int, int]] = []
+        if tail:
+            for version, text in latest.commit_log(tail[0] - 1, tail[-1]):
+                for line in text.splitlines():
+                    if '"commitInfo"' in line:
+                        ict = json.loads(line)["commitInfo"].get("inCommitTimestamp")
+                        if ict is not None:
+                            stamps.append((int(version), int(ict)))
+                        break
+
+        def resolve(value: Any, after: bool) -> int:
+            ms = timestamp_ms(value)
+            if after:
+                try:
+                    return int(latest.version_at(ms, True)[0])
+                except ValueError:
+                    for version, stamp in stamps:
+                        if stamp >= ms:
+                            return version
+                    raise InvalidArgumentError(
+                        "read the change data feed: the starting timestamp is after the "
+                        "latest commit"
+                    ) from None
+            for version, stamp in reversed(stamps):
+                if stamp <= ms:
+                    return version
+            try:
+                return int(latest.version_at(ms, False)[0])
+            except ValueError as exc:
+                raise InvalidArgumentError(f"read the change data feed: {exc}") from exc
+
+        start = starting_version
+        end = ending_version
+        if starting_timestamp is not None:
+            start = resolve(starting_timestamp, True)
+        if ending_timestamp is not None:
+            end = resolve(ending_timestamp, False)
+        return start, end
 
     def file_commit_times(self, table: ResolvedTable) -> dict[int, int] | None:
         """version -> commit time (epoch ms) of each commit timed by its file.
@@ -2723,11 +2851,18 @@ class KernelEngine:
             )
         cdf = str(table.properties.get("delta.enableChangeDataFeed", "false")).lower() == "true"
         dv_delete = operation is Operation.DELETE and self._dv_path(table)
+        # A build that writes CDC files serves the rest too, on the paths that
+        # commit through `_commit_dv_changes` (deletion vectors, or rewrites of
+        # the touched files), which write the commit's change rows beside it.
+        writes_changes = _native_has("change_files") and (
+            self._dv_path(table) or self._file_rewrite_path(table)
+        )
         if (
             cdf
             and operation not in _ADDING_OPS
             and operation is not Operation.OVERWRITE
             and not dv_delete
+            and not writes_changes
         ):
             # A DELETE through deletion vectors is exempt: its commit adds no
             # data, and change-feed readers derive the deleted rows from the
@@ -3119,6 +3254,7 @@ class KernelEngine:
         engine_info: str | None = None,
         read_predicate: str | None = None,
         predicate: str | None = None,
+        changes: Any = None,
     ) -> int:
         """Commit `deletions` (path, row_index) as vectors plus `data`, in one transaction.
 
@@ -3132,7 +3268,19 @@ class KernelEngine:
         On a table without deletion vectors enabled the same change is written
         copy-on-write instead (`_as_file_rewrites`): every touched file is
         removed, and its surviving rows are written again with `data`.
+
+        On a table with the change data feed the commit carries its change
+        rows as CDC files: `changes` (the table's columns plus `_change_type`)
+        where the caller classified them (a MERGE), else the rows it removes
+        (`update_preimage` for an UPDATE, `delete` otherwise) and `data`
+        (`update_postimage`, or `insert`). A DELETE through deletion vectors
+        writes none: readers derive its rows from the vectors, as Spark's do.
         """
+        if self._writes_change_files(table, operation, deletions, whole_files):
+            if changes is None:
+                changes = self._derived_changes(snapshot, deletions, whole_files, data, operation)
+        else:
+            changes = None
         if deletions.num_rows and not self._dv_path(table):
             deletions, data, whole_files = self._as_file_rewrites(
                 table, snapshot, deletions, data, whole_files
@@ -3163,6 +3311,7 @@ class KernelEngine:
                             or None,
                             **_dml_info(operation, predicate, snapshot),
                             **checked,
+                            **({"changes": changes.to_reader()} if changes is not None else {}),
                         )
                     break
                 except CommitConflictError:
@@ -3249,6 +3398,89 @@ class KernelEngine:
         rewritten = pa.concat_tables(parts)
         files = sorted(set(paths) | set(whole_files or ()))
         return deletions.slice(0, 0), rewritten if rewritten.num_rows else None, files
+
+    def _writes_change_files(
+        self,
+        table: ResolvedTable,
+        operation: str,
+        deletions: Any,
+        whole_files: list[str] | None,
+    ) -> bool:
+        """Whether this DML commit must carry CDC files (see `_commit_dv_changes`)."""
+        if str(table.properties.get("delta.enableChangeDataFeed", "false")).lower() != "true":
+            return False
+        if not deletions.num_rows and not whole_files:
+            return False  # adds only: readers take them as inserts
+        if operation == "DELETE" and self._dv_path(table):
+            return False
+        if not _native_has("change_files"):
+            raise UnreachableTableError(
+                f"{operation.lower()} a table with the change data feed",
+                "the installed native extension cannot write the CDC files the commit needs",
+            )
+        return True
+
+    def _derived_changes(
+        self,
+        snapshot: Any,
+        deletions: Any,
+        whole_files: list[str] | None,
+        data: Any,
+        operation: str,
+    ) -> Any:
+        """A DML's change rows from what it removes and what it writes.
+
+        Read before the commit, while the files are live: the rows
+        `deletions` addresses, and every live row of `whole_files`.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        schema = _arrow_schema(snapshot)
+        removed_kind = "update_preimage" if operation == "UPDATE" else "delete"
+        added_kind = "update_postimage" if operation == "UPDATE" else "insert"
+        parts: list[Any] = []
+
+        def conformed(rows: Any, kind: str) -> Any:
+            columns = []
+            for field in schema:
+                if field.name in rows.column_names:
+                    column = rows.column(field.name)
+                    columns.append(column if column.type == field.type else column.cast(field.type))
+                else:
+                    columns.append(pa.nulls(rows.num_rows, field.type))
+            columns.append(pa.array([kind] * rows.num_rows, pa.string()))
+            return pa.Table.from_arrays(
+                columns, schema=pa.schema([*schema, pa.field("_change_type", pa.string())])
+            )
+
+        paths = sorted(set(deletions.column("path").to_pylist()))
+        if paths:
+            read = pa.table(snapshot.scan(files=paths, row_positions=True))
+            catalog = pa.array(paths, pa.string())
+
+            def keys(files: Any, rows: Any) -> Any:
+                ids = pc.cast(
+                    pc.index_in(pc.cast(files, pa.string()), value_set=catalog), pa.int64()
+                )
+                return pc.add(pc.shift_left(ids, 40), pc.cast(rows, pa.int64()))
+
+            gone = pc.unique(keys(deletions.column("path"), deletions.column("row_index")))
+            removed = read.filter(
+                pc.is_in(
+                    keys(read.column(_FILE_COLUMN), read.column(_ROW_INDEX_COLUMN)),
+                    value_set=gone,
+                )
+            )
+            parts.append(conformed(removed, removed_kind))
+        whole = sorted(set(whole_files or ()) - set(paths))
+        if whole:
+            parts.append(conformed(pa.table(snapshot.scan(files=whole)), removed_kind))
+        if data is not None and data.num_rows:
+            parts.append(conformed(data, added_kind))
+        if not parts:
+            return None
+        return pa.concat_tables(parts)
 
     #: Re-commits of a DELETE/UPDATE/MERGE that lost to writers which left
     #: every file it touched alone and added nothing it should have read.
