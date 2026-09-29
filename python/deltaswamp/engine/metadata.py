@@ -2059,6 +2059,60 @@ def _wire(protocol: Mapping[str, Any], *names: str) -> Any:
     return None
 
 
+def _declare_identity(schema: dict[str, Any], operation: str) -> None:
+    """Identity columns of a new table's schema, as the protocol types them.
+
+    Column metadata from Arrow is all strings; Spark reads ``start`` and
+    ``step`` with ``getLong`` and ``allowExplicitInsert`` with ``getBoolean``,
+    so they are written as a JSON number and a boolean. An identity column is
+    a top-level BIGINT with a non-zero step, as Spark requires, and a new
+    table has generated nothing, so a high-water mark is refused.
+    """
+    top = [id(f) for f in _fields(schema)]
+    for f in _walk(schema):
+        meta = f.get("metadata") or {}
+        if not any(str(k).startswith("delta.identity.") for k in meta):
+            continue
+        name = f.get("name")
+        if id(f) not in top:
+            raise _refuse(operation, f"identity column {name} must be a top-level column")
+        if f.get("type") != "long":
+            raise _refuse(
+                operation,
+                f"identity column {name} is {f.get('type')!r}; identity columns are BIGINT",
+            )
+        if "delta.identity.highWaterMark" in meta:
+            raise _refuse(
+                operation,
+                f"identity column {name} declares a high-water mark; a new table has "
+                "generated no values, so declare only start, step and allowExplicitInsert",
+            )
+        for key in ("delta.identity.start", "delta.identity.step"):
+            raw = meta.get(key, 1)
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                raise _refuse(
+                    operation, f"identity column {name}: {key} is {raw!r}, not an integer"
+                ) from None
+            if not -(1 << 63) <= value < (1 << 63):
+                raise _refuse(operation, f"identity column {name}: {key} is not a BIGINT")
+            meta[key] = value
+        if meta["delta.identity.step"] == 0:
+            raise _refuse(operation, f"identity column {name}: the step cannot be 0")
+        explicit = meta.get("delta.identity.allowExplicitInsert", False)
+        if isinstance(explicit, str):
+            if explicit.lower() not in ("true", "false"):
+                raise _refuse(
+                    operation,
+                    f"identity column {name}: allowExplicitInsert is {explicit!r}, "
+                    "not true or false",
+                )
+            explicit = explicit.lower() == "true"
+        meta["delta.identity.allowExplicitInsert"] = bool(explicit)
+        f["metadata"] = meta
+
+
 def initial_actions(
     *,
     table_id: str,
@@ -2086,6 +2140,7 @@ def initial_actions(
             raise _refuse(operation, f"the property {key} has no value")
     schema = copy.deepcopy(schema)
     schema = _valid_type(schema, operation, "the table schema")
+    _declare_identity(schema, operation)
     # A state over the new schema, for the checks that consult one.
     draft = TableState(
         version=-1,

@@ -282,6 +282,10 @@ _USAGE_GATED: dict[TableFeature, tuple[str, str]] = {
 _CREATE_UNDECLARABLE: frozenset[str] = frozenset(
     {"generatedColumns", "identityColumns", "allowColumnDefaults", "invariants"}
 )
+#: Of those, the features a path table's create declares by composing
+#: version 0 itself (`metadata.initial_actions`) and putting it, instead of
+#: the kernel's create: every kernel write fills defaults and identity values.
+_CREATE_COMPOSED: frozenset[str] = frozenset({"identityColumns", "allowColumnDefaults"})
 
 _IMPLEMENTED: frozenset[Operation] = frozenset(
     {
@@ -1264,8 +1268,12 @@ class KernelEngine:
                     ),
                     remedy="create the table, then set them through the catalog",
                 )
+            undeclarable = _CREATE_UNDECLARABLE
+            if not table.is_catalog_managed:
+                # Composed as version 0 here (`_composed_create`), feature included.
+                undeclarable = undeclarable - _CREATE_COMPOSED
             declared = sorted(
-                (meta.create_schema_features(shape.get("schema")) or set()) & _CREATE_UNDECLARABLE
+                (meta.create_schema_features(shape.get("schema")) or set()) & undeclarable
             )
             if declared:
                 # delta-kernel 0.28 refuses these features at CREATE, and left
@@ -2404,6 +2412,18 @@ class KernelEngine:
                 "set the comment through the catalog after creating the table",
             )
 
+        if not table.is_catalog_managed and (
+            (meta.create_schema_features(schema) or set()) & _CREATE_COMPOSED
+        ):
+            return self._composed_create(
+                table,
+                schema,
+                partition_by=partition_by,
+                cluster_by=cluster_by,
+                properties=properties,
+                engine_info=engine_info,
+                description=description,
+            )
         # delta-kernel refuses these in CREATE TABLE although its metadata
         # commit stores them; they land as version 1, before this returns.
         deferred = {k: v for k, v in (properties or {}).items() if k in KERNEL_CREATE_DEFERRED}
@@ -2432,6 +2452,59 @@ class KernelEngine:
         if description is not None:
             version = self.set_comment(table, description)
         return version
+
+    def _composed_create(
+        self,
+        table: ResolvedTable,
+        schema: Any,
+        *,
+        partition_by: list[str] | None,
+        cluster_by: list[str] | None,
+        properties: dict[str, str] | None,
+        engine_info: str | None,
+        description: str | None,
+    ) -> int:
+        """Create a table whose schema declares identity or default columns.
+
+        delta-kernel 0.28 cannot declare `identityColumns` or
+        `allowColumnDefaults` at create (it would write the column metadata
+        without the feature), so version 0 is composed here, as Databricks
+        writes it -- a table-features protocol listing the feature, identity
+        start/step/allowExplicitInsert typed as the protocol types them --
+        and put if absent: one commit, no window without the feature.
+        """
+        import uuid
+
+        from deltaswamp import _native
+
+        pa_schema = schema
+        if not hasattr(pa_schema, "names"):
+            import pyarrow as pa
+
+            pa_schema = pa.schema(schema)
+        actions = meta.initial_actions(
+            table_id=str(uuid.uuid4()),
+            schema=meta.arrow_to_delta_schema(pa_schema),
+            required_protocol={},
+            configuration=dict(properties or {}),
+            partition_columns=partition_by,
+            cluster_by=cluster_by,
+            description=description,
+            engine_info=engine_info or _engine_info(),
+        )
+        assert table.location is not None  # checked by create()
+        try:
+            _native.commit_raw(
+                table.location,
+                0,
+                list(actions),
+                options=self._options(table, write=True) or None,
+            )
+        except _native.CommitConflictError:
+            raise UnreachableTableError(
+                "create", f"a table already exists at {table.location}"
+            ) from None
+        return 0
 
     #: Fallback when the table sets no interval. Matches Delta's own default.
     default_checkpoint_interval = 10

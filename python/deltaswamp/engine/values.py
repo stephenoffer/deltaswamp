@@ -71,8 +71,33 @@ class IdentitySpec:
     allow_explicit: bool
 
     def first_free(self) -> int:
-        """The first value no writer has generated yet."""
-        return self.start if self.high_water_mark is None else self.high_water_mark + self.step
+        """The first value no writer has generated yet, as Delta Spark computes it.
+
+        The value after the high-water mark, rounded up (in the step's
+        direction) to the next ``start + k * step``: a mark another writer left
+        off that sequence must not put generated values off it. A mark before
+        ``start`` counts for nothing (Spark replaces it), so generation begins
+        at ``start``.
+        """
+        mark = self.high_water_mark
+        if mark is None or (mark < self.start if self.step > 0 else mark > self.start):
+            return self.start
+        return round_to_next(self.start, self.step, mark + self.step)
+
+
+def round_to_next(start: int, step: int, value: int) -> int:
+    """`value`, or the next ``start + k * step`` after it in the step's direction.
+
+    Delta Spark's ``IdentityColumn.roundToNext``, with Java's truncating
+    division: a value on the start's wrong side rounds towards it, never past.
+    """
+    offset = value - start
+    if offset % step == 0:
+        return value
+    quotient = abs(offset) // abs(step) * (1 if (offset >= 0) == (step > 0) else -1)
+    if (offset > 0) == (step > 0):
+        quotient += 1
+    return start + step * quotient
 
 
 @dataclass(frozen=True)
