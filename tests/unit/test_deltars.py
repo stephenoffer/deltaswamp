@@ -3,39 +3,44 @@
 from __future__ import annotations
 
 import pytest
+from deltaswamp._storage import engine_options, pin_s3_endpoint
 from deltaswamp.capability import Operation
 from deltaswamp.catalog import ResolvedTable
 from deltaswamp.credentials.base import Cloud, Credentials, StaticCredentialProvider
-from deltaswamp.engine.deltars import DeltaRsEngine, _pin_s3_endpoint
+from deltaswamp.engine.deltars import DeltaRsEngine
 from deltaswamp.identity import parse_ref
 
 from tests.helpers import resolved_table
 
 
 class TestS3Endpoint:
-    """An explicit regional endpoint keeps delta-rs from probing EC2 metadata for a region."""
+    """An explicit regional endpoint keeps delta-rs from probing EC2 metadata for a region.
+
+    The rule lives in `_storage` now, shared with the kernel (which ignored
+    the China endpoint).
+    """
 
     def test_vended_keys_get_a_regional_endpoint(self) -> None:
         options = {"aws_access_key_id": "k", "aws_region": "us-west-2"}
-        _pin_s3_endpoint(options)
+        pin_s3_endpoint(options, "s3://b/t", vended=True)
         assert options["aws_endpoint"] == "https://s3.us-west-2.amazonaws.com"
 
     def test_china_regions_use_their_own_domain(self) -> None:
         options = {"aws_access_key_id": "k", "aws_region": "cn-north-1"}
-        _pin_s3_endpoint(options)
+        pin_s3_endpoint(options, "s3://b/t", vended=True)
         assert options["aws_endpoint"] == "https://s3.cn-north-1.amazonaws.com.cn"
 
     @pytest.mark.parametrize("key", ["aws_endpoint", "AWS_ENDPOINT_URL", "endpoint"])
     def test_an_explicit_endpoint_is_never_overridden(self, key: str) -> None:
-        options = {"aws_access_key_id": "k", "aws_region": "us-west-2", key: "http://minio"}
-        _pin_s3_endpoint(options)
-        assert options[key] == "http://minio"
+        vended = {"aws_access_key_id": "k", "aws_region": "us-west-2", key: "http://minio"}
+        options = engine_options({}, vended, "s3://b/t")
+        assert options["aws_endpoint"] == "http://minio"
         assert len(options) == 3
 
     def test_no_region_or_no_keys_means_no_change(self) -> None:
         for options in ({"aws_access_key_id": "k"}, {"aws_region": "us-west-2"}):
             before = dict(options)
-            _pin_s3_endpoint(options)
+            pin_s3_endpoint(options, "s3://b/t", vended=True)
             assert options == before
 
 

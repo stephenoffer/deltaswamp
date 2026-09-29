@@ -170,7 +170,10 @@ SHAPES: list[Shape] = [
     ),
     _shape(
         "variant",
-        "CREATE TABLE {t} (id BIGINT, v VARIANT)",
+        # Databricks turns shredding on for every new VARIANT table; off, the
+        # files hold only the binary encoding a direct engine decodes.
+        "CREATE TABLE {t} (id BIGINT, v VARIANT) "
+        "TBLPROPERTIES ('delta.enableVariantShredding'='false')",
         "INSERT INTO {t} VALUES (1, PARSE_JSON('{{\"a\": 1}}')), (2, PARSE_JSON('\"s\"'))",
     ),
     _shape(
@@ -178,7 +181,9 @@ SHAPES: list[Shape] = [
         "CREATE TABLE {t} (id BIGINT, v VARIANT) "
         "TBLPROPERTIES ('delta.enableVariantShredding'='true')",
         "INSERT INTO {t} VALUES (1, PARSE_JSON('{{\"a\": 1}}')), (2, PARSE_JSON('{{\"a\": 2}}'))",
-        direct_read=None,
+        # No direct engine decodes a shredded file, and the log cannot say
+        # which files are, so the property alone keeps reads off them.
+        direct_read=False,
     ),
     _shape(
         "timestamp_ntz",
@@ -575,3 +580,271 @@ class TestWrites:
             table.restore(1)
         assert warehouse.count(name) == want
         assert pa.table(fallback.table(name).to_arrow()).num_rows == want
+
+
+# ------------------------------------------------------- writes, shape by shape
+
+
+@dataclass(frozen=True)
+class WriteShape:
+    """A table shape the write round trip runs on, and how to address its rows."""
+
+    name: str
+    statements: tuple[str, ...]
+    #: Columns the table computes (identity, generated), left out of the data.
+    computed: tuple[str, ...] = ()
+    #: The column MERGE joins on, and a value for it no row has.
+    key: str = "id"
+    fresh: Any = 9_000_000
+    #: Rows that replaceWhere rewrites.
+    where: str = "id < 3"
+    #: A partition column, for a dynamic partition overwrite.
+    partition: str | None = None
+
+
+def _write_shape(name: str, *statements: str, **kwargs: Any) -> WriteShape:
+    return WriteShape(name, statements, **kwargs)
+
+
+_W_ROWS = (
+    "INSERT INTO {t} VALUES (1, 'oslo', TIMESTAMP'2026-01-01 10:00:00'), "
+    "(2, 'lima', TIMESTAMP'2026-01-02 10:00:00'), (3, 'oslo', TIMESTAMP'2026-01-03 10:00:00'), "
+    "(4, NULL, NULL)"
+)
+_W_BASE = "(id BIGINT, city STRING, ts TIMESTAMP)"
+
+WRITE_SHAPES: list[WriteShape] = [
+    _write_shape(
+        "partitioned",
+        f"CREATE TABLE {{t}} {_W_BASE} PARTITIONED BY (city)",
+        _W_ROWS,
+        partition="city",
+    ),
+    _write_shape(
+        "empty_string_partition",
+        f"CREATE TABLE {{t}} {_W_BASE} PARTITIONED BY (city)",
+        "INSERT INTO {t} VALUES (1, '', NULL), (2, 'eu', NULL), (3, NULL, NULL)",
+        partition="city",
+    ),
+    _write_shape(
+        "column_mapping",
+        f"CREATE TABLE {{t}} {_W_BASE} TBLPROPERTIES ('delta.columnMapping.mode'='name')",
+        _W_ROWS,
+        "ALTER TABLE {t} RENAME COLUMN city TO `the town`",
+        where="id < 3",
+    ),
+    _write_shape(
+        "deletion_vectors",
+        f"CREATE TABLE {{t}} {_W_BASE} TBLPROPERTIES ('delta.enableDeletionVectors'='true')",
+        _W_ROWS,
+        "DELETE FROM {t} WHERE id = 3",
+    ),
+    _write_shape(
+        "change_data_feed",
+        f"CREATE TABLE {{t}} {_W_BASE} TBLPROPERTIES ('delta.enableChangeDataFeed'='true')",
+        _W_ROWS,
+    ),
+    _write_shape(
+        "identity_always",
+        "CREATE TABLE {t} (id BIGINT GENERATED ALWAYS AS IDENTITY, city STRING)",
+        "INSERT INTO {t} (city) VALUES ('a'), ('b'), ('c')",
+        computed=("id",),
+        key="city",
+        fresh="never-seen",
+        where="city = 'a'",
+    ),
+    _write_shape(
+        "generated",
+        "CREATE TABLE {t} (id BIGINT, ts TIMESTAMP, "
+        "day DATE GENERATED ALWAYS AS (CAST(ts AS DATE)))",
+        "INSERT INTO {t} (id, ts) VALUES (1, TIMESTAMP'2026-01-01 10:00:00'), "
+        "(2, TIMESTAMP'2026-01-02 10:00:00'), (3, NULL)",
+        computed=("day",),
+    ),
+    _write_shape(
+        "defaults",
+        "CREATE TABLE {t} (id BIGINT, status STRING DEFAULT 'new', "
+        "at TIMESTAMP DEFAULT current_timestamp()) "
+        "TBLPROPERTIES ('delta.feature.allowColumnDefaults'='supported')",
+        "INSERT INTO {t} (id) VALUES (1), (2)",
+        "INSERT INTO {t} VALUES (3, 'old', TIMESTAMP'2026-01-01 00:00:00')",
+    ),
+    _write_shape(
+        "variant",
+        "CREATE TABLE {t} (id BIGINT, v VARIANT)",
+        'INSERT INTO {t} VALUES (1, PARSE_JSON(\'{{"a": 1, "b": [1, "x"]}}\')), '
+        "(2, PARSE_JSON('\"s\"')), (3, NULL)",
+    ),
+    _write_shape(
+        "timestamp_ntz",
+        "CREATE TABLE {t} (id BIGINT, t TIMESTAMP_NTZ)",
+        "INSERT INTO {t} VALUES (1, TIMESTAMP_NTZ'2026-01-01 10:00:00'), (2, NULL)",
+    ),
+    _write_shape("clustered", f"CREATE TABLE {{t}} {_W_BASE} CLUSTER BY (id)", _W_ROWS),
+    _write_shape(
+        "legacy_protocol",
+        f"CREATE TABLE {{t}} {_W_BASE} TBLPROPERTIES ('delta.enableDeletionVectors'='false', "
+        "'delta.enableRowTracking'='false', 'delta.minReaderVersion'='1', "
+        "'delta.minWriterVersion'='2')",
+        _W_ROWS,
+    ),
+]
+
+
+@pytest.fixture(scope="session")
+def write_built(warehouse: Warehouse, live_config: Any) -> Any:
+    """One table per write shape, dropped afterwards; a shape that fails to build skips."""
+    run_id = uuid.uuid4().hex[:8]
+    names = {s.name: f"{live_config.prefix}.dsw_{run_id}_{s.name}" for s in WRITE_SHAPES}
+
+    def build(shape: WriteShape) -> tuple[str, str | None]:
+        try:
+            for statement in shape.statements:
+                warehouse.run(statement.format(t=names[shape.name]))
+        except Exception as exc:
+            return shape.name, str(exc)[:300]
+        return shape.name, None
+
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        errors = dict(pool.map(build, WRITE_SHAPES))
+    try:
+        yield {n: (names[n] if errors[n] is None else RuntimeError(errors[n])) for n in names}
+    finally:
+        for name in names.values():
+            with contextlib.suppress(Exception):
+                warehouse.run(f"DROP TABLE IF EXISTS {name}")
+
+
+def _rows_json(warehouse: Warehouse, name: str, columns: list[str]) -> list[str]:
+    """The table's rows over `columns`, as Databricks renders them, sorted."""
+    quoted = ", ".join("`" + c.replace("`", "``") + "`" for c in columns)
+    return sorted(
+        str(r[0]) for r in warehouse.rows(f"SELECT to_json(struct({quoted})) FROM {name}")
+    )
+
+
+write_shapes = pytest.mark.parametrize("shape", WRITE_SHAPES, ids=[s.name for s in WRITE_SHAPES])
+
+
+class TestWriteShapes:
+    """Every staged write, on every shape: what goes in is what Databricks then holds.
+
+    The data written is deltaswamp's own read of the table, so a round trip
+    that changes a value -- a VARIANT object stored as its JSON text, a DEFAULT
+    replaced by NULL, a '' partition that REPLACE WHERE cannot match -- shows
+    up as a difference in the rows Databricks renders.
+    """
+
+    @write_shapes
+    def test_round_trip(
+        self, shape: WriteShape, write_built: Any, fallback: Any, warehouse: Warehouse
+    ) -> None:
+        name = write_built[shape.name]
+        if isinstance(name, Exception):
+            pytest.skip(f"this workspace cannot build {shape.name}: {name}")
+        table = fallback.table(name)
+        columns = [c for c in warehouse.columns(name) if c not in shape.computed]
+        before = _rows_json(warehouse, name, columns)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # append: the table's own read, written back.
+            assert table.can(Operation.APPEND).ok
+            table.append(pa.table(table.to_arrow()).select(columns))
+            doubled = sorted(before * 2)
+            assert _rows_json(warehouse, name, columns) == doubled
+
+            # replaceWhere: the matching rows, rewritten as they are.
+            rows = pa.table(table.to_arrow(predicate=shape.where)).select(columns)
+            assert table.can(Operation.OVERWRITE, predicate=shape.where).ok
+            table.overwrite(rows, predicate=shape.where)
+            assert _rows_json(warehouse, name, columns) == doubled
+
+            # dynamic partition overwrite: every partition, rewritten as it is.
+            if shape.partition is not None:
+                everything = pa.table(table.to_arrow()).select(columns)
+                table.overwrite(everything, partition_overwrite="dynamic")
+                assert _rows_json(warehouse, name, columns) == doubled
+
+            # MERGE: a source row matching nothing is inserted, whatever the
+            # table computes for itself.
+            source = pa.table(table.head(1)).select(columns)
+            index = source.column_names.index(shape.key)
+            source = source.set_column(
+                index,
+                shape.key,
+                pa.array([shape.fresh], source.schema.field(shape.key).type),
+            )
+            (
+                table.merge(source, f"target.`{shape.key}` = source.`{shape.key}`")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute()
+            )
+            assert warehouse.count(name) == len(doubled) + 1
+
+    def test_an_empty_partition_value_is_the_null_partition(
+        self, write_built: Any, fallback: Any, warehouse: Warehouse
+    ) -> None:
+        name = write_built["empty_string_partition"]
+        if isinstance(name, Exception):
+            pytest.skip(str(name))
+        others = warehouse.count(name, "city IS NOT NULL")
+        data = pa.table(
+            {
+                "id": pa.array([50], pa.int64()),
+                "city": [""],
+                "ts": pa.array([None], pa.timestamp("us", tz="UTC")),
+            }
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fallback.table(name).overwrite(data, partition_overwrite="dynamic")
+        assert warehouse.rows(f"SELECT id FROM {name} WHERE city IS NULL") == [["50"]]
+        assert warehouse.count(name, "city IS NOT NULL") == others
+
+    def test_defaults_apply_to_left_out_columns(
+        self, write_built: Any, fallback: Any, warehouse: Warehouse
+    ) -> None:
+        name = write_built["defaults"]
+        if isinstance(name, Exception):
+            pytest.skip(str(name))
+        table = fallback.table(name)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            table.append(pa.table({"id": pa.array([100], pa.int64())}))
+            table.overwrite(pa.table({"id": pa.array([3], pa.int64())}), predicate="id = 3")
+        got = warehouse.rows(f"SELECT id, status, at IS NOT NULL FROM {name} WHERE id IN (3, 100)")
+        assert sorted(got) == [["100", "new", "true"], ["3", "new", "true"]]
+
+    def test_variant_objects_stay_objects(
+        self, write_built: Any, fallback: Any, direct: Any, warehouse: Warehouse
+    ) -> None:
+        name = write_built["variant"]
+        if isinstance(name, Exception):
+            pytest.skip(str(name))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fallback.table(name).append(pa.table({"id": [7], "v": ['{"z": {"y": 2}}']}))
+            fallback.table(name).append(pa.table({"id": [8]}))
+        kinds = dict(
+            warehouse.rows(f"SELECT id, schema_of_variant(v) FROM {name} WHERE id IN (7, 8)")
+        )
+        assert kinds == {"7": "OBJECT<z: OBJECT<y: BIGINT>>", "8": None}
+        # Direct reads give the same JSON text the warehouse does, or refuse.
+        table = direct.table(name)
+        if table.can(Operation.SCAN).ok:
+            got = pa.table(table.to_arrow()).column("v").type
+            assert got == pa.string()
+        else:
+            assert "shred" in table.can(Operation.SCAN).reason
+            assert table.count() == warehouse.count(name)
+
+    def test_legacy_protocol_alters_are_refused_up_front(
+        self, write_built: Any, fallback: Any
+    ) -> None:
+        name = write_built["legacy_protocol"]
+        if isinstance(name, Exception):
+            pytest.skip(str(name))
+        table = fallback.table(name)
+        for op in (Operation.RENAME_COLUMN, Operation.DROP_COLUMN, Operation.ALTER_COLUMN_TYPE):
+            assert not table.can(op).ok, op

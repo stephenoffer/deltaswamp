@@ -102,8 +102,10 @@ class TestScanArguments:
 class TestPinnedVersion:
     def test_timestamp_overrides_the_pinned_version(self, conn: Any, path: str) -> None:
         # Used to send version=0 and the timestamp together: "not both".
+        # The latest commit's own time (one after it is refused, as Spark does).
+        latest = max(h["timestamp"] for h in conn.open_table(path).history())
         t = conn.open_table(path, version=0)
-        assert t.to_arrow(timestamp="2999-01-01T00:00:00Z").num_rows == 4
+        assert t.to_arrow(timestamp=latest).num_rows == 4
 
     def test_pinned_read_routes_as_time_travel(
         self, conn: Any, path: str, monkeypatch: Any

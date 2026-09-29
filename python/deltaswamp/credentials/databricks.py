@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from datetime import UTC
@@ -29,7 +30,13 @@ from .base import DEFAULT_REFRESH_MARGIN_SECONDS, Cloud, Credentials, Operation
 if TYPE_CHECKING:  # pragma: no cover
     from databricks.sdk.core import Config
 
-__all__ = ["DatabricksCredentialProvider", "azure_endpoint_for", "r2_endpoint_for"]
+__all__ = [
+    "AZURE_STORAGE_SUFFIXES",
+    "DatabricksCredentialProvider",
+    "azure_endpoint_for",
+    "is_azure_storage_host",
+    "r2_endpoint_for",
+]
 
 #: How long a credential whose response carried no usable expiration is served
 #: before it is re-vended. Vended credentials live about an hour.
@@ -55,6 +62,29 @@ def _is_local_host(host: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+#: DNS suffixes Azure Storage serves accounts under: the public cloud (its
+#: private-link aliases included), the sovereign clouds, and Fabric OneLake.
+AZURE_STORAGE_SUFFIXES = (
+    "core.windows.net",
+    "core.chinacloudapi.cn",
+    "core.usgovcloudapi.net",
+    "core.cloudapi.de",
+    "fabric.microsoft.com",
+)
+
+
+def is_azure_storage_host(host: str) -> bool:
+    """Whether `host` (a port allowed) is under one of `AZURE_STORAGE_SUFFIXES`.
+
+    An endpoint is derived only for these. The connection's Azure secret (a
+    SAS, an AAD token) goes to whatever endpoint the location names, and the
+    location comes from a catalog entry or a log other users may write:
+    ``abfss://c@acct.dfs.evil.example/t`` sent it to that host.
+    """
+    name = host.rsplit(":", 1)[0].strip().lower().rstrip(".")
+    return any(name.endswith("." + suffix) for suffix in AZURE_STORAGE_SUFFIXES)
 
 
 def _blob_host(host: str) -> str:
@@ -84,7 +114,9 @@ def azure_endpoint_for(url: str) -> str | None:
     host is mapped to its ``blob`` sibling (see `_blob_host`). Beyond that
     label the host is kept verbatim, which is what keeps this correct on
     private-link and sovereign-cloud hosts, where the suffix is not
-    ``core.windows.net`` at all.
+    ``core.windows.net`` at all. A host under no Azure Storage suffix
+    (`is_azure_storage_host`) yields None: credentials go to such a host only
+    when the caller names it as the endpoint.
     """
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
@@ -108,6 +140,8 @@ def azure_endpoint_for(url: str) -> str | None:
         # dropping the account sent every request to a path Azurite rejects.
         account = next((seg for seg in parsed.path.split("/") if seg), "")
         return f"{prefix}://{host}/{account}" if account else f"{prefix}://{host}"
+    if not is_azure_storage_host(host):
+        return None
     return f"{prefix}://{_blob_host(host)}"
 
 
@@ -195,6 +229,9 @@ def r2_endpoint_for(url: str) -> str | None:
     host = parsed.netloc.rpartition("@")[2]
     if not host or "." not in host:
         return None
+    if not host.lower().rstrip(".").endswith(".r2.cloudflarestorage.com"):
+        # Only Cloudflare's own hosts receive the vended R2 keys.
+        return None
     return f"https://{host}"
 
 
@@ -228,6 +265,17 @@ _TRANSIENT_CODES = frozenset(
 )
 
 
+def sdk_message(exc: BaseException) -> str:
+    """An SDK error's message without the client configuration it appends.
+
+    databricks-sdk ends an authentication failure with ``Config: host=...,
+    account_id=..., workspace_id=..., discovery_url=..., token=***, ...``
+    and ``Env: ...``: the token is masked, but the rest is noise in an
+    error that already names the host to check.
+    """
+    return re.split(r"\.?\s+Config: ", str(exc), maxsplit=1)[0]
+
+
 def _error_kind(exc: BaseException) -> str | None:
     """ "not_found" / "denied" / "unauthenticated" / "transient" for an SDK error, else None.
 
@@ -249,11 +297,22 @@ def _error_kind(exc: BaseException) -> str | None:
         return "not_found"
     if "Unauthenticated" in names or code == "UNAUTHENTICATED":
         return "unauthenticated"
+    # Databricks answers a bad or revoked PAT with a 403 PermissionDenied,
+    # not a 401, so it was reported as a missing privilege.
+    text = str(exc).lower()
+    if "invalid access token" in text or "token is expired" in text:
+        return "unauthenticated"
     if "PermissionDenied" in names or code == "PERMISSION_DENIED":
         return "denied"
     if names & _TRANSIENT_ERRORS or code in _TRANSIENT_CODES:
         return "transient"
     return None
+
+
+def _external_write_refused(exc: BaseException) -> bool:
+    """Whether a vend failed because the table takes no external writes."""
+    code = str(getattr(exc, "error_code", "") or "").upper()
+    return "EXTERNAL_WRITE_NOT_ALLOWED" in code or "EXTERNAL_WRITE_NOT_ALLOWED" in str(exc).upper()
 
 
 def _config_attributes(config: Any) -> dict[str, Any]:
@@ -274,6 +333,98 @@ def _config_attributes(config: Any) -> dict[str, Any]:
         out.pop("profile", None)
         out.pop("config_file", None)
     return out
+
+
+#: `Config` attributes that are literal secrets.
+_CONFIG_SECRETS = frozenset(
+    {
+        "token",
+        "client_secret",
+        "azure_client_secret",
+        "password",
+        "google_credentials",
+        "actions_id_token_request_token",
+        "oidc_token",
+    }
+)
+
+
+def without_secrets(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """`kwargs` without the attributes that are literal secrets.
+
+    What a pickled provider or catalog carries by default: the host, auth
+    type, client id and the like, from which a worker's SDK re-derives auth
+    from its own environment. A PAT or client secret the driver found in its
+    environment otherwise travelled in every pickle of a Table -- Ray task
+    arguments, joblib and dask caches, multiprocessing.
+    """
+    return {
+        k: v
+        for k, v in kwargs.items()
+        if k.lower() not in _CONFIG_SECRETS
+        and not k.lower().endswith(("_secret", "_token", "password"))
+    }
+
+
+def shipping(obj: Any) -> Any:
+    """A shallow copy of a provider or catalog that pickles its secrets.
+
+    For `plan_scan(ship_catalog_auth=True)` / `plan_write(...)` and
+    ``connect(ship_credentials=True)``, where workers are meant to re-vend.
+    """
+    if not hasattr(obj, "_ship_secrets"):
+        return obj
+    copy = obj.__class__.__new__(obj.__class__)
+    copy.__dict__.update(obj.__dict__)
+    copy._ship_secrets = True
+    return copy
+
+
+#: Keys `credential_identity` digests with a secret of this process's own, so
+#: the identity carries nothing checkable offline against a guessed token.
+_IDENTITY_KEY = os.urandom(32)
+
+#: Providers unpickled in this process, by identity: every read task of a
+#: plan unpickles its own copy, and each vended (and built a client) anew --
+#: N tasks in one worker, N vends of the same credential. Bounded, oldest out.
+_SHARED_PROVIDERS: dict[tuple[type, str, bool], DatabricksCredentialProvider] = {}
+_SHARED_LIMIT = 256
+#: Workspace clients by authentication, shared across tables: N tables were
+#: N OAuth token fetches in every process.
+_SHARED_CLIENTS: dict[str, Any] = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def _auth_digest(parts: Any) -> str:
+    import hashlib
+    import json
+
+    material = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.blake2b(material.encode(), key=_IDENTITY_KEY, digest_size=16).hexdigest()
+
+
+def _shared_provider(
+    cls: type[DatabricksCredentialProvider], state: dict[str, Any], pickled_in: int
+) -> DatabricksCredentialProvider:
+    """Unpickle a provider, reusing this process's copy of the same one.
+
+    Only across processes: a copy made in the process that pickled it (a
+    `copy.deepcopy`, a pickle round trip in tests) is a new object, as copies
+    are expected to be.
+    """
+    provider = cls.__new__(cls)
+    provider.__setstate__(state)
+    if pickled_in == os.getpid():
+        return provider
+    key = (cls, provider.credential_identity(), bool(state.get("_ship_secrets")))
+    with _SHARED_LOCK:
+        existing = _SHARED_PROVIDERS.get(key)
+        if existing is not None:
+            return existing
+        if len(_SHARED_PROVIDERS) >= _SHARED_LIMIT:
+            _SHARED_PROVIDERS.pop(next(iter(_SHARED_PROVIDERS)))
+        _SHARED_PROVIDERS[key] = provider
+    return provider
 
 
 class DatabricksCredentialProvider:
@@ -308,6 +459,8 @@ class DatabricksCredentialProvider:
         self._token = token
         self._config_kwargs = config_kwargs
         self._explicit_config = config
+        #: Pickle the literal secrets (token, client secret) too; see `shipping`.
+        self._ship_secrets = False
 
         self._client: Any = None
         self._cache: dict[Operation, Credentials] = {}
@@ -343,6 +496,7 @@ class DatabricksCredentialProvider:
         state["_vended_at"] = {}
         state["_retry_after"] = {}
         state["_skewed"] = set()
+        state.pop("_identity", None)
         # Locks cannot be pickled; __setstate__ installs fresh ones.
         del state["_lock"]
         state.pop("_vend_locks", None)
@@ -355,9 +509,40 @@ class DatabricksCredentialProvider:
         state["_explicit_config"] = None
         if config is not None:
             state["_config_kwargs"] = {**_config_attributes(config), **self._config_kwargs}
+        if not state.get("_ship_secrets"):
+            state["_token"] = None
+            state["_config_kwargs"] = without_secrets(state["_config_kwargs"])
         return state
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # See `_shared_provider`: one copy per process on the far side.
+        return (_shared_provider, (type(self), self.__getstate__(), os.getpid()))
+
+    def credential_identity(self) -> str:
+        """Who vends for which table: the same from every copy of this provider.
+
+        A keyed digest of the workspace, the authentication settings (secrets
+        included, so two principals never share a credential) and the table.
+        """
+        cached = self.__dict__.get("_identity")
+        if cached is not None:
+            return str(cached)
+        config = self._explicit_config
+        attributes = _config_attributes(config) if config is not None else {}
+        digest = _auth_digest(
+            [
+                self._host,
+                self._profile,
+                self._token,
+                {**attributes, **self._config_kwargs},
+            ]
+        )
+        identity = f"dbx-{digest}-{self._table_id}"
+        self._identity = identity
+        return identity
+
     def __setstate__(self, state: dict[str, Any]) -> None:
+        state.setdefault("_ship_secrets", False)
         state.setdefault("_vended_at", {})
         state.setdefault("_retry_after", {})
         state.setdefault("_skewed", set())
@@ -375,13 +560,31 @@ class DatabricksCredentialProvider:
 
     def _workspace_locked(self) -> Any:
         if self._client is None:
-            self._client = workspace_client(
-                config=self._explicit_config,
-                profile=self._profile,
-                host=self._host,
-                token=self._token,
-                **self._config_kwargs,
-            )
+            # A pickled copy carries its Config's attributes (host, token, ...)
+            # in _config_kwargs. Passing those next to host= / token= failed
+            # with "got multiple values for keyword argument 'host'", so no
+            # worker could vend. An explicit argument wins over a carried one.
+            kwargs = dict(self._config_kwargs)
+            for key, value in (
+                ("profile", self._profile),
+                ("host", self._host),
+                ("token", self._token),
+            ):
+                if value:
+                    kwargs[key] = value
+            if self._explicit_config is not None:
+                self._client = workspace_client(config=self._explicit_config, **kwargs)
+            else:
+                # The same authentication gets one client per process, whatever
+                # the table: each client fetched its own OAuth token.
+                key = f"{id(workspace_client):x}-{_auth_digest(kwargs)}"
+                with _SHARED_LOCK:
+                    client = _SHARED_CLIENTS.get(key)
+                if client is None:
+                    client = workspace_client(**kwargs)
+                    with _SHARED_LOCK:
+                        client = _SHARED_CLIENTS.setdefault(key, client)
+                self._client = client
         return self._client
 
     def _margin_for(self, operation: Operation, cached: Credentials) -> float:
@@ -515,6 +718,19 @@ class DatabricksCredentialProvider:
                 table_id=self._table_id, operation=op
             )
         except Exception as exc:
+            if _external_write_refused(exc):
+                from ..errors import ExternalWriteNotAllowedError
+
+                raise ExternalWriteNotAllowedError(
+                    f"Unity Catalog will not vend write credentials for table_id="
+                    f"{self._table_id} (EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE): it is a "
+                    "managed table without catalog commits, and Databricks accepts writes "
+                    "to managed tables from outside Databricks only through catalog "
+                    "commits. Enable catalog commits on the table (catalog-managed), write "
+                    "to an external table instead, or pass allow_sql_fallback=True to write "
+                    "through a SQL warehouse (a driver-side Table.append, not a distributed "
+                    f"write). Underlying error: {sdk_message(exc)}"
+                ) from exc
             kind = _error_kind(exc)
             if kind == "transient":
                 raise CredentialError(
@@ -535,7 +751,7 @@ class DatabricksCredentialProvider:
                     f"credential vending failed for table_id={self._table_id} "
                     f"({operation.value}): the Databricks credentials were rejected "
                     "(expired or invalid token, or wrong workspace host). "
-                    f"Underlying error: {exc}"
+                    f"Underlying error: {sdk_message(exc)}"
                 ) from exc
             raise CredentialError(
                 f"credential vending failed for table_id={self._table_id} ({operation.value}). "
@@ -631,8 +847,17 @@ def credentials_from_response(
         if token := _get(aws, "session_token"):
             secrets["aws_session_token"] = str(token)
         # UC vends keys but never a region, and object_store would assume
-        # us-east-1; any other bucket then fails with an opaque redirect.
-        region = aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        # us-east-1; any other bucket then fails with an opaque redirect. The
+        # catalog's region is its metastore's, which an external table's
+        # bucket need not share, so the bucket's own region comes first.
+        from .._storage import s3_bucket_region
+
+        region = (
+            s3_bucket_region(url)
+            or aws_region
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+        )
         if region:
             secrets["aws_region"] = region
         if access_point := _get(aws, "access_point"):

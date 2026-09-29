@@ -13,9 +13,15 @@ FEATURES: list[str]
 
 One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "metadata_json", "app_id_version", "commit_raw", "partitioned_append",
-"uc_create_table_request", "checkpoint", "file_restricted_scan",
-"distributed_write", "deletion_vector_dml", "materialized_row_ids". Gate on this
-list, not `hasattr`, so a stale build refuses cleanly.
+"uc_create_table_request", "checkpoint", "file_restricted_scan", "legacy_calendar_files",
+"distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
+"compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
+"restore", "commit_actions", "row_tracking_compaction", "add_tags", "write_checksum",
+"incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
+"schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
+"commit_timestamps", "credential_slots", "planned_scan", "values_checked",
+"checkpoint_protection", "domain_metadata", "deferred_create". Gate on this list, not
+`hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -29,6 +35,13 @@ def runtime_is_multithreaded() -> bool:
 
     `UCCommitter` requires it and panics on a current-thread runtime.
     """
+
+# Every exception the extension raises (these classes, and the builtin
+# FileNotFoundError, OSError and ValueError it also raises) carries a `kind`
+# attribute: a stable code for what failed, one of "not_found", "storage",
+# "kernel", "unsupported", "arrow", "invalid_input", "commit_conflict",
+# "backfill_required", "retryable", "catalog_permission", "catalog_not_found"
+# and "catalog_rejected". Classify by it, not by the message.
 
 class CommitConflictError(RuntimeError):
     """Another writer committed this version first.
@@ -130,6 +143,87 @@ def table_changes(
     not enabled at the range's endpoints or the schema changed across it.
     """
 
+def feed_versions(
+    table_root: str,
+    options: dict[str, str] | None = None,
+    start_version: int | None = None,
+    end_version: int | None = None,
+    start_timestamp_ms: int | None = None,
+    end_timestamp_ms: int | None = None,
+) -> tuple[int, int | None]:
+    """The `(start, end)` versions a change feed's bounds name, as `table_changes` reads them.
+
+    A start timestamp is the first commit at or after it, an end timestamp the
+    latest at or before it, by commit times as Delta assigns them (file times
+    made monotonic before in-commit timestamps). ValueError when either is
+    after the latest commit, an end is before the first, or the range is empty.
+    """
+
+def validate_retry_options(options: dict[str, str]) -> None:
+    """Refuse retry storage options either engine would refuse or panic on.
+
+    Raises InvalidInputError. Keys are read as delta-rs reads them.
+    """
+
+def set_credential_slot(
+    slot: str, options: dict[str, str], expires_at: float | None = None
+) -> None:
+    """Publish a freshly vended credential in `slot`, for stores built with its key."""
+
+def remove_credential_slot(slot: str) -> None:
+    """Forget `slot`; stores built from it keep the credential they last saw."""
+
+def probe_put_if_absent(table_root: str, options: dict[str, str] | None = None) -> bool:
+    """Whether the store under `table_root` honours put-if-absent.
+
+    Puts one sentinel under ``_delta_log/`` twice with put-if-absent, then
+    deletes it: False if the second put succeeded (the store ignores the
+    condition) or the store has no conditional put at all.
+    """
+
+def absolute_deletion_vector(table_root: str, descriptor: str) -> str:
+    """A deletion-vector descriptor (JSON) of a file under `table_root`, made absolute.
+
+    A relative (`u`) vector becomes a `p` one with the vector file's full URL;
+    an inline or absolute one is returned unchanged. For shallow clones.
+    """
+
+def copy_objects(
+    source_root: str,
+    target_root: str,
+    paths: list[str],
+    source_options: dict[str, str] | None = None,
+    target_options: dict[str, str] | None = None,
+) -> int:
+    """Copy `paths` (relative, URL-encoded) from one table root to another; bytes copied."""
+
+def rollback_create_table(
+    table_root: str, metadata_id: str, options: dict[str, str] | None = None
+) -> bool:
+    """Delete `_delta_log/<0>.json` if it is the only version and its metaData id is `metadata_id`.
+
+    Undoes a create whose first data commit failed for certain; returns whether
+    it deleted anything.
+    """
+
+def write_create_template(
+    table_root: str, plan_id: str, actions: list[str], options: dict[str, str] | None = None
+) -> tuple[str, int, int]:
+    """Write `actions` as the template version 0 of a table a distributed write will create.
+
+    Put-if-absent at `<table_root>/_deltaswamp_pending/<plan_id>/_delta_log/`.
+    Returns `(url, last_modified_millis, size)`, what `Snapshot.resolve` takes
+    as `template=`.
+    """
+
+def create_published(table_root: str, options: dict[str, str] | None = None) -> bool:
+    """Whether `_delta_log/<0>.json` is there; raises when storage cannot say."""
+
+def delete_create_template(
+    table_root: str, plan_id: str, options: dict[str, str] | None = None
+) -> bool:
+    """Delete plan `plan_id`'s template; True if it was there."""
+
 def commit_raw(
     table_root: str,
     version: int,
@@ -192,8 +286,18 @@ class Snapshot:
         log_tail: list[tuple[int, str, int, int]] | None = None,
         max_catalog_version: int | None = None,
         timestamp_ms: int | None = None,
+        identify: bool = False,
+        template: tuple[str, int, int] | None = None,
     ) -> Snapshot:
         """Resolve a snapshot.
+
+        `template` is `(url, last_modified_millis, size)` of a version-0 commit
+        under `<table_root>/_deltaswamp_pending/<plan>/_delta_log/`: a table a
+        distributed write will create, resolved before it exists. It is the
+        whole log; no `log_tail`, `timestamp_ms` or `identify` with it.
+
+        `identify=True` records the strong identity of the commit file the
+        snapshot ends at (`commit_identity`), which `refresh` revalidates.
 
         `log_tail` entries are `(version, filename, last_modified_millis, size)`
         and `max_catalog_version` caps the version that may be trusted. Together
@@ -209,6 +313,35 @@ class Snapshot:
         timestamp is before the earliest recreatable commit (version 0 or the
         oldest retained checkpoint).
         """
+
+    @staticmethod
+    def planned(
+        table_root: str,
+        version: int,
+        protocol_json: str,
+        metadata_json: str,
+        options: dict[str, str] | None = None,
+    ) -> Snapshot:
+        """A snapshot at `version` built from a plan's protocol and metadata.
+
+        Reads no log: a worker scans planned files through it with
+        `scan(files=..., scan_rows=...)`, the rows `files(scan_rows=True)`
+        listed on the driver. Anything else that needs the log (`files()`, a
+        scan without `scan_rows`) is refused. Requires "planned_scan".
+        """
+
+    def refresh(self, options: dict[str, str] | None = None, latest: bool = True) -> Snapshot:
+        """This snapshot revalidated against storage and brought up to date.
+
+        The commit file it ends at must still have the recorded identity;
+        otherwise the table is read afresh (at the same version with
+        `latest=False`). Needs a snapshot resolved with `identify=True`.
+        Path-based tables only.
+        """
+
+    @property
+    def commit_identity(self) -> str | None:
+        """Opaque identity of the commit file at `version`, or None."""
 
     @property
     def version(self) -> int: ...
@@ -238,6 +371,9 @@ class Snapshot:
         files: list[str] | None = None,
         row_positions: bool = False,
         row_ids: bool = False,
+        file_groups: list[int] | None = None,
+        row_tracking: bool = False,
+        scan_rows: list[str] | None = None,
     ) -> Any:
         """Read the table as an Arrow stream, with deletion vectors applied.
 
@@ -245,7 +381,16 @@ class Snapshot:
         the log stores its path) and `__deltaswamp_row_index` (its physical
         position in that file): the address a deletion vector uses. `row_ids`
         (which needs `row_positions`, and row tracking enabled) also appends
-        `__deltaswamp_row_id`, each row's stable row id.
+        `__deltaswamp_row_id`, each row's stable row id. `row_tracking` (with
+        `file_groups` or `row_positions`, row tracking enabled) appends `__deltaswamp_row_id` and
+        `__deltaswamp_row_commit_version`: each row's id and commit version as
+        Databricks' `_metadata` reads them, for a compaction to write back.
+
+        `files` are read in the order given, a few ahead in the background.
+        `file_groups` (with `files`, not `row_positions`) splits them into runs
+        of that many files each: every batch holds rows of one run only,
+        consecutive files' batches merged, tagged by `__deltaswamp_file`
+        (dictionary-encoded) -- a compaction's bins.
 
         `predicate` is a JSON string used ONLY to skip files (by statistics and
         partition values); rows that do not match can still be returned, so the
@@ -276,9 +421,16 @@ class Snapshot:
         not in this snapshot are ignored; `[]` yields an empty stream with the
         same schema. So scans over a partition of `files()` union to the full
         scan -- the building block for distributed reads.
+
+        `scan_rows` (requires "planned_scan"; with `files`, not with
+        `row_positions`, `file_groups` or `row_tracking`) reads the files
+        those scan rows describe without replaying the log: the rows are the
+        `scan_row` column of `files(scan_rows=True)`.
         """
 
-    def files(self, predicate: str | None = None) -> Any:
+    def files(
+        self, predicate: str | None = None, tags: bool = False, scan_rows: bool = False
+    ) -> Any:
         """One row per live data file, as an Arrow table (arro3 Table).
 
         Columns: `path` (string, as stored in the log: usually relative to the
@@ -290,6 +442,89 @@ class Snapshot:
         if present, rows in the file are deleted and must be masked) and
         `num_records` (int64 from stats, nullable; counts rows *before* the
         deletion vector). `predicate` skips files exactly as in `scan`.
+        `tags=True` appends `tags`: each add's tags as a JSON object (nullable).
+        `scan_rows=True` (requires "planned_scan") appends `scan_row`: each
+        file's kernel scan row as JSON, statistics left out, for
+        `scan(scan_rows=...)` on a worker.
+        """
+
+    def add_actions(self) -> list[str]:
+        """Every live file as the `add` action (a JSON object) that restores it.
+
+        All of the add as the log recorded it -- statistics, partition values,
+        tags, deletion vector, `baseRowId`, `defaultRowCommitVersion`,
+        `clusteringProvider` -- with `dataChange` true. Requires "restore".
+        """
+
+    @property
+    def deleted_file_retention_ms(self) -> int | None:
+        """`delta.deletedFileRetentionDuration` in ms as the kernel parses it; None if unset."""
+
+    def vacuum_plan(
+        self,
+        cutoff_ms: int,
+        lite: bool = False,
+        partition_columns: list[str] | None = None,
+    ) -> list[tuple[str, str, int, int]]:
+        """What a VACUUM would delete with retention cutoff `cutoff_ms` (epoch ms).
+
+        `(key, path, size, modified_ms)` per file: `key` as `delete_files`
+        takes it, `path` relative to the table root. Referenced (never listed):
+        live files and their deletion vectors, files of removes whose
+        `deletionTimestamp` is at or after the cutoff and their vectors, and
+        the change-data files of commits written since. A full plan lists the
+        table directory (hidden paths skipped as Spark skips them) and keeps
+        files modified at or after the cutoff; `lite` lists only what expired
+        removes name. `partition_columns` are the names partition directories
+        may carry. Requires "vacuum".
+        """
+
+    def delete_files(self, keys: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+        """Delete `keys` from `vacuum_plan` under the root: (deleted, [(key, error)])."""
+
+    @property
+    def log_retention_ms(self) -> int:
+        """`delta.logRetentionDuration` in ms, or Delta's default (30 days) if unset."""
+
+    def cleanup_log(
+        self, cutoff_ms: int, dry_run: bool = False
+    ) -> tuple[int | None, list[str], list[tuple[str, str]]]:
+        """Delete the log below the newest checkpoint committed at or before `cutoff_ms`.
+
+        Commit, checksum, checkpoint and compacted files below that checkpoint,
+        and sidecars no retained v2 checkpoint references that are older than
+        the cutoff. Commit times are in-commit timestamps where the table has
+        them, else monotonized file modification times. Returns
+        `(kept_checkpoint, deleted_keys, [(key, error)])`; `dry_run` returns
+        the plan. Refuses a catalog-managed table and checkpointProtection.
+        Requires "log_cleanup".
+        """
+
+    def write_symlink_manifest(self) -> list[str]:
+        """Write `_symlink_format_manifest/[<partition>/]manifest` for the live files.
+
+        As Spark writes them: one decoded absolute path per line, a manifest
+        per Hive-escaped partition directory (an empty one for an empty
+        unpartitioned table), and the manifests of partitions with no files
+        deleted. Returns the manifests written, relative to the table root.
+        Requires "symlink_manifest".
+        """
+
+    def missing_data_files(self) -> list[str]:
+        """The add actions (JSON, as `add_actions`) of live files whose data file is gone.
+
+        Deletion vectors are not looked for; a file outside the table root
+        counts as gone. Requires "fsck".
+        """
+
+    def missing_files(self, adds: list[str]) -> list[str]:
+        """URLs of the data and deletion-vector files `adds` (JSON) name that are gone."""
+
+    def legacy_calendar_files(self, files: list[tuple[str, int]]) -> list[str]:
+        """Which of `files` (`(path, size)`, paths as `files()` reports them)
+        a reader that does not rebase would misread: written by Spark in its
+        legacy hybrid calendar, or storing INT96 timestamps. Requires the
+        "legacy_calendar_files" feature; reads only each file's footer.
         """
 
     def metadata_json(self) -> str:
@@ -322,11 +557,61 @@ class Snapshot:
         `delta.setTransactionRetentionDuration` read as None.
         """
 
+    def commit_log(self, after: int, until: int | None = None) -> list[tuple[int, str]]:
+        """The raw commit files after version `after` up to this one, ascending.
+
+        `(version, text)`, each text the newline-delimited actions of that
+        commit. Published commits only. `until` stops at that version instead
+        (never past this one), to read a long range in chunks.
+        """
+
+    def write_checksum(self, always: bool = False) -> bool:
+        """Write `_delta_log/<version>.crc` for this snapshot, best effort.
+
+        Only when cheap (a checksum at most 100 commits back, or a short log
+        with no checkpoint) unless `always`; a commit that changed no file
+        carries the previous checksum forward. True if one was written; never
+        raises.
+        """
+
+    def incremental_files(
+        self, base_version: int
+    ) -> tuple[list[tuple[str, str | None]], list[tuple[str, str | None]]] | None:
+        """The data files added and removed in `(base_version, self.version]`.
+
+        `(live_adds, removes)`, each sorted `(path, dv_unique_id)` pairs with
+        paths as stored in the log; the adds are those still live here. None
+        when the range's commits are no longer all in the log.
+        """
+
     def timestamp(self) -> int:
         """This version's commit timestamp in epoch milliseconds.
 
         The in-commit timestamp when ICT is enabled, else the commit file's
         modification time.
+        """
+
+    def commit_timestamp(self) -> int:
+        """This version's commit timestamp as Delta assigns it, in epoch ms.
+
+        The in-commit timestamp when ICT is enabled, else the commit file's
+        modification time made monotonic: no earlier than a millisecond after
+        the commit before it, as Spark reports it and time travel compares it.
+        """
+
+    def file_commit_timestamps(self) -> list[tuple[int, int]]:
+        """`(version, ms)` of each published commit timed by its file.
+
+        Every commit when in-commit timestamps are off, those before their
+        enablement when they were turned on later; the times made monotonic.
+        """
+
+    def version_at(self, timestamp_ms: int, at_or_after: bool = False) -> tuple[int, int]:
+        """`(version, commit ms)` of the published commit a timestamp names.
+
+        The latest at or before it, or with `at_or_after` the first at or
+        after it. Raises ValueError ("timestamp out of range") when there is
+        none.
         """
 
     def checkpoint(self) -> bool:
@@ -348,8 +633,19 @@ class Snapshot:
         overwrite: bool = False,
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, str] | None = None,
+        operation_parameters: dict[str, str] | None = None,
+        blind_append: bool | None = None,
+        metadata: str | None = None,
+        protocol: str | None = None,
+        constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
+        domain_metadata: dict[str, str] | None = None,
     ) -> int:
         """Append Arrow data as one transaction; returns the committed version.
+
+        `operation_parameters` and `blind_append` are written into the commit's
+        commitInfo as `operationParameters` and `isBlindAppend`, which kernel
+        otherwise writes as `{}` and (unless true) not at all.
 
         Pass `uc` for a catalog-managed table, where the commit is staged and
         then ratified by the catalog rather than written directly.
@@ -372,15 +668,38 @@ class Snapshot:
         commit. `txn` is `(app_id, version)` for idempotent writes;
         `commit_metadata` goes into commitInfo, and may not use a key the
         commitInfo action reserves (`operation`, `timestamp`, `txnId`, ...).
+
+        `metadata` and `protocol` (log JSON, "schema_evolution") are the
+        table's new metaData and protocol, committed with the rows: the rows
+        are conformed to and written under the new schema, and both actions
+        are written into the same commit. The metaData must keep the table's
+        id. `constraints_checked` ("check_constraints") says the caller
+        evaluated every CHECK constraint over every row written; the kernel
+        refuses a table with the checkConstraints feature otherwise.
+        `values_checked` ("values_checked") names the other value features the
+        caller stood in for over every row -- ``generatedColumns`` (computed
+        or checked), ``identityColumns`` (generated within the high-water
+        mark) and ``invariants`` -- which the kernel refuses too; an unknown
+        name is a ValueError. A table's ``checkpointProtection``
+        ("checkpoint_protection") is set aside for every commit.
+        `domain_metadata` ("domain_metadata") sets user domains, domain ->
+        configuration, in the same commit.
         """
 
-    def write_files(self, data: Any, uc: UcCommitConfig | None = None) -> bytes:
+    def write_files(
+        self,
+        data: Any,
+        uc: UcCommitConfig | None = None,
+        constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
+    ) -> bytes:
         """Write data files without committing; returns opaque fragment bytes.
 
         The worker half of a distributed write. Partitioned tables are handled
         exactly as in `append`. The files are durable when this returns but
         belong to no version until `commit_files` accepts them, so a coordinator
         that abandons the write leaves them behind as garbage.
+        `constraints_checked` and `values_checked` are as for `append`.
         """
 
     def commit_files(
@@ -392,35 +711,73 @@ class Snapshot:
         overwrite: bool = False,
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, str] | None = None,
+        operation_parameters: dict[str, str] | None = None,
+        blind_append: bool | None = None,
+        constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
+        domain_metadata: dict[str, str] | None = None,
     ) -> int:
         """Commit fragments from `write_files` as one transaction.
 
         Every fragment lands at a single version, so a distributed write is
         atomic. `overwrite` removes every file visible in this snapshot in the
-        same commit. Raises the same errors as `append`.
+        same commit. Raises the same errors as `append`. `constraints_checked`,
+        `values_checked` and `domain_metadata` are as for `append`: every
+        worker checked the rows it wrote.
+        """
+
+    def commits_adding(self, after: int, paths: list[str]) -> list[tuple[int, int]]:
+        """`(version, n)` for each commit in `(after, version]` adding any of `paths`.
+
+        Reads only those commits, a catalog-managed table's ratified tail
+        included. Raises when one of them can no longer be read.
+        """
+
+    def delete_uncommitted(self, paths: list[str]) -> list[str]:
+        """Delete data files `write_files` wrote that no commit references.
+
+        Only relative paths under the table root; returns the ones that could
+        not be deleted, with why.
         """
 
     def commit_dml(
         self,
         deletions: Any,
         data: Any | None = None,
+        whole_files: list[str] | None = None,
         uc: UcCommitConfig | None = None,
         engine_info: str | None = None,
         operation: str | None = None,
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, str] | None = None,
+        data_change: bool = True,
+        operation_parameters: dict[str, str] | None = None,
+        blind_append: bool | None = None,
+        add_tags: dict[str, str] | None = None,
+        constraints_checked: bool = False,
     ) -> tuple[int, int, int, int]:
         """Commit row-level DML as deletion vectors, in one transaction.
 
+        `whole_files` are removed outright; `data_change=False` commits the
+        whole thing as a compaction (OPTIMIZE), the same rows in new files:
+        `data` is then pulled one batch at a time and each batch written as
+        one file as it arrives, and the table's CHECK constraints, generated
+        and identity columns and invariants do not stop it (they constrain
+        new values, and a compaction writes the ones it read). On a row-tracked
+        table every commit's removes are staged here (kernel refuses them),
+        and `__deltaswamp_row_id` / `__deltaswamp_row_commit_version` columns
+        in `data` are written to the materialized row-tracking columns (a null
+        is a fresh value). `add_tags` are written as the `tags` of every add.
+        `constraints_checked` is as for `append`: every CHECK constraint holds
+        for the rows in `data`.
+
         `deletions` is an Arrow stream of `path` and `row_index` columns, as a
         positional scan reports them. Each touched file's new deletions are
-        unioned with its existing vector; a file left with no rows is removed
-        (or, where row tracking forbids removes, keeps a full vector). `data`,
-        if given, is appended in the same commit; a `__deltaswamp_row_id`
-        column in it is written to the table's materialized row-id column, so
-        updated rows keep their ids. Returns `(version, deleted_rows,
-        deletion_vectors_added, files_removed)`; nothing to change commits
-        nothing and returns this snapshot's version.
+        unioned with its existing vector; a file left with no rows is removed.
+        `data`, if given, is appended in the same commit, so a copy-on-write
+        rewrite is `whole_files` plus their surviving rows in `data`. Returns
+        `(version, deleted_rows, deletion_vectors_added, files_removed)`;
+        nothing to change commits nothing and returns this snapshot's version.
         """
 
     @property
@@ -429,3 +786,21 @@ class Snapshot:
 
     def publish(self, uc: UcCommitConfig | None = None) -> int:
         """Publish ratified-but-unpublished commits into `_delta_log/`."""
+
+    def commit_actions(
+        self,
+        actions: list[str],
+        uc: UcCommitConfig | None = None,
+        engine_info: str | None = None,
+        operation: str | None = None,
+        operation_parameters: dict[str, str] | None = None,
+        commit_metadata: dict[str, str] | None = None,
+        blind_append: bool = False,
+    ) -> int:
+        """Commit raw add/remove/txn/domainMetadata actions on this snapshot; the new version.
+
+        Through the catalog when `uc` is given: kernel writes the commitInfo
+        (with its in-commit timestamp) and its committer ratifies the version.
+        Raises CommitConflictError when another writer took it first.
+        Requires "commit_actions".
+        """

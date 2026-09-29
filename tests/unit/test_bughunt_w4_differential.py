@@ -135,7 +135,9 @@ class TestStringLiterals:
 
     def test_escaped_quote_is_part_of_the_string(self) -> None:
         assert self.value(r"s = 'it\'s'") == "it's"
-        assert self.value("s = 'it''s'") == "it's"
+        # Spark reads a doubled quote as two adjacent literals, concatenated.
+        assert self.value("s = 'it''s'") == "its"
+        assert self.value("s = 'it' 's'") == "its"
         assert self.value(r's = "say \"hi\""') == 'say "hi"'
 
     def test_like_keeps_escaped_wildcards_literal(self) -> None:

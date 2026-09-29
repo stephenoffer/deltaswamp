@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..catalog import ResolvedTable
-from ..errors import InvalidArgumentError, UnreachableTableError
+from ..errors import InvalidArgumentError, InvalidReferenceError, UnreachableTableError
 from ..identity import RefKind, split_identifier
 
 _PRIVILEGE = re.compile(r"^[A-Za-z][A-Za-z _]*$")
@@ -50,6 +50,43 @@ def column(path: str | Sequence[str]) -> str:
     if not parts:
         raise InvalidArgumentError("a column path needs at least one part")
     return ".".join(quote(p) for p in parts)
+
+
+def column_path(path: str | Sequence[str]) -> str:
+    """Quote the column an ALTER names: a dotted str is a nested path, as the kernel reads it.
+
+    `column` quotes a str as one identifier, so ALTER COLUMN `s.a` looked for
+    a top-level column literally named "s.a" and failed on the warehouse
+    while the same call on a path table changed the nested field. A part
+    containing a dot is backtick-quoted, exactly as the kernel expects.
+    """
+    return column(split_identifier(path) if isinstance(path, str) else path)
+
+
+def leaf_name(old: str | Sequence[str], new: str) -> str:
+    """The new name of a column RENAME, which keeps it in its struct.
+
+    RENAME COLUMN s.aa TO `s.x` created a field literally named "s.x". As on
+    the kernel path, the new name may repeat the struct path, and only the
+    last part may change.
+    """
+    path = split_identifier(old) if isinstance(old, str) else list(old)
+    try:
+        new_path = split_identifier(new) if "`" in new or "." in new else [new]
+    except InvalidReferenceError:
+        new_path = [new]  # an unbalanced backtick is part of the name
+    if len(new_path) > 1 and (
+        len(new_path) != len(path)
+        or [p.lower() for p in new_path[:-1]] != [p.lower() for p in path[:-1]]
+    ):
+        raise InvalidArgumentError(
+            f"cannot rename {old!r} to {new!r}: a rename keeps the column in its struct; "
+            "only the last part of the path may change (quote a name containing a dot "
+            "with backticks)"
+        )
+    if not new_path[-1]:
+        raise InvalidArgumentError(f"cannot rename {old!r}: the new name is empty")
+    return quote(new_path[-1])
 
 
 def columns(columns: str | Sequence[str | Sequence[str]]) -> str:
@@ -305,9 +342,11 @@ def arrow_to_sql(arrow_type: Any) -> str:
     if t.is_map(arrow_type):
         return f"MAP<{arrow_to_sql(arrow_type.key_type)}, {arrow_to_sql(arrow_type.item_type)}>"
     if t.is_struct(arrow_type):
+        # A nested field's NOT NULL is part of the type; without it the
+        # warehouse created every struct field nullable.
         inner = ", ".join(
-            f"{quote(arrow_type.field(i).name)}: {arrow_to_sql(arrow_type.field(i).type)}"
-            for i in range(arrow_type.num_fields)
+            f"{quote(f.name)}: {arrow_to_sql(f.type)}" + ("" if f.nullable else " NOT NULL")
+            for f in (arrow_type.field(i) for i in range(arrow_type.num_fields))
         )
         return f"STRUCT<{inner}>"
     raise UnreachableTableError("add columns via SQL", f"no SQL type for Arrow type {arrow_type}")

@@ -92,12 +92,15 @@ class TestEnginesFailInOppositeDirections:
         so the kernel is listed last and promoted only on DV-enabled tables."""
         assert OPERATION_ENGINES[Operation.MERGE].engines[-1] is Engine.KERNEL
 
-    @pytest.mark.parametrize(
-        "op", [Operation.OPTIMIZE, Operation.VACUUM, Operation.RESTORE, Operation.REPAIR]
-    )
-    def test_maintenance_never_routes_to_kernel(self, op: Operation) -> None:
-        """Kernel implements none of these."""
-        assert Engine.KERNEL not in OPERATION_ENGINES[op].engines
+    @pytest.mark.parametrize("op", [Operation.VACUUM, Operation.RESTORE, Operation.REPAIR])
+    def test_vacuum_and_restore_fall_back_to_the_kernel(self, op: Operation) -> None:
+        """delta-rs serves the tables it can commit to; the kernel the rest."""
+        assert OPERATION_ENGINES[op].engines == (Engine.DELTARS, Engine.KERNEL, Engine.SQL)
+
+    @pytest.mark.parametrize("op", [Operation.OPTIMIZE, Operation.ZORDER])
+    def test_compaction_routes_to_the_kernel_first(self, op: Operation) -> None:
+        """Only the kernel's compaction commit conflicts with a concurrent one."""
+        assert OPERATION_ENGINES[op].engines[0] is Engine.KERNEL
 
     def test_publish_is_kernel_only(self) -> None:
         """Only kernel implements the staged->published transition."""
@@ -144,16 +147,20 @@ class TestEasilyMissedFacts:
         assert row.kernel_write is Support.YES
         assert row.deltars_write is Support.PARTIAL
 
-    @pytest.mark.parametrize(
-        "feature",
-        [TableFeature.COLLATIONS, TableFeature.CHECKPOINT_PROTECTION],
-    )
+    @pytest.mark.parametrize("feature", [TableFeature.COLLATIONS])
     def test_features_with_no_kernel_variant_block_both_engines(
         self, feature: TableFeature
     ) -> None:
         """No kernel 0.28 variant -> classified Unknown -> writes blocked."""
         row = FEATURE_SUPPORT[feature]
         assert row.kernel_write is Support.NO
+        assert row.deltars_write is Support.NO
+
+    def test_checkpoint_protection_is_written_past_on_the_kernel(self) -> None:
+        """Unknown to kernel 0.28 too, but it binds only log cleanup: the kernel
+        paths set it aside for every commit, and delta-rs still refuses it."""
+        row = FEATURE_SUPPORT[TableFeature.CHECKPOINT_PROTECTION]
+        assert row.kernel_write is Support.PARTIAL
         assert row.deltars_write is Support.NO
 
     def test_collations_are_writer_only(self) -> None:
@@ -164,9 +171,10 @@ class TestEasilyMissedFacts:
 
     def test_checkconstraints_deltars_ahead_of_kernel(self) -> None:
         """A case where delta-rs is the more capable engine, so routing must not
-        assume kernel is always better."""
+        assume kernel is always better: the kernel refuses the feature, and only
+        the write paths here, evaluating each constraint themselves, get past it."""
         row = FEATURE_SUPPORT[TableFeature.CHECK_CONSTRAINTS]
-        assert row.kernel_write is Support.NO
+        assert row.kernel_write is Support.PARTIAL
         assert row.deltars_write is Support.YES
 
 
@@ -191,7 +199,6 @@ class TestDatabricksOnlyOperations:
         [
             Operation.DROP_FEATURE,
             Operation.REORG,
-            Operation.CLONE,
             Operation.ANALYZE,
             Operation.SYNC_ICEBERG,
             Operation.REFRESH,
@@ -200,7 +207,9 @@ class TestDatabricksOnlyOperations:
     def test_expected_members(self, op: Operation) -> None:
         assert op in DATABRICKS_ONLY_OPERATIONS
 
-    @pytest.mark.parametrize("op", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN])
+    @pytest.mark.parametrize(
+        "op", [Operation.DROP_COLUMN, Operation.RENAME_COLUMN, Operation.CLONE]
+    )
     def test_column_mapping_ddl_has_a_direct_path(self, op: Operation) -> None:
         """Rename and drop are metadata-only under column mapping, which the
         kernel path writes itself, so they are not Databricks-only."""
@@ -225,6 +234,13 @@ class TestDocsMatchTheMatrices:
         text = self._conformance()
         missing = [key for key in PROPERTY_SUPPORT if f"`{key}`" not in text]
         assert not missing, f"undocumented properties: {sorted(missing)}"
+
+    def test_table_sizes_are_stated_correctly(self) -> None:
+        # The page said 30 properties after two more were added.
+        text = self._conformance()
+        assert f"| `FEATURE_SUPPORT` | {len(FEATURE_SUPPORT)} table features" in text
+        assert f"| `OPERATION_ENGINES` | {len(OPERATION_ENGINES)} operations" in text
+        assert f"| `PROPERTY_SUPPORT` | {len(PROPERTY_SUPPORT)} table properties" in text
 
     def test_every_write_operation_is_documented(self) -> None:
         from deltaswamp.capability import Operation as Op

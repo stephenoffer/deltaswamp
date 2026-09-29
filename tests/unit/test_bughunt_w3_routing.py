@@ -19,7 +19,7 @@ import deltaswamp as ds
 import pytest
 from deltaswamp.capability import Capability, Engine, Operation
 from deltaswamp.catalog import ResolvedTable
-from deltaswamp.errors import FallbackRequiredError, UnreachableTableError
+from deltaswamp.errors import FallbackRequiredError, InvalidArgumentError, UnreachableTableError
 from deltaswamp.identity import parse_ref
 from deltaswamp.router import Router
 
@@ -81,24 +81,26 @@ class _Yes:
 
 
 @needs_native
-def test_optimize_on_a_column_mapped_table_is_refused_up_front(conn: Any, tmp_path: Path) -> None:
+def test_optimize_on_a_column_mapped_table_routes_to_the_kernel(conn: Any, tmp_path: Path) -> None:
     """delta-rs raised "Column mapping is not supported for write operation
     'OPTIMIZE'" after being chosen; the mapping here is on a legacy protocol
-    (writer 5), so no feature list names it."""
+    (writer 5), so no feature list names it. The kernel compacts it (it was
+    refused, over a DuckDB bug that reads every mapped table's partition
+    columns as NULL, whoever wrote it)."""
     path = _make(conn, tmp_path, {"delta.columnMapping.mode": "name"})
     t = conn.table(path)
-    assert not t.can("optimize").ok
-    assert "columnMapping" in t.can("optimize").reason
-    assert not t.can("zorder").ok
-    with pytest.raises(UnreachableTableError, match="columnMapping"):
-        t.optimize()
+    assert t.can("optimize").engine is Engine.KERNEL
+    assert t.can("zorder", columns=["id"]).engine is Engine.KERNEL
+    before = sorted(t.to_arrow().column("id").to_pylist())
+    t.optimize()
+    assert sorted(conn.table(path).to_arrow().column("id").to_pylist()) == before
 
 
 @needs_native
 def test_optimize_with_column_mapping_mode_none_still_routes(conn: Any, tmp_path: Path) -> None:
-    """The feature listed but mode none: delta-rs optimizes it fine."""
+    """The feature listed but mode none: the kernel compacts it."""
     path = _make(conn, tmp_path, {"delta.feature.columnMapping": "supported"})
-    assert conn.table(path).can("optimize").engine is Engine.DELTARS
+    assert conn.table(path).can("optimize").engine is Engine.KERNEL
     conn.table(path).optimize()
 
 
@@ -141,16 +143,15 @@ def test_rename_column_without_column_mapping_is_refused_at_routing(
 
 
 @needs_native
-def test_overwrite_of_a_row_tracking_table_is_refused_up_front(conn: Any, tmp_path: Path) -> None:
-    """The kernel's transaction refused at commit: "Remove actions are not yet
-    supported on tables with rowTracking"."""
+def test_overwrite_of_a_row_tracking_table_routes_to_the_kernel(conn: Any, tmp_path: Path) -> None:
+    """The kernel's transaction refuses every remove on a row-tracked table
+    ("Remove actions are not yet supported"); the overwrite stages them by
+    hand, and was refused up front until it did."""
     path = _make(conn, tmp_path, {"delta.enableRowTracking": "true"})
     verdict = conn.table(path).can("overwrite")
-    assert not verdict.ok
-    assert "overwrite is not supported on a table with rowTracking" in verdict.reason
-    with pytest.raises(UnreachableTableError, match="rowTracking"):
-        conn.table(path).overwrite(_data(10))
-    assert conn.table(path).to_arrow().num_rows == 6
+    assert verdict.ok and verdict.engine is Engine.KERNEL
+    conn.table(path).overwrite(_data(10))
+    assert sorted(conn.table(path).to_arrow().column("id").to_pylist()) == [11, 12, 13]
 
 
 @needs_native
@@ -199,15 +200,19 @@ def test_history_of_a_vacuum_protocol_check_table(conn: Any, tmp_path: Path) -> 
         {"delta.enableRowTracking": "true"},
     ],
 )
-def test_vacuum_dry_run_is_served_but_a_real_vacuum_is_not(
+def test_vacuum_dry_run_and_a_real_vacuum_are_served(
     conn: Any, tmp_path: Path, props: dict[str, str]
 ) -> None:
-    """A dry run deletes nothing and commits nothing; a real VACUUM commits
-    VACUUM START/END, which delta-rs refuses on these tables."""
+    """A real VACUUM commits VACUUM START/END, which delta-rs refuses on these
+    tables; the kernel plans and commits it (it was refused before)."""
     path = _make(conn, tmp_path, props)
+    assert conn.table(path).can("vacuum", dry_run=False).engine is Engine.KERNEL
     assert conn.table(path).vacuum() == []  # the default is a dry run
-    with pytest.raises(UnreachableTableError):
+    with pytest.raises(InvalidArgumentError, match="deletedFileRetentionDuration"):
         conn.table(path).vacuum(dry_run=False, retention_hours=0)
+    rows = conn.table(path).to_arrow().num_rows
+    conn.table(path).vacuum(dry_run=False, retention_hours=0, enforce_retention_duration=False)
+    assert conn.table(path).to_arrow().num_rows == rows
 
 
 @needs_native
@@ -224,9 +229,12 @@ def test_cleanup_and_log_compaction_of_a_clustered_table(conn: Any, tmp_path: Pa
 
 
 @needs_native
-def test_cleanup_is_still_refused_on_in_commit_timestamps(conn: Any, tmp_path: Path) -> None:
+def test_cleanup_of_in_commit_timestamps_is_served_by_the_kernel(conn: Any, tmp_path: Path) -> None:
+    """delta-rs refuses the table; the kernel cleans up by in-commit timestamps."""
     path = _make(conn, tmp_path, {"delta.enableInCommitTimestamps": "true"})
-    assert not conn.table(path).can("cleanup_metadata").ok
+    assert conn.table(path).can("cleanup_metadata").engine is Engine.KERNEL
+    conn.table(path).cleanup_metadata()
+    assert conn.table(path).to_arrow().num_rows == 6
 
 
 def test_history_exemptions_do_not_leak_into_writes() -> None:
@@ -241,7 +249,9 @@ def test_history_exemptions_do_not_leak_into_writes() -> None:
     )
     assert router.capability(Operation.HISTORY, table).ok
     assert not router.capability(Operation.SCAN, table).ok
-    assert not router.capability(Operation.OPTIMIZE, table).ok
+    # A write delta-rs itself would commit (OPTIMIZE now hands its commit to
+    # the kernel, so it is not one).
+    assert not router.capability(Operation.DELETE, table).ok
 
 
 # ------------------------------------------------------------ kernel checkpoint
@@ -261,21 +271,36 @@ def _legacy(path: Path, writer: int) -> str:
     return p
 
 
+def _checkpoint_protocol(path: str, version: int) -> dict[str, Any]:
+    import pyarrow.parquet as pq
+
+    rows = pq.read_table(f"{path}/_delta_log/{version:020d}.checkpoint.parquet").to_pylist()
+    (protocol,) = [row["protocol"] for row in rows if row["protocol"] is not None]
+    return dict(protocol)
+
+
 @needs_native
 @pytest.mark.parametrize("writer", [3, 4])
-def test_kernel_checkpoint_refuses_a_legacy_writer_protocol(
+def test_kernel_checkpoints_a_legacy_writer_protocol(
     kernel_only: Any, tmp_path: Path, writer: int
 ) -> None:
-    """The kernel's checkpoint writer fails "Feature 'checkConstraints' is not
-    supported" on writer 3-6; supports() never checked, so it was claimed."""
+    """The kernel's checkpoint writer failed "Feature 'checkConstraints' is not
+    supported" on writer 3-6; supports() then refused it. A checkpoint writes
+    no row, so the build now writes it past the implied value-constraint
+    features, with the table's own legacy protocol in it."""
     p = _legacy(tmp_path, writer)
-    verdict = kernel_only.table(p).can("checkpoint")
-    assert not verdict.ok
-    assert "legacy writer protocol" in verdict.reason
+    t = kernel_only.table(p)
+    verdict = t.can("checkpoint")
+    assert verdict.ok, verdict
+    t.checkpoint()
+    version = deltalake.DeltaTable(p).version()
+    protocol = _checkpoint_protocol(p, version)
+    assert (protocol["minReaderVersion"], protocol["minWriterVersion"]) == (1, writer)
+    assert not protocol.get("writerFeatures")
 
 
 @needs_native
-def test_kernel_checkpoint_refuses_invariants(kernel_only: Any, tmp_path: Path) -> None:
+def test_kernel_checkpoints_past_invariants(kernel_only: Any, tmp_path: Path) -> None:
     from deltalake import DeltaTable, Field, Schema, write_deltalake
     from deltalake.schema import PrimitiveType
 
@@ -294,8 +319,15 @@ def test_kernel_checkpoint_refuses_invariants(kernel_only: Any, tmp_path: Path) 
         ),
     )
     write_deltalake(p, _data(), mode="append")
-    verdict = kernel_only.table(p).can("checkpoint")
-    assert not verdict.ok and "invariants" in verdict.reason
+    t = kernel_only.table(p)
+    verdict = t.can("checkpoint")
+    assert verdict.ok, verdict
+    t.checkpoint()
+    protocol = _checkpoint_protocol(p, 1)
+    assert (protocol["minReaderVersion"], protocol["minWriterVersion"]) == (1, 2)
+    # A write is served too: the kernel paths evaluate the invariant over the
+    # rows they write (engine/values.py), where kernel 0.28 itself refused.
+    assert t.can("append").ok
 
 
 def test_kernel_checkpoint_refuses_unwritable_writer_features() -> None:
@@ -309,10 +341,12 @@ def test_kernel_checkpoint_refuses_unwritable_writer_features() -> None:
         location="/tmp/t",
         min_reader_version=3,
         min_writer_version=7,
-        writer_features=frozenset({"identityColumns"}),
+        writer_features=frozenset({"identityColumns", "icebergCompatV1"}),
     )
     verdict = router.capability(Operation.CHECKPOINT, table)
-    assert not verdict.ok and "identityColumns" in verdict.reason
+    # identityColumns binds only the values written, which a checkpoint has none of.
+    assert not verdict.ok and "icebergCompatV1" in verdict.reason
+    assert "identityColumns" not in verdict.reason
 
 
 @needs_native
@@ -581,5 +615,7 @@ def test_repair_dry_run_on_an_in_commit_timestamp_table(conn: Any, tmp_path: Pat
     os.remove(glob.glob(os.path.join(path, "*.parquet"))[0])
     result = conn.table(path).repair(dry_run=True)
     assert result["dry_run"] is True and len(result["files_removed"]) == 1
-    with pytest.raises(UnreachableTableError):
-        conn.table(path).repair()
+    # delta-rs cannot commit the repair; the kernel does.
+    assert conn.table(path).can("repair").engine is Engine.KERNEL
+    assert conn.table(path).repair()["files_removed"] == result["files_removed"]
+    assert conn.table(path).repair(dry_run=True)["files_removed"] == []

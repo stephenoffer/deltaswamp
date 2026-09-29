@@ -76,7 +76,7 @@ class TestDynamicPartitionOverwrite:
             plain.overwrite(pa.table({"id": [1], "city": ["x"]}), partition_overwrite="dynamic")
 
     def test_predicate_and_dynamic_are_mutually_exclusive(self, partitioned: Any) -> None:
-        with pytest.raises(UnreachableTableError, match="cannot be combined"):
+        with pytest.raises(InvalidArgumentError, match="cannot be combined"):
             partitioned.overwrite(
                 pa.table({"id": [1], "region": ["eu"]}),
                 predicate="region = 'eu'",
@@ -98,7 +98,8 @@ class TestDynamicPartitionOverwrite:
             )
 
     def test_unknown_mode_is_refused(self, partitioned: Any) -> None:
-        with pytest.raises(UnreachableTableError, match="'static' and 'dynamic'"):
+        # A malformed argument, not a table no engine can serve.
+        with pytest.raises(InvalidArgumentError, match="'static' or 'dynamic'"):
             partitioned.overwrite(
                 pa.table({"id": [1], "region": ["eu"]}), partition_overwrite="sideways"
             )
@@ -184,7 +185,11 @@ class TestKernelRefusesWhatItCannotHonor:
 
         with pytest.raises(DeltaSwampError, match="does not implement"):
             KernelEngine().append(
-                plain.resolved, pa.table({"id": [3], "city": ["x"]}), schema_mode="merge"
+                plain.resolved, pa.table({"id": [3], "city": ["x"]}), target_file_size=1
+            )
+        with pytest.raises(DeltaSwampError, match="cannot replace the table schema"):
+            KernelEngine().append(
+                plain.resolved, pa.table({"id": [3], "city": ["x"]}), schema_mode="overwrite"
             )
 
 

@@ -283,8 +283,10 @@ def test_poll_failure_cancels_the_running_statement() -> None:
     pending = SimpleNamespace(statement_id="s1", status=status("RUNNING"))
     statements = Statements([pending])
     statements.poll_error = ConnectionError("network down")
-    with pytest.raises(ConnectionError):
+    # Wrapped (LC-07): every public error is a DeltaSwampError.
+    with pytest.raises(SqlStatementError, match="network down") as info:
         sdk(statements).execute("SELECT")
+    assert isinstance(info.value.__cause__, ConnectionError)
     assert statements.cancelled == ["s1"]
 
 
@@ -415,8 +417,8 @@ def test_merge_clauses_are_emitted_in_grammar_order() -> None:
     )
     sql = m.statement("rel", ["id"])
     i_matched_delete = sql.index("WHEN MATCHED AND source.gone THEN DELETE")
-    i_matched_update = sql.index("WHEN MATCHED THEN UPDATE SET *")
-    i_insert = sql.index("WHEN NOT MATCHED THEN INSERT *")
+    i_matched_update = sql.index("WHEN MATCHED THEN UPDATE SET `target`.`id` = `source`.`id`")
+    i_insert = sql.index("WHEN NOT MATCHED THEN INSERT (`id`) VALUES (`source`.`id`)")
     assert i_matched_delete < i_matched_update < i_insert
 
 
@@ -510,8 +512,9 @@ def test_describe_extended_partition_rows_do_not_leak_into_info() -> None:
 def test_failed_upload_cleans_up_the_partial_file() -> None:
     files = Files(fail_upload=True)
     e, _ = eng(files=files)
-    with pytest.raises(OSError):
+    with pytest.raises(SqlStatementError, match="staging volume") as info:
         e.append(tbl(), pa.table({"id": [1]}))
+    assert isinstance(info.value.__cause__, OSError)
     assert len(files.deleted) == 1
 
 

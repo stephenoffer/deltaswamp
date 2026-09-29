@@ -110,8 +110,14 @@ class TestIcebergPredicates:
         assert got == [3]
 
     def test_type_mismatched_literal_does_not_crash(self, loaded: IcebergEngine) -> None:
-        # PyIceberg raised TypeError binding `name = 1`; SQL coerces.
-        assert _ids(loaded.scan(_resolved(), predicate="name = 1")) == []
+        # PyIceberg raised TypeError binding `name = 1`. Spark would cast the
+        # STRING column to a number, so the comparison is refused as a
+        # PredicateError asking for a quoted literal, not guessed at.
+        from deltaswamp.predicate import PredicateError
+
+        with pytest.raises(PredicateError, match="Quote the literal"):
+            loaded.scan(_resolved(), predicate="name = 1")
+        assert _ids(loaded.scan(_resolved(), predicate="name = '1'")) == []
 
     def test_column_case_is_resolved_like_sql(self, loaded: IcebergEngine) -> None:
         assert _ids(loaded.scan(_resolved(), predicate="ID = 1")) == [1]
@@ -737,8 +743,13 @@ class TestIcebergSecondPass:
         assert _ids(engine.scan(_resolved())) == [5]
 
     def test_extra_column_is_a_clear_error(self, engine: IcebergEngine) -> None:
+        from deltaswamp.capability import Engine
+        from deltaswamp.engine.boundary import guard
+
+        # The translation is the engine boundary's, which the router puts
+        # every engine behind.
         with pytest.raises(UnreachableTableError, match="does not evolve schemas"):
-            engine.append(_resolved(), pa.table({"id": [1], "zzz": [1]}))
+            guard(Engine.ICEBERG, engine).append(_resolved(), pa.table({"id": [1], "zzz": [1]}))
 
 
 class _Snap:

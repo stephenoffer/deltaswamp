@@ -46,11 +46,22 @@ __all__ = [
     "filter_table",
     "parse",
     "parse_value",
+    "standard_string_literals",
 ]
 
 
 class PredicateError(DeltaSwampError):
-    """A predicate string could not be parsed, or uses unsupported SQL."""
+    """A predicate string could not be parsed, or uses unsupported SQL.
+
+    `beyond_grammar` tells the two apart: True for SQL this parser does not
+    read (an operator it has no token for, a function call, a keyword such as
+    CASE), which an engine that evaluates SQL may serve; False for text that is
+    malformed in any SQL (``id ===``, ``id >``), which no engine will.
+    """
+
+    def __init__(self, message: str, *, beyond_grammar: bool = False) -> None:
+        super().__init__(message)
+        self.beyond_grammar = beyond_grammar
 
 
 # --------------------------------------------------------------------------- AST
@@ -84,8 +95,8 @@ _TOKEN = re.compile(
     r"""
     \s*(?:
       (?P<number>[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[LlDdFf]?)
-     |(?P<string>'(?:[^'\\]|\\.|'')*')
-     |(?P<dstring>"(?:[^"\\]|\\.|"")*")
+     |(?P<string>'(?:[^'\\]|\\.)*')
+     |(?P<dstring>"(?:[^"\\]|\\.)*")
      |(?P<quoted>`(?:[^`]|``)+`)
      |(?P<op><=>|<=|>=|<>|!=|==|=|<|>|\(|\)|,|\.)
      |(?P<word>(?:[^\W\d]|_)\w*)
@@ -105,15 +116,52 @@ class _Tok:
     text: str
 
 
+def refuse_statement_separator(text: Any) -> None:
+    """Refuse SQL text holding a ';' outside a string literal or quoted name.
+
+    A predicate or SET value is one expression. DataFusion stops reading at
+    the first ';', so the text after it was silently ignored.
+    """
+    if not isinstance(text, str) or ";" not in text:
+        return
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\" and quote != "`":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == ";":
+            raise PredicateError(
+                f"{text!r} contains ';' outside a string literal; a predicate or SET "
+                "value is a single SQL expression"
+            )
+        i += 1
+
+
 def _tokenize(text: str) -> list[_Tok]:
     tokens: list[_Tok] = []
     pos = 0
     stripped = text.rstrip()
     while pos < len(stripped):
         match = _TOKEN.match(stripped, pos)
+        if (match is None or match.end() == pos) and stripped[pos] == ";":
+            # Not SQL this or any engine should take further: DataFusion
+            # stops reading at the ';', so "id = 1; id = 2" deleted id = 1
+            # and reported success. A predicate is one expression.
+            raise PredicateError(
+                f"predicate {text!r} contains ';' outside a string literal; a predicate "
+                "is a single SQL expression"
+            )
         if match is None or match.end() == pos:
             raise PredicateError(
-                f"cannot parse predicate {text!r} at position {pos}: {stripped[pos : pos + 20]!r}"
+                f"cannot parse predicate {text!r} at position {pos}: {stripped[pos : pos + 20]!r}",
+                beyond_grammar=True,
             )
         kind = match.lastgroup or ""
         tokens.append(_Tok(kind, match.group(kind)))
@@ -246,6 +294,17 @@ class _Parser:
                 self.i += 1
                 items.append(self.value())
             self.expect_symbol(")")
+            if any(isinstance(i, Literal) and i.type == "double" for i in items):
+                # Spark compares an IN list in the common type of its items:
+                # one DOUBLE makes it `l IN (DOUBLE, DOUBLE)`, so
+                # `l IN (9007199254740992, 7D)` holds for 9007199254740993
+                # too. Item by item, the BIGINT one compared exactly.
+                items = [
+                    Literal(float(i.value), "double")
+                    if isinstance(i, Literal) and i.type in ("long", "decimal")
+                    else i
+                    for i in items
+                ]
             return Node("in", (left, *items), negated)
 
         if self.keyword("BETWEEN"):
@@ -259,7 +318,9 @@ class _Parser:
             op = "ilike" if self.take().text.upper() == "ILIKE" else "like"
             pattern = self.value()
             if not (isinstance(pattern, Literal) and isinstance(pattern.value, str)):
-                raise PredicateError(f"LIKE needs a string pattern in {self.text!r}")
+                raise PredicateError(
+                    f"LIKE needs a string pattern in {self.text!r}", beyond_grammar=True
+                )
             if self.keyword("ESCAPE"):
                 self.i += 1
                 escape = self.value()
@@ -283,7 +344,7 @@ class _Parser:
             return Node("column", (left,))
         if isinstance(left, Literal) and isinstance(left.value, bool):
             return Node("true" if left.value else "false")
-        raise PredicateError(f"{self.text!r} is not a boolean predicate")
+        raise PredicateError(f"{self.text!r} is not a boolean predicate", beyond_grammar=True)
 
     def _matching_paren(self) -> int:
         """Index of the `)` closing the `(` at the cursor (past the end if none)."""
@@ -317,8 +378,14 @@ class _Parser:
         if tok.kind == "number":
             return _number(tok.text)
         if tok.kind in ("string", "dstring"):
-            # Spark treats double quotes as a string literal by default.
-            return Literal(_unescape(tok.text), "string")
+            # Spark treats double quotes as a string literal by default, and
+            # concatenates adjacent literals: `'it''s'` is `'it' 's'`, which
+            # is `its` -- not the ANSI `it's`. The warehouse reads it that way,
+            # so every other engine has to as well.
+            text = _unescape(tok.text)
+            while (nxt := self.peek()) is not None and nxt.kind in ("string", "dstring"):
+                text += _unescape(self.take().text)
+            return Literal(text, "string")
         if tok.kind == "op" and tok.text == "(":
             inner = self.value()
             self.expect_symbol(")")
@@ -338,11 +405,15 @@ class _Parser:
                 raw = _unescape(self.take().text)
                 return _typed(upper, raw, self.text)
             if tok.kind == "word" and upper in _KEYWORDS:
-                raise PredicateError(f"unexpected keyword {tok.text} in predicate {self.text!r}")
+                raise PredicateError(
+                    f"unexpected keyword {tok.text} in predicate {self.text!r}",
+                    beyond_grammar=True,
+                )
             if self.symbol("("):
                 raise PredicateError(
                     f"function calls such as {tok.text}(...) are not supported in predicates "
-                    "evaluated outside a SQL engine"
+                    "evaluated outside a SQL engine",
+                    beyond_grammar=True,
                 )
             path = [_ident(tok)]
             while self.symbol("."):
@@ -375,19 +446,16 @@ def _unescape(token: str) -> str:
     """The value of a quoted SQL string token, as Spark reads it.
 
     Spark processes backslash escapes in string literals (`'a\\b'` is `a\b`,
-    `'it\'s'` is `it's`), which is what the SQL warehouse evaluates; a doubled
-    quote is also accepted. The kernel and delta-rs paths used to take the
+    `'it\'s'` is `it's`), which is what the SQL warehouse evaluates. A doubled
+    quote is not an escape in Spark: it ends one literal and starts the next
+    (see `_Parser.value`). The kernel and delta-rs paths used to take the
     backslashes literally, so the same predicate matched different rows.
     """
-    quote, body = token[0], token[1:-1]
+    body = token[1:-1]
     out: list[str] = []
     i = 0
     while i < len(body):
         ch = body[i]
-        if ch == quote and i + 1 < len(body) and body[i + 1] == quote:
-            out.append(quote)
-            i += 2
-            continue
         if ch != "\\" or i + 1 >= len(body):
             out.append(ch)
             i += 1
@@ -403,6 +471,60 @@ def _unescape(token: str) -> str:
         else:
             out.append(_SPARK_ESCAPES.get(nxt, nxt))
             i += 2
+    return "".join(out)
+
+
+_SPARK_TEXT = re.compile(r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")|(`(?:[^`]|``)*`)|['"]""", re.S)
+
+
+def standard_string_literals(text: str) -> str:
+    """SQL text with each Spark string literal respelled as ANSI SQL spells it.
+
+    DataFusion and DuckDB read string literals the ANSI way: `''` is an
+    escaped quote and a backslash is just a backslash. Spark -- and so the
+    warehouse -- reads `'it''s'` as two adjacent literals (`its`) and
+    `'a\\'b'` as `a'b`. Each run of adjacent literals is decoded as Spark
+    decodes it and written back as one `'...'` with doubled quotes, so every
+    engine sees the value the warehouse would. A double-quoted literal is a
+    string in Spark too (the warehouse reads `"ab"` as `ab`), where both
+    engines read a column named ab, so it is respelled the same way.
+    Backquoted text is an identifier and is left alone. An unterminated
+    quote is left as is, for the engine to reject. `engine.dialect` does
+    this and more for text the engines run.
+    """
+    if not isinstance(text, str) or ("'" not in text and '"' not in text):
+        return text
+    out: list[str] = []
+    pos = 0
+    #: The literals of the current run, and where the run ends.
+    run: list[str] = []
+    run_end = 0
+
+    def flush() -> None:
+        value = "".join(_unescape(t) for t in run)
+        out.append("'" + value.replace("'", "''") + "'")
+        run.clear()
+
+    for match in _SPARK_TEXT.finditer(text):
+        literal = match.group(1)
+        if literal is not None and run and not text[run_end : match.start()].strip():
+            run.append(literal)
+            run_end = match.end()
+            continue
+        if run:
+            flush()
+            pos = run_end
+        if literal is not None:
+            out.append(text[pos : match.start()])
+            run.append(literal)
+            run_end = match.end()
+        elif match.group(2) is None:
+            # An unterminated quote: nothing after it is a token.
+            break
+    if run:
+        flush()
+        pos = run_end
+    out.append(text[pos:])
     return "".join(out)
 
 
@@ -548,11 +670,13 @@ def parse_value(text: str) -> Column | Literal:
         value = parser.value()
     except PredicateError as exc:
         raise PredicateError(
-            f"{text!r} is not a plain value; only a literal or a column is supported here"
+            f"{text!r} is not a plain value; only a literal or a column is supported here",
+            beyond_grammar=exc.beyond_grammar,
         ) from exc
     if parser.peek() is not None:
         raise PredicateError(
-            f"{text!r} is an expression; only a literal or a column is supported here"
+            f"{text!r} is an expression; only a literal or a column is supported here",
+            beyond_grammar=True,
         )
     return value
 
@@ -740,14 +864,190 @@ def _stats_can_decide(node: Node, exact: bool, unsafe: dict[tuple[str, ...], str
     return False
 
 
+_FLIPPED = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
+#: Integers a double represents exactly, so `i < 3.0D` may become `i < 3`.
+_EXACT_DOUBLE_INT = 2**53
+
+
+def _skip_literal(lit: Literal, target: Any, op: str) -> Literal | None:
+    """`lit` as a literal of the `target` column's type for skipping; None if unchanged.
+
+    The kernel skips nothing when the literal's type differs from the
+    column's: `id < 1000.0` (a DECIMAL literal) read every file where
+    `id < 1000` read two. Each rewrite here is exactly the comparison the
+    row filter makes (`_coerce`), so it moves no boundary:
+
+    * DOUBLE column, DECIMAL literal: Arrow's decimal -> double cast, the
+      one the filter compares with (Spark compares them as DOUBLE too).
+    * integer column, DECIMAL or DOUBLE literal: integral values become
+      longs; a fraction becomes the nearest integer on the side the
+      comparison keeps (`i < 3.5` is `i <= 3`, `i > 3.5` is `i >= 4`).
+
+    Returns a Literal whose `type` is the op to use when it changed
+    (``Literal(value, "long:le")``); the caller splits it off.
+    """
+    import pyarrow as pa
+
+    value = lit.value
+    if isinstance(value, bool) or not isinstance(value, (float, decimal.Decimal)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if pa.types.is_float64(target) and isinstance(value, decimal.Decimal):
+        try:
+            as_double = pa.scalar(value).cast(pa.float64()).as_py()
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, OverflowError):
+            return None
+        return Literal(as_double, f"double:{op}")
+    if not pa.types.is_integer(target):
+        return None
+    number = decimal.Decimal(value) if isinstance(value, float) else value
+    if isinstance(value, float) and abs(value) >= _EXACT_DOUBLE_INT:
+        # From 2**53 the filter's double comparison rounds the column too:
+        # 2**53 + 1 compares equal to 2**53.0, so a bound at exactly 2**53
+        # skipped files holding matching rows.
+        return None
+    if number == number.to_integral_value():
+        new_op, whole = op, int(number)
+    elif op in ("lt", "le"):
+        new_op, whole = "le", int(number.to_integral_value(decimal.ROUND_FLOOR))
+    elif op in ("gt", "ge"):
+        new_op, whole = "ge", int(number.to_integral_value(decimal.ROUND_CEILING))
+    else:
+        return None  # `i = 2.5` holds for no integer; not worth a skipping form
+    if not _LONG_MIN <= whole <= _LONG_MAX:
+        return None
+    return Literal(whole, f"long:{new_op}")
+
+
+def _like_prefix(pattern: str) -> tuple[str, bool] | None:
+    """(literal prefix, whether the pattern is only that prefix) of a LIKE pattern.
+
+    The pattern is in the backslash-escaped form the parser stores. None when
+    it starts with a wildcard, so no range bounds it.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(pattern[i + 1])
+            i += 2
+            continue
+        if ch in "%_":
+            return ("".join(out), False) if out else None
+        out.append(ch)
+        i += 1
+    return "".join(out), True
+
+
+def _after_prefix(prefix: str) -> str | None:
+    """The smallest string greater than every string starting with `prefix`.
+
+    Statistics compare UTF-8 bytes, whose order is code point order, so
+    bumping the last code point that can be bumped bounds the range.
+    """
+    chars = list(prefix)
+    while chars:
+        code = ord(chars[-1]) + 1
+        if code == 0xD800:
+            code = 0xE000  # surrogates are not characters
+        if code <= 0x10FFFF:
+            chars[-1] = chr(code)
+            return "".join(chars)
+        chars.pop()
+    return None
+
+
+def _prepare_skipping(node: Node, schema: Any, exact: bool = False) -> Node:
+    """`node` with rewrites that let file statistics decide more, for skipping only.
+
+    Literal types are aligned with their columns (`_skip_literal`), and a
+    LIKE with a literal prefix on a STRING column becomes the range of
+    strings with that prefix. The range is weaker than the LIKE (it keeps
+    'abcx' for 'abc%x'), so it is used only where weakening is safe: not
+    beneath a NOT (`exact`).
+    """
+    op = node.op
+    if op in ("and", "or"):
+        return Node(op, tuple(_prepare_skipping(a, schema, exact) for a in node.args))
+    if op == "not":
+        return Node(op, (_prepare_skipping(node.args[0], schema, True),))
+
+    def column_type(value: Any) -> Any:
+        if not isinstance(value, Column):
+            return None
+        try:
+            return _schema_type(schema, value.path)
+        except PredicateError:
+            return None
+
+    if op in _FLIPPED and len(node.args) == 2:
+        left, right = node.args
+        flipped = isinstance(left, Literal) and isinstance(right, Column)
+        column, lit = (right, left) if flipped else (left, right)
+        target = column_type(column)
+        if target is not None and isinstance(lit, Literal):
+            wanted = _FLIPPED[op] if flipped else op
+            if (fixed := _skip_literal(lit, target, wanted)) is not None:
+                kind, new_op = fixed.type.split(":")
+                return Node(new_op, (column, Literal(fixed.value, kind)))
+        return node
+    if op in ("in", "between"):
+        target = column_type(node.args[0])
+        if target is None:
+            return node
+        items = list(node.args[1:])
+        wants = ["ge", "le"] if op == "between" else ["eq"] * len(items)
+        fixed_items = []
+        for item, want in zip(items, wants, strict=True):
+            fixed = _skip_literal(item, target, want) if isinstance(item, Literal) else None
+            if fixed is None:
+                fixed_items.append(item)
+                continue
+            kind, new_op = fixed.type.split(":")
+            if new_op != want and op == "in":
+                return node  # `i IN (2.5)`: that item can match nothing; leave it
+            fixed_items.append(Literal(fixed.value, kind))
+        return Node(op, (node.args[0], *fixed_items), node.negated)
+    if op == "like" and not node.negated and not exact:
+        target, pattern = node.args
+        text_type = column_type(target)
+        if text_type is None or not _is_text(_pa(), text_type):
+            return node  # LIKE casts a non-string column to text: its order differs
+        split = _like_prefix(pattern.value)
+        if split is None:
+            return node
+        prefix, whole = split
+        if whole:
+            return Node("eq", (target, Literal(prefix, "string")))
+        upper = _after_prefix(prefix)
+        low = Node("ge", (target, Literal(prefix, "string")))
+        if upper is None:
+            return low
+        return Node("and", (low, Node("lt", (target, Literal(upper, "string")))))
+    return node
+
+
+def _pa() -> Any:
+    import pyarrow as pa
+
+    return pa
+
+
 def to_kernel_json(node: Node, schema: Any = None) -> str | None:
     """The skipping predicate as the native extension's JSON, or None.
 
     With the table's Arrow `schema`, comparisons that file statistics cannot
     decide safely (NaN in floating columns, lossy wide-decimal stats) are
-    left out of skipping; the exact row filter still applies them.
+    left out of skipping; the exact row filter still applies them. The
+    schema also lets literals be aligned with their columns' types and a
+    prefix LIKE become a range (`_prepare_skipping`).
     """
-    unsafe = _unsafe_columns(schema) if schema is not None else None
+    unsafe = None
+    if schema is not None:
+        unsafe = _unsafe_columns(schema)
+        node = _prepare_skipping(node, schema)
     rendered = _skip(node, unsafe=unsafe)
     return None if rendered is None else json.dumps(rendered)
 
@@ -867,6 +1167,13 @@ def _common_decimal(pa: Any, column: Any, literal: Any) -> Any:
     return pa.decimal256(min(digits, 76), scale_out)
 
 
+def _is_variant_struct(pa: Any, target: Any) -> bool:
+    return bool(pa.types.is_struct(target)) and sorted(f.name for f in target) == [
+        "metadata",
+        "value",
+    ]
+
+
 def _coerce(pa: Any, lit: Literal, target: Any) -> tuple[Any, Any]:
     """(cast for the column or None, scalar) to compare `lit` with a `target` column.
 
@@ -881,6 +1188,39 @@ def _coerce(pa: Any, lit: Literal, target: Any) -> tuple[Any, Any]:
     if target is None:
         return None, _to_scalar(pa, value)
     types = pa.types
+    if types.is_nested(target):
+        # A VARIANT is read as struct<metadata, value>: `v = '"x"'` reached
+        # Arrow's `equal` on the struct and failed as NotImplementedError.
+        raise PredicateError(
+            f"a {'VARIANT' if _is_variant_struct(pa, target) else str(target)} column cannot "
+            f"be compared with the literal {value!r} (Spark raises a type mismatch); compare "
+            "one of its fields, or read the column and filter its values"
+        )
+    numeric_target = (
+        types.is_integer(target) or types.is_floating(target) or types.is_decimal(target)
+    )
+
+    if isinstance(value, (int, float, decimal.Decimal)) and not isinstance(value, bool):
+        if _is_text(pa, target):
+            # Spark casts the STRING column to the literal's type (`s = 1`
+            # matches '01' and ' 1', and fails on 'abc' under ANSI); Arrow
+            # compared text with text and matched only '1'. Rather than
+            # guess at a cast, ask for the comparison the user means.
+            raise PredicateError(
+                f"a STRING column is compared with the number {value!r}; Spark would cast "
+                "every value of the column to a number (and fail on text that is not one). "
+                f"Quote the literal to compare as text ('{value}'), or CAST the column in SQL"
+            )
+        if types.is_boolean(target):
+            raise PredicateError(
+                f"a BOOLEAN column cannot be compared with the number {value!r} "
+                "(Spark raises a type mismatch); compare it with TRUE or FALSE"
+            )
+    if isinstance(value, bool) and numeric_target:
+        raise PredicateError(
+            f"a {target} column cannot be compared with {str(value).upper()} "
+            "(Spark raises a type mismatch); compare it with a number"
+        )
 
     if isinstance(value, str) and not _is_text(pa, target):
         if types.is_date(target) or types.is_timestamp(target):
@@ -898,7 +1238,14 @@ def _coerce(pa: Any, lit: Literal, target: Any) -> tuple[Any, Any]:
                 number = decimal.Decimal(value.strip())
             except decimal.InvalidOperation:
                 number = None
-            if number is None or not number.is_finite() or types.is_boolean(target):
+            if (
+                number is None
+                or not number.is_finite()
+                or types.is_boolean(target)
+                # Spark casts the string to the integral column's type, and
+                # under ANSI '7.0' is not a valid BIGINT: an error, not 7.
+                or (types.is_integer(target) and not re.fullmatch(r"[+-]?\d+", value.strip()))
+            ):
                 raise PredicateError(
                     f"string literal {value!r} cannot be compared with a {target} column: "
                     "it is not a valid value of that type"

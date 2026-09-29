@@ -80,8 +80,12 @@ def test_renaming_without_column_mapping_is_refused_in_supports() -> None:
 
 def test_renaming_is_allowed_once_column_mapping_is_on() -> None:
     for mode in ("name", "id"):
+        # The feature, not only the property: see the next test.
         table = resolved_table(
-            data_source_format="DELTA", properties={"delta.columnMapping.mode": mode}
+            data_source_format="DELTA",
+            properties={"delta.columnMapping.mode": mode},
+            min_reader_version=2,
+            min_writer_version=5,
         )
         assert KernelEngine().supports(Operation.RENAME_COLUMN, table).ok, mode
         assert KernelEngine().supports(Operation.DROP_COLUMN, table).ok, mode

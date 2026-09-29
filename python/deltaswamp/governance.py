@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
-from .errors import DeltaSwampError, InvalidReferenceError
+from .errors import DeltaSwampError, InvalidArgumentError, InvalidReferenceError
 from .identity import TableRef
 
 __all__ = [
@@ -652,13 +652,23 @@ class Volume:
         """The absolute ``/Volumes/...`` path for a volume-relative one.
 
         An absolute path already inside this volume is accepted as-is, rather
-        than being nested under the root a second time.
+        than being nested under the root a second time. Any other absolute
+        path is refused: ``/Volumes/c/s/other/x`` was quietly nested under
+        this volume's root, so a write "to another volume" landed here.
         """
+        if not isinstance(path, str):
+            raise InvalidArgumentError(f"a volume path is a string, not {type(path).__name__}")
         path = path.replace("\\", "/")
         if path.casefold() == self.root.casefold() or path.casefold().startswith(
             self.root.casefold() + "/"
         ):
             path = path[len(self.root) :]
+        elif path.startswith("/"):
+            raise InvalidReferenceError(
+                f"{path!r} is an absolute path outside volume {self.full_name} "
+                f"({self.root}); pass a path relative to the volume, or open the "
+                "volume it names with conn.volume('catalog.schema.volume')"
+            )
         parts = [p for p in path.split("/") if p not in ("", ".")]
         if ".." in parts:
             raise InvalidReferenceError(f"{path!r} climbs out of volume {self.full_name}")
@@ -667,7 +677,7 @@ class Volume:
     def list(self, path: str = "") -> list[FileEntry]:
         directory = self.path(path).rstrip("/") + "/"
         entries = self._run(
-            "list volume files",
+            f"list {directory}",
             lambda: list(self._files.list_directory_contents(directory_path=directory)),
         )
         out: list[FileEntry] = []
@@ -707,12 +717,24 @@ class Volume:
                 if callable(close):
                     close()
 
-        return self._run("read a volume file", download)
+        return self._run(f"read {target}", download)
 
     def write(self, path: str, data: bytes, *, overwrite: bool = False) -> None:
+        if isinstance(path, str) and path.replace("\\", "/").endswith("/"):
+            # The trailing slash was dropped, and a file named after the
+            # "directory" was created instead.
+            raise InvalidArgumentError(
+                f"{path!r} names a directory; a write needs a file path (use mkdir() "
+                "for a directory)"
+            )
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise InvalidArgumentError(
+                f"volume files are written from bytes, not {type(data).__name__}; "
+                "encode text first (text.encode())"
+            )
         target = self.path(path)
         self._run(
-            "write a volume file",
+            f"write {target}",
             lambda: self._files.upload(
                 file_path=target, contents=io.BytesIO(data), overwrite=overwrite
             ),
@@ -720,12 +742,13 @@ class Volume:
 
     def delete(self, path: str) -> None:
         target = self.path(path)
-        self._run("delete a volume file", lambda: self._files.delete(file_path=target))
+        self._run(f"delete {target}", lambda: self._files.delete(file_path=target))
 
     def mkdir(self, path: str) -> None:
         target = self.path(path)
         self._run(
-            "create a volume directory", lambda: self._files.create_directory(directory_path=target)
+            f"create the directory {target}",
+            lambda: self._files.create_directory(directory_path=target),
         )
 
 
@@ -800,7 +823,13 @@ _STAGING_KEYS = {
     "s3.endpoint": "aws_endpoint",
     "azure.sas-token": "azure_storage_sas_key",
     "gcs.oauth-token": "google_bearer_token",
+    # The Iceberg REST spellings of the same credentials, which the UC Delta
+    # API may vend too; dropping them left the create on ambient credentials.
+    "client.region": "aws_region",
+    "gcs.oauth2.token": "google_bearer_token",
 }
+#: Iceberg names the Azure SAS per account: ``adls.sas-token.<account host>``.
+_STAGING_PREFIXED_KEYS = {"adls.sas-token.": "azure_storage_sas_key"}
 
 
 def staging_storage_options(
@@ -830,6 +859,17 @@ def staging_storage_options(
     chosen = max(creds, key=score)
     config = chosen.get("config") or {}
     options = {_STAGING_KEYS[k]: str(v) for k, v in config.items() if k in _STAGING_KEYS}
+    for key, value in config.items():
+        for prefix, name in _STAGING_PREFIXED_KEYS.items():
+            if str(key).startswith(prefix):
+                options.setdefault(name, str(value))
+    if config and not options:
+        # Nothing mapped, so the create would run on whatever ambient
+        # credentials this machine has -- another identity, or none.
+        raise DeltaSwampError(
+            f"the catalog vended a storage credential for {location} with config keys "
+            f"{sorted(config)}, none of which this layer knows how to use"
+        )
     if "azure_storage_sas_key" in options:
         from .credentials.databricks import azure_endpoint_for
 

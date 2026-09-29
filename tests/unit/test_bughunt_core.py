@@ -103,7 +103,11 @@ class TestPredicateExactFilter:
             rows(t, "b = 'maybe'")
 
     def test_numeric_string_against_integer_column(self, t: Any) -> None:
-        assert rows(t, "id = '1.0'") == 1
+        assert rows(t, "id = '1'") == 1
+        # The warehouse casts the string to BIGINT and fails on '1.0'
+        # (CAST_INVALID_INPUT); matching it as 1 gave a different answer.
+        with pytest.raises(P.PredicateError, match="not a valid value"):
+            rows(t, "id = '1.0'")
 
     def test_string_against_timestamp_column(self, t: Any) -> None:
         assert rows(t, "ts = '2024-01-01 12:00:00'") == 3
@@ -390,7 +394,10 @@ class TestPropertyValues:
 
     def test_kernel_remedy_does_not_blame_delta_rs(self) -> None:
         with pytest.raises(PropertyNotSupportedError) as info:
-            validate_properties({"delta.targetFileSize": "1"}, Engine.KERNEL, Operation.CREATE)
+            # (delta.targetFileSize, used here before, is now stored at create.)
+            validate_properties(
+                {"delta.parquet.compression.codec": "zstd"}, Engine.KERNEL, Operation.CREATE
+            )
         assert "delta-rs rejects" not in str(info.value)
 
 

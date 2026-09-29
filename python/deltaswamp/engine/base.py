@@ -21,12 +21,28 @@ __all__ = [
     "AddFile",
     "DeletionVectorDescriptor",
     "Engine",
+    "PlannedSnapshot",
     "ScanSplit",
     "TranslatingStream",
     "missing_file_error",
     "missing_method",
     "translating_stream",
 ]
+
+
+def unpartitioned_dynamic_overwrite(needs: frozenset[str], table: ResolvedTable) -> str | None:
+    """Why a dynamic partition overwrite cannot run on `table`, if it cannot.
+
+    The partitions it replaces are the ones the data holds, and an
+    unpartitioned table has none. The engines refused this only inside the
+    write, after can() had said yes.
+    """
+    if "dynamic_overwrite" in needs and not table.partition_columns:
+        return (
+            "the table is not partitioned, so a dynamic partition overwrite has no "
+            "partitions to replace; use a plain overwrite, or a predicate"
+        )
+    return None
 
 
 def missing_method(engine: object, operation: Operation) -> Capability | None:
@@ -72,6 +88,20 @@ class DeletionVectorDescriptor:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannedSnapshot:
+    """The protocol and metadata a scan was planned against.
+
+    Every split of one plan refers to the same instance, so pickling a group
+    of splits carries it once. A worker builds the snapshot from it without
+    reading the log.
+    """
+
+    version: int
+    protocol_json: str
+    metadata_json: str
+
+
+@dataclass(frozen=True, slots=True)
 class ScanSplit:
     """One unit of scan work. Must be serializable to a worker.
 
@@ -88,6 +118,11 @@ class ScanSplit:
     # The commit version this file was observed at. Pass-through fields must be
     # decoded against *their own* commit's protocol, not the target snapshot's.
     commit_version: int | None = None
+    # The file as the kernel's scan metadata describes it (JSON, statistics
+    # left out), and the snapshot it was planned from. With both, a worker
+    # reads the file without listing or replaying the log.
+    scan_row: str | None = None
+    planned: PlannedSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,8 +228,11 @@ class Engine(Protocol):
 # ---------------------------------------------------------------------------
 
 #: object_store's NotFound, which both engines read through on every backend
-#: (a local ENOENT, an S3/GCS 404, an Azure BlobNotFound).
-_MISSING_FILE = re.compile(r"Object at location (?P<path>.+?) not found")
+#: (a local ENOENT, an S3/GCS 404, an Azure BlobNotFound); and the kernel's
+#: own error for a deletion vector file it cannot open.
+_MISSING_FILE = re.compile(
+    r"Object at location (?P<path>.+?) not found|File not found: (?P<file>\S+)"
+)
 
 
 def missing_file_error(exc: BaseException, context: str) -> Exception | None:
@@ -206,7 +244,7 @@ def missing_file_error(exc: BaseException, context: str) -> Exception | None:
     found = _MISSING_FILE.search(str(exc))
     if found is None:
         return None
-    path = found.group("path").strip()
+    path = (found.group("path") or found.group("file")).strip()
     return MissingDataFileError(
         path,
         f"reading {context} failed: the file {path} it references is missing from storage. "
@@ -228,17 +266,27 @@ class TranslatingStream:
     get its message, as the C stream interface carries no exception type.
     """
 
-    def __init__(self, source: Any, context: str) -> None:
+    def __init__(
+        self, source: Any, context: str, translate: Any = None, *, missing_files: bool = True
+    ) -> None:
         import pyarrow as pa
 
-        self._reader = (
+        # Another TranslatingStream is read as it is: through the C stream
+        # interface its errors would arrive untyped.
+        self._reader: Any = (
             source
-            if isinstance(source, pa.RecordBatchReader)
+            if isinstance(source, (pa.RecordBatchReader, TranslatingStream))
             else pa.RecordBatchReader.from_stream(source)
         )
         self._context = context
+        #: A further `exc -> Exception | None` for failures particular to one
+        #: kind of read, consulted when the failure is not a missing file.
+        self._translate = translate
+        #: False for the engine boundary's stream: it keeps the message whole,
+        #: and the reader that knows the table's location names the file.
+        self._missing_files = missing_files
         self._batches = self._iterate()
-        self.schema = self._reader.schema
+        self.schema: Any = self._reader.schema
 
     def _iterate(self) -> Any:
         while True:
@@ -247,10 +295,22 @@ class TranslatingStream:
             except StopIteration:
                 return
             except Exception as exc:
-                translated = missing_file_error(exc, self._context)
+                translated = missing_file_error(exc, self._context) if self._missing_files else None
+                if translated is None and self._translate is not None:
+                    translated = self._translate(exc)
                 if translated is None:
                     raise
                 raise translated from exc
+            except BaseException as exc:
+                # A Rust panic mid-stream is a BaseException that `except
+                # Exception` missed, so it escaped raw while the same panic in
+                # a direct call became EnginePanicError. Everything else that
+                # is not an Exception (KeyboardInterrupt, ...) passes through.
+                if type(exc).__name__ != "PanicException":
+                    raise
+                from ..errors import EnginePanicError
+
+                raise EnginePanicError(f"{self._context}: the engine panicked: {exc}") from exc
             yield batch
 
     def __iter__(self) -> Any:
@@ -288,7 +348,9 @@ class TranslatingStream:
         return getattr(self._reader, name)
 
 
-def translating_stream(source: Any, context: str) -> Any:
+def translating_stream(
+    source: Any, context: str, translate: Any = None, *, missing_files: bool = True
+) -> Any:
     """`source` wrapped in a TranslatingStream, or as is without pyarrow."""
     if not hasattr(source, "__arrow_c_stream__"):
         return source
@@ -296,4 +358,44 @@ def translating_stream(source: Any, context: str) -> Any:
         import pyarrow  # noqa: F401
     except ImportError:
         return source
-    return TranslatingStream(source, context)
+    return TranslatingStream(source, context, translate, missing_files=missing_files)
+
+
+# ---------------------------------------------------------------------------
+# MERGE clauses
+# ---------------------------------------------------------------------------
+
+#: Clause methods whose first argument is the SET/INSERT mapping, so the
+#: condition is their second.
+_MAPPING_CLAUSES = frozenset(
+    {"when_matched_update", "when_not_matched_insert", "when_not_matched_by_source_update"}
+)
+
+
+def merge_clause(
+    name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[str, bool] | None:
+    """A MERGE builder call's clause kind and whether it has a condition.
+
+    The kind is ``matched``, ``not_matched`` or ``not_matched_by_source``;
+    None for a call that adds no clause.
+    """
+    if name.startswith("when_not_matched_by_source"):
+        kind = "not_matched_by_source"
+    elif name.startswith("when_not_matched"):
+        kind = "not_matched"
+    elif name.startswith("when_matched"):
+        kind = "matched"
+    else:
+        return None
+    position = 1 if name in _MAPPING_CLAUSES else 0
+    predicate = kwargs.get("predicate", args[position] if len(args) > position else None)
+    return kind, predicate is not None
+
+
+def merge_clause_values(name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """The column -> SQL mapping a MERGE builder call sets, or None for one that sets none."""
+    if name not in _MAPPING_CLAUSES:
+        return None
+    values = kwargs.get("updates", args[0] if args else None)
+    return dict(values) if isinstance(values, dict) else None

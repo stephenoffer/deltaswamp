@@ -187,10 +187,14 @@ class TestCapabilities:
     def test_databricks_only_operations_are_refused_with_a_remedy(
         self, conn: Any, path: str
     ) -> None:
-        cap = conn.open_table(path).can(Operation.CLONE)
+        # CLONE of a path table to a path is the kernel's; to a catalog
+        # name it is Databricks'.
+        cap = conn.open_table(path).can(Operation.REORG)
         assert not cap.ok
         assert "Databricks" in cap.reason
         assert "allow_sql_fallback" in cap.remedy
+        cap = conn.open_table(path).can(Operation.CLONE, target="main.sales.copy")
+        assert not cap.ok and "allow_sql_fallback" in cap.remedy
 
 
 class TestCreate:
@@ -415,12 +419,20 @@ class TestCreateRoutingAndProperties:
     def test_inert_property_warns(self, conn: Any, tmp_path: Any) -> None:
         from deltaswamp.errors import IgnoredPropertyWarning
 
-        with pytest.warns(IgnoredPropertyWarning, match="checkpointPolicy"):
+        with pytest.warns(IgnoredPropertyWarning, match="setTransactionRetentionDuration"):
             conn.create_table(
                 str(tmp_path / "inert"),
                 self._schema(),
-                properties={"delta.checkpointPolicy": "v2"},
+                properties={"delta.setTransactionRetentionDuration": "interval 7 days"},
             )
+
+    def test_v2_checkpoint_policy_adds_its_feature(self, conn: Any, tmp_path: Any) -> None:
+        # delta-rs stored the policy without the v2Checkpoint feature, which
+        # Databricks treats as an invalid protocol; the kernel creates it.
+        t = conn.create_table(
+            str(tmp_path / "v2"), self._schema(), properties={"delta.checkpointPolicy": "v2"}
+        )
+        assert "v2Checkpoint" in t.features()
 
 
 class TestTableIdentity:
@@ -497,18 +509,25 @@ class TestUnmodelledWriterFeatures:
     def test_an_unmodelled_feature_blocks_even_a_metadata_commit(
         self, conn: Any, path: str
     ) -> None:
-        """checkpointProtection governs which checkpoints may be removed.
+        """collations changes what a string column means.
 
         The kernel has no variant for it at all, so it cannot know what the
         feature requires of a commit. A metadata-only commit was allowed through
         because it writes no data, which is the wrong test: writing blind to a
-        table whose rules you cannot read risks corrupting history.
+        table whose rules you cannot read risks corrupting it.
         """
-        t = self._with_writer_feature(conn, path, "checkpointProtection")
+        t = self._with_writer_feature(conn, path, "collations")
         for op in (Operation.APPEND, Operation.ADD_COLUMN, Operation.SET_PROPERTIES):
             verdict = t.can(op)
             assert not verdict.ok, f"{op.value} should be refused"
-            assert "checkpointProtection" in verdict.reason
+            assert "collations" in verdict.reason
+
+    def test_checkpoint_protection_binds_only_log_cleanup(self, conn: Any, path: str) -> None:
+        """Modelled now: it says which history may be deleted, and nothing else."""
+        t = self._with_writer_feature(conn, path, "checkpointProtection")
+        for op in (Operation.APPEND, Operation.ADD_COLUMN, Operation.SET_PROPERTIES):
+            assert t.can(op).ok, op.value
+        assert not t.can(Operation.CLEANUP_METADATA).ok
 
     def test_a_modelled_feature_still_allows_a_metadata_commit(self, conn: Any, path: str) -> None:
         """identityColumns is understood; the kernel just cannot write data for it.
@@ -518,7 +537,8 @@ class TestUnmodelledWriterFeatures:
         needlessly refuse half the DDL surface.
         """
         t = self._with_writer_feature(conn, path, "identityColumns")
-        assert not t.can(Operation.APPEND).ok
+        # No column is an identity column, so an append has none to generate.
+        assert t.can(Operation.APPEND).ok
         assert t.can(Operation.ADD_COLUMN).ok
 
 
@@ -650,14 +670,14 @@ class TestDistributedWrite:
                             "minReaderVersion": 3,
                             "minWriterVersion": 7,
                             "readerFeatures": [],
-                            "writerFeatures": ["checkpointProtection"],
+                            "writerFeatures": ["collations"],
                         }
                     }
                 )
                 + "\n"
             )
         before = len(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
-        with pytest.raises(UnreachableTableError, match="checkpointProtection"):
+        with pytest.raises(UnreachableTableError, match="collations"):
             conn.open_table(path).plan_write()
         after = len(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
         assert after == before, "a refused plan must not have written anything"
@@ -831,10 +851,22 @@ class TestEnforcementIsNotBypassed:
         assert table.can(Operation.APPEND).engine is Engine.DELTARS
         assert table.can(Operation.SCAN).engine is Engine.KERNEL, "reads are unaffected"
 
-    def test_a_distributed_write_is_refused_at_plan_time(self, conn: Any, amounts: str) -> None:
+    def test_a_distributed_write_enforces_it_on_the_worker(self, conn: Any, amounts: str) -> None:
+        """The workers evaluate the invariant over their rows before any file is
+        written (engine/values.py), where the kernel failed after writing them."""
+        import glob
+        import os
+
+        from deltaswamp.errors import InvalidArgumentError
+
         self._with_invariant(conn, amounts)
-        with pytest.raises(UnreachableTableError, match="invariant"):
-            conn.open_table(amounts).plan_write()
+        plan = conn.open_table(amounts).plan_write()
+        before = set(glob.glob(os.path.join(amounts, "*.parquet")))
+        with pytest.raises(InvalidArgumentError, match="invariant"):
+            plan.write(pa.table({"id": [3], "amt": [-1]}))
+        assert set(glob.glob(os.path.join(amounts, "*.parquet"))) == before
+        plan.commit([plan.write(pa.table({"id": [3], "amt": [4]}))])
+        assert conn.open_table(amounts).to_arrow().num_rows == 2
 
     def test_the_invariant_is_still_enforced(self, conn: Any, amounts: str) -> None:
         self._with_invariant(conn, amounts)
@@ -859,13 +891,13 @@ class TestEnforcementIsNotBypassed:
         plan.commit([plan.write(pa.table({"id": [9], "city": ["z"]}))])
         assert conn.open_table(path).to_arrow().num_rows == 4
 
-    def test_row_tracking_refuses_overwrite_before_workers_run(self, conn: Any) -> None:
+    def test_row_tracking_takes_a_distributed_overwrite(self, conn: Any) -> None:
         """A kernel overwrite removes every visible file in the same commit.
 
-        Kernel 0.28 refuses a commit that stages removes on a row-tracked table,
-        because it cannot preserve the ids of what it removes -- and it refuses
-        at commit, after the data files exist. Appends are unaffected: they
-        stage no removes, and the kernel assigns fresh ids.
+        Kernel 0.28 refuses a commit that stages removes on a row-tracked
+        table, at commit, after the data files exist; the overwrite (this one
+        distributed) stages them by hand, and was refused up front until it
+        did. The new rows get fresh ids.
         """
         import os
         import tempfile
@@ -881,8 +913,9 @@ class TestEnforcementIsNotBypassed:
         plan.commit([plan.write(pa.table({"id": [1]}))])
         assert conn.open_table(location).to_arrow().num_rows == 1, "append still works"
 
-        with pytest.raises(UnreachableTableError, match=r"row ids|rowTracking"):
-            conn.open_table(location).plan_write(mode="overwrite")
+        plan = conn.open_table(location).plan_write(mode="overwrite")
+        plan.commit([plan.write(pa.table({"id": [7, 8]}))])
+        assert sorted(conn.open_table(location).to_arrow().column("id").to_pylist()) == [7, 8]
 
     def test_deletion_vectors_do_not_block_an_overwrite(self, conn: Any) -> None:
         """Only row tracking rules removes out; a DV table overwrites normally."""
@@ -902,11 +935,12 @@ class TestEnforcementIsNotBypassed:
         replace.commit([replace.write(pa.table({"id": [9]}))])
         assert conn.open_table(location).to_arrow().to_pydict()["id"] == [9]
 
-    def test_a_check_constraint_keeps_writes_on_delta_rs(self, conn: Any, amounts: str) -> None:
+    def test_a_check_constraint_is_enforced_by_either_engine(self, conn: Any, amounts: str) -> None:
         """A legacy protocol names no features, so only the version reveals this.
 
         Reading just the named list made the table look featureless: the kernel
-        would have accepted the write and skipped the constraint entirely.
+        would have accepted the write and skipped the constraint entirely. It
+        now evaluates the constraint over every row it writes, as delta-rs does.
         """
         conn.open_table(amounts).add_constraint({"amt_positive": "amt > 0"})
         table = conn.open_table(amounts)
@@ -915,20 +949,24 @@ class TestEnforcementIsNotBypassed:
         assert "checkConstraints" in table.resolved.effective_writer_features
         assert table.can(Operation.APPEND).engine is Engine.DELTARS
 
-        with pytest.raises(UnreachableTableError, match="checkConstraints"):
-            conn.open_table(amounts).plan_write()
+        plan = conn.open_table(amounts).plan_write()
+        with pytest.raises(InvalidArgumentError, match="amt_positive"):
+            plan.write(pa.table({"id": [3], "amt": [-5]}))
+        plan.commit([plan.write(pa.table({"id": [3], "amt": [5]}))])
         with pytest.raises(Exception, match=r"(?i)invalid data|constraint"):
-            conn.open_table(amounts).append(pa.table({"id": [3], "amt": [-5]}))
+            conn.open_table(amounts).append(pa.table({"id": [4], "amt": [-5]}))
+        assert sorted(conn.open_table(amounts).to_arrow().column("amt").to_pylist()) == [5, 10]
 
 
 class TestTheKernelWritePathIsVersionBound:
-    """What rules a table out of a kernel write is its protocol *version*.
+    """What ruled a table out of a kernel write was its protocol *version*.
 
     A legacy writer version implies a whole feature set. Version 3 and above
     imply `checkConstraints`, which the kernel refuses whether or not a single
-    constraint exists -- so enabling change data feed, which alone puts a table
-    at version 4, takes it off the kernel write path entirely. The same features
-    are fine on a version 7 table, where only what is *named* applies.
+    constraint exists, and 4 and above `generatedColumns` -- so enabling change
+    data feed, which alone puts a table at version 4, took it off the kernel
+    write path entirely. A checked write (every constraint evaluated here, no
+    column generated) now commits past both; a build without it still refuses.
     """
 
     @staticmethod
@@ -944,8 +982,8 @@ class TestTheKernelWritePathIsVersionBound:
         ("properties", "writable"),
         [
             ({}, True),
-            ({"delta.enableChangeDataFeed": "true"}, False),
-            ({"delta.columnMapping.mode": "name"}, False),
+            ({"delta.enableChangeDataFeed": "true"}, True),
+            ({"delta.columnMapping.mode": "name"}, True),
             ({"delta.enableChangeDataFeed": "true", "delta.enableRowTracking": "true"}, True),
             ({"delta.columnMapping.mode": "name", "delta.enableDeletionVectors": "true"}, True),
         ],
@@ -963,22 +1001,38 @@ class TestTheKernelWritePathIsVersionBound:
             with pytest.raises(UnreachableTableError):
                 conn.open_table(location).plan_write()
 
-    def test_a_refusal_says_when_the_feature_is_only_implied(self, conn: Any) -> None:
+    @staticmethod
+    def _unchecked(monkeypatch: Any) -> None:
+        """A native build that cannot commit a checked write."""
+        from deltaswamp.engine import kernel
+
+        real = kernel._native_has
+        monkeypatch.setattr(
+            kernel, "_native_has", lambda *f: "check_constraints" not in f and real(*f)
+        )
+
+    def test_a_refusal_says_when_the_feature_is_only_implied(
+        self, conn: Any, monkeypatch: Any
+    ) -> None:
         """A CDF table with no constraints must not send its owner hunting."""
+        self._unchecked(monkeypatch)
         location = self._table(conn, {"delta.enableChangeDataFeed": "true"})
         with pytest.raises(UnreachableTableError, match="neither names nor uses") as caught:
             conn.open_table(location).plan_write()
         assert "writer version 4 implies" in str(caught.value)
 
-    def test_the_note_omits_a_feature_the_table_really_uses(self, conn: Any) -> None:
+    def test_the_note_omits_a_feature_the_table_really_uses(
+        self, conn: Any, monkeypatch: Any
+    ) -> None:
         location = self._table(conn, {"delta.enableChangeDataFeed": "true"})
         conn.open_table(location).append(pa.table({"id": [1]}))
         conn.open_table(location).add_constraint({"positive": "id > 0"})
+        self._unchecked(monkeypatch)
 
         with pytest.raises(UnreachableTableError) as caught:
             conn.open_table(location).plan_write()
         message = str(caught.value)
-        assert "neither names nor uses generatedColumns" in message
+        assert "checkConstraints" in message
         assert "neither names nor uses checkConstraints" not in message, (
             "the table really has a constraint; saying otherwise sends the reader astray"
         )

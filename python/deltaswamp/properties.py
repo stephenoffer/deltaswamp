@@ -16,15 +16,20 @@ from .capability import Engine, Operation, TableFeature, feature_from_wire
 from .errors import IgnoredPropertyWarning, PropertyNotSupportedError
 
 __all__ = [
+    "CHECKPOINT_STATS_REMEDY",
     "FEATURE_SIGNAL_PREFIX",
+    "KERNEL_CREATE_DEFERRED",
     "KERNEL_CREATE_FEATURES",
     "PROPERTY_SUPPORT",
     "PropertyEffect",
     "PropertySupport",
+    "checkpoint_drops_stats",
     "effect_for",
     "engine_can_set",
+    "parse_byte_size",
     "property_support",
     "validate_properties",
+    "with_checkpoint_stats",
 ]
 
 
@@ -118,8 +123,11 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
         # --- delta-rs stores but does not act on
         _prop(
             "delta.checkpointPolicy",
-            _ST,
-            _ST,
+            # Rejected rather than stored: delta-rs keeps the value but adds no
+            # v2Checkpoint feature, a protocol Databricks treats as invalid, and
+            # on a table-features protocol it panics. The kernel honors it.
+            _RJ,
+            _RJ,
             _H,
             False,
             "delta-rs stores it but adds no v2Checkpoint feature, so a v2 policy "
@@ -128,16 +136,30 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
         _prop("delta.checkpointInterval", _H, _H, _H),
         _prop("delta.logRetentionDuration", _H, _H, _H),
         _prop("delta.deletedFileRetentionDuration", _H, _H, _H),
-        _prop("delta.enableExpiredLogCleanup", _ST, _ST, _H),
+        # delta-rs acts on it: a write that lands on a checkpoint interval
+        # deletes expired log files (as Spark does) unless this is false.
+        _prop("delta.enableExpiredLogCleanup", _H, _H, _H),
         _prop("delta.setTransactionRetentionDuration", _ST, _ST, _H),
-        _prop("delta.dataSkippingStatsColumns", _ST, _ST, _H),
+        _prop(
+            "delta.dataSkippingStatsColumns",
+            _H,
+            _H,
+            _H,
+            False,
+            "delta-rs honors top-level leaf names only (not nested fields, structs or "
+            "column-mapped names), so appends and overwrites of a table that sets it go "
+            "to the kernel, which honors every form",
+        ),
         _prop("delta.checkpoint.writeStatsAsJson", _ST, _ST, _H),
-        _prop("delta.targetFileSize", _H, _H, _UN, False, "delta-rs-only writer hint"),
-        _prop("delta.isolationLevel", _H, _H, _UN),
-        _prop("delta.tuneFileSizesForRewrites", _ST, _ST, _UN, True),
-        _prop("delta.autoOptimize.optimizeWrite", _ST, _ST, _UN, True),
-        _prop("delta.autoOptimize.autoCompact", _ST, _ST, _UN, True),
-        _prop("delta.randomizeFilePrefixes", _ST, _ST, _UN, True),
+        # The kernel refuses these at CREATE but stores them through the same
+        # metadata commit set_properties() writes, so a kernel create applies
+        # them as version 1 (KERNEL_CREATE_DEFERRED).
+        _prop("delta.targetFileSize", _H, _H, _ST, False, "delta-rs-only writer hint"),
+        _prop("delta.isolationLevel", _H, _H, _ST),
+        _prop("delta.tuneFileSizesForRewrites", _ST, _ST, _ST, True),
+        _prop("delta.autoOptimize.optimizeWrite", _ST, _ST, _ST, True),
+        _prop("delta.autoOptimize.autoCompact", _ST, _ST, _ST, True),
+        _prop("delta.randomizeFilePrefixes", _ST, _ST, _ST, True),
         # --- kernel only: delta-rs rejects these outright
         _prop("delta.enableRowTracking", _RJ, _RJ, _H),
         _prop("delta.enableInCommitTimestamps", _RJ, _RJ, _H),
@@ -161,7 +183,29 @@ PROPERTY_SUPPORT: dict[str, PropertySupport] = dict(
             True,
             "UniForm metadata generation is a Databricks-side job",
         ),
-        _prop("delta.parquet.compression.codec", _RJ, _RJ, _UN),
+        # Stored by set_properties() through the kernel's metadata commit; the
+        # kernel's writer then compresses every data file it writes with it.
+        _prop(
+            "delta.parquet.compression.codec",
+            _RJ,
+            _RJ,
+            _UN,
+            False,
+            "the kernel writes data files with this codec (snappy when unset; lzo, "
+            "which arrow-rs cannot write, as snappy); delta-rs writes snappy",
+        ),
+        # Real Delta keys that delta-rs rejects ("Error parsing property");
+        # the kernel's metadata path stores them for Databricks to act on.
+        _prop(
+            "delta.compatibility.symlinkFormatManifest.enabled",
+            _RJ,
+            _RJ,
+            _UN,
+            True,
+            "Databricks regenerates the manifest on every write; writes from here do "
+            "not, so call generate() after them",
+        ),
+        _prop("delta.checkpointRetentionDuration", _RJ, _RJ, _ST, True),
         # --- protocol versions: never set these by hand
         _prop(
             "delta.minReaderVersion",
@@ -209,6 +253,101 @@ KERNEL_CREATE_FEATURES: frozenset[TableFeature] = frozenset(
 )
 
 FEATURE_SIGNAL_PREFIX = "delta.feature."
+
+#: Plain metadata keys delta-kernel refuses in CREATE TABLE ("not supported
+#: during CREATE TABLE") although the metadata commit behind set_properties()
+#: stores them on the same table a moment later. Refusing them made a DV,
+#: row-tracked or clustered table impossible to create with common Databricks
+#: settings, so the kernel create commits them as version 1 instead.
+KERNEL_CREATE_DEFERRED: frozenset[str] = frozenset(
+    {
+        "delta.targetFileSize",
+        "delta.isolationLevel",
+        "delta.tuneFileSizesForRewrites",
+        "delta.autoOptimize.optimizeWrite",
+        "delta.autoOptimize.autoCompact",
+        "delta.randomizeFilePrefixes",
+        "delta.checkpointRetentionDuration",
+    }
+)
+
+_STATS_JSON = "delta.checkpoint.writeStatsAsJson"
+_STATS_STRUCT = "delta.checkpoint.writeStatsAsStruct"
+
+
+def checkpoint_drops_stats(properties: Mapping[str, str] | None) -> bool:
+    """Whether a checkpoint written here would keep no file statistics at all.
+
+    With writeStatsAsJson=false and writeStatsAsStruct unset, Spark writes
+    struct stats (its default for the struct is true), but delta-rs and the
+    kernel read unset as false and write neither -- every file then loses
+    data skipping, on Databricks too, until the next full rewrite.
+    """
+    props = properties or {}
+    return (
+        str(props.get(_STATS_JSON, "true")).lower() == "false" and props.get(_STATS_STRUCT) is None
+    )
+
+
+CHECKPOINT_STATS_REMEDY = (
+    "set delta.checkpoint.writeStatsAsStruct=true (Spark's default, which Databricks "
+    "applies when it is unset) with set_properties(), then checkpoint"
+)
+
+
+def with_checkpoint_stats(
+    properties: Mapping[str, str] | None, existing: Mapping[str, str] | None = None
+) -> dict[str, str] | None:
+    """`properties`, recording writeStatsAsStruct=true where they turn JSON stats off.
+
+    Spark treats an unset writeStatsAsStruct as true; this library's writers
+    treat it as false. Written down with the property that makes it matter,
+    both read the table the same way and checkpoints keep their statistics.
+    """
+    if properties is None:
+        return None
+    out = dict(properties)
+    if (
+        str(out.get(_STATS_JSON, "")).lower() == "false"
+        and _STATS_STRUCT not in out
+        and (existing or {}).get(_STATS_STRUCT) is None
+    ):
+        out[_STATS_STRUCT] = "true"
+    return out
+
+
+_BYTE_UNITS = {
+    "": 1,
+    "b": 1,
+    "k": 1 << 10,
+    "kb": 1 << 10,
+    "m": 1 << 20,
+    "mb": 1 << 20,
+    "g": 1 << 30,
+    "gb": 1 << 30,
+    "t": 1 << 40,
+    "tb": 1 << 40,
+    "p": 1 << 50,
+    "pb": 1 << 50,
+}
+
+
+def parse_byte_size(value: object) -> int | None:
+    """A Spark byte string ("134217728", "128mb", "1g") in bytes; None if it is not one.
+
+    Databricks reads delta.targetFileSize this way (binary units, case-blind).
+    delta-rs parses only a bare integer and silently falls back to its own
+    default for anything else, so "2mb" was accepted and then ignored.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    digits = len(text) - len(text.lstrip("0123456789"))
+    number, unit = text[:digits], text[digits:].strip()
+    if not number or not number.isascii() or unit not in _BYTE_UNITS:
+        return None
+    size = int(number) * _BYTE_UNITS[unit]
+    return size if size > 0 else None
 
 
 def property_support(key: str) -> PropertySupport:
@@ -329,6 +468,9 @@ def _value_problem(key: str, value: object) -> str | None:
     elif key in _POSITIVE_INT_KEYS:
         if not (value.isascii() and value.isdigit() and int(value) > 0):
             return f"{value!r} is not a positive integer"
+    elif key == "delta.targetFileSize":
+        if parse_byte_size(value) is None:
+            return f"{value!r} is not a positive size in bytes, such as '134217728' or '128mb'"
     elif key in _VERSION_KEYS:
         if not (value.isascii() and value.isdigit()):
             return f"{value!r} is not a protocol version number"
@@ -463,6 +605,18 @@ def validate_properties(
             remedy,
         )
 
+    listed = properties.get("delta.dataSkippingStatsColumns")
+    mapped = str(properties.get("delta.columnMapping.mode", "none")).lower() not in ("", "none")
+    if warn and engine is Engine.DELTARS and listed and (mapped or "." in str(listed)):
+        # Appends and overwrites of such a table go to the kernel when it can
+        # write the table; delta-rs's own writes (UPDATE, MERGE, OPTIMIZE, and
+        # every write to a column-mapped table it created) still drop these.
+        warnings.warn(
+            "delta-rs writes no statistics for the nested fields in, or (under column "
+            "mapping) any of, delta.dataSkippingStatsColumns; only kernel writes honor them",
+            IgnoredPropertyWarning,
+            stacklevel=3,
+        )
     if warn and inert:
         warnings.warn(
             f"{engine.value} stores but does not act on: " + "; ".join(inert),

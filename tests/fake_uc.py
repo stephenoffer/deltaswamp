@@ -77,6 +77,9 @@ class FakeUnityCatalog:
         self.tables: dict[str, FakeTable] = {}
         #: Set to a status code to make the next commit fail that way.
         self.next_commit_status: int | None = None
+        #: Set to a status code to make the next commit take effect and then
+        #: answer with that status: a ratification whose response was lost.
+        self.next_commit_status_after_ratify: int | None = None
         #: Every commit body received, for assertions.
         self.commit_log: list[dict[str, Any]] = []
         #: Every request, as (method, path-with-query, body), for assertions.
@@ -240,13 +243,52 @@ class FakeUnityCatalog:
                         429: "the maximum number of unbackfilled commits has been reached",
                     }
                     return self._send(code, {"message": messages.get(code, "error")})
+                conflict = catalog._version_conflict(path, body)
+                if conflict is not None:
+                    catalog.commit_log[-1]["refused"] = 409
+                    return self._send(409, {"message": conflict})
                 catalog._ratify(self.path, body)
+                if catalog.next_commit_status_after_ratify is not None:
+                    code = catalog.next_commit_status_after_ratify
+                    catalog.next_commit_status_after_ratify = None
+                    return self._send(code, {"message": "error"})
                 return self._send(200, {})
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self._thread.start()
         return self
+
+    def _version_conflict(self, path: str, body: Any) -> str | None:
+        """The 409 a real server returns for a version that is not the next one.
+
+        Two writers that read the same version both stage its successor; the
+        catalog ratifies the first and refuses the second, which is what makes
+        a lost update impossible. Ratifying both would let the fake accept a
+        commit that silently drops the other writer's rows.
+        """
+        if not isinstance(body, dict) or not isinstance(body.get("updates"), list):
+            return None
+        parts = path.split("/")
+        if "tables" not in parts:
+            return None
+        try:
+            table = self.tables.get(f"{parts[-5]}.{parts[-3]}.{parts[-1]}")
+        except IndexError:
+            return None
+        if table is None:
+            return None
+        for update in body["updates"]:
+            if update.get("action") != "add-commit":
+                continue
+            version = int(update["commit"]["version"])
+            if version != table.latest_version + 1:
+                return (
+                    f"commit version {version} is not the next version ({table.latest_version + 1})"
+                )
+        return None
 
     def _ratify(self, path: str, body: dict[str, Any]) -> None:
         """Apply a commit the way UC does: record it in the table's tail.

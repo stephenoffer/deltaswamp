@@ -699,12 +699,18 @@ name = "deltaswamp-native"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
+ "bytes",
  "delta-kernel-unity-catalog",
  "delta_kernel",
  "delta_kernel_default_engine",
+ "futures",
+ "humantime",
+ "percent-encoding",
  "pyo3",
  "pyo3-arrow",
  "roaring",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

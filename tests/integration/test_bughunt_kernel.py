@@ -18,7 +18,11 @@ from deltaswamp.capability import Operation  # noqa: E402
 from deltaswamp.catalog.base import ResolvedTable  # noqa: E402
 from deltaswamp.credentials.base import CredentialProvider  # noqa: E402
 from deltaswamp.engine.kernel import KernelEngine  # noqa: E402
-from deltaswamp.errors import CommitConflictError, UnreachableTableError  # noqa: E402
+from deltaswamp.errors import (  # noqa: E402
+    CommitConflictError,
+    InvalidArgumentError,
+    UnreachableTableError,
+)
 from deltaswamp.identity import parse_ref  # noqa: E402
 
 
@@ -189,20 +193,46 @@ class TestSupports:
         assert not verdict.ok
         assert "unpartitioned" in verdict.reason
 
-    @pytest.mark.parametrize("writer", [3, 4, 6])
-    def test_legacy_writer_protocol_refuses_data_writes(self, tmp_path: Any, writer: int) -> None:
+    @pytest.mark.parametrize("writer", [3, 4])
+    def test_legacy_writer_protocol_takes_checked_data_writes(
+        self, tmp_path: Any, writer: int
+    ) -> None:
+        """Writer 3 and 4 imply checkConstraints (4 generatedColumns too), which
+        the kernel refuses; a checked write commits past both where no
+        constraint fails and no column is generated."""
         path = write(
             str(tmp_path / "legacy"),
             pa.table({"id": [1]}),
             configuration={"delta.minWriterVersion": str(writer)},
         )
-        verdict = KernelEngine().supports(Operation.APPEND, resolved(path))
-        assert not verdict.ok
-        assert "checkConstraints" in verdict.reason
+        engine = KernelEngine()
+        assert engine.supports(Operation.APPEND, resolved(path)).ok
+        engine.append(resolved(path), pa.table({"id": [2]}))
+        from deltalake import DeltaTable
 
-    @pytest.mark.parametrize(
-        "op", [Operation.DELETE, Operation.UPDATE, Operation.OVERWRITE, Operation.REPLACE_WHERE]
-    )
+        table = DeltaTable(path)
+        assert table.protocol().min_writer_version == writer
+        assert sorted(table.to_pyarrow_table().column("id").to_pylist()) == [1, 2]
+
+    def test_legacy_writer_6_without_an_identity_column_takes_data_writes(
+        self, tmp_path: Any
+    ) -> None:
+        """Writer version 6 implies identityColumns for any table; with no column
+        declaring one there is no value to generate, and the write commits past
+        the kernel's refusal (as generatedColumns does at 4)."""
+        path = write(
+            str(tmp_path / "legacy"),
+            pa.table({"id": [1]}),
+            configuration={"delta.minWriterVersion": "6"},
+        )
+        engine = KernelEngine()
+        assert engine.supports(Operation.APPEND, resolved(path)).ok
+        engine.append(resolved(path), pa.table({"id": [2]}))
+        from deltalake import DeltaTable
+
+        assert DeltaTable(path).protocol().min_writer_version == 6
+
+    @pytest.mark.parametrize("op", [Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE])
     def test_cdf_enabled_refuses_removing_writes(self, tmp_path: Any, op: Operation) -> None:
         path = kernel_table(
             str(tmp_path / "t"),
@@ -225,16 +255,19 @@ class TestSupports:
         assert not verdict.ok
         assert "append-only" in verdict.reason
 
-    def test_schema_invariants_refuse_writes(self, tmp_path: Any) -> None:
+    def test_schema_invariants_refuse_rewrites_but_not_appends(self, tmp_path: Any) -> None:
         field = pa.field(
             "id",
             pa.int64(),
             metadata={"delta.invariants": json.dumps({"expression": {"expression": "id > 0"}})},
         )
         path = write(str(tmp_path / "inv"), pa.table({"id": [1]}, schema=pa.schema([field])))
-        verdict = KernelEngine().supports(Operation.APPEND, resolved(path))
+        engine = KernelEngine()
+        # An append evaluates the invariant over its rows (engine/values.py).
+        assert engine.supports(Operation.APPEND, resolved(path)).ok
+        verdict = engine.supports(Operation.DELETE, resolved(path))
         assert not verdict.ok
-        assert "invariants" in verdict.reason
+        assert "invariant" in verdict.reason
 
 
 class _FakeCredentials:
@@ -408,7 +441,7 @@ class TestAddColumns:
 
     def test_unknown_type_is_refused_before_commit(self, plain: str) -> None:
         engine = KernelEngine()
-        with pytest.raises(UnreachableTableError, match="not a Delta type"):
+        with pytest.raises(InvalidArgumentError, match="not a Delta type"):
             engine.add_columns(resolved(plain), {"n": "nope"})
         assert engine.snapshot(resolved(plain)).version == 0
 
@@ -563,14 +596,14 @@ class TestAppendRetry:
 class TestReplaceWhereContract:
     def test_rows_outside_the_predicate_are_refused(self, plain: str) -> None:
         engine = KernelEngine()
-        with pytest.raises(UnreachableTableError, match="do not satisfy the predicate"):
+        with pytest.raises(InvalidArgumentError, match="do not satisfy the predicate"):
             engine.overwrite(
                 resolved(plain), pa.table({"id": [9], "city": ["z"]}), predicate="id = 1"
             )
         assert engine.snapshot(resolved(plain)).version == 0
 
     def test_null_predicate_result_is_refused(self, plain: str) -> None:
-        with pytest.raises(UnreachableTableError, match="do not satisfy"):
+        with pytest.raises(InvalidArgumentError, match="do not satisfy"):
             KernelEngine().overwrite(
                 resolved(plain), pa.table({"id": [None], "city": ["z"]}), predicate="id = 1"
             )

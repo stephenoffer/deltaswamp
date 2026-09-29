@@ -362,7 +362,9 @@ class FakeSharingServer:
                 return self._reply(200, lines, headers)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        ).start()
         return self
 
     def stop(self) -> None:
@@ -443,6 +445,13 @@ def _rows(ids: list[int], day: str) -> FakeFile:
     )
     assert data.num_rows == n
     return FakeFile(id=f"f-{day}-{ids[0]}", data=_parquet(data), partition_values={"day": day})
+
+
+@pytest.fixture(autouse=True)
+def _local_presigned_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fake sharing servers here issue http:// URLs on 127.0.0.1, which a
+    # real one never does; the SSRF guard lets them through only on opt-in.
+    monkeypatch.setenv("DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS", "1")
 
 
 @pytest.fixture(scope="module")
@@ -859,7 +868,7 @@ class TestRouted:
 
 class TestHints:
     def test_unexpressible_conjuncts_are_dropped(self) -> None:
-        hint = json_predicate_hints("(id = 1 OR id = 2) AND name = 'it''s'", SCHEMA_STRING)
+        hint = json_predicate_hints(r"(id = 1 OR id = 2) AND name = 'it\'s'", SCHEMA_STRING)
         assert hint is not None
         assert json.loads(hint) == {
             "op": "equal",
@@ -974,11 +983,13 @@ class TestDeltaFormat:
         # The query advertised delta responses with the reader features...
         capabilities = [h.get("delta-sharing-capabilities", "") for h in server.request_headers]
         assert any("responseformat=delta" in c and "columnmapping" in c for c in capabilities)
-        # ...and the log written for the kernel holds the delta actions verbatim.
+        # ...and the log written for the kernel holds the delta actions, each
+        # file downloaded here first: the kernel is never handed a server URL.
         protocol, metadata, add = fake_kernel.logs[-1]
         assert protocol["protocol"]["readerFeatures"] == ["columnMapping"]
         assert metadata["metaData"]["configuration"]["delta.columnMapping.mode"] == "name"
-        assert add["add"]["path"].endswith("/files/mapped-1")
+        assert add["add"]["path"].startswith("file://")
+        assert "deltaswamp-sharing-" in add["add"]["path"]
 
     def test_parquet_request_would_have_been_refused(self, renamed: ResolvedTable) -> None:
         # Guard for the fake itself: without the delta header the server refuses.

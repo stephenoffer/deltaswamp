@@ -27,7 +27,7 @@ from deltaswamp.capability import (
 from deltaswamp.catalog import TableType
 from deltaswamp.engine.sql import SqlEngine, SqlFallbackWarning, SqlMerger
 from deltaswamp.engine.sql_backend import SqlStatementError
-from deltaswamp.errors import UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
 from deltaswamp.identity import RefKind, TableRef
 
 from tests.helpers import resolved_table as table
@@ -297,10 +297,18 @@ class TestDdl:
         assert rec.last == f"ALTER TABLE {NAME} ADD COLUMNS (`new col` DECIMAL(10,2))"
         eng.add_columns(table(), pa.schema([("a", pa.int64()), ("t", pa.list_(pa.string()))]))
         assert rec.last == f"ALTER TABLE {NAME} ADD COLUMNS (`a` BIGINT, `t` ARRAY<STRING>)"
+        # A dotted name is a nested path, as on the kernel path; backticks
+        # keep a dot inside one name.
         eng.drop_column(table(), "a.b")
+        assert rec.last == f"ALTER TABLE {NAME} DROP COLUMN `a`.`b`"
+        eng.drop_column(table(), "`a.b`")
         assert rec.last == f"ALTER TABLE {NAME} DROP COLUMN `a.b`"
         eng.rename_column(table(), "old", "n`ew")
         assert rec.last == f"ALTER TABLE {NAME} RENAME COLUMN `old` TO `n``ew`"
+        eng.rename_column(table(), ["s", "aa"], "s.x")
+        assert rec.last == f"ALTER TABLE {NAME} RENAME COLUMN `s`.`aa` TO `x`"
+        with pytest.raises(InvalidArgumentError, match="keeps the column in its struct"):
+            eng.rename_column(table(), "s.aa", "t.x")
 
     def test_features(self) -> None:
         eng, rec, _ = engine()
@@ -501,7 +509,8 @@ class TestStagedWrites:
         # which INSERT ... BY NAME rejects as an extra column.
         assert rec.last == (
             f"INSERT INTO {NAME} BY NAME SELECT `id`, `city` "
-            f"FROM read_files('{path}', format => 'parquet')"
+            f"FROM read_files('{path}', format => 'parquet', "
+            "datetimeRebaseMode => 'CORRECTED', int96RebaseMode => 'CORRECTED')"
         )
         assert client.files.deleted == [path]
 
@@ -547,8 +556,9 @@ class TestStagedWrites:
         path = _staged_path(client)
         assert rec.sql == [
             f"SELECT * FROM {NAME} LIMIT 0",
-            f"INSERT INTO {NAME} REPLACE WHERE day = 'd1' SELECT `id`, `day` "
-            f"FROM read_files('{path}', format => 'parquet')",
+            f"INSERT INTO {NAME} (`id`, `day`) REPLACE WHERE day = 'd1' SELECT `id`, `day` "
+            f"FROM read_files('{path}', format => 'parquet', "
+            "datetimeRebaseMode => 'CORRECTED', int96RebaseMode => 'CORRECTED')",
         ]
         assert client.files.deleted == [path]
 
@@ -602,12 +612,13 @@ class TestMerge:
         assert rec.last == (
             f"MERGE INTO {NAME} AS `t` USING (SELECT `id`, `v`, `ts` "
             f"FROM read_files('{path}', format => "
-            "'parquet')) AS `s` ON t.id = s.id"
+            "'parquet', datetimeRebaseMode => 'CORRECTED', int96RebaseMode => 'CORRECTED')) "
+            "AS `s` ON t.id = s.id"
             " WHEN MATCHED AND s.ts > t.ts THEN UPDATE SET `t`.`v` = s.v"
             " WHEN MATCHED THEN UPDATE SET `t`.`id` = `s`.`id`, `t`.`v` = `s`.`v`"
             " WHEN MATCHED AND s.v IS NULL THEN DELETE"
             " WHEN NOT MATCHED AND s.id > 0 THEN INSERT (`id`, `v`) VALUES (s.id, s.v)"
-            " WHEN NOT MATCHED THEN INSERT *"
+            " WHEN NOT MATCHED THEN INSERT (`id`, `v`, `ts`) VALUES (`s`.`id`, `s`.`v`, `s`.`ts`)"
             " WHEN NOT MATCHED BY SOURCE THEN UPDATE SET `t`.`v` = 'gone'"
             " WHEN NOT MATCHED BY SOURCE THEN DELETE"
         )

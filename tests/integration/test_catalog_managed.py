@@ -60,6 +60,9 @@ def _make_catalog_managed(table_path: str) -> None:
             configuration["delta.enableInCommitTimestamps"] = "true"
 
     first.write_text("\n".join(json.dumps(a) for a in actions) + "\n")
+    # Checksums record the old protocol; readers trust them over the log.
+    for crc in log.glob("*.crc"):
+        crc.unlink()
 
 
 def _metadata_id(table_path: str) -> str:
@@ -86,6 +89,9 @@ def _stage_latest_commit(table_path: str) -> dict[str, Any]:
     staged_dir.mkdir(exist_ok=True)
     staged_name = f"{version:020d}.{uuid.uuid4()}.json"
     shutil.move(str(newest), str(staged_dir / staged_name))
+    # A published-only checksum must not outlive its commit: readers refuse a
+    # .crc newer than the log they can see.
+    (log / f"{version:020d}.crc").unlink(missing_ok=True)
 
     return {
         "version": version,
@@ -382,11 +388,12 @@ class TestDistributedWrite:
         plan.commit([plan.write(pa.table({"id": [9], "city": ["z"]}))])
         assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [9]
 
-    def test_committing_nothing_is_still_a_commit(self, writable_catalog_managed: Any) -> None:
-        """A job that produced no data advances the table rather than erroring."""
+    def test_committing_nothing_adds_no_commit(self, writable_catalog_managed: Any) -> None:
+        """A job that produced no data returns the current version rather than erroring."""
         conn = writable_catalog_managed
+        before = conn.table("main.sales.cm").version
         version = conn.table("main.sales.cm").plan_write().commit([])
-        assert isinstance(version, int)
+        assert version == before == conn.table("main.sales.cm").version
         assert conn.table("main.sales.cm").to_arrow().num_rows == 0
 
     def test_alter_is_still_refused(self, writable_catalog_managed: Any) -> None:
@@ -451,7 +458,18 @@ class TestCommitFailuresReachCallersAsLibraryErrors:
         fragment = plan.write(pa.table({"id": [1]}))
         uc.next_commit_status = 409
         with pytest.raises(CommitConflictError):
-            plan.commit([fragment])
+            plan.commit([fragment], retries=0)
+
+    def test_a_distributed_append_rebases_over_a_conflict_by_default(
+        self, uc_and_conn: Any
+    ) -> None:
+        """Planned through its catalog, a catalog-managed append retries like any other."""
+        uc, conn = uc_and_conn
+        plan = conn.table("main.sales.cm").plan_write()
+        fragment = plan.write(pa.table({"id": [1]}))
+        uc.next_commit_status = 409
+        plan.commit([fragment])
+        assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [1]
 
     def test_retrying_a_catalog_managed_commit_says_to_re_open(self, uc_and_conn: Any) -> None:
         """A retry re-reads the commit tail from the catalog, so it can succeed.

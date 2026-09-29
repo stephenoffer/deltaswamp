@@ -7,7 +7,7 @@
 //! the add/remove DV pairs that encode a row-level update) and preserves file
 //! row order; this module only hands its batches onward.
 //!
-//! Timestamp bounds are converted with the history manager using *published*
+//! Timestamp bounds are converted by `commit_time` using *published*
 //! commits: CDF needs the commits in the range to exist in the log, not a
 //! checkpoint to rebuild the table from. Asking for "recreatable" versions
 //! instead would silently move the start forward to the earliest checkpoint and
@@ -16,13 +16,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
+use delta_kernel::history_manager::HistoryCommitType;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::Engine;
 use url::Url;
 
 use crate::commit::SharedEngine;
+use crate::commit_time::Bound;
 use crate::error::{NativeError, Result};
 use crate::predicate::parse_predicate;
 use crate::runtime;
@@ -40,7 +41,7 @@ pub struct Range {
 }
 
 /// Resolve timestamp bounds to versions, refusing ambiguous combinations.
-fn resolve_range(url: &Url, engine: &SharedEngine, range: Range) -> Result<(u64, Option<u64>)> {
+pub fn resolve_range(url: &Url, engine: &SharedEngine, range: Range) -> Result<(u64, Option<u64>)> {
     if range.start_version.is_some() && range.start_timestamp_ms.is_some() {
         return Err(NativeError::Invalid(
             "pass start_version or start_timestamp_ms, not both".to_string(),
@@ -58,27 +59,41 @@ fn resolve_range(url: &Url, engine: &SharedEngine, range: Range) -> Result<(u64,
     let engine_ref = engine.as_ref() as &dyn Engine;
     let latest =
         runtime::block_on(async { Snapshot::builder_for(url.as_str()).build(engine_ref) })?;
+    let latest_time = crate::commit_time::commit_time(&latest, engine_ref)?;
+    let after_latest = |ts: i64, bound: &str| {
+        NativeError::Invalid(format!(
+            "the {bound} timestamp {ts} ms is after the latest commit (version {}, at {latest_time} \
+             ms), so no version of the table exists at that time \
+             (DELTA_TIMESTAMP_GREATER_THAN_COMMIT)",
+            latest.version()
+        ))
+    };
+    let resolve = |ts: i64, bound: Bound| {
+        crate::commit_time::version_at(&latest, engine_ref, ts, bound, HistoryCommitType::Published)
+    };
     let start = match range.start_timestamp_ms {
+        Some(ts) if ts > latest_time => return Err(after_latest(ts, "start")),
         Some(ts) => {
-            first_version_after(&latest, engine_ref, ts, HistoryCommitType::Published)
+            resolve(ts, Bound::AtOrAfter)
                 .map_err(|e| {
                     NativeError::Invalid(format!(
                         "no commit at or after start timestamp {ts} ms: {e}"
                     ))
                 })?
-                .version
+                .0
         }
         None => range.start_version.unwrap_or(0),
     };
     let end = match range.end_timestamp_ms {
+        Some(ts) if ts > latest_time => return Err(after_latest(ts, "end")),
         Some(ts) => Some(
-            latest_version_as_of(&latest, engine_ref, ts, HistoryCommitType::Published)
+            resolve(ts, Bound::AtOrBefore)
                 .map_err(|e| {
                     NativeError::Invalid(format!(
                         "no commit at or before end timestamp {ts} ms: {e}"
                     ))
                 })?
-                .version,
+                .0,
         ),
         None => range.end_version,
     };
@@ -143,7 +158,11 @@ pub fn table_changes(
         .with_predicate(predicate.map(Arc::new))
         .build()?;
     let schema = scan.logical_schema().clone();
-    let iter = scan.execute(engine.clone() as Arc<dyn Engine>)?;
+    // Rebases Parquet files Spark wrote in its legacy hybrid calendar.
+    let iter = scan.execute(crate::confine::confined(
+        crate::rebase::reading_engine(&engine, url),
+        url,
+    ))?;
     Ok(KernelBatchReader::from_parts(schema.as_ref(), iter)?
         .without_column(crate::scan::ROW_COUNT_COLUMN))
 }

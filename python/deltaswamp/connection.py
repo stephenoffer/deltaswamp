@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
-from typing import Any
+import re
+from collections.abc import Iterator, Mapping
+from typing import TYPE_CHECKING, Any
 
+from ._util import check_keywords
 from .capability import Engine as EngineKind
 from .capability import Operation
 from .catalog import Catalog, ResolvedTable
@@ -13,17 +17,24 @@ from .catalog.filesystem import FilesystemCatalog
 from .catalog.registry import catalog_for_uri
 from .engine.deltars import DeltaRsEngine
 from .engine.kernel import KernelEngine
+from .engine.metadata import cdf_clash_error, cdf_name_clash
 from .errors import (
     SQL_FALLBACK_REMEDY,
     DeltaSwampError,
+    EngineError,
     FallbackRequiredError,
     InvalidArgumentError,
     InvalidReferenceError,
+    TableNotFoundError,
     UnreachableTableError,
 )
-from .identity import RefKind, parse_ref
+from .identity import RefKind, TableRef, parse_ref
+from .properties import with_checkpoint_stats
 from .router import Router
 from .table import Table, _call, _check_version, _governed, _require, _write_data
+
+if TYPE_CHECKING:
+    from .governance import FunctionSummary, Grant, TableSummary, Volume, VolumeSummary
 
 __all__ = ["Connection", "connect"]
 
@@ -42,6 +53,8 @@ def connect(
     storage_options: dict[str, str] | None = None,
     default_catalog: str | None = None,
     default_schema: str | None = None,
+    iceberg_properties: dict[str, str] | None = None,
+    ship_credentials: bool = False,
 ) -> Connection:
     """Open a connection.
 
@@ -54,8 +67,11 @@ def connect(
     the SDK find one. A PAT cannot be refreshed, so prefer OAuth M2M for anything
     that runs longer than the token's lifetime.
 
-    `uri` may name an OSS Unity Catalog server (``uc://http://host:8080``) or a
-    Hive metastore (``hms://thrift://host:9083``). Omit it for Databricks.
+    `uri` may name an OSS Unity Catalog server (``uc://http://host:8080``), a
+    Hive metastore (``hms://thrift://host:9083``), AWS Glue (``glue://``), a
+    Delta Sharing profile (``sharing:///path/config.share``), or no catalog at
+    all (``file://``), for tables opened by path with `Connection.table` or
+    `Connection.open_table`. Omit it for Databricks.
 
     Set `allow_sql_fallback=True` to permit routing through a SQL warehouse for
     operations no open-source engine implements. Without `warehouse_id` one is
@@ -64,13 +80,38 @@ def connect(
     deleted. It is off by default because
     that reroute changes latency and cost by orders of magnitude, and a silent
     reroute is exactly the kind of surprise this library exists to avoid.
+
+    `storage_options` reach every engine: the kernel and delta-rs take them as
+    object_store options (see "Storage options" in docs/usage.md for how they
+    merge with vended credentials); Iceberg tables get their PyIceberg FileIO equivalents
+    (``s3.endpoint``, ``s3.region``, ``s3.proxy-uri``, ...), and Delta Sharing
+    downloads their ``proxy_url`` and ``timeout``. `iceberg_properties` are
+    PyIceberg catalog and FileIO properties passed verbatim, over those.
+
+    A pickled connection, table or credential provider carries no literal
+    secret (a token, a client secret): a worker re-derives Databricks auth
+    from its own environment. `ship_credentials=True` pickles them too, for
+    workers that have no auth of their own.
     """
+    if not isinstance(allow_sql_fallback, bool):
+        # The fallback costs money, so it is on only when asked for exactly.
+        # A string from an environment variable -- "false", "0" -- is truthy
+        # and switched it on.
+        raise InvalidArgumentError(
+            f"allow_sql_fallback must be True or False, not {allow_sql_fallback!r}"
+        )
     if catalog is not None and uri is not None and str(uri).strip():
         # The URI was silently ignored: ds.connect("hms://...", catalog=cat)
         # talked to `cat` while the caller believed it reached the metastore.
         raise InvalidArgumentError(
             f"pass a connection URI or catalog=, not both (got {uri!r} and a "
             f"{type(catalog).__name__})"
+        )
+    if storage_options is not None and not isinstance(storage_options, Mapping):
+        # A list of pairs or a string reached the engines, which failed with a
+        # raw AttributeError ('list' object has no attribute 'items').
+        raise InvalidArgumentError(
+            f"storage_options is a {{key: value}} dict, not {type(storage_options).__name__}"
         )
     resolved_catalog = catalog or _default_catalog(
         uri, profile=profile, host=host, token=token, config=config
@@ -83,17 +124,54 @@ def connect(
     # Engines for tables that are not reached by storage location. Each serves
     # only its own kind of table and refuses the rest, so registering them
     # costs nothing for a connection that never meets one.
+    from ._storage import canonical_options, http_settings, iceberg_fileio_properties
     from .engine.iceberg import IcebergEngine
     from .engine.sharing import SharingEngine
 
+    # Canonical up front, so a dict naming one setting twice is refused here
+    # rather than at the first table.
+    for cloud_scheme in ("s3://", "abfss://", "gs://"):
+        canonical_options(storage_options, cloud_scheme)
+    _check_retry_options(storage_options)
     if SharingEngine.available():
-        engines[EngineKind.SHARING] = SharingEngine()
+        http = http_settings(storage_options)
+        engines[EngineKind.SHARING] = SharingEngine(
+            proxy_url=http.get("proxy_url"),
+            **({"request_timeout": http["timeout"]} if "timeout" in http else {}),
+        )
     if IcebergEngine.available():
-        engines[EngineKind.ICEBERG] = IcebergEngine(token=token)
+        # connect()'s storage_options never reached PyIceberg: the proxy, CA,
+        # endpoint and region the other engines honour were silently ignored.
+        properties = {**iceberg_fileio_properties(storage_options), **(iceberg_properties or {})}
+        engines[EngineKind.ICEBERG] = IcebergEngine(token=token, properties=properties or None)
+        engines[EngineKind.ICEBERG]._ship_secrets = bool(ship_credentials)  # type: ignore[attr-defined]
+    if ship_credentials and hasattr(resolved_catalog, "_ship_secrets"):
+        resolved_catalog._ship_secrets = True
 
+    # The warehouse addresses tables by Unity Catalog name in its own
+    # workspace. Any other catalog -- an OSS Unity Catalog server above all,
+    # whose names look exactly the same -- has tables the warehouse cannot
+    # see, and a same-named Databricks table was read and written instead.
+    warehouse_catalog = bool(getattr(resolved_catalog, "sql_warehouse", False))
+    if allow_sql_fallback and not warehouse_catalog:
+        raise InvalidArgumentError(
+            "allow_sql_fallback=True routes operations to a Databricks SQL warehouse, which "
+            "serves only the tables of its own workspace's Unity Catalog; this connection's "
+            f"catalog is {getattr(resolved_catalog, 'name', type(resolved_catalog).__name__)!r}. "
+            "Leave the fallback off here, or open the table through ds.connect() to the "
+            "Databricks workspace that holds it"
+        )
     if allow_sql_fallback:
         from .engine.sql import SqlEngine
 
+        if catalog is not None and not any(v is not None for v in (profile, host, token, config)):
+            # A catalog passed in carries its own authentication; the engine
+            # built from none resolved the SDK defaults, which may be another
+            # workspace than the one whose tables it was sent.
+            profile = getattr(catalog, "_profile", None)
+            host = getattr(catalog, "_host", None)
+            token = getattr(catalog, "_token", None)
+            config = getattr(catalog, "_explicit_config", None)
         engines[EngineKind.SQL] = SqlEngine(
             profile=profile,
             host=host,
@@ -103,9 +181,17 @@ def connect(
             staging_volume=staging_volume,
         )
 
+    if default_catalog is None:
+        # A metastore has two levels: `db.table` on an hms:// or glue://
+        # connection was refused as "a two-part name ... no default catalog".
+        default_catalog = getattr(resolved_catalog, "default_catalog_name", None)
     return Connection(
         catalog=resolved_catalog,
-        router=Router(engines=engines, allow_sql_fallback=allow_sql_fallback),
+        router=Router(
+            engines=engines,
+            allow_sql_fallback=allow_sql_fallback,
+            warehouse_catalog=warehouse_catalog,
+        ),
         default_catalog=default_catalog,
         default_schema=default_schema,
         storage_options=dict(storage_options or {}),
@@ -161,6 +247,8 @@ def _schema_arg(schema: Any) -> Any:
     except ImportError:
         if hasattr(schema, "__arrow_c_schema__"):
             return schema
+        # A list or dict schema is built with pyarrow.schema().
+        _require("pyarrow", "pyarrow", "a list or dict schema (pass an Arrow schema object)")
         raise
     if not isinstance(schema, pa.Schema):
         if hasattr(schema, "__arrow_c_schema__") and not isinstance(schema, (list, dict)):
@@ -170,14 +258,50 @@ def _schema_arg(schema: Any) -> Any:
                 return schema  # a Delta schema object; the engine reads it
         else:
             try:
-                schema = pa.schema(schema)
+                schema = pa.schema(_sql_typed(schema))
             except (TypeError, ValueError, pa.ArrowInvalid) as exc:
                 raise InvalidArgumentError(f"not a table schema: {schema!r} ({exc})") from exc
+    if len(schema) == 0:
+        # Databricks created a zero-column table from it, which nothing can
+        # write to; Delta needs at least one column.
+        raise InvalidArgumentError("create_table needs a schema with at least one column")
     return _widen_unsigned(schema)
 
 
+def _sql_typed(schema: Any) -> Any:
+    """A `{name: type}` or `[(name, type)]` schema with SQL type names read as Delta reads them.
+
+    pyarrow knows only its own aliases, so ``{"id": "bigint"}``, ``"long"``,
+    ``"timestamp"`` or ``"decimal(10,2)"`` -- the names Spark, Databricks and
+    the Delta log use -- were refused. A name neither reads is left for
+    pyarrow, which names what it cannot read.
+    """
+    from .engine.metadata import sql_type_to_delta
+    from .engine.sharing import _delta_type_to_arrow
+
+    def arrow(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return _delta_type_to_arrow(sql_type_to_delta(value))
+        except (ValueError, DeltaSwampError):
+            return value
+
+    if isinstance(schema, dict):
+        return {name: arrow(value) for name, value in schema.items()}
+    if isinstance(schema, list):
+        return [
+            (item[0], arrow(item[1]), *item[2:])
+            if isinstance(item, tuple) and len(item) >= 2
+            else item
+            for item in schema
+        ]
+    return schema
+
+
 def _widen_unsigned(schema: Any) -> Any:
-    """Map unsigned integers to the signed type that holds all their values.
+    """Map unsigned integers to the signed type that holds all their values,
+    nanosecond timestamps to microseconds and zoned timestamps to UTC.
 
     Delta has no unsigned types, and the create mapped uint8 to byte: the
     table was created, then the first write failed with "Can't cast value 200
@@ -196,6 +320,18 @@ def _widen_unsigned(schema: Any) -> Any:
     def widen(t: Any, where: str) -> Any:
         if t in wider:
             return wider[t]
+        if pa.types.is_timestamp(t) and t.unit == "ns":
+            # pandas' datetime64[ns] (and pa.timestamp("ns")) created a
+            # timestamp_nanos column behind delta-rs's non-standard
+            # timestampNanos feature, which DuckDB, Spark and Databricks
+            # cannot read. A Delta timestamp is microseconds, as Spark
+            # writes it; the data is cast on the way in, as appends cast it.
+            t = pa.timestamp("us", t.tz)
+        if pa.types.is_timestamp(t) and t.tz is not None and t.tz.upper() not in ("UTC", "+00:00"):
+            # A Delta timestamp is an instant stored in UTC; the zone is only
+            # how the caller's frame displays it. Appends already convert, and
+            # a create with America/New_York failed with a bare Exception.
+            return pa.timestamp(t.unit, "UTC")
         if pa.types.is_struct(t):
             return pa.struct([f.with_type(widen(f.type, f"{where}.{f.name}")) for f in t])
         if pa.types.is_map(t):
@@ -209,6 +345,47 @@ def _widen_unsigned(schema: Any) -> Any:
     fields = [f.with_type(widen(f.type, f.name)) for f in schema]
     widened = pa.schema(fields, metadata=schema.metadata)
     return schema if widened.equals(schema) else widened
+
+
+#: The local SQL engines' exceptions for a query that is wrong: it does not
+#: parse, or names a table, column or function that is not there.
+_BAD_QUERY = {
+    "duckdb": ("ParserException", "CatalogException", "BinderException", "SyntaxException"),
+    "polars": (
+        "SQLSyntaxError",
+        "SQLInterfaceError",
+        "ColumnNotFoundError",
+        "SchemaFieldNotFoundError",
+    ),
+}
+
+
+@contextlib.contextmanager
+def _local_sql_errors(engine: str, query: str) -> Iterator[None]:
+    """duckdb's or Polars' exceptions from running `query`, as this library's.
+
+    They escaped raw, so `except DeltaSwampError` around conn.sql() caught
+    nothing. A query that does not parse or names what is not there is the
+    caller's mistake; any other failure is the local engine's.
+    """
+    from .errors import engine_error
+
+    try:
+        yield
+    except DeltaSwampError:
+        raise
+    except Exception as exc:
+        names = {cls.__name__ for cls in type(exc).__mro__}
+        if names & set(_BAD_QUERY[engine]):
+            raise InvalidArgumentError(
+                f"sql(): {engine} refused the query: {str(exc).strip()[:400]}"
+            ) from exc
+        raise engine_error(
+            f"sql(): {engine} failed running the query: {type(exc).__name__}: {exc}",
+            engine=engine,
+            operation="sql",
+            original=exc,
+        ) from exc
 
 
 def _names_arg(value: Any, what: str) -> list[str] | None:
@@ -264,9 +441,132 @@ def _check_layout(
         )
 
 
-def _local_log_dir(name: str) -> str | None:
-    """The `_delta_log` directory of a local-path table name, else None."""
-    ref = parse_ref(name)
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _check_local_create_path(name: str) -> None:
+    """Refuse a local path neither engine can read back once it is created.
+
+    Both write version 0 at the literal path, then read the log through a URL
+    that decodes `%41` to `A` and treats `\\` as a separator: the create failed
+    with "File not found" after the table was written, and nothing could open
+    it afterwards.
+    """
+    if "://" in name:
+        # A URL, file:// included, whose escapes are meant as escapes. But a
+        # URL reads `?` and `#` as a query and a fragment: the table went to
+        # `.../x` for "file://.../x#y", and every write through the returned
+        # handle landed there too, while opening the URI was refused.
+        if "?" in name or "#" in name:
+            raise InvalidArgumentError(
+                f"the table URI {name!r} contains '?' or '#', which a URL reads as a query "
+                "or fragment, so the table would be created at a different path; nothing "
+                "was created. Percent-encode them (%3F, %23) or choose a name without them"
+            )
+        return
+    bad = _PERCENT_ESCAPE.search(name)
+    if bad is not None or (os.sep == "/" and "\\" in name):
+        what = repr(bad.group(0)) if bad is not None else "a backslash"
+        raise InvalidArgumentError(
+            f"the local path {name!r} contains {what}, which the engines read back as a "
+            "different path; nothing was created. Choose a directory name without it"
+        )
+
+
+def _refuse_foreign_files(location: str, options: Mapping[str, str] | None = None) -> None:
+    """Refuse to create a table where files that are not a Delta table already are.
+
+    Spark refuses a create at a non-empty location. Here the create succeeded,
+    and the table's first standard VACUUM then deleted every file already in
+    the directory -- documents, another dataset -- as unreferenced. What a
+    Delta table leaves behind is allowed (a log directory, Parquet and
+    deletion-vector files, ``col=value`` partition directories, hidden
+    entries): a table recreated where one was, or an interrupted create.
+    """
+    from urllib.parse import unquote, urlparse
+
+    from .engine.deltars import _delta_file_name
+
+    parsed = urlparse(location)
+    listed: list[tuple[str, bool]] = []
+    if parsed.scheme.lower() in ("", "file"):
+        path = unquote(parsed.path) if parsed.scheme else location
+        if not os.path.isdir(path):
+            return
+        listed = [(e.name, e.is_dir()) for e in os.scandir(path)]
+    else:
+        try:
+            import pyarrow.fs as pafs
+            from deltalake._internal import DeltaFileSystemHandler
+
+            handler = DeltaFileSystemHandler(location, dict(options or {}))
+            infos = handler.get_file_info_selector("", True, False)
+        except Exception:
+            # Not listable with these credentials (or not at all): the create
+            # itself decides, as before.
+            return
+        listed = [
+            (str(i.path).rstrip("/").rsplit("/", 1)[-1], i.type == pafs.FileType.Directory)
+            for i in infos
+        ]
+    entries = [
+        name
+        for name, is_dir in listed
+        if name
+        and not name.startswith(("_", "."))
+        and not (is_dir and "=" in name)
+        and not (not is_dir and _delta_file_name(name))
+    ]
+    if entries:
+        shown = ", ".join(sorted(entries)[:3]) + (", ..." if len(entries) > 3 else "")
+        raise UnreachableTableError(
+            f"create a table at {location}",
+            f"the location already holds {len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
+            f"that are not a Delta table ({shown}); a VACUUM of the new table would delete "
+            "them as unreferenced files",
+            "create the table in an empty directory, or convert_to_delta() a directory of "
+            "Parquet files",
+        )
+
+
+def _refuse_local_catalog_location(catalog: Any, location: str) -> None:
+    """Refuse a local location a remote catalog chose for a table.
+
+    A catalog server that answers a staging or create request with
+    ``file:///home/<user>/...`` had version 0 written into that directory of
+    this machine, and a VACUUM later deleted what else was there. Only a
+    catalog on this machine (the OSS UC quickstart) may place tables on its
+    filesystem.
+    """
+    from urllib.parse import urlparse
+
+    scheme = urlparse(location).scheme.lower()
+    if scheme not in ("", "file"):
+        return
+    endpoint = str(
+        getattr(catalog, "_base_url", "")
+        or getattr(catalog, "base_url", "")
+        or getattr(catalog, "_host", "")
+        or ""
+    )
+    host = (urlparse(endpoint).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return
+    raise UnreachableTableError(
+        f"create a table at {location}",
+        f"the catalog{f' at {endpoint}' if endpoint else ''} placed the table on this "
+        "machine's filesystem, which only a catalog running on this machine may do",
+        "check the catalog's storage root; a remote catalog must use cloud storage",
+    )
+
+
+def _local_log_dir(ref: TableRef, name: str) -> str | None:
+    """The `_delta_log` directory of a local-path table name, else None.
+
+    Takes the ref the caller parsed with the connection's defaults: parsing
+    `name` again without them refused every bare `orders`, so write_table's
+    create-if-absent path failed on a connection with default_catalog/schema.
+    """
     if ref.kind is not RefKind.PATH:
         return None
     location = name
@@ -275,6 +575,36 @@ def _local_log_dir(name: str) -> str | None:
     elif "://" in location:
         return None
     return os.path.join(os.path.abspath(location), "_delta_log")
+
+
+def _check_existing_layout(
+    table: Table, name: str, partition_by: list[str] | None, properties: Mapping[str, Any] | None
+) -> None:
+    """Refuse create-time layout or properties for a table that already exists.
+
+    Layout and properties apply when creating; on an existing table they were
+    silently dropped, so the caller believed them applied.
+    """
+    wanted_parts = _names_arg(partition_by, "partition_by")
+    current = table._enrich()
+    if wanted_parts is not None and list(current.partition_columns) != wanted_parts:
+        raise InvalidArgumentError(
+            f"{name} is partitioned by {list(current.partition_columns)}, not "
+            f"{wanted_parts}; partition_by= only applies when the table is created"
+        )
+    changed = {k: v for k, v in (properties or {}).items() if current.properties.get(k) != str(v)}
+    if changed:
+        raise InvalidArgumentError(
+            f"{name} already exists, so properties= would not be applied: "
+            f"{sorted(changed)}; call set_properties() on the table instead"
+        )
+
+
+def _same_location(a: str | None, b: str | None) -> bool:
+    """Whether two storage locations name the same directory (trailing slash aside)."""
+    if a is None or b is None:
+        return False
+    return a.rstrip("/") == b.rstrip("/")
 
 
 def _registered_anyway(catalog: Any, ref: Any, exc: BaseException) -> bool:
@@ -291,8 +621,62 @@ def _registered_anyway(catalog: Any, ref: Any, exc: BaseException) -> bool:
         return False
 
 
+def _ref_scheme(ref: TableRef) -> str | None:
+    """The catalog a reference names by its scheme, or None for a bare name.
+
+    A bare ``catalog.schema.table`` parses with the ``uc`` scheme, but it
+    names no catalog of its own: it belongs to whichever one the connection
+    is bound to. Only a written-out ``uc://`` / ``unity://`` names Unity
+    Catalog.
+    """
+    scheme = ref.scheme
+    if scheme in ("uc", "unity"):
+        raw = (ref.raw or "").lstrip().lower()
+        return "uc" if raw.startswith(("uc://", "unity://")) else None
+    if scheme == "hive":
+        return "hms"
+    return scheme
+
+
+#: What each reference scheme names, for refusals.
+_SCHEME_LABELS = {
+    "uc": "Unity Catalog",
+    "hms": "Hive Metastore",
+    "glue": "AWS Glue",
+    "deltasharing": "Delta Sharing",
+}
+
+
+#: Properties by which a create chooses whether a table is catalog-managed.
+_CATALOG_MANAGED_KEYS = frozenset(
+    {"delta.feature.catalogmanaged", "delta.feature.catalogowned-preview"}
+)
+
+
 #: The save modes a create at a path takes.
 _CREATE_MODES = frozenset({"error", "create", "ignore", "overwrite", "append"})
+
+
+def _check_retry_options(options: Mapping[str, Any] | None) -> None:
+    """Refuse retry options (`max_retries`, `retry_timeout`, ...) an engine cannot use.
+
+    Read as delta-rs reads them (humantime durations, exact key names), for
+    every engine at once: the kernel took bare seconds ("2") that delta-rs
+    refuses, so a read worked and can() named delta-rs for a DELETE that then
+    failed; delta-rs took "30 s" and the kernel refused the connection; and
+    "1e30" panicked inside the kernel's store. A base or initial backoff
+    object_store's backoff cannot draw from is refused too.
+    """
+    from .engine.kernel import _native_has
+
+    if not options or not _native_has("retry_options"):
+        return
+    from . import _native
+
+    try:
+        _native.validate_retry_options({str(k): str(v) for k, v in options.items()})
+    except Exception as exc:
+        raise InvalidArgumentError(f"storage_options: {exc}") from None
 
 
 def _default_catalog(
@@ -318,6 +702,73 @@ class Connection:
     # Not in repr: these carry object-store secrets (access keys, SAS tokens),
     # and a Connection printed in a log or a traceback leaked them verbatim.
     storage_options: dict[str, str] = dataclasses.field(default_factory=dict, repr=False)
+    # Catalogs built for references that name another catalog (glue://,
+    # hms://host), keyed by the URI they were built from.
+    _foreign: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False, compare=False)
+
+    def _catalog_for(self, ref: TableRef) -> Any:
+        """The catalog that serves `ref`.
+
+        A reference whose scheme names a catalog goes to that catalog.
+        Sending every one to the bound catalog read the wrong table without
+        a word: on a Unity Catalog connection ``glue://crm.customers`` opened
+        UC's ``glue.crm.customers``, and ``hms://other:9083/db/t`` Databricks'
+        own ``hive_metastore.db.t``. Glue and a Hive Metastore are reachable
+        from any connection (the reference carries the catalog id or the
+        metastore endpoint), so a catalog for them is built on first use and
+        kept. Unity Catalog and Delta Sharing need credentials a reference
+        does not carry, so a connection bound elsewhere refuses them.
+        """
+        if ref.kind is RefKind.PATH:
+            return FilesystemCatalog()
+        scheme = _ref_scheme(ref)
+        # A plugin catalog that declares nothing keeps serving every name.
+        served = getattr(self.catalog, "ref_schemes", None)
+        if scheme is None or served is None or scheme in served:
+            return self.catalog
+        bound = getattr(self.catalog, "name", type(self.catalog).__name__)
+        label = _SCHEME_LABELS.get(scheme, scheme)
+        if scheme == "glue":
+            uri = f"glue://{ref.endpoint or ''}"
+        elif scheme == "hms" and ref.endpoint:
+            uri = f"hms://{ref.endpoint}"
+        elif scheme == "hms":
+            raise InvalidReferenceError(
+                f"{ref.raw or ref!r} names no metastore endpoint, and this connection is "
+                f"bound to the {bound} catalog, not a Hive Metastore. Name the metastore "
+                "(hms://host:9083/db/table), or connect to it with "
+                "ds.connect('hms://host:9083')."
+            )
+        else:
+            raise InvalidReferenceError(
+                f"{ref.raw or ref!r} names a {label} table, but this connection is bound to "
+                f"the {bound} catalog, which does not serve it. Open it through a "
+                f"connection to {label}."
+            )
+        catalog = self._foreign.get(uri)
+        if catalog is None:
+            catalog = self._foreign.setdefault(uri, catalog_for_uri(uri))
+        return catalog
+
+    def _bound_ref(self, name: str, what: str) -> TableRef:
+        """A catalog name for an operation only the bound catalog performs."""
+        try:
+            ref: TableRef = self._catalog_ref(name, what)
+        except InvalidReferenceError as exc:
+            text = str(exc)
+            if "volume" not in what or not ("bare table name" in text or "two-part" in text):
+                raise
+            # parse_ref speaks of tables; this names a volume.
+            raise InvalidReferenceError(
+                f"cannot {what} {name!r}: a volume is named catalog.schema.volume, and "
+                "the connection has no default catalog/schema to complete it"
+            ) from exc
+        if self._catalog_for(ref) is not self.catalog:
+            raise InvalidReferenceError(
+                f"cannot {what} {name!r}: it names another catalog than the one this "
+                f"connection is bound to ({getattr(self.catalog, 'name', 'current')})"
+            )
+        return ref
 
     def table(self, name: str, *, version: int | None = None) -> Table:
         """Open a table by three-level name, or by path."""
@@ -325,15 +776,17 @@ class Connection:
         ref = parse_ref(
             name, default_catalog=self.default_catalog, default_schema=self.default_schema
         )
-        catalog = FilesystemCatalog() if ref.kind is RefKind.PATH else self.catalog
-        return Table(self, catalog.resolve(ref), version=version)
+        return Table(self, self._catalog_for(ref).resolve(ref), version=version)
 
     def open_table(self, path: str, *, version: int | None = None) -> Table:
         """Open a table directly by storage path, bypassing the catalog."""
         _check_version(version)
         ref = parse_ref(path)
         if ref.kind is not RefKind.PATH:
-            raise InvalidReferenceError(f"{path!r} is a catalog name; use .table() instead")
+            raise InvalidReferenceError(
+                f"{path!r} is a catalog table name (catalog.schema.table), not a storage "
+                "path; open it with .table() instead"
+            )
         return Table(self, FilesystemCatalog().resolve(ref), version=version)
 
     def _catalog_ref(self, name: str, what: str) -> Any:
@@ -352,23 +805,25 @@ class Connection:
             )
         return ref
 
-    def _catalog_call(self, method: str, what: str, *args: Any) -> Any:
+    def _catalog_call(self, method: str, what: str, *args: Any, catalog: Any = None) -> Any:
         """Call an optional catalog method, refusing cleanly when it is absent.
 
         The plugin contract is `resolve` and `list_tables`; the built-in path
         catalog raises NotImplementedError for the rest. Both escaped raw
         (AttributeError, NotImplementedError) instead of a DeltaSwampError.
         """
-        fn = getattr(self.catalog, method, None)
+        catalog = self.catalog if catalog is None else catalog
+        fn = getattr(catalog, method, None)
         if not callable(fn):
             raise UnreachableTableError(
                 what,
-                f"the {getattr(self.catalog, 'name', type(self.catalog).__name__)} catalog "
+                f"the {getattr(catalog, 'name', type(catalog).__name__)} catalog "
                 f"does not implement {method}()",
             )
         return _call(what, fn, *args)
 
     def list_tables(self, catalog: str, schema: str) -> list[ResolvedTable]:
+        """The tables in `catalog.schema`, as the catalog resolves them."""
         what = f"list tables in {catalog}.{schema}"
         return list(self._catalog_call("list_tables", what, catalog, schema))
 
@@ -399,17 +854,15 @@ class Connection:
         The two catalog shapes need a catalog that supports table lifecycle
         (Databricks or open-source Unity Catalog).
         """
-        ref = parse_ref(
-            name, default_catalog=self.default_catalog, default_schema=self.default_schema
-        )
-        schema = _schema_arg(schema)
-        partition_by = _names_arg(partition_by, "partition_by")
-        cluster_by = _names_arg(cluster_by, "cluster_by")
-        if partition_by and cluster_by:
+        if mode not in _CREATE_MODES:
+            # Checked for catalog names too, which blamed any unknown mode on
+            # "replacing a catalog table".
             raise InvalidArgumentError(
-                "a table is either partitioned or liquid-clustered, not both"
+                f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
             )
-        _check_layout(schema, partition_by, cluster_by)
+        ref, schema, partition_by, cluster_by, properties = self._create_args(
+            name, schema, partition_by, cluster_by, properties
+        )
         if ref.kind is RefKind.PATH:
             if location is not None:
                 # It was ignored: the table went to `name`, not `location`.
@@ -421,7 +874,9 @@ class Connection:
                 raise InvalidArgumentError(
                     f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
                 )
-            if mode in ("error", "create", "ignore") and self.table_exists(name):
+            _check_local_create_path(name)
+            present = self.table_exists(name)
+            if mode in ("error", "create", "ignore") and present:
                 if mode == "ignore":
                     # Nothing is created, so nothing (the comment included)
                     # may be changed on the table that is already there.
@@ -431,6 +886,8 @@ class Connection:
                     "a Delta table already exists there",
                     "pass mode='ignore' to keep it or mode='overwrite' to replace it",
                 )
+            if not present:
+                _refuse_foreign_files(name, self.storage_options)
             try:
                 return self._create_at(
                     FilesystemCatalog().resolve(ref),
@@ -461,10 +918,12 @@ class Connection:
                     "pass mode='ignore' to keep it or mode='overwrite' to replace it",
                 ) from exc
 
-        lifecycle = self._lifecycle_catalog(f"create the catalog table {ref}")
+        lifecycle = self._lifecycle_catalog(f"create the catalog table {ref}", ref)
+        exists = None
         if mode == "ignore":
             # CREATE TABLE IF NOT EXISTS: it was refused as a "replace".
-            if self.table_exists(name):
+            exists = self.table_exists(name)
+            if exists:
                 return self.table(name)
             mode = "error"
         if mode not in ("error", "create"):
@@ -472,6 +931,14 @@ class Connection:
                 f"create {ref} with mode={mode!r}",
                 "a catalog table is created once; replacing one is a different operation",
                 "drop_table() first, or write to it with mode='append' / 'overwrite'",
+            )
+        if exists is None and self.table_exists(name):
+            # The warehouse's raw TABLE_OR_VIEW_ALREADY_EXISTS otherwise, or a
+            # staging table allocated for nothing.
+            raise UnreachableTableError(
+                f"create {ref}",
+                "a table of that name already exists",
+                "pass mode='ignore' to keep it, or write to it with conn.table(...)",
             )
         if location is not None:
             return self._create_external(
@@ -481,19 +948,60 @@ class Connection:
             lifecycle, ref, schema, partition_by, cluster_by, properties, comment
         )
 
-    def _lifecycle_catalog(self, what: str) -> Any:
+    def _create_args(
+        self,
+        name: str,
+        schema: Any,
+        partition_by: list[str] | None,
+        cluster_by: list[str] | None,
+        properties: dict[str, str] | None,
+    ) -> tuple[TableRef, Any, list[str] | None, list[str] | None, dict[str, str] | None]:
+        """`create_table`'s arguments checked and normalized, before anything is created."""
+        ref = parse_ref(
+            name, default_catalog=self.default_catalog, default_schema=self.default_schema
+        )
+        schema = _schema_arg(schema)
+        if _schema_names(schema) == []:
+            # Databricks creates a zero-column table; the kernel refuses one
+            # only after the catalog has allocated it.
+            raise InvalidArgumentError("a table needs at least one column")
+        if properties is not None and not isinstance(properties, Mapping):
+            # A list failed with a bare AttributeError, or ValueError from dict().
+            raise InvalidArgumentError(
+                f"properties= maps property names to values, e.g. "
+                f"{{'delta.appendOnly': 'true'}}; got a {type(properties).__name__}"
+            )
+        partition_by = _names_arg(partition_by, "partition_by")
+        cluster_by = _names_arg(cluster_by, "cluster_by")
+        if partition_by and cluster_by:
+            raise InvalidArgumentError(
+                "a table is either partitioned or liquid-clustered, not both"
+            )
+        _check_layout(schema, partition_by, cluster_by)
+        # JSON stats off with no word on struct stats: record Spark's default
+        # (struct on), or this library's checkpoints would keep no stats.
+        properties = with_checkpoint_stats(properties)
+        clash = cdf_name_clash(_schema_names(schema) or (), properties)
+        if clash:
+            # The kernel's create refused this; delta-rs's created the table,
+            # and every DML and change-feed read on it then failed.
+            raise cdf_clash_error(f"create {name}", clash)
+        return ref, schema, partition_by, cluster_by, properties
+
+    def _lifecycle_catalog(self, what: str, ref: TableRef) -> Any:
         from .catalog.base import TableLifecycleCatalog
 
-        if not isinstance(self.catalog, TableLifecycleCatalog):
+        catalog = self._catalog_for(ref)
+        if not isinstance(catalog, TableLifecycleCatalog):
             raise UnreachableTableError(
                 what,
-                f"the {getattr(self.catalog, 'name', 'current')} catalog cannot register "
+                f"the {getattr(catalog, 'name', 'current')} catalog cannot register "
                 "tables, and writing a Delta log alone would leave it orphaned while this "
                 "call appeared to succeed",
                 "create the table at a path with create_table('<path>', ...), then register "
                 "it with the catalog's own tools",
             )
-        return self.catalog
+        return catalog
 
     def _create_at(
         self,
@@ -509,8 +1017,16 @@ class Connection:
         # Engines satisfy a structural protocol, so the router returns `object`.
         # Passing the properties lets a create delta-rs would reject fall
         # through to the kernel, which accepts most of the Delta spec.
+        # The schema too: its column metadata and types decide which engine
+        # can declare the features the table needs.
         engine: Any = self.router.engine_for(
-            Operation.CREATE, resolved, properties=properties, cluster_by=cluster_by, mode=mode
+            Operation.CREATE,
+            resolved,
+            properties=properties,
+            cluster_by=cluster_by,
+            mode=mode,
+            schema=schema,
+            partition_by=partition_by,
         )
         # delta-rs writes the comment into version 0; the kernel create takes
         # none, so there it is set by a follow-up commit rather than dropped.
@@ -545,6 +1061,16 @@ class Connection:
         from .credentials.base import StaticCredentialProvider
 
         credentials = catalog.path_credentials(location, "PATH_CREATE_TABLE")
+        from ._storage import engine_options, store_options
+
+        _refuse_foreign_files(
+            location,
+            store_options(
+                engine_options(
+                    self.storage_options, getattr(credentials, "secrets", None), location
+                )
+            ),
+        )
         staged = ResolvedTable(
             ref=parse_ref(location),
             location=location,
@@ -559,12 +1085,10 @@ class Connection:
                 mode="error",
                 properties=properties,
             )
-        except DeltaSwampError:
-            raise
-        except Exception as exc:
-            # delta-rs' own DeltaError escaped here untranslated, so
-            # `except DeltaSwampError` missed the commonest failure of all:
-            # a table already at the location, which wants registering.
+        except EngineError as exc:
+            # delta-rs says only in its message (which the engine boundary's
+            # EngineError carries) that a table is already at the location:
+            # the commonest failure of all, and it wants registering.
             if "already exists" not in str(exc).lower():
                 raise
             raise UnreachableTableError(
@@ -611,8 +1135,7 @@ class Connection:
         """
         import json
 
-        from . import __version__, _native
-        from .engine.metadata import arrow_to_delta_schema, initial_actions
+        from . import _native
 
         try:
             staging = catalog.create_staging_table(ref)
@@ -620,17 +1143,82 @@ class Connection:
             # Nothing has been written yet, so the warehouse can take over
             # cleanly -- if the caller allowed it.
             sql: Any = self.router.engines.get(EngineKind.SQL)
-            if not self.router.allow_sql_fallback or sql is None:
+            if (
+                not self.router.allow_sql_fallback
+                or sql is None
+                or not self.router.warehouse_catalog
+            ):
                 raise
+            # The staging flow makes a catalog-managed table, as documented;
+            # a plain CREATE TABLE made an ordinary managed one, which Unity
+            # Catalog then refuses external writes to, so every later write
+            # needed the warehouse too. Unless the caller chose otherwise.
+            fallback_properties = dict(properties or {})
+            if not any(key.lower() in _CATALOG_MANAGED_KEYS for key in fallback_properties):
+                fallback_properties["delta.feature.catalogManaged"] = "supported"
             sql.create_managed(
                 ref.full_name,
                 schema,
                 partition_by=partition_by,
                 cluster_by=cluster_by,
-                properties=properties,
+                properties=fallback_properties,
                 comment=comment,
             )
             return self.table(ref.full_name)
+        actions = self._managed_v0(
+            catalog, ref, staging, schema, partition_by, cluster_by, properties, comment
+        )
+        from ._storage import engine_options, store_options
+
+        # The engines' merge rule: a plain dict merge kept alias spellings side
+        # by side, and object_store chose between them at random.
+        options = store_options(
+            engine_options(self.storage_options, staging.storage_options, staging.location)
+        )
+        _native.commit_raw(staging.location, 0, actions, options=options or None)
+        try:
+            body = json.loads(
+                _native.uc_create_table_request(staging.location, ref.table, options=options)
+            )
+            if comment:
+                body["comment"] = comment
+            resolved = catalog.finalize_managed_table(ref, body)
+        except Exception as exc:
+            if _registered_anyway(catalog, ref, exc):
+                # The catalog took the registration and only the read-back
+                # failed. Calling that "not accepted" sent users to retry,
+                # which then failed with "already exists".
+                raise UnreachableTableError(
+                    f"open the managed table {ref} after creating it",
+                    f"the catalog registered it (version 0 is at {staging.location}), but "
+                    f"reading it back failed: {exc}",
+                    f"do not repeat the create; open it with conn.table({str(ref)!r})",
+                ) from exc
+            raise UnreachableTableError(
+                f"finalize the managed table {ref}",
+                f"version 0 was written at {staging.location}, but the catalog did not "
+                f"accept the registration: {exc}",
+                "the staging location is not reclaimed automatically; retry the create, "
+                "which allocates a fresh one",
+            ) from exc
+        return Table(self, resolved)
+
+    def _managed_v0(
+        self,
+        catalog: Any,
+        ref: Any,
+        staging: Any,
+        schema: Any,
+        partition_by: list[str] | None,
+        cluster_by: list[str] | None,
+        properties: dict[str, str] | None,
+        comment: str | None,
+    ) -> list[str]:
+        """Version 0 of a staged managed table: what the catalog requires, then what was asked."""
+        from . import __version__, _native
+        from .engine.metadata import arrow_to_delta_schema, initial_actions
+
+        _refuse_local_catalog_location(catalog, staging.location)
         configuration: dict[str, str] = {}
         # What the kernel's own UC create flow writes, then what this catalog
         # says it requires, then what the caller asked for.
@@ -671,34 +1259,7 @@ class Connection:
             description=comment,
             engine_info=f"deltaswamp/{__version__}",
         )
-        options = {**self.storage_options, **staging.storage_options}
-        _native.commit_raw(staging.location, 0, actions, options=options or None)
-        try:
-            body = json.loads(
-                _native.uc_create_table_request(staging.location, ref.table, options=options)
-            )
-            if comment:
-                body["comment"] = comment
-            resolved = catalog.finalize_managed_table(ref, body)
-        except Exception as exc:
-            if _registered_anyway(catalog, ref, exc):
-                # The catalog took the registration and only the read-back
-                # failed. Calling that "not accepted" sent users to retry,
-                # which then failed with "already exists".
-                raise UnreachableTableError(
-                    f"open the managed table {ref} after creating it",
-                    f"the catalog registered it (version 0 is at {staging.location}), but "
-                    f"reading it back failed: {exc}",
-                    f"do not repeat the create; open it with conn.table({str(ref)!r})",
-                ) from exc
-            raise UnreachableTableError(
-                f"finalize the managed table {ref}",
-                f"version 0 was written at {staging.location}, but the catalog did not "
-                f"accept the registration: {exc}",
-                "the staging location is not reclaimed automatically; retry the create, "
-                "which allocates a fresh one",
-            ) from exc
-        return Table(self, resolved)
+        return list(actions)
 
     def register_table(self, name: str, location: str, *, comment: str | None = None) -> Table:
         """Register an existing Delta table's location under a catalog name.
@@ -709,7 +1270,7 @@ class Connection:
         import json
 
         ref = self._catalog_ref(name, "register")
-        catalog = self._lifecycle_catalog(f"register {ref}")
+        catalog = self._lifecycle_catalog(f"register {ref}", ref)
         from .credentials.base import StaticCredentialProvider
 
         staged = ResolvedTable(
@@ -720,15 +1281,46 @@ class Connection:
             ),
         )
         kernel: Any = self.router.engines[EngineKind.KERNEL]
-        metadata = json.loads(kernel.snapshot(staged).metadata_json())
-        resolved = catalog.register_table(
-            ref,
-            location,
-            columns_schema_json=metadata["schemaString"],
-            partition_columns=list(metadata.get("partitionColumns") or []),
-            properties=dict(metadata.get("configuration") or {}),
-            comment=comment,
-        )
+        try:
+            metadata = json.loads(kernel.snapshot(staged).metadata_json())
+        except EngineError as exc:
+            text = str(exc).lower()
+            if any(
+                m in text
+                for m in (
+                    "no files in log segment",
+                    "not found",
+                    "no such file",
+                    # The kernel's words for a local path that is not there.
+                    "path does not exist",
+                    "invalid table location",
+                )
+            ):
+                raise UnreachableTableError(
+                    f"register {ref}",
+                    f"there is no Delta log at {location} ({str(exc).splitlines()[0][:200]})",
+                    "check the location, or create the table with create_table(location=...)",
+                ) from exc
+            raise
+        try:
+            resolved = catalog.register_table(
+                ref,
+                location,
+                columns_schema_json=metadata["schemaString"],
+                partition_columns=list(metadata.get("partitionColumns") or []),
+                properties=dict(metadata.get("configuration") or {}),
+                comment=comment,
+            )
+        except DeltaSwampError:
+            # Registered already -- by an earlier call whose answer was lost,
+            # say -- at this very location: that is what was asked for.
+            try:
+                existing = catalog.resolve(ref)
+            except DeltaSwampError:
+                existing = None
+            if existing is None or not _same_location(existing.location, location):
+                raise
+            resolved = existing
         return Table(self, resolved)
 
     def list_catalogs(self) -> list[str]:
@@ -744,13 +1336,19 @@ class Connection:
             )
         return list(self._catalog_call("list_schemas", f"list schemas in {target}", target))
 
-    def drop_table(self, name: str) -> None:
+    def drop_table(self, name: str, *, if_exists: bool = False) -> None:
         """Remove a table from the catalog.
 
         For an EXTERNAL table the files remain; only the registration goes.
+        With `if_exists`, a table that is not there is not an error (DROP
+        TABLE IF EXISTS).
         """
         ref = self._catalog_ref(name, "drop")
-        self._catalog_call("drop_table", f"drop {ref}", ref)
+        try:
+            self._catalog_call("drop_table", f"drop {ref}", ref, catalog=self._catalog_for(ref))
+        except TableNotFoundError:
+            if not if_exists:
+                raise
 
     def table_exists(self, name: str) -> bool:
         """Whether a table is already there.
@@ -761,7 +1359,7 @@ class Connection:
         ref = parse_ref(
             name, default_catalog=self.default_catalog, default_schema=self.default_schema
         )
-        exists = getattr(self.catalog, "table_exists", None)
+        exists = getattr(self._catalog_for(ref), "table_exists", None)
         if ref.kind is RefKind.CATALOG and callable(exists):
             try:
                 return bool(exists(ref))
@@ -823,6 +1421,11 @@ class Connection:
             )
 
         data = _write_data(data)
+        # Checked before anything is created: a misspelt option failed the
+        # first write, as a TypeError naming Table.append, after the create.
+        check_keywords(
+            "write_table", Table.overwrite if mode == "overwrite" else Table.append, write_options
+        )
         exists = self.table_exists(name)
         if exists and mode == "error":
             raise UnreachableTableError(
@@ -845,7 +1448,14 @@ class Connection:
                     f"the data has columns {extra} that schema= does not; nothing was created"
                 )
         if not exists:
-            log_dir = _local_log_dir(name)
+            log_dir = _local_log_dir(
+                parse_ref(
+                    name,
+                    default_catalog=self.default_catalog,
+                    default_schema=self.default_schema,
+                ),
+                name,
+            )
             log_existed = log_dir is not None and os.path.exists(log_dir)
             try:
                 table = self.create_table(
@@ -903,28 +1513,79 @@ class Connection:
     ) -> Table:
         """write_table's append/overwrite into a table that is already there."""
         table = self.table(name)
-        # Layout and properties apply when creating; on an existing table
-        # they were silently dropped, so the caller believed them applied.
-        wanted_parts = _names_arg(partition_by, "partition_by")
-        current = table._enrich()
-        if wanted_parts is not None and list(current.partition_columns) != wanted_parts:
-            raise InvalidArgumentError(
-                f"{name} is partitioned by {list(current.partition_columns)}, not "
-                f"{wanted_parts}; partition_by= only applies when the table is created"
-            )
-        changed = {
-            k: v for k, v in (properties or {}).items() if current.properties.get(k) != str(v)
-        }
-        if changed:
-            raise InvalidArgumentError(
-                f"{name} already exists, so properties= would not be applied: "
-                f"{sorted(changed)}; call set_properties() on the table instead"
-            )
+        _check_existing_layout(table, name, partition_by, properties)
         if mode == "overwrite":
             table.overwrite(data, **write_options)
         else:
             table.append(data, **write_options)
         return table
+
+    def plan_write(
+        self,
+        name: str,
+        *,
+        schema: Any = None,
+        mode: str = "append",
+        location: str | None = None,
+        partition_by: list[str] | None = None,
+        cluster_by: list[str] | None = None,
+        properties: dict[str, str] | None = None,
+        comment: str | None = None,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+        ship_catalog_auth: bool = False,
+        supplies_defaults: bool = False,
+    ) -> Any:
+        """Plan a distributed write to `name`, creating the table at commit if it is not there.
+
+        For a table that exists this is ``conn.table(name).plan_write(...)``
+        after the save mode is applied: ``append`` and ``overwrite`` write into
+        it, ``error`` refuses, and ``ignore`` returns None (nothing to write).
+        partition_by= and properties= must then agree with the table.
+
+        For a table that does not exist, the three shapes of `create_table`
+        apply (a path; a catalog name with `location`, external; a catalog
+        name without, managed), and `schema` is required. Nothing is visible
+        until the commit: workers write under the table's location, resolving
+        it from a template version 0 no reader sees, and `commit()` creates the
+        table and commits the job's files. A managed table is registered by
+        the commit (its staging location is allocated here); an external one
+        is registered after its data is in. When the commit certainly fails,
+        or `abort()` is called, the files are deleted and the create undone:
+        version 0 is removed while it is the only version, and a managed
+        table the commit registered is dropped while it is empty. A managed
+        table's staging allocation cannot be released and stays with the
+        catalog.
+
+        Everything a write into the table would be refused for is refused
+        here, before any worker runs. If another writer creates the table
+        while the job runs, ``error`` and ``overwrite`` fail the commit,
+        ``ignore`` keeps their table, and ``append`` appends the files to it
+        when they fit its layout (never for a managed table, whose files are
+        in this plan's own staging location); files not committed are deleted.
+
+        Returns a `WritePlan` (or None, as above): ship it to workers, call
+        `plan.write(batch)` there, and `plan.commit(fragments)` here.
+        ``ship_catalog_auth=True`` is refused for a catalog table that does not
+        exist yet: there is no table to vend credentials for until the commit.
+        """
+        from ._create import plan_create_write
+
+        return plan_create_write(
+            self,
+            name,
+            schema=schema,
+            mode=mode,
+            location=location,
+            partition_by=partition_by,
+            cluster_by=cluster_by,
+            properties=properties,
+            comment=comment,
+            txn=txn,
+            commit_metadata=commit_metadata,
+            ship_catalog_auth=ship_catalog_auth,
+            supplies_defaults=supplies_defaults,
+        )
 
     def convert_to_delta(self, location: str, **kwargs: Any) -> Table:
         """Convert a directory of Parquet into a Delta table in place."""
@@ -952,8 +1613,26 @@ class Connection:
         ``engine="warehouse"`` sends `query` verbatim to the SQL fallback, where
         names resolve in Unity Catalog and `tables` is not used.
         """
+        if not isinstance(query, str):
+            # duckdb refused it with its own InvalidInputException.
+            raise InvalidArgumentError(
+                f"sql() takes the query as a string, not {type(query).__name__}"
+            )
+        if tables is not None and not isinstance(tables, Mapping):
+            # A list failed with a bare AttributeError ('list' has no 'items').
+            raise InvalidArgumentError(
+                f"tables= maps the names the query uses to tables, e.g. {{'t': 'cat.sch.t'}}; "
+                f"got a {type(tables).__name__}"
+            )
         if engine == "warehouse":
             sql_engine: Any = self.router.engines.get(EngineKind.SQL)
+            if not self.router.warehouse_catalog:
+                raise UnreachableTableError(
+                    "run SQL on a warehouse",
+                    "a SQL warehouse serves only a Databricks workspace's own tables, and "
+                    "this connection's catalog is not Databricks Unity Catalog",
+                    "run it locally (engine='duckdb' or 'polars')",
+                )
             if sql_engine is None or not self.router.allow_sql_fallback:
                 raise UnreachableTableError(
                     "run SQL on a warehouse",
@@ -967,10 +1646,16 @@ class Connection:
             raise InvalidArgumentError(
                 f"sql engine={engine!r}: the engines are 'duckdb', 'polars' and 'warehouse'"
             )
-        pa = _require("pyarrow", "pyarrow")
+        _require("pyarrow", "pyarrow")
         module = _require(engine, engine)
+        # Lazy datasets, not tables read in full: each engine pushes the
+        # query's projection and simple WHERE comparisons into the scan. Each
+        # is pinned to the version current now, so one statement reads one
+        # snapshot of each table however many times it scans it.
         frames = {
-            alias: pa.table((ref if isinstance(ref, Table) else self.table(ref)).scan())
+            alias: (ref if isinstance(ref, Table) else self.table(ref))._lazy_dataset(
+                duckdb_filters=engine == "duckdb"
+            )
             for alias, ref in (tables or {}).items()
         }
         if engine == "duckdb":
@@ -978,15 +1663,19 @@ class Connection:
             try:
                 for alias, frame in frames.items():
                     con.register(alias, frame)
-                relation = con.sql(query)
-                # A statement (CREATE, SET, ...) yields no relation to convert.
-                return relation.to_arrow_table() if relation is not None else None
+                with _local_sql_errors("duckdb", query):
+                    relation = con.sql(query)
+                    # A statement (CREATE, SET, ...) yields no relation to convert.
+                    return relation.to_arrow_table() if relation is not None else None
             finally:
                 # An in-memory database per call; leaving it open leaked it
                 # and every registered frame until garbage collection.
                 con.close()
-        ctx = module.SQLContext({alias: module.from_arrow(f) for alias, f in frames.items()})
-        return ctx.execute(query, eager=True).to_arrow()
+        from ._lazy import polars_frame
+
+        ctx = module.SQLContext({alias: polars_frame(f) for alias, f in frames.items()})
+        with _local_sql_errors("polars", query):
+            return ctx.execute(query, eager=True).to_arrow()
 
     # ------------------------------------------------------------- namespaces
 
@@ -996,10 +1685,12 @@ class Connection:
     def create_catalog(
         self, name: str, *, comment: str | None = None, storage_root: str | None = None
     ) -> None:
+        """Create a catalog, optionally with a comment and a managed storage root."""
         cat = self._namespaces(f"create catalog {name}")
         _call(f"create catalog {name}", cat.create_catalog, name, comment, storage_root)
 
     def drop_catalog(self, name: str, *, force: bool = False) -> None:
+        """Drop a catalog; `force` drops it even when it still holds schemas."""
         cat = self._namespaces(f"drop catalog {name}")
         _call(f"drop catalog {name}", cat.drop_catalog, name, force)
 
@@ -1016,6 +1707,10 @@ class Connection:
         _call(f"create schema {name}", cat.create_schema, catalog, schema, comment, storage_root)
 
     def drop_schema(self, name: str, *, force: bool = False) -> None:
+        """Drop `catalog.schema` (or `schema` under the default catalog).
+
+        `force` drops it even when it still holds tables.
+        """
         catalog, schema = self._schema_parts(name)
         cat = self._namespaces(f"drop schema {name}")
         _call(f"drop schema {name}", cat.drop_schema, catalog, schema, force)
@@ -1036,7 +1731,7 @@ class Connection:
         *,
         schema_pattern: str | None = None,
         table_pattern: str | None = None,
-    ) -> list[Any]:
+    ) -> list[TableSummary]:
         """Table summaries matching SQL LIKE patterns, in one listing call."""
         target = catalog or self.default_catalog
         if target is None:
@@ -1046,12 +1741,14 @@ class Connection:
             _call("search tables", cat.search_tables, target, schema_pattern, table_pattern)
         )
 
-    def list_functions(self, schema: str) -> list[Any]:
+    def list_functions(self, schema: str) -> list[FunctionSummary]:
+        """The functions in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list functions")
         return list(_call("list functions", cat.list_functions, catalog, name))
 
-    def list_volumes(self, schema: str) -> list[Any]:
+    def list_volumes(self, schema: str) -> list[VolumeSummary]:
+        """The volumes in `catalog.schema` (or `schema` under the default catalog)."""
         catalog, name = self._schema_parts(schema)
         cat = self._namespaces("list volumes")
         return list(_call("list volumes", cat.list_volumes, catalog, name))
@@ -1063,10 +1760,11 @@ class Connection:
         volume_type: str = "MANAGED",
         storage_location: str | None = None,
         comment: str | None = None,
-    ) -> Any:
-        ref = self._catalog_ref(name, "create the volume")
+    ) -> VolumeSummary:
+        """Create a Unity Catalog volume, ``MANAGED`` or ``EXTERNAL`` at `storage_location`."""
+        ref = self._bound_ref(name, "create the volume")
         cat = self._namespaces(f"create volume {name}")
-        return _call(
+        summary: VolumeSummary = _call(
             f"create volume {name}",
             cat.create_volume,
             ref.catalog,
@@ -1076,21 +1774,24 @@ class Connection:
             storage_location,
             comment,
         )
+        return summary
 
     def drop_volume(self, name: str) -> None:
-        ref = self._catalog_ref(name, "drop the volume")
+        """Drop a Unity Catalog volume."""
+        ref = self._bound_ref(name, "drop the volume")
         cat = self._namespaces(f"drop volume {name}")
         _call(f"drop volume {name}", cat.drop_volume, ref.catalog, ref.schema, ref.table)
 
-    def volume(self, name: str) -> Any:
+    def volume(self, name: str) -> Volume:
         """A Unity Catalog volume: list, read, write and delete its files."""
-        ref = self._catalog_ref(name, "open the volume")
+        ref = self._bound_ref(name, "open the volume")
         cat = self._namespaces(f"open volume {name}")
-        return _call(f"open volume {name}", cat.volume, ref)
+        volume: Volume = _call(f"open volume {name}", cat.volume, ref)
+        return volume
 
     def grants(
         self, securable: str, *, securable_type: str = "SCHEMA", principal: str | None = None
-    ) -> list[Any]:
+    ) -> list[Grant]:
         """Grants on a catalog, schema, volume or function. Tables: `Table.grants()`."""
         cat = _governed(self.catalog, "GovernedCatalog", f"read grants on {securable}")
         return list(
@@ -1107,10 +1808,17 @@ class Connection:
         self,
         securable: str,
         principal: str,
-        privileges: list[str],
+        privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
-    ) -> list[Any]:
+    ) -> list[Grant]:
+        """Grant privileges on a catalog, schema, volume or function to a principal.
+
+        `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);
+        tables: `Table.grant`. Returns the securable's grants afterwards.
+        """
+        # A bare string was iterated into one privilege per character.
+        names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = _governed(self.catalog, "GovernedCatalog", f"grant on {securable}")
         return list(
             _call(
@@ -1118,7 +1826,7 @@ class Connection:
                 cat.grant,
                 securable,
                 principal,
-                privileges,
+                names,
                 securable_type=securable_type,
             )
         )
@@ -1127,10 +1835,17 @@ class Connection:
         self,
         securable: str,
         principal: str,
-        privileges: list[str],
+        privileges: list[str] | str,
         *,
         securable_type: str = "SCHEMA",
-    ) -> list[Any]:
+    ) -> list[Grant]:
+        """Revoke privileges on a catalog, schema, volume or function from a principal.
+
+        `securable_type` names the kind (``"CATALOG"``, ``"SCHEMA"``, ...);
+        tables: `Table.revoke`. Returns the securable's grants afterwards.
+        """
+        # A bare string was iterated into one privilege per character.
+        names = [privileges] if isinstance(privileges, str) else list(privileges)
         cat = _governed(self.catalog, "GovernedCatalog", f"revoke on {securable}")
         return list(
             _call(
@@ -1138,15 +1853,21 @@ class Connection:
                 cat.revoke,
                 securable,
                 principal,
-                privileges,
+                names,
                 securable_type=securable_type,
             )
         )
 
     def undrop_table(self, name: str) -> None:
         """UNDROP TABLE: restore a recently dropped managed table (SQL fallback)."""
-        ref = self._catalog_ref(name, "undrop")
+        ref = self._bound_ref(name, "undrop")
         sql_engine: Any = self.router.engines.get(EngineKind.SQL)
+        if not self.router.warehouse_catalog:
+            raise UnreachableTableError(
+                f"undrop {ref}",
+                "UNDROP is Databricks-only, and this connection's catalog is not "
+                "Databricks Unity Catalog",
+            )
         if sql_engine is None or not self.router.allow_sql_fallback:
             raise FallbackRequiredError(
                 f"undrop {ref}",
@@ -1159,15 +1880,61 @@ class Connection:
         """A fresh handle on the same table: the latest version, and for a
         catalog-managed table a fresh commit tail from the catalog."""
         ref = table.resolved.ref
-        catalog = FilesystemCatalog() if ref.kind is RefKind.PATH else self.catalog
-        return Table(self, catalog.resolve(ref))
+        return Table(self, self._catalog_for(ref).resolve(ref))
 
     def preflight(self) -> list[str]:
         """Check workspace prerequisites. Empty list means ready.
 
-        Worth running once before anything else: the two settings it checks are
-        off by default, grantable only by someone else, and account for most
-        first-contact failures.
+        Worth running once before anything else. On Databricks it checks
+        external data access on the metastore and, when the connection has a
+        default catalog and schema, EXTERNAL USE SCHEMA on that schema: both
+        are off by default, grantable only by someone else, and account for
+        most first-contact failures. With the SQL fallback on, it also checks
+        that the warehouse exists, and says when no staging volume is set, so
+        writes the direct engines cannot serve would be refused.
+
+        It cannot see per-table limits: Unity Catalog allows external writes
+        only to some table kinds, which `Table.can()` reports per table.
         """
         check = getattr(self.catalog, "preflight", None)
-        return list(check()) if callable(check) else []
+        problems: list[str] = []
+        if callable(check):
+            schema = (
+                f"{self.default_catalog}.{self.default_schema}"
+                if self.default_catalog and self.default_schema
+                else None
+            )
+            import inspect
+
+            try:
+                takes_schema = "schema" in inspect.signature(check).parameters
+            except (TypeError, ValueError):
+                takes_schema = False
+            # A plugin catalog's preflight may take no arguments.
+            problems = list(check(schema=schema) if takes_schema else check())
+        sql_engine: Any = self.router.engines.get(EngineKind.SQL)
+        if self.router.allow_sql_fallback and sql_engine is not None:
+            resolve = getattr(sql_engine, "_resolve_warehouse", None)
+            if callable(resolve) and resolve() is None:
+                problems.append(
+                    "the SQL fallback is on, but no usable warehouse was found: "
+                    + (
+                        getattr(sql_engine, "_selection_error", None)
+                        or getattr(sql_engine, "_last_listing_error", None)
+                        or "no SQL warehouse configured"
+                    )
+                )
+            if getattr(sql_engine, "_staging_volume", True) is None:
+                problems.append(
+                    "the SQL fallback has no staging volume, so it cannot serve writes "
+                    "(append, overwrite, MERGE) to tables the direct engines cannot write; "
+                    "pass ds.connect(..., staging_volume='catalog.schema.volume')"
+                )
+            else:
+                # A staging volume that does not exist (or cannot be read)
+                # passed preflight, and the first write then failed.
+                probe = getattr(sql_engine, "staging_volume_problem", None)
+                problem = probe() if callable(probe) else None
+                if problem is not None:
+                    problems.append(problem)
+        return problems

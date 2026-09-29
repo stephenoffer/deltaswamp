@@ -32,7 +32,6 @@ import json
 import operator
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -278,23 +277,6 @@ def _conform(rows: Any, schema: Any) -> Any:
     return rows
 
 
-@contextmanager
-def _schema_errors(what: str) -> Iterator[None]:
-    """PyIceberg's schema-mismatch ValueError -> an error that names the remedy."""
-    try:
-        yield
-    except ValueError as exc:
-        text = str(exc)
-        if "more columns" in text or "Mismatch in fields" in text:
-            raise UnreachableTableError(
-                what,
-                f"the data does not match the table's Iceberg schema: {text}",
-                "the Iceberg engine does not evolve schemas (no schema_mode='merge'); "
-                "ALTER the table first, or select and cast the data to its schema",
-            ) from exc
-        raise
-
-
 def _numeric(value: Any) -> Decimal | None:
     if isinstance(value, bool) or not isinstance(value, int | float | Decimal):
         return None
@@ -383,6 +365,26 @@ def _as_json(model: Any) -> Any:
     return json.loads(model.model_dump_json())
 
 
+_VARIANT_FEATURES = frozenset({"variantType", "variantType-preview", "variantShredding"})
+
+
+def _has_variant(table: ResolvedTable) -> bool:
+    """Whether the table's protocol (or its properties) says it holds a VARIANT."""
+    features = set(table.features) | {
+        key[len("delta.feature.") :] for key in table.properties if key.startswith("delta.feature.")
+    }
+    return bool(features & _VARIANT_FEATURES)
+
+
+def _pyiceberg_reads_variant() -> bool:
+    """Whether PyIceberg knows the Iceberg v3 ``variant`` type (0.12 does not)."""
+    try:
+        types = importlib.import_module("pyiceberg.types")
+    except ImportError:
+        return False
+    return hasattr(types, "VariantType")
+
+
 class IcebergEngine:
     """Reads and writes Iceberg tables through a catalog's Iceberg REST endpoint."""
 
@@ -416,6 +418,8 @@ class IcebergEngine:
         """
         self._properties = dict(properties or {})
         self._token = token
+        #: Pickle `_token` too (``connect(ship_credentials=True)``).
+        self._ship_secrets = False
         self._factory: CatalogFactory = catalog_factory or _default_factory
         # (uri, warehouse) -> (token it was built with, catalog)
         self._catalogs: dict[tuple[str, str], tuple[str | None, Any]] = {}
@@ -429,9 +433,13 @@ class IcebergEngine:
         state["_catalogs"] = {}
         state["_built_seq"] = {}
         del state["_lock"]
+        if not state.get("_ship_secrets"):
+            # A worker's copy re-derives auth from its own environment.
+            state["_token"] = None
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        state.setdefault("_ship_secrets", False)
         self.__dict__.update(state)
         self._lock = threading.Lock()
 
@@ -439,8 +447,11 @@ class IcebergEngine:
 
     @staticmethod
     def available() -> bool:
+        # pyarrow too: PyIceberg installs without it, and every scan then
+        # failed with a raw ModuleNotFoundError after supports() said yes.
         try:
             importlib.import_module("pyiceberg.catalog")
+            importlib.import_module("pyarrow")
         except ImportError:
             return False
         return True
@@ -450,7 +461,7 @@ class IcebergEngine:
             return Capability(
                 operation,
                 ok=False,
-                reason="the pyiceberg package is not installed",
+                reason="the pyiceberg package (with pyarrow) is not installed",
                 remedy="pip install 'deltaswamp[iceberg]'",
             )
 
@@ -467,7 +478,7 @@ class IcebergEngine:
                 "open-source), which serves one",
             )
 
-        uniform = not table.is_iceberg
+        uniform = not table.is_managed_iceberg
         if uniform and not table.has_iceberg_compat:
             return Capability(
                 operation,
@@ -486,6 +497,36 @@ class IcebergEngine:
                 remedy=SQL_FALLBACK_REMEDY,
             )
 
+        if _has_variant(table) and not _pyiceberg_reads_variant():
+            # An Iceberg v3 schema (UniForm icebergCompatV3, or USING ICEBERG
+            # with format-version 3) carries the VARIANT as `variant`, which
+            # PyIceberg cannot parse: loading the table failed with a pydantic
+            # "Unsupported field type: 'variant'" after can() said yes.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table has a VARIANT column, which the installed PyIceberg cannot "
+                "read from Iceberg v3 metadata",
+                remedy="the Delta engines, or ds.connect(..., allow_sql_fallback=True), read it",
+            )
+
+        if operation is Operation.HISTORY and not table.is_iceberg:
+            # The table has a Delta log, and Delta history is that log's. The
+            # Iceberg snapshot log records a Delta version only for some
+            # commits (for managed Iceberg, none), so history came back with
+            # every version None and the CREATE commit missing.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the table's history is its Delta log's, and the Iceberg snapshot "
+                "log does not carry Delta versions",
+                remedy=(
+                    SQL_FALLBACK_REMEDY
+                    if table.is_catalog_managed
+                    else "the Delta engines serve it"
+                ),
+            )
+
         if operation in _WRITES:
             if uniform:
                 return Capability(
@@ -501,6 +542,19 @@ class IcebergEngine:
                     operation,
                     ok=False,
                     reason="the catalog reports no external-engine write support for this table",
+                    remedy=SQL_FALLBACK_REMEDY,
+                )
+            if operation is not Operation.APPEND and not table.is_iceberg:
+                # Databricks managed Iceberg (a Delta log beside the Iceberg
+                # metadata). PyIceberg commits an overwrite as a delete and an
+                # append snapshot together, and the endpoint refuses that:
+                # "Adding multiple snapshots in a single update is not
+                # supported". Seen live; nothing is written.
+                return Capability(
+                    operation,
+                    ok=False,
+                    reason="Databricks' Iceberg REST endpoint takes one snapshot per commit, "
+                    "and an Iceberg overwrite commits two (a delete and an append)",
                     remedy=SQL_FALLBACK_REMEDY,
                 )
         elif operation not in _READS:
@@ -789,6 +843,16 @@ class IcebergEngine:
             else pa.schema([reader.schema.field(c) for c in columns])
         )
 
+        sqlpred = importlib.import_module("deltaswamp.predicate")
+        try:
+            residual_node = sqlpred.parse(residual)
+        except sqlpred.PredicateError:
+            residual_node = None
+        if residual_node is not None:
+            # Bound now, so a refused comparison (`name = 1` on a STRING
+            # column) raises from scan() rather than mid-stream.
+            sqlpred.to_arrow(residual_node, reader.schema)
+
         def batches() -> Iterator[Any]:
             remaining = limit
             if remaining == 0:
@@ -897,7 +961,7 @@ class IcebergEngine:
             "partition_columns": partition_columns,
             "sort_order": _as_json(iceberg.sort_order()),
             "properties": dict(metadata.properties),
-            "is_uniform": not table.is_iceberg,
+            "is_uniform": not table.is_managed_iceberg,
         }
 
     # ------------------------------------------------------------------ write
@@ -939,8 +1003,7 @@ class IcebergEngine:
             # A no-op, as the Delta engines treat it. PyIceberg committed an
             # empty snapshot, which moved the version and grew the history.
             return
-        with _schema_errors("append to an Iceberg table"):
-            iceberg.append(rows, snapshot_properties=properties)
+        iceberg.append(rows, snapshot_properties=properties)
 
     def overwrite(
         self,
@@ -1020,17 +1083,15 @@ class IcebergEngine:
                         f"do not match {predicate!r}",
                         "filter the data to the predicate before writing",
                     )
-            with _schema_errors("overwrite an Iceberg table"):
-                iceberg.overwrite(
-                    rows,
-                    overwrite_filter=row_filter,
-                    snapshot_properties=properties,
-                    case_sensitive=case_sensitive,
-                )
+            iceberg.overwrite(
+                rows,
+                overwrite_filter=row_filter,
+                snapshot_properties=properties,
+                case_sensitive=case_sensitive,
+            )
             return
 
-        with _schema_errors("overwrite an Iceberg table"):
-            iceberg.overwrite(rows, snapshot_properties=properties)
+        iceberg.overwrite(rows, snapshot_properties=properties)
 
     # ------------------------------------------------------ distributed path
 

@@ -1,9 +1,11 @@
 """Distributed reads and writes: plan on the driver, do the work on workers.
 
 A scan plan is a list of `ScanSplit`s pinned to one snapshot version. A worker
-receives the engine, the resolved table (with its credential provider, never a
-credential) and its splits, re-resolves that exact version and vends its own
-storage credentials. The Ray Data datasource makes one read task per
+receives the engine, the resolved table and its splits, and re-resolves that
+exact version. By default the table carries one short-lived storage credential
+vended on the driver (`ShippedCredentials`), never the catalog's credentials;
+with ``ship_catalog_auth=True`` it carries the credential provider, and each
+worker vends its own. The Ray Data datasource makes one read task per
 byte-balanced group of splits.
 
 Writes run in reverse. `WritePlan` checks on the driver that the commit can
@@ -13,12 +15,26 @@ fragments, and the driver commits every fragment in one transaction.
 
 from __future__ import annotations
 
+import os
+import threading
+import time
+import uuid
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
 from typing import Any, ClassVar, cast
 
-__all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance"]
+from ._util import commit_backoff
+
+__all__ = [
+    "ChangesPlan",
+    "ChangesSplit",
+    "DeltaSwampDatasource",
+    "ScanPlan",
+    "WritePlan",
+    "balance",
+    "merge_fragments",
+]
 
 
 @dataclass(frozen=True)
@@ -37,6 +53,25 @@ class ScanPlan:
     #: Ship the catalog's own credential provider (and with it the catalog
     #: token) to workers, so they can re-vend. Off by default: see _for_workers.
     ship_catalog_auth: bool = False
+    #: Where the table's VARIANT columns are (paths of names), read as JSON
+    #: text as `Table` reads them; the engines give the binary encoding.
+    variant_paths: tuple[tuple[str, ...], ...] = ()
+    #: Where its interval columns are, by kind (`engine.intervals`): read as
+    #: `Table` reads them, a duration or text, where the engines give integers.
+    interval_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = ()
+    #: Where workers get a fresh storage credential when the shipped one
+    #: nears expiry: a picklable ``source(table_id, operation)`` reaching a
+    #: driver-side `credentials.CredentialBroker`. None: they cannot.
+    credential_source: Any = None
+
+    @property
+    def credential_expires_at(self) -> float | None:
+        """When the storage credential workers get expires (epoch seconds), if known.
+
+        Workers refresh it when the plan has a `credential_source` or ships
+        catalog auth; otherwise a job running past this fails on its workers.
+        """
+        return _credential_expiry(self.table, write=False)
 
     @property
     def version(self) -> int | None:
@@ -46,7 +81,9 @@ class ScanPlan:
         # What crosses a process boundary: see `_for_workers`.
         fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
         if not self.ship_catalog_auth:
-            fields["table"] = _for_workers(self.table, write=False)
+            fields["table"] = _for_workers(self.table, write=False, source=self.credential_source)
+        else:
+            fields["table"] = _shipping_table(self.table)
         return (_rebuild, (type(self), fields))
 
     @property
@@ -67,6 +104,16 @@ class ScanPlan:
         """Read some (default: all) of the planned splits as an Arrow stream."""
         chosen = list(self.splits if splits is None else splits)
         if splits is not None:
+            from .engine.base import ScanSplit
+            from .errors import InvalidArgumentError
+
+            foreign = [s for s in chosen if not isinstance(s, ScanSplit)]
+            if foreign:
+                # A string raised a bare AttributeError ('str' has no 'path').
+                raise InvalidArgumentError(
+                    f"read() takes this plan's splits (ScanSplit objects), not "
+                    f"{type(foreign[0]).__name__} {foreign[0]!r:.80}"
+                )
             # A split names its file relative to its own table, so one from
             # another plan read *this* table's root: a missing file, or rows
             # from whatever file happened to share the name -- and an empty
@@ -91,6 +138,15 @@ class ScanPlan:
         )
         from .engine.base import translating_stream
 
+        if self.variant_paths:
+            from ._variant import json_text_stream
+
+            # to_arrow() gives VARIANT as JSON text; so does a planned read.
+            stream = json_text_stream(stream, frozenset(self.variant_paths))
+        if self.interval_paths:
+            from .engine.intervals import interval_stream
+
+            stream = interval_stream(stream, {g: frozenset(p) for g, p in self.interval_paths})
         # A split whose file was vacuumed since planning failed as a bare
         # OSError; name the file instead.
         where = getattr(self.table, "location", None) or "the table"
@@ -98,7 +154,146 @@ class ScanPlan:
         return translating_stream(stream, f"{where}{at}")
 
     def partitions(self, n: int) -> list[tuple[Any, ...]]:
+        from .errors import InvalidArgumentError
+
+        # 0, -5 and True quietly came back as one group, and None as a bare
+        # TypeError from the comparison inside `balance`.
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise InvalidArgumentError(f"partitions(n) needs a positive int, not {n!r}")
         return balance(self.splits, n)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangesSplit:
+    """One unit of change-feed work: the commits `start..end` (both inclusive).
+
+    A split is a run of whole commits, never part of one: a commit's
+    deletion-vector updates pair a remove with an add of the same file, and
+    only a reader of both sides tells an update from a delete and an insert.
+    `size` is the bytes of data files the commits' changes read, which is
+    what `balance` weighs.
+    """
+
+    start: int
+    end: int
+    size: int
+
+    @property
+    def path(self) -> str:
+        # `balance` breaks size ties by path, so equal splits group the same
+        # way on every run.
+        return f"{self.start:020d}"
+
+
+@dataclass(frozen=True)
+class ChangesPlan:
+    """A distributed change-feed read: runs of commits, read on workers.
+
+    Built by `Table.plan_changes()`, which pins the range's end, refuses a
+    range no worker could read (a catalog-managed table, the feed off within
+    it, a schema change across it) and splits it into runs of commits of about
+    the same bytes. Picklable as `ScanPlan` is, with the same credential rules.
+    """
+
+    engine: Any
+    table: Any
+    splits: tuple[ChangesSplit, ...]
+    columns: tuple[str, ...] | None = None
+    predicate: str | None = None
+    ship_catalog_auth: bool = False
+    interval_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = ()
+
+    @property
+    def starting_version(self) -> int | None:
+        return self.splits[0].start if self.splits else None
+
+    @property
+    def ending_version(self) -> int | None:
+        return self.splits[-1].end if self.splits else None
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(s.size for s in self.splits)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
+        if not self.ship_catalog_auth:
+            fields["table"] = _for_workers(self.table, write=False)
+        else:
+            fields["table"] = _shipping_table(self.table)
+        return (_rebuild, (type(self), fields))
+
+    def read(self, splits: Iterable[ChangesSplit] | None = None) -> Any:
+        """Read some (default: all) of the planned splits as a pyarrow Table."""
+        return self.stream(splits).read_all()
+
+    def stream(self, splits: Iterable[ChangesSplit] | None = None) -> Any:
+        """The change feed of some (default: all) splits, in commit order."""
+        import pyarrow as pa
+
+        from .errors import InvalidArgumentError
+
+        chosen = sorted(self.splits if splits is None else splits, key=lambda s: s.start)
+        stray = [s for s in chosen if s not in self.splits]
+        if stray:
+            raise InvalidArgumentError(
+                f"{len(stray)} split(s) are not part of this plan (e.g. commits "
+                f"{stray[0].start}..{stray[0].end}); read splits only through their own plan"
+            )
+        if not chosen:
+            # No splits asked for: the feed's schema, with no rows.
+            schema = self._split_stream(self.splits[0]).schema
+            return pa.RecordBatchReader.from_batches(schema, iter(()))
+        first = self._split_stream(chosen[0])
+        schema = first.schema
+
+        def batches() -> Iterator[Any]:
+            yield from first
+            for split in chosen[1:]:
+                reader = self._split_stream(split)
+                # One schema across the plan (planning refused a range across
+                # a change); a difference would be a bug, not data to cast.
+                if not reader.schema.equals(schema):
+                    raise InvalidArgumentError(
+                        f"commits {split.start}..{split.end} read with another schema than "
+                        f"commits {chosen[0].start}..{chosen[0].end}"
+                    )
+                yield from reader
+
+        return pa.RecordBatchReader.from_batches(schema, batches())
+
+    def _split_stream(self, split: ChangesSplit) -> Any:
+        import pyarrow as pa
+
+        from .engine.base import translating_stream
+
+        stream = self.engine.cdf(
+            self.table,
+            starting_version=split.start,
+            ending_version=split.end,
+            columns=list(self.columns) if self.columns is not None else None,
+            predicate=self.predicate,
+        )
+        if self.interval_paths:
+            from .engine.intervals import interval_stream
+
+            stream = interval_stream(stream, {g: frozenset(p) for g, p in self.interval_paths})
+        from .table import _cdf_types
+
+        where = getattr(self.table, "location", None) or "the table"
+        stream = translating_stream(
+            _cdf_types(stream),
+            f"the change data feed of {where}, commits {split.start}..{split.end}",
+        )
+        return pa.RecordBatchReader.from_stream(stream)
+
+    def partitions(self, n: int) -> list[tuple[ChangesSplit, ...]]:
+        """The splits in at most `n` byte-balanced groups, each in commit order."""
+        from .errors import InvalidArgumentError
+
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise InvalidArgumentError(f"partitions(n) needs a positive int, not {n!r}")
+        return [tuple(sorted(g, key=lambda s: s.start)) for g in balance(self.splits, n)]
 
 
 @dataclass(frozen=True)
@@ -128,14 +323,52 @@ class WritePlan:
     #: Ship the catalog's credential provider and the catalog itself (and with
     #: them the catalog token) to workers. Off by default: see _for_workers.
     ship_catalog_auth: bool = False
+    #: Where the table's VARIANT columns are: JSON text given for one is
+    #: encoded as `Table.append` encodes it.
+    variant_paths: tuple[tuple[str, ...], ...] = ()
+    #: Where its interval columns are (see `ScanPlan`): a duration or text
+    #: given for one is written as the integers Delta stores.
+    interval_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = ()
+    #: The table's metaData id at the planned version. Workers reuse a cached
+    #: snapshot, and the commit reads a fresh one; both must be this table,
+    #: not one dropped and re-created at the same path since planning.
+    table_identity: str | None = None
+    #: The top-level columns with a literal DEFAULT, as Arrow fields: a batch
+    #: that leaves one out gets the default, as `Table.append` fills it.
+    default_fields: tuple[Any, ...] = ()
+    #: See `ScanPlan.credential_source`.
+    credential_source: Any = None
+
+    @property
+    def credential_expires_at(self) -> float | None:
+        """When the storage credential workers write with expires, if known."""
+        return _credential_expiry(self.table, write=True)
+
+    #: Identity values reserved for this write when it was planned, as
+    #: (column, first, step, count) blocks, and the number of equal slots
+    #: each is cut into: `write(data, task_index=i)` draws from slot i.
+    identity_blocks: tuple[tuple[str, int, int, int], ...] = ()
+    identity_slots: int = 0
+    #: Tells this plan's identity slots apart from another's in one process.
+    plan_id: str = ""
+    #: User domain metadata the commit sets beside the rows (domain ->
+    #: configuration), checked when the write was planned.
+    domain_metadata: dict[str, str] | None = None
+    #: For a write that creates its table (`Connection.plan_write` of a name
+    #: not there yet): what creates it at commit. Driver-only -- never
+    #: pickled -- as workers only write files, resolving the table from its
+    #: template version 0 (`table.pending_commit`).
+    create: Any = None
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
     #: three `CommitConflictError`s -- and rebasing an append is always correct,
-    #: so the default matches `KernelEngine.metadata_commit_attempts` rather
-    #: than leaving every connector to write the same loop. An overwrite gets
-    #: none, and so does a catalog-managed table, which cannot rebase here.
-    default_append_retries: ClassVar[int] = 5
+    #: so the default matches `KernelEngine.append_commit_retries` (and
+    #: delta-rs), with a jittered backoff between attempts, rather than leaving
+    #: every connector to write the same loop. An overwrite gets none, and so
+    #: does a catalog-managed table resolved without its catalog, which cannot
+    #: re-read its commit tail.
+    default_append_retries: ClassVar[int] = 15
 
     @property
     def overwrite(self) -> bool:
@@ -145,21 +378,40 @@ class WritePlan:
         # What crosses a process boundary: see `_for_workers`. The driver keeps
         # its own copy, with full catalog access, for the commit.
         fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
+        # A worker never commits, so it never creates the table either.
+        fields["create"] = None
         if not self.ship_catalog_auth:
-            fields["table"] = _for_workers(self.table, write=True)
+            fields["table"] = _for_workers(self.table, write=True, source=self.credential_source)
             fields["catalog"] = None
+        else:
+            from .credentials.databricks import shipping
+
+            fields["table"] = _shipping_table(self.table)
+            fields["catalog"] = shipping(fields["catalog"])
         return (_rebuild, (type(self), fields))
 
-    def write(self, data: Any) -> bytes:
+    def write(self, data: Any, *, task_index: int | None = None) -> bytes:
         """Worker side: write `data` as files, returning a fragment to send back.
 
         The files are durable when this returns but belong to no version yet.
         Every fragment must reach `commit()` or the files are orphaned.
+
+        `task_index` is this worker task's number, from 0 to the plan's
+        ``identity_tasks - 1`` (a Ray datasink's ``ctx.task_idx``): on a table
+        with identity columns it picks the slot of reserved values the task's
+        rows are numbered from. Calls with one index must come from one
+        process, which hands them successive values of the slot.
         """
         from .errors import InvalidArgumentError
 
         if data is None:
             raise InvalidArgumentError("plan.write() needs data; got None")
+        identity = self._identity_slot(task_index)
+        from ._util import not_table_data
+
+        refusal = not_table_data(data)
+        if refusal is not None:
+            raise InvalidArgumentError(refusal)
         if isinstance(data, list) and data:
             import pyarrow as pa
 
@@ -169,8 +421,64 @@ class WritePlan:
                 data = pa.Table.from_pylist(data)
             elif all(isinstance(b, pa.RecordBatch) for b in data):
                 data = pa.Table.from_batches(data)
-        result: bytes = self.engine.write_files(self.table, data)
+        if self.default_fields:
+            # Left to the kernel, a batch without a defaulted column failed
+            # on every worker, after planning had accepted the write.
+            data = _with_defaults(data, self.default_fields)
+        if self.variant_paths:
+            import pyarrow as pa
+
+            from ._variant import binary_columns
+
+            if isinstance(data, pa.RecordBatch):
+                data = pa.Table.from_batches([data])
+            if isinstance(data, pa.Table):
+                # The engines take the binary encoding; JSON text failed with a
+                # raw "Expected Struct, got Utf8".
+                data = binary_columns(pa, data, frozenset(self.variant_paths))
+        if self.interval_paths:
+            import pyarrow as pa
+
+            from .engine.intervals import storage_columns
+
+            if isinstance(data, pa.RecordBatch):
+                data = pa.Table.from_batches([data])
+            if isinstance(data, pa.Table):
+                data = storage_columns(pa, data, {g: frozenset(p) for g, p in self.interval_paths})
+
+        # At the planned version: resolved once per process and reused by
+        # every later write(), where the latest snapshot cost a log replay
+        # per call (0.6 s each, 5000 commits past a checkpoint).
+        kwargs: dict[str, Any] = {}
+        if self.table_identity:
+            kwargs["table_identity"] = self.table_identity
+        if identity:
+            kwargs["identity"] = identity
+        result: bytes = self.engine.write_files(self.table, data, version=self.version, **kwargs)
         return result
+
+    def _identity_slot(self, task_index: int | None) -> dict[str, Any] | None:
+        """The cursor over task `task_index`'s slot of each reserved identity block."""
+        if not self.identity_blocks:
+            return None
+        from .engine.values import IdentityBlock, slot_cursor
+        from .errors import InvalidArgumentError
+
+        if task_index is None or isinstance(task_index, bool) or int(task_index) != task_index:
+            raise InvalidArgumentError(
+                "the table has identity columns, so plan.write() needs task_index= (0 to "
+                f"{self.identity_slots - 1}): each task numbers its rows from its own slot "
+                "of the values reserved when the write was planned"
+            )
+        return {
+            name: slot_cursor(
+                self.plan_id,
+                int(task_index),
+                name,
+                IdentityBlock(first, step, count).slot(int(task_index), self.identity_slots),
+            )
+            for name, first, step, count in self.identity_blocks
+        }
 
     def commit(
         self,
@@ -179,6 +487,8 @@ class WritePlan:
         operation: str | None = "WRITE",
         retries: int | None = None,
         allow_concurrent_overwrite: bool = False,
+        allow_empty_overwrite: bool = False,
+        abort_on_failure: bool = True,
     ) -> int:
         """Driver side: commit every fragment as one transaction.
 
@@ -190,30 +500,46 @@ class WritePlan:
         do collide: four committing at once leaves one winner and three
         conflicts. Rebasing an append is always correct, so `retries` defaults
         to `default_append_retries` and the losers simply commit at the next
-        version. Pass `retries=0` to see the conflict instead.
+        version. Pass `retries=0` to see the conflict instead. A
+        catalog-managed table planned through its catalog rebases the same
+        way: every attempt re-reads the catalog's commit tail.
 
         An overwrite is the opposite: it removes what it finds, so committing
         against a table that has moved on would discard a writer that arrived
         after planning. That is refused unless `allow_concurrent_overwrite` says
-        the last writer should win.
+        the last writer should win. Left as None, `retries` is 0 for one.
 
-        On a catalog-managed table the catalog arbitrates and can still reject
-        the commit outright. The table is untouched when it does, and the
-        fragments stay valid: they describe data files, which carry no version,
-        so the same fragments can be committed again against a fresh snapshot.
-        `retries` re-attempts that here for tables this library commits itself;
-        a catalog-managed table has to be re-opened through its catalog first,
-        and says so rather than spinning against a stale commit tail. Left as
-        None, an ordinary append on a path table gets `default_append_retries`;
-        an overwrite gets none, because retrying one means overwriting the
-        writer that just won.
+        `fragments` may be any iterable, a generator included; they are merged
+        as they arrive (see `merge_fragments`), so the driver never holds one
+        schema per worker.
+
+        Every attempt first checks whether these files already landed -- a
+        commit reported as failed can have taken effect (a put or a catalog
+        call that timed out after it did), and a restarted driver may commit
+        its saved fragments again. It reads only the commits made since the
+        write was planned. When they did land, the version they landed at is
+        returned and nothing is committed again.
+
+        A concurrent change to the schema (other than adding a nullable
+        column), partitioning or column mapping is never retried: the
+        fragments' files were written for the old layout, so the commit raises
+        `MetadataChangedError` and the write must be planned again.
+
+        When the commit fails for certain -- refused before anything was
+        written, `MetadataChangedError`, an overwrite whose table moved, or a
+        conflict on every attempt -- the fragments' files are deleted
+        (`abort`), since nothing will ever reference them; pass
+        ``abort_on_failure=False`` to keep them for another commit. A failure
+        whose outcome is unknown (`TransientCommitError`: a timeout or a 5xx)
+        never deletes anything: commit the same fragments again, which returns
+        the version if the first attempt landed, and abort only after that.
+
+        No fragments with any files (every worker's data was empty) commits
+        nothing: an append returns the current version without adding an
+        empty one, and an overwrite -- which would empty the table -- is
+        refused unless `allow_empty_overwrite=True` says that is intended.
         """
-        from .errors import (
-            CommitConflictError,
-            InvalidArgumentError,
-            TransientCommitError,
-            UnreachableTableError,
-        )
+        from .errors import InvalidArgumentError
 
         collected = _fragments_arg(fragments)
         # None was recorded in the log as "UNKNOWN", and "" as a blank
@@ -225,18 +551,72 @@ class WritePlan:
                 f"operation must be a non-empty string such as 'WRITE', not {operation!r}"
             )
         if retries is None:
-            # Only an ordinary append gets them. Retrying an overwrite means
-            # overwriting the writer that just won, and a catalog-managed table
-            # cannot rebase here at all -- it would spin against the commit tail
-            # captured when it was resolved, so defaulting to a retry that
-            # cannot work would only change which error the caller sees.
-            retries = (
-                0
-                if (self.overwrite or self.table.is_catalog_managed)
-                else self.default_append_retries
-            )
+            # Retrying an overwrite means overwriting the writer that just
+            # won. A catalog-managed table rebases only through its catalog:
+            # without it, the commit tail captured at resolution would make
+            # every retry lose again.
+            rebases = not self.table.is_catalog_managed or self.catalog is not None
+            retries = self.default_append_retries if rebases and not self.overwrite else 0
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
             raise InvalidArgumentError(f"retries must be a non-negative int, not {retries!r}")
+        if self.create is not None:
+            result: int = self.create.commit(
+                self,
+                collected,
+                operation=operation,
+                retries=retries,
+                abort_on_failure=abort_on_failure,
+            )
+            return result
+        self._refuse_uncreated("commit these fragments")
+        try:
+            return self._commit(
+                collected,
+                operation=operation,
+                retries=retries,
+                allow_concurrent_overwrite=allow_concurrent_overwrite,
+                allow_empty_overwrite=allow_empty_overwrite,
+            )
+        except _CertainFailure as failure:
+            if abort_on_failure:
+                self._abort_after(collected, failure.error)
+            raise failure.error from failure.error.__cause__
+
+    def _commit(
+        self,
+        collected: list[bytes],
+        *,
+        operation: str,
+        retries: int,
+        allow_concurrent_overwrite: bool,
+        allow_empty_overwrite: bool,
+    ) -> int:
+        """`commit`'s attempts. A failure that surely committed nothing is a `_CertainFailure`."""
+        from .errors import (
+            CommitConflictError,
+            MetadataChangedError,
+            TransientCommitError,
+            UnreachableTableError,
+        )
+
+        if not any(collected):
+            # A job whose workers all produced nothing added an empty version
+            # on every call (and every retry of the job), and an overwrite
+            # silently truncated the table. With a txn the commit still
+            # matters -- it records that the batch is done -- so it goes ahead.
+            if self.overwrite and not allow_empty_overwrite:
+                raise UnreachableTableError(
+                    "commit this overwrite",
+                    "no fragment carries any files, so it would remove every row in the "
+                    "table and add none",
+                    "pass allow_empty_overwrite=True if emptying the table is intended",
+                )
+            if not self.overwrite and self.txn is None:
+                current = self._with_fresh_tail(self.table) or self.table
+                version_now = self.engine.detail(current).get("version")
+                if version_now is not None:
+                    return int(version_now)
+        paths, written_at = _fragment_files(collected)
         attempts = retries + 1
         last: Exception | None = None
         conflict_version = -1
@@ -248,41 +628,55 @@ class WritePlan:
         for attempt in range(attempts):
             refreshed = self._with_fresh_tail(table)
             table = refreshed if refreshed is not None else table
-            if (attempt or not self.overwrite) and self._already_landed(table, collected):
-                # A commit reported as failed can still have landed (a put
-                # that timed out after it was written), and a driver that
-                # restarts may commit its saved fragments a second time.
-                # Re-committing added every file again in a new version: the
-                # change feed reported the rows twice.
-                raise UnreachableTableError(
-                    "commit these fragments",
-                    "their files are already in the table, so an earlier commit landed "
-                    + (f"after all ({last})" if last is not None else "them before"),
-                    "check the table's history; do not commit these fragments again",
-                )
+            # Every attempt, the first and an overwrite's included: a driver
+            # that restarts commits its saved fragments with nothing to say an
+            # earlier run landed them, and an overwrite committed twice added
+            # and removed the same files in one version.
+            landed = self._landed_version(table, paths, written_at)
+            if landed is not None:
+                return landed
             # Re-checked every attempt, not once: losing a race means the table
             # moved by definition, so a retry is exactly when an overwrite is
             # most likely to be discarding someone.
             if self.overwrite and not allow_concurrent_overwrite:
-                self._refuse_if_the_table_moved(table)
+                try:
+                    self._refuse_if_the_table_moved(table)
+                except UnreachableTableError as exc:
+                    raise _CertainFailure(exc) from None
             try:
-                version: int = self.engine.commit_files(
+                version: int = self._backfilled(
+                    lambda target: self.engine.commit_files(
+                        target,
+                        collected,
+                        overwrite=self.overwrite,
+                        operation=operation,
+                        txn=self.txn,
+                        commit_metadata=self.commit_metadata,
+                        **({"version": pinned} if pinned is not None else {}),
+                        **({"table_identity": self.table_identity} if self.table_identity else {}),
+                        **(
+                            {"domain_metadata": self.domain_metadata}
+                            if self.domain_metadata
+                            else {}
+                        ),
+                    ),
                     table,
-                    collected,
-                    overwrite=self.overwrite,
-                    operation=operation,
-                    txn=self.txn,
-                    commit_metadata=self.commit_metadata,
-                    **({"version": pinned} if pinned is not None else {}),
                 )
+            except MetadataChangedError as exc:
+                # The files do not fit the table any more: no retry can help,
+                # and nothing was committed.
+                raise _CertainFailure(exc) from None
             except TransientCommitError as exc:
-                # Nobody won the version and the table is unchanged, so the
-                # very same commit can go again -- which `retries` promises.
-                # Not on a catalog-managed table: a failed ratification call
-                # may have landed, and only the catalog can say.
+                # Nobody is known to have won the version, so the same commit
+                # can go again -- which `retries` promises. The landed check
+                # at the top of the next attempt settles whether this one took
+                # effect after all, a catalog's ratification included, so a
+                # catalog-managed table planned through its catalog retries too.
                 last = exc
-                if attempts == 1 or self.table.is_catalog_managed:
+                if attempts == 1 or (self.table.is_catalog_managed and self.catalog is None):
+                    _unknown_outcome(exc)
                     raise
+                commit_backoff(attempt)
                 continue
             except CommitConflictError as exc:
                 last = exc
@@ -292,47 +686,184 @@ class WritePlan:
                     # Diverting to a different error type here would hide it
                     # from a caller catching CommitConflictError, which is what
                     # every other write path raises.
-                    raise
+                    raise _CertainFailure(exc) from None
                 if self.table.is_catalog_managed and self.catalog is None:
                     # The ratified tail and the version ceiling were captured
                     # when the table was resolved, and with no catalog to
                     # re-read them from, a retry would race the same stale view.
-                    raise UnreachableTableError(
+                    refusal = UnreachableTableError(
                         "retry the commit",
                         "this table is catalog-managed, and its commit tail was captured "
                         f"when it was resolved, so a retry here would reuse it ({exc})",
                         "re-open the table through the catalog and commit the same "
-                        "fragments against the fresh snapshot -- they stay valid",
-                    ) from exc
+                        "fragments against the fresh snapshot (with abort_on_failure=False "
+                        "here, so they are kept)",
+                    )
+                    refusal.__cause__ = exc
+                    raise _CertainFailure(refusal) from None
+                # Losers retrying at once collide again; spread them out.
+                commit_backoff(attempt)
                 continue
             return version
 
         if isinstance(last, TransientCommitError):
-            raise last
-        raise CommitConflictError(
-            conflict_version,
-            f"another writer committed first on each of {attempts} attempts ({last}). "
-            "The fragments are still valid: re-open the table and commit them again.",
+            raise _unknown_outcome(last)
+        raise _CertainFailure(
+            CommitConflictError(
+                conflict_version,
+                f"another writer committed first on each of {attempts} attempts ({last}). "
+                "Nothing was committed.",
+            )
         )
 
-    def _already_landed(self, table: Any, fragments: list[bytes]) -> bool:
-        """Whether any fragment's data file is already live in the table."""
-        from urllib.parse import unquote
+    def abort(self, fragments: Iterable[bytes]) -> int:
+        """Delete the data files `fragments` describe; the number deleted.
+
+        For a write that will not be committed: a failed or cancelled job
+        (a Ray datasink's ``on_write_failed``), or a `commit` that raised
+        `TransientCommitError` and, committed again, still did not land.
+        `commit` already aborts on a failure that certainly committed nothing.
+
+        Refused when any of the files is in a commit made since the write was
+        planned -- deleting a committed file would corrupt the table -- or
+        when that cannot be told. Files that cannot be deleted are logged,
+        not raised: an abort is cleanup, and the job's own error matters more.
+        """
+        from .errors import UnreachableTableError
+
+        collected = _fragments_arg(fragments)
+        if self.create is not None:
+            deleted: int = self.create.abort(self, collected)
+            return deleted
+        self._refuse_uncreated("abort these fragments")
+        paths, written_at = _fragment_files(collected)
+        if not paths:
+            return 0
+        if self.table.is_catalog_managed and self.catalog is None:
+            # Only the catalog knows its newest commits: the tail captured at
+            # resolution cannot show that these files were committed since.
+            raise UnreachableTableError(
+                "abort these fragments",
+                "the table is catalog-managed and this plan has no catalog to read its "
+                "newest commits from, so whether the files were committed cannot be told",
+                "abort through the plan returned by plan_write() on the driver",
+            )
+        table = self._with_fresh_tail(self.table) or self.table
+        if self._landed_version(table, paths, written_at) is not None:
+            raise UnreachableTableError(
+                "abort these fragments",
+                "their files were committed, so deleting them would corrupt the table",
+                "leave them; the write succeeded",
+            )
+        failed = self.engine.delete_uncommitted(table, sorted(paths))
+        if failed:
+            import logging
+
+            logging.getLogger("deltaswamp").warning(
+                "abort could not delete %d of %d uncommitted data file(s) (VACUUM will): %s",
+                len(failed),
+                len(paths),
+                "; ".join(failed[:10]),
+            )
+        return len(paths) - len(failed)
+
+    def _refuse_uncreated(self, action: str) -> None:
+        """Refuse to commit (or abort) a creating write from a worker's copy of its plan.
+
+        That copy resolves the table from its template, which is not the
+        table's log: a commit from it would write version 1 of a log that has
+        no version 0.
+        """
+        if getattr(self.table, "pending_commit", None) is None:
+            return
+        from .errors import UnreachableTableError
+
+        raise UnreachableTableError(
+            action,
+            "this plan creates its table, and this copy of it (a worker's, unpickled) "
+            "cannot: only the plan Connection.plan_write() returned on the driver creates "
+            "the table and commits into it",
+            "send the fragments back to the driver and call commit() (or abort()) there",
+        )
+
+    def _abort_after(self, collected: list[bytes], error: Exception) -> None:
+        """`abort` after `error`, which stays the one raised; a failed abort is logged."""
+        import logging
 
         try:
-            import pyarrow as pa
+            deleted = self.abort(collected)
+        except Exception as exc:
+            logging.getLogger("deltaswamp").warning(
+                "the commit failed (%s) and its data files could not be deleted: %s", error, exc
+            )
+            return
+        if deleted:
+            logging.getLogger("deltaswamp").info(
+                "the commit failed, so its %d data file(s) were deleted", deleted
+            )
 
-            ours: set[str] = set()
-            for fragment in fragments:
-                if fragment:
-                    paths = pa.ipc.open_stream(fragment).read_all().column("path")
-                    ours.update(unquote(p) for p in paths.to_pylist() if p)
-            if not ours:
-                return False
-            live = pa.table(self.engine.files(table)).column("path").to_pylist()
-        except Exception:
-            return False  # cannot tell; commit as before
-        return any(p is not None and unquote(p) in ours for p in live)
+    def _landed_version(self, table: Any, paths: set[str], written_at: int | None) -> int | None:
+        """The version these files landed at, or None if they did not.
+
+        Reads only the commits after the files were written (`written_at`,
+        from the fragments; else the planned version), so fragments committed
+        again through a later plan are still found. Raises when that cannot
+        be told (a commit since was cleaned up), or when only some of the
+        files landed -- neither is a reason to commit them again.
+        """
+        from .errors import InvalidArgumentError, UnreachableTableError
+
+        if not paths:
+            return None
+        check = getattr(self.engine, "commits_adding", None)
+        if not callable(check):
+            return None  # an engine without distributed writes has nothing to find
+        after = min((v for v in (written_at, self.version) if v is not None), default=0)
+        try:
+            found = check(table, after, sorted(paths))
+        except Exception as exc:
+            raise UnreachableTableError(
+                "commit these fragments",
+                f"whether an earlier commit already landed them cannot be told ({exc})",
+                "check the table's history for these files before committing again",
+            ) from exc
+        if not found:
+            return None
+        if len(found) == 1 and found[0][1] == len(paths):
+            return int(found[0][0])
+        raise InvalidArgumentError(
+            f"only some of these fragments' files are in the table (commits "
+            f"{sorted(v for v, _ in found)} add {sum(n for _, n in found)} of {len(paths)}); "
+            "they were committed in part elsewhere, so they cannot be committed again"
+        )
+
+    def _backfilled(self, commit: Any, table: Any) -> int:
+        """`commit(table)`; on a catalog's backfill demand, publish and commit once more.
+
+        What `Table._backfilled` does for `Table.append`. Nothing on this path
+        ever published, so once the catalog's cap of unpublished commits was
+        reached every distributed commit failed with the 429 -- after its job
+        had run -- while appends through the same table kept working. The
+        refused commit changed nothing and the fragments stay valid, so the
+        same commit can go again once the tail is published.
+        """
+        from .errors import BackfillRequiredError, DeltaSwampError
+
+        try:
+            result: int = commit(table)
+            return result
+        except BackfillRequiredError as exc:
+            if not getattr(table, "is_catalog_managed", False) or self.catalog is None:
+                # Without the catalog the tail cannot be re-read after
+                # publishing, so a second commit would race a stale view.
+                raise
+            try:
+                self.engine.publish(table)
+            except DeltaSwampError:
+                raise exc from None
+            refreshed = self._with_fresh_tail(table)
+            result = commit(refreshed if refreshed is not None else table)
+            return result
 
     def _with_fresh_tail(self, table: Any) -> Any:
         """`table` with its catalog commit tail re-read, or None when not applicable."""
@@ -436,8 +967,8 @@ def _commit_metadata_arg(metadata: Any) -> dict[str, str] | None:
     return out
 
 
-def _fragments_arg(fragments: Any) -> list[Any]:
-    """The fragments to commit, checked before anything is sent to the log.
+def _checked_fragments(fragments: Any, what: str = "commit") -> Iterator[bytes]:
+    """Each fragment as bytes, checked as it arrives.
 
     `commit(fragment)` with one bare fragment iterated its bytes as ints and
     failed deep in the binding, and a worker that returned None (or a str)
@@ -447,20 +978,226 @@ def _fragments_arg(fragments: Any) -> list[Any]:
 
     if isinstance(fragments, (bytes, bytearray, memoryview)):
         raise InvalidArgumentError(
-            "commit() takes a list of fragments; wrap a single one: commit([fragment])"
+            f"{what}() takes a list of fragments; wrap a single one: {what}([fragment])"
         )
     if fragments is None or isinstance(fragments, (str, dict)):
         raise InvalidArgumentError(
-            f"commit() takes a list of fragments from plan.write(), not {type(fragments).__name__}"
+            f"{what}() takes a list of fragments from plan.write(), not {type(fragments).__name__}"
         )
-    collected = list(fragments)
-    for index, fragment in enumerate(collected):
+    for index, fragment in enumerate(fragments):
         if not isinstance(fragment, (bytes, bytearray, memoryview)):
             raise InvalidArgumentError(
                 f"fragment {index} is a {type(fragment).__name__}, not the bytes "
                 "plan.write() returns; did that worker fail?"
             )
-    return [bytes(f) for f in collected]
+        yield bytes(fragment)
+
+
+def _fragments_arg(fragments: Any) -> list[bytes]:
+    """The fragments to commit, checked and merged as they arrive.
+
+    A fragment is an Arrow IPC stream: a schema (the add-metadata columns,
+    per-column stats included, and the layout the files were written under)
+    and a batch of a few rows, each batch message describing every nested
+    buffer. At a row or two per task that was ten kilobytes per fragment, and
+    20k tasks held 600 MiB on the driver. Consecutive fragments of one plan
+    are concatenated into a few large ones as they are read; one that does not
+    decode, or carries a different schema, is passed on as it is for the
+    commit to name.
+    """
+    out: list[bytes] = []
+    merger = _Merger()
+    for fragment in _checked_fragments(fragments):
+        if not fragment:
+            continue  # no files
+        try:
+            merged = merger.add(fragment)
+        except _NotMergeable:
+            out.extend(merger.flush())
+            out.append(fragment)
+            continue
+        out.extend(merged)
+    out.extend(merger.flush())
+    return out
+
+
+class _NotMergeable(Exception):
+    """A fragment that does not decode, left for the commit to name."""
+
+
+class _Merger:
+    """Concatenates fragments of one schema into few, large ones."""
+
+    #: Pending batches are concatenated once there are this many.
+    COMBINE_EVERY = 512
+    #: A merged fragment is cut once it holds this many rows (files).
+    ROWS = 250_000
+
+    def __init__(self) -> None:
+        self.schema: Any = None
+        self.batches: list[Any] = []
+        self.rows = 0
+
+    def add(self, fragment: bytes) -> list[bytes]:
+        """Take `fragment`; the merged fragments that are complete because of it."""
+        import pyarrow as pa
+
+        try:
+            reader = pa.ipc.open_stream(fragment)
+            schema = reader.schema
+            batches = list(reader)
+        except Exception as exc:
+            raise _NotMergeable() from exc
+        done: list[bytes] = []
+        if self.schema is not None and not schema.equals(self.schema, check_metadata=True):
+            done = self.flush()
+        self.schema = schema
+        self.batches.extend(b for b in batches if b.num_rows)
+        self.rows += sum(b.num_rows for b in batches)
+        if len(self.batches) >= self.COMBINE_EVERY:
+            self.batches = self._combined()
+        if self.rows >= self.ROWS:
+            done.extend(self.flush())
+        return done
+
+    def _combined(self) -> list[Any]:
+        import pyarrow as pa
+
+        if len(self.batches) <= 1:
+            return self.batches
+        table = pa.Table.from_batches(self.batches, schema=self.schema).combine_chunks()
+        return list(table.to_batches())
+
+    def flush(self) -> list[bytes]:
+        """The pending fragments as one, if any."""
+        import pyarrow as pa
+
+        if self.schema is None:
+            return []
+        batches = self._combined()
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, self.schema) as writer:
+            for batch in batches:
+                writer.write_batch(batch)
+        self.schema, self.batches, self.rows = None, [], 0
+        return [sink.getvalue().to_pybytes()]
+
+
+def merge_fragments(fragments: Iterable[bytes]) -> bytes:
+    """Merge fragments from one plan's workers into one fragment.
+
+    For combining results before they reach the driver -- a tree reduction
+    over a large job -- so the driver receives a few fragments rather than
+    one per task. `commit` accepts the result like any other fragment, and
+    merges what it is given too. Fragments from different plans (another
+    table, or one written under a different layout) are refused.
+    """
+    import pyarrow as pa
+
+    from .errors import InvalidArgumentError
+
+    merger = _Merger()
+    merger.ROWS = 2**62  # one fragment, however large
+    for index, fragment in enumerate(_checked_fragments(fragments, "merge_fragments")):
+        if not fragment:
+            continue
+        try:
+            schema = pa.ipc.open_stream(fragment).schema
+        except Exception as exc:
+            raise InvalidArgumentError(
+                f"fragment {index} is not a fragment plan.write() produced ({exc})"
+            ) from exc
+        if merger.schema is not None and not schema.equals(merger.schema, check_metadata=True):
+            raise InvalidArgumentError(
+                f"fragment {index} was written for a different table or layout than the "
+                "first; merge only the fragments of one plan"
+            )
+        merger.add(fragment)
+    merged = merger.flush()
+    return merged[0] if merged else b""
+
+
+def _fragment_files(fragments: list[bytes]) -> tuple[set[str], int | None]:
+    """The data file paths `fragments` describe, and the earliest version they were written at.
+
+    The version is None when a fragment does not record it (one written by
+    an older release).
+    """
+    import pyarrow as pa
+
+    from .engine.kernel import FRAGMENT_WRITTEN_AT
+
+    paths: set[str] = set()
+    earliest: int | None = None
+    unrecorded = False
+    for fragment in fragments:
+        if not fragment:
+            continue
+        try:
+            table = pa.ipc.open_stream(fragment).read_all()
+        except Exception:
+            continue  # the commit names a malformed fragment itself
+        if "path" in table.column_names:
+            paths.update(p for p in table.column("path").to_pylist() if p)
+        written = (table.schema.metadata or {}).get(FRAGMENT_WRITTEN_AT.encode())
+        try:
+            at = int(written) if written is not None else None
+        except ValueError:
+            at = None
+        if at is None:
+            unrecorded = True
+        elif earliest is None or at < earliest:
+            earliest = at
+    return paths, None if unrecorded else earliest
+
+
+def _with_defaults(data: Any, fields: tuple[Any, ...]) -> Any:
+    """`data` with each of `fields` it leaves out filled with the column's literal DEFAULT."""
+    import pyarrow as pa
+
+    from .table import _default_column
+
+    if isinstance(data, pa.RecordBatch):
+        data = pa.Table.from_batches([data])
+    elif not isinstance(data, pa.Table) and type(data).__name__ == "DataFrame":
+        try:
+            data = pa.Table.from_pandas(data, preserve_index=False)
+        except Exception:
+            return data
+    if not isinstance(data, pa.Table):
+        return data
+    present = {name.lower() for name in data.column_names}
+    for field in fields:
+        if field.name.lower() in present:
+            continue
+        column = _default_column(pa, field, data.num_rows)
+        if column is not None:
+            data = data.append_column(field, column)
+    return data
+
+
+class _CertainFailure(Exception):
+    """A commit failure that certainly committed nothing; carries the error to raise."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _unknown_outcome(exc: Exception) -> Exception:
+    """`exc` (a TransientCommitError), saying what to do with the fragments."""
+    from .errors import TransientCommitError
+
+    if not isinstance(exc, TransientCommitError):
+        return exc
+    note = (
+        " Whether the commit took effect is unknown, so its data files were kept: commit "
+        "the same fragments again (a landed commit is recognized and its version "
+        "returned), and abort them only if that says they did not land."
+    )
+    if note not in str(exc):
+        exc.args = (str(exc) + note, *exc.args[1:])
+    return exc
 
 
 def _rebuild(cls: type, fields: dict[str, Any]) -> Any:
@@ -492,14 +1229,29 @@ class ShippedCredentials:
         credentials: Any,
         table_id: str | None,
         workspace_url: str | None = None,
+        source: Any = None,
+        identity: str | None = None,
     ) -> None:
         self._credentials = credentials
         self._table_id = table_id
         self._workspace_url = workspace_url
+        #: `credential_source` of the plan: asked for a fresh credential.
+        self._source = source
+        #: The driver provider's identity: every task of a plan (and every
+        #: plan of one principal and table) shares a slot and a cache entry.
+        self._identity = identity or f"shipped-{uuid.uuid4().hex}"
 
     @property
     def table_id(self) -> str | None:
         return self._table_id
+
+    @property
+    def refreshable(self) -> bool:
+        """Whether a fresh credential can be had here (a credential source)."""
+        return self._source is not None
+
+    def credential_identity(self) -> str:
+        return f"shipped-{self._identity}"
 
     @property
     def expires_at(self) -> float | None:
@@ -516,6 +1268,8 @@ class ShippedCredentials:
                 "this plan carries a read-only storage credential and cannot write; "
                 "plan the write with plan_write() on the driver"
             )
+        if self._source is not None:
+            self._credentials = _sourced(self, Operation(str(wanted).upper()))
         if self._credentials.expires_within(SHIPPED_CREDENTIAL_MARGIN_SECONDS):
             import time
 
@@ -525,7 +1279,8 @@ class ShippedCredentials:
                 + ("has expired" if left <= 0 else f"expires in {left:.0f}s")
                 + ", and a worker cannot re-vend it: plans carry no catalog credentials. "
                 "Re-plan on the driver (plan_scan()/plan_write() again), or plan with "
-                "ship_catalog_auth=True so workers can refresh it themselves"
+                "credential_source= (a driver-side CredentialBroker) or "
+                "ship_catalog_auth=True so workers can refresh it"
             )
         return self._credentials
 
@@ -539,8 +1294,99 @@ class ShippedCredentials:
     def __repr__(self) -> str:
         return f"ShippedCredentials({self._credentials!r})"
 
+    def __getstate__(self) -> dict[str, Any]:
+        # Shipping the storage credential is this class's whole purpose, so it
+        # opts in explicitly: `Credentials` itself refuses to pickle.
+        state = self.__dict__.copy()
+        credentials = state.pop("_credentials")
+        state["_credential_state"] = (
+            credentials._state() if hasattr(credentials, "_state") else None
+        )
+        if state["_credential_state"] is None:
+            state["_credentials"] = credentials
+        return state
 
-def _for_workers(table: Any, *, write: bool) -> Any:
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        from .credentials import Credentials
+
+        carried = state.pop("_credential_state", None)
+        self.__dict__.update(state)
+        if carried is not None:
+            self._credentials = Credentials._from_state(carried)
+
+
+#: Credentials a credential source served in this process, and when it was
+#: last asked, by (identity, operation): every task of a plan in one worker
+#: shares one answer, so a job asks once per refresh per process.
+_SOURCED: dict[tuple[str, str], tuple[Any, float]] = {}
+_SOURCED_LOCK = threading.Lock()
+
+#: A credential source is not asked again sooner than this, unless the
+#: credential has expired: one it answers with a short-lived credential
+#: would otherwise be asked on every request.
+SOURCE_MIN_INTERVAL_SECONDS = 30.0
+
+
+def _sourced(shipped: ShippedCredentials, operation: Any) -> Any:
+    """The freshest credential for `shipped`: its own, this process's, or the source's."""
+    from .credentials import Credentials
+    from .credentials.base import DEFAULT_REFRESH_MARGIN_SECONDS
+    from .errors import CredentialError
+
+    key = (shipped.credential_identity(), str(operation.value))
+    current = shipped._credentials
+    with _SOURCED_LOCK:
+        known, asked = _SOURCED.get(key, (None, 0.0))
+        if known is not None and (known.expires_at or 0) > (current.expires_at or 0):
+            current = known
+        now = time.time()
+        if not current.expires_within(DEFAULT_REFRESH_MARGIN_SECONDS) or (
+            not current.is_expired and now - asked < SOURCE_MIN_INTERVAL_SECONDS
+        ):
+            return current
+        # Asked under the lock: the other tasks in this process wait for the
+        # one answer rather than each asking the driver.
+        _SOURCED[key] = (current, now)
+        try:
+            answer = shipped._source(shipped.table_id, operation.value)
+        except Exception as exc:
+            if not current.is_expired:
+                return current  # asked again after the interval
+            raise CredentialError(
+                f"the plan's credential source could not vend a fresh credential: {exc}"
+            ) from exc
+        served = answer if isinstance(answer, Credentials) else Credentials._from_state(answer)
+        _SOURCED[key] = (served, now)
+        return served
+
+
+def _credential_expiry(table: Any, *, write: bool) -> float | None:
+    """When the credential a plan ships for `table` expires (vends it on the driver)."""
+    from .credentials import Operation
+
+    provider = getattr(table, "credential_provider", None)
+    if provider is None:
+        return None
+    return getattr(
+        provider.credentials(Operation.READ_WRITE if write else Operation.READ), "expires_at", None
+    )
+
+
+def _shipping_table(table: Any) -> Any:
+    """`table` with a provider that pickles its catalog secrets: ship_catalog_auth=True.
+
+    A provider pickles no literal secret by default (`credentials.databricks.shipping`);
+    a plan that ships catalog auth is the caller asking for exactly that.
+    """
+    from .credentials.databricks import shipping
+
+    provider = getattr(table, "credential_provider", None)
+    if provider is None or not hasattr(provider, "_ship_secrets"):
+        return table
+    return replace(table, credential_provider=shipping(provider))
+
+
+def _for_workers(table: Any, *, write: bool, source: Any = None) -> Any:
     """`table` as a worker should receive it: no catalog credentials.
 
     The provider is replaced by the storage credential it vends now, on the
@@ -558,7 +1404,19 @@ def _for_workers(table: Any, *, write: bool) -> Any:
         auth = getattr(provider, "workspace_auth", None)
         if callable(auth):
             workspace_url = auth()[0]
-    shipped = ShippedCredentials(credentials, getattr(provider, "table_id", None), workspace_url)
+    # The same for every pickle of this provider, so a plan's tasks share one
+    # slot, cache entry and refresh in each worker process.
+    identity = f"object-{id(provider):x}-{os.getpid()}"
+    get_identity = getattr(provider, "credential_identity", None)
+    if callable(get_identity):
+        identity = get_identity()
+    shipped = ShippedCredentials(
+        credentials,
+        getattr(provider, "table_id", None),
+        workspace_url,
+        source=source,
+        identity=identity,
+    )
     return replace(table, credential_provider=shipped)
 
 
@@ -572,13 +1430,17 @@ def balance(splits: Iterable[Any], n: int) -> list[tuple[Any, ...]]:
     items = sorted(splits, key=lambda s: (-s.size, s.path))
     if not items:
         return []
+    import heapq
+
     count = max(1, min(n, len(items)))
     bins: list[list[Any]] = [[] for _ in range(count)]
-    loads = [0] * count
+    # (load, bin index): the lightest bin, lowest index on a tie -- the same
+    # choice as scanning for min(loads), in O(log n) rather than O(n) per split.
+    loads = [(0, i) for i in range(count)]
     for split in items:
-        target = loads.index(min(loads))
+        load, target = heapq.heappop(loads)
         bins[target].append(split)
-        loads[target] += split.size
+        heapq.heappush(loads, (load + split.size, target))
     return [tuple(b) for b in bins if b]
 
 
@@ -629,7 +1491,7 @@ def DeltaSwampDatasource(plan: ScanPlan) -> Any:
         ) -> list[Any]:
             # An empty plan still gets one task, so the dataset has a schema
             # rather than none at all.
-            groups = self._plan.partitions(parallelism) or [()]
+            groups = self._plan.partitions(max(1, int(parallelism))) or [()]
             tasks = []
             for group in groups:
                 # Each task carries only its own splits: closing over the whole
@@ -659,6 +1521,16 @@ def DeltaSwampDatasource(plan: ScanPlan) -> Any:
                         # A file vacuumed since planning: name it, not OSError.
                         where = getattr(plan.table, "location", None) or "the table"
                         reader = TranslatingStream(stream, f"{where} (a Ray read task)")
+                    paths = getattr(plan, "variant_paths", ())
+                    if paths:
+                        from deltaswamp._variant import json_text_stream
+
+                        reader = json_text_stream(reader, frozenset(paths))
+                    intervals = getattr(plan, "interval_paths", ())
+                    if intervals:
+                        from deltaswamp.engine.intervals import interval_stream
+
+                        reader = interval_stream(reader, {g: frozenset(p) for g, p in intervals})
                     produced = False
                     for batch in reader:
                         if batch.num_rows:

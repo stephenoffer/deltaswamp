@@ -280,35 +280,46 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _Y,
             _Y,
             "kernel is nominally Supported but fails any write when invariants are "
-            "actually present in the schema; route those writes to delta-rs",
+            "actually present in the schema; appends and overwrites here evaluate them "
+            "in DuckDB (as CHECK constraints) and commit past the refusal; other writes "
+            "go to delta-rs",
         ),
         _row(
             TableFeature.CHECK_CONSTRAINTS,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _Y,
-            "delta-rs is ahead of kernel here: add_constraint/drop_constraint exist",
+            "delta-kernel refuses every write to a table with the feature; the kernel "
+            "paths here evaluate each constraint in DuckDB over the rows they write and "
+            "commit past the refusal, and checkpoint and checksum it past the refusal too "
+            "(they write no rows), with the real protocol in the files",
         ),
         _row(TableFeature.CHANGE_DATA_FEED, _W, _Y, _Y, _Y, _Y),
         _row(
             TableFeature.GENERATED_COLUMNS,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _Y,
-            "delta-rs evaluates generated columns via DataFusion; kernel refuses to write",
+            "delta-rs evaluates generated columns via DataFusion; kernel refuses to write. "
+            "Appends and overwrites here (distributed ones included) compute a left-out "
+            "generated column in DuckDB and check a given one, and commit past the "
+            "refusal; DML goes to delta-rs",
         ),
         _row(
             TableFeature.IDENTITY_COLUMNS,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _N,
-            "delta-rs has the enum variant but it is commented out of writer_features",
+            "delta-rs has the enum variant but it is commented out of writer_features. "
+            "Appends and overwrites here generate values above the high-water mark, "
+            "moved in the same commit (a distributed write reserves a block when it is "
+            "planned); DML goes to the warehouse",
             "delta-rs#3249",
         ),
         _row(TableFeature.IN_COMMIT_TIMESTAMP, _W, _Y, _Y, _Y, _N, "", "delta-rs#3253"),
@@ -457,8 +468,9 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             "reads unshredded files only. Databricks enables shredding on every VARIANT "
             "table, but shreds a file only when its values share a shape, so nothing in "
-            "the log says which tables fail; the kernel reads eagerly and a shredded file "
-            "hands the read to the next engine",
+            "the log says which files fail; delta.enableVariantShredding keeps reads of "
+            "VARIANT columns off the direct engines, and a shredded file met anyway hands "
+            "the read to the next engine",
         ),
         _row(
             TableFeature.VARIANT_SHREDDING_PREVIEW,
@@ -469,8 +481,9 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             _N,
             "reads unshredded files only. Databricks enables shredding on every VARIANT "
             "table, but shreds a file only when its values share a shape, so nothing in "
-            "the log says which tables fail; the kernel reads eagerly and a shredded file "
-            "hands the read to the next engine",
+            "the log says which files fail; delta.enableVariantShredding keeps reads of "
+            "VARIANT columns off the direct engines, and a shredded file met anyway hands "
+            "the read to the next engine",
         ),
         # Both sit behind a kernel cargo feature this build does not
         # enable (see crates/native/Cargo.toml), so for *this* binary they are
@@ -518,12 +531,13 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             TableFeature.CHECKPOINT_PROTECTION,
             _W,
             _Y,
-            _N,
+            _P,
             _Y,
             _N,
-            "Databricks DBR 16.3, added when a table feature is dropped. Ignoring it "
-            "during metadata cleanup can delete the checkpoint that makes a downgraded "
-            "table readable.",
+            "Databricks DBR 16.3, added when a table feature is dropped. It binds only "
+            "metadata cleanup, which could otherwise delete the checkpoint that makes a "
+            "downgraded table readable: expired log cleanup refuses it, and every other "
+            "kernel write commits past the kernel's refusal of the Unknown feature",
             "delta-rs#4462",
         ),
         _row(
@@ -668,9 +682,9 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         _op(
             Operation.INCREMENTAL,
             (),
-            "reading only the files added since a version needs the kernel's "
-            "incremental_scan, which is not bound yet; Table.changes() follows the change "
-            "data feed instead",
+            "Table.changes() follows the change data feed, and is routed as cdf() is; "
+            "Table.added_since() reads the files the kernel's incremental scan lists, "
+            "and is routed as a scan",
         ),
         _op(
             Operation.HISTORY,
@@ -717,9 +731,10 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(
             Operation.MERGE_SCHEMA,
-            (_D, _S),
-            "kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH "
-            "SCHEMA EVOLUTION",
+            (_D, _K, _S),
+            "delta-rs first; the kernel for tables it cannot write or whose column mapping "
+            "it cannot extend, committing the rows and the widened schema together; the "
+            "warehouse uses INSERT WITH SCHEMA EVOLUTION",
         ),
         # --- dml: delta-rs (copy-on-write) or the kernel with deletion vectors.
         # On a table with deletion vectors enabled the router asks the kernel
@@ -729,21 +744,24 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
             (_D, _S, _K),
             "deletion vectors through the kernel when the table enables them; otherwise "
             "delta-rs copy-on-write, then the warehouse, and last a bounded whole-table "
-            "rewrite through the kernel",
+            "rewrite through the kernel (on a row-tracked table, a rewrite of the touched "
+            "files that keeps every row id)",
         ),
         _op(
             Operation.UPDATE,
             (_D, _S, _K),
             "deletion vectors plus new files through the kernel when the table enables "
             "them (row ids kept under row tracking); otherwise delta-rs, the warehouse, "
-            "and last a bounded whole-table rewrite, with literal or column assignments",
+            "and last a bounded whole-table rewrite (on a row-tracked table, a rewrite of "
+            "the touched files that keeps every row id), with literal or column assignments",
         ),
         _op(
             Operation.MERGE,
             (_D, _S, _K),
             "deletion vectors through the kernel, with clauses evaluated in DuckDB, when the "
             "table enables them; otherwise delta-rs, then the warehouse, which merges from "
-            "a source staged in a volume",
+            "a source staged in a volume, and last the kernel copy-on-write (touched files "
+            "rewritten; row ids kept under row tracking)",
         ),
         # --- ddl. The kernel rows are metadata-only commits this library writes
         # itself, for path tables delta-rs cannot alter or cannot express.
@@ -767,9 +785,9 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(
             Operation.ADD_CONSTRAINT,
-            (_D, _S),
-            "kernel marks checkConstraints NotSupported for writes, and adding one means "
-            "validating every existing row",
+            (_D, _K, _S),
+            "delta-rs first; the kernel path for tables delta-rs cannot write, after "
+            "checking every existing row in DuckDB",
         ),
         _op(Operation.DROP_CONSTRAINT, (_D, _K, _S), "a metadata-only change"),
         _op(
@@ -815,15 +833,46 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         # --- maintenance
         _op(
             Operation.OPTIMIZE,
-            (_D, _S),
-            "kernel has no OPTIMIZE; the warehouse runs it on managed and clustered tables",
+            (_K, _D, _S),
+            "the kernel commits a compaction on the snapshot it read, so a concurrent one "
+            "conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows "
+            "both compacted, so delta-rs hands it to the kernel. The warehouse runs it on "
+            "managed and clustered tables",
         ),
-        _op(Operation.ZORDER, (_D, _S), "kernel has no Z-ORDER"),
-        _op(Operation.VACUUM, (_D, _S), "kernel has no VACUUM"),
-        _op(Operation.RESTORE, (_D, _S), "kernel has no RESTORE"),
-        _op(Operation.REPAIR, (_D, _S), "kernel has no FSCK"),
+        _op(
+            Operation.ZORDER,
+            (_K, _D, _S),
+            "as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one",
+        ),
+        _op(
+            Operation.VACUUM,
+            (_D, _K, _S),
+            "delta-rs for tables it can commit to; the kernel's log replay for the rest "
+            "(clustering, row tracking, in-commit timestamps, type widening, "
+            "vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files "
+            "delta-rs cannot tell apart from orphans",
+        ),
+        _op(
+            Operation.RESTORE,
+            (_D, _K, _S),
+            "delta-rs for tables it can commit to; the kernel re-adds the target version's "
+            "files as logged (deletion vectors, row ids) on deletion-vector tables, which "
+            "delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write",
+        ),
+        _op(
+            Operation.REPAIR,
+            (_D, _K, _S),
+            "delta-rs for tables it can commit to; the kernel removes the missing files as "
+            "logged (row ids kept) on the rest",
+        ),
         _op(Operation.CONVERT, (_D,), "kernel has no CONVERT TO DELTA"),
-        _op(Operation.GENERATE, (_D,), "kernel has no manifest generation"),
+        _op(
+            Operation.GENERATE,
+            (_D, _K),
+            "delta-rs for tables it can open for writing; the kernel's file listing for the "
+            "rest (clustering, row tracking, in-commit timestamps, type widening, defaults). "
+            "Deletion vectors and column mapping are refused, as Spark refuses them",
+        ),
         _op(
             Operation.CHECKPOINT,
             (_D, _K),
@@ -837,14 +886,22 @@ OPERATION_ENGINES: dict[Operation, OperationSupport] = dict(
         ),
         _op(
             Operation.CLEANUP_METADATA,
-            (_D,),
-            "delta-rs removes log files older than delta.logRetentionDuration",
+            (_K, _D),
+            "the kernel deletes log files older than delta.logRetentionDuration below a "
+            "checkpoint every retained version reads from, by in-commit timestamps where the "
+            "table has them, v2 checkpoints' sidecars included; delta-rs where the kernel "
+            "cannot read the table",
         ),
         _op(
             Operation.PUBLISH, (_K,), "Snapshot::publish; only kernel implements staged->published"
         ),
         _op(Operation.REORG, (_S,), "Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM)"),
-        _op(Operation.CLONE, (_S,), "Databricks-only (shallow and deep CLONE)"),
+        _op(
+            Operation.CLONE,
+            (_K, _S),
+            "kernel: path table to a path (a raw version 0 over the source's files); "
+            "Databricks for catalog tables",
+        ),
         _op(
             Operation.ANALYZE,
             (_S,),
@@ -929,18 +986,22 @@ ENGINE_METHODS: dict[Operation, str] = {
 #:
 #: * delta-rs OPTIMIZE / Z-ORDER / ADD COLUMN raise "Column mapping is not
 #:   supported for write operation ..." on a column-mapped table.
-#: * the kernel's transaction refuses any commit carrying a remove on a table
-#:   whose row tracking is not suspended ("Remove actions are not yet
-#:   supported"), so a kernel OVERWRITE fails after staging the new data.
+#:
+#: (The kernel's transaction refuses every remove on a row-tracked table; its
+#: OVERWRITE there stages them by hand, and the kernel engine refuses it
+#: itself on a native build that cannot.)
 OPERATION_FEATURE_BLOCKERS: dict[tuple[Engine, Operation], frozenset[TableFeature]] = {
     (Engine.DELTARS, Operation.OPTIMIZE): frozenset({TableFeature.COLUMN_MAPPING}),
     (Engine.DELTARS, Operation.ZORDER): frozenset({TableFeature.COLUMN_MAPPING}),
     (Engine.DELTARS, Operation.ADD_COLUMN): frozenset({TableFeature.COLUMN_MAPPING}),
-    (Engine.KERNEL, Operation.OVERWRITE): frozenset({TableFeature.ROW_TRACKING}),
     # A symlink manifest lists whole Parquet files: readers of one would return
     # rows a deletion vector removed, and see physical column names. Spark
-    # refuses both; delta-rs writes the manifest regardless.
+    # refuses both; delta-rs writes the manifest regardless. The kernel's
+    # GENERATE refuses them itself too.
     (Engine.DELTARS, Operation.GENERATE): frozenset(
+        {TableFeature.DELETION_VECTORS, TableFeature.COLUMN_MAPPING}
+    ),
+    (Engine.KERNEL, Operation.GENERATE): frozenset(
         {TableFeature.DELETION_VECTORS, TableFeature.COLUMN_MAPPING}
     ),
 }
@@ -990,6 +1051,20 @@ UNIFORM_STALE_WRITES: frozenset[Operation] = frozenset(
 #: schema, and any writer feature it cannot write -- but supports() never
 #: checked, so CHECKPOINT was claimed and then failed.
 KERNEL_LOG_WRITE_OPERATIONS: frozenset[Operation] = frozenset({Operation.CHECKPOINT})
+
+#: Features that bind only the values of the rows a commit writes. A
+#: checkpoint writes none, and a build with "value_constrained_checkpoint"
+#: writes it from a snapshot whose checked protocol sets these aside (the
+#: checkpoint holds the table's own protocol, from the log): the kernel's
+#: refusal of them does not bind a KERNEL_LOG_WRITE_OPERATIONS operation.
+VALUE_CONSTRAINT_FEATURES: frozenset[TableFeature] = frozenset(
+    {
+        TableFeature.CHECK_CONSTRAINTS,
+        TableFeature.GENERATED_COLUMNS,
+        TableFeature.IDENTITY_COLUMNS,
+        TableFeature.INVARIANTS,
+    }
+)
 
 #: Features delta-rs may ignore for one operation, because that operation writes
 #: no commit and reads nothing the feature changes. delta-rs refuses to *commit*
@@ -1066,6 +1141,7 @@ METADATA_OPERATIONS: frozenset[Operation] = frozenset(
         Operation.SET_PROPERTIES,
         Operation.UNSET_PROPERTIES,
         Operation.ADD_FEATURE,
+        Operation.ADD_CONSTRAINT,
         Operation.DROP_CONSTRAINT,
         Operation.SET_COMMENT,
         Operation.SET_COLUMN_COMMENT,

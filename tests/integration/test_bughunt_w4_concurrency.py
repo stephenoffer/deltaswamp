@@ -141,16 +141,16 @@ def test_deltars_lost_race_is_a_commit_conflict_error(path: str, monkeypatch: An
     monkeypatch.setattr(
         DeltaRsEngine,
         "_open",
-        lambda self, table, *, version=None, write=False: stale
-        if write
-        else real(self, table, version=version, write=write),
+        lambda self, table, *, version=None, write=False: (
+            stale if write else real(self, table, version=version, write=write)
+        ),
     )
     with pytest.raises(CommitConflictError):
         t.delete("id = 2")
 
 
 def test_non_conflict_commit_failure_is_not_relabelled() -> None:
-    from deltaswamp.engine.deltars import _as_commit_conflict
+    from deltaswamp.engine.boundary import as_commit_conflict as _as_commit_conflict
 
     class CommitFailedError(Exception):
         pass
@@ -202,17 +202,30 @@ def _stale_write_open(monkeypatch: Any, stale: Any) -> None:
 def test_optimize_over_a_concurrent_optimize_does_not_duplicate_rows(
     tmp_path: Any, monkeypatch: Any
 ) -> None:
+    """A delta-rs connection's OPTIMIZE is committed by the kernel, which re-plans
+    after losing to another compaction; delta-rs's own commit (with a rollback
+    after the fact, since removed) left the rows twice wherever it ran."""
+    from deltaswamp.engine.kernel import KernelEngine
+
     p = str(tmp_path / "t")
     for i in range(4):
         deltalake.write_deltalake(p, _rows(1, i), mode="append")
     conn = _conn(Engine.DELTARS)
     t = conn.open_table(p)
-    stale = deltalake.DeltaTable(p)
-    deltalake.DeltaTable(p).optimize.compact()  # the other process wins
-    _stale_write_open(monkeypatch, stale)
-    with pytest.raises(CommitConflictError, match="rolled back"):
-        t.optimize()
+    real = KernelEngine._commit_compaction
+    fired: list[int] = []
+
+    def other_process_wins(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not fired:
+            fired.append(1)
+            deltalake.DeltaTable(p).optimize.compact()
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(KernelEngine, "_commit_compaction", other_process_wins)
+    result = t.optimize()
     monkeypatch.undo()
+    assert fired and result.engine == Engine.KERNEL
+    assert dict(result)["numFilesRemoved"] == 0
     assert _ids(conn, p) == [0, 1, 2, 3]
 
 
@@ -230,7 +243,9 @@ def test_overwrite_after_a_concurrent_optimize_conflicts(tmp_path: Any, monkeypa
     monkeypatch.setattr(
         deltalake,
         "write_deltalake",
-        lambda target, data, **kw: real(stale if isinstance(target, str) else target, data, **kw),
+        # The write opens the table and writes through it; the stale handle
+        # stands in for one opened before the compaction committed.
+        lambda target, data, **kw: real(stale, data, **kw),
     )
     with pytest.raises(CommitConflictError):
         t.overwrite(_rows(1, 9))
@@ -277,7 +292,10 @@ def test_forked_delta_rs_runtime_is_a_clear_error_and_rerouted(path: str, monkey
 
     monkeypatch.setattr(deltalake, "DeltaTable", forked)
     try:
-        engine = deltars.DeltaRsEngine()
+        from deltaswamp.capability import Engine as EngineKind
+        from deltaswamp.engine.boundary import guard
+
+        engine = guard(EngineKind.DELTARS, deltars.DeltaRsEngine())
         from deltaswamp.catalog.filesystem import FilesystemCatalog
         from deltaswamp.identity import parse_ref
 

@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "One Python connector for every Delta table: Unity Catalog managed and external, Hive Metastore, Glue, and plain object storage."
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Stephen Offer" }]
 keywords = ["delta", "delta-lake", "unity-catalog", "databricks", "lakehouse", "arrow"]
@@ -15,8 +16,13 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Database",
+    "Typing :: Typed",
 ]
 
 # Arrow leaves through the PyCapsule interface, so pyarrow is optional: Polars,
@@ -31,18 +37,19 @@ ray = ["ray[data]>=2.58.0"]
 sql = ["pyarrow>=17"]   # the warehouse fallback speaks the Statement Execution API via databricks-sdk
 hms = ["pymetastore>=0.4.0"]
 glue = ["boto3>=1.35"]
-iceberg = ["pyiceberg>=0.12.0"]             # managed Iceberg via the UC IRC endpoint
+iceberg = ["pyiceberg>=0.12.0", "pyarrow>=17"]   # managed Iceberg via the UC IRC endpoint; scans are Arrow
 sharing = ["delta-sharing>=1.4.1"]
-pyarrow = ["pyarrow>=17"]
-pandas = ["pandas>=2"]
-polars = ["polars>=1.39"]
+pyarrow = ["pyarrow>=17", "numpy>=1.23"]   # numpy: Z-ORDER interleaves column ranks
+# to_pandas/to_polars convert through a pyarrow Table.
+pandas = ["pandas>=2", "pyarrow>=17"]
+polars = ["polars>=1.39", "pyarrow>=17"]
 # pytz: DuckDB imports it to hand TIMESTAMP WITH TIME ZONE values to Python
 # (fetchall/fetchone), and fails "Required module 'pytz' failed to import"
 # on every tz-aware Delta timestamp column without it.
 duckdb = ["duckdb>=1.1", "pyarrow>=17", "pytz"]     # to_duckdb, Connection.sql
 daft = ["daft>=0.4"]
 all = [
-    "pyarrow>=17", "pandas>=2", "polars>=1.39", "duckdb>=1.1", "pytz",
+    "pyarrow>=17", "numpy>=1.23", "pandas>=2", "polars>=1.39", "duckdb>=1.1", "pytz",
     "pyiceberg>=0.12.0", "delta-sharing>=1.4.1", "boto3>=1.35", "pymetastore>=0.4.0",
 ]
 # databricks-connect is never a dependency: it pins requires-python ==3.12.*
@@ -87,7 +94,7 @@ warn_unreachable = true
 files = ["python/deltaswamp", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["deltalake.*", "databricks.*", "pyarrow.*", "ray.*", "pymetastore.*", "polars.*", "boto3.*", "pyiceberg.*", "delta_sharing.*", "duckdb.*", "daft.*"]
+module = ["numpy.*", "deltalake.*", "databricks.*", "pyarrow.*", "ray.*", "pymetastore.*", "polars.*", "boto3.*", "pyiceberg.*", "delta_sharing.*", "duckdb.*", "daft.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

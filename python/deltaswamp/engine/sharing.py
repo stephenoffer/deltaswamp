@@ -25,6 +25,7 @@ refused with a reason.
 
 from __future__ import annotations
 
+import http.client
 import importlib
 import itertools
 import json
@@ -49,9 +50,10 @@ from ..catalog.sharing import (
     load_profile,
     quote_name,
     request_error_types,
+    rest_client,
     sharing_module,
 )
-from ..errors import UnreachableTableError
+from ..errors import EngineLimitError, UnreachableTableError
 from .base import missing_method
 
 __all__ = [
@@ -80,6 +82,27 @@ CHANGE_TYPE, COMMIT_VERSION, COMMIT_TIMESTAMP = (
     "_commit_version",
     "_commit_timestamp",
 )
+
+
+def _delta_format_features(table: ResolvedTable) -> frozenset[str]:
+    """The features that make a parquet-format response unreadable as it stands.
+
+    Judged on what the table does, not only what its protocol lists. A
+    column-mapped table on the legacy protocol (reader 2, writer 5) lists no
+    reader features at all -- its mapping lives in ``delta.columnMapping.mode``
+    -- and its files hold physical names (``col-<uuid>``); read as parquet,
+    every column came back NULL.
+    """
+    found = set(_DELTA_FORMAT_FEATURES & table.effective_reader_features)
+    mode = str(table.properties.get("delta.columnMapping.mode", "")).strip().lower()
+    if mode in ("name", "id"):
+        found.add("columnMapping")
+    elif "columnMapping" not in table.reader_features:
+        # Reader version 2 implies column mapping is *supported*; with the
+        # mode off (or unset) the files carry logical names and parquet reads
+        # them, so the legacy version alone does not force the delta path.
+        found.discard("columnMapping")
+    return frozenset(found)
 
 
 def _pa() -> Any:
@@ -117,11 +140,23 @@ def filter_arrow_exact(table: Any, predicate: Any) -> Any:
     """
     if isinstance(predicate, _SandboxedSql):
         return _sandboxed_filter(table, predicate.text)
+    if isinstance(predicate, str):
+        try:
+            predicate_node = sqlpred.parse(predicate)
+        except sqlpred.PredicateError:
+            predicate_node = None
+        if predicate_node is not None:
+            # Parsed, so evaluated here: a comparison refused as not meaning
+            # what Spark means (`name = 1` on a STRING column) must stay
+            # refused, not be handed to DuckDB's different coercions.
+            return sqlpred.filter_table(table, predicate_node)
     try:
         return sqlpred.filter_table(table, predicate)
     except sqlpred.PredicateError:
         if not isinstance(predicate, str) or _duckdb() is None:
             raise
+        # DuckDB reads Spark SQL differently in places; respell it.
+        predicate = _duckdb_text(predicate)
         _screen_expression(predicate)
     return _sandboxed_filter(table, predicate)
 
@@ -135,6 +170,24 @@ class _SandboxedSql:
         self.text = text
 
 
+def _duckdb_text(predicate: str) -> str:
+    """Spark SQL `predicate` as DuckDB must read it to mean the same.
+
+    `"ab"` is a string in Spark, a column in DuckDB; `substring`, CAST, `/`
+    and the rest differ too (see `engine.dialect`). SQL DuckDB cannot be
+    made to evaluate as Spark does is refused rather than filtered wrongly.
+    """
+    predicate_module = importlib.import_module("deltaswamp.predicate")
+    dialect = importlib.import_module("deltaswamp.engine.dialect")
+    try:
+        text: str = dialect.to_duckdb(predicate)
+    except EngineLimitError as exc:
+        raise predicate_module.PredicateError(
+            f"cannot filter a shared table by {predicate!r}: {exc.reason}"
+        ) from None
+    return text
+
+
 def _duckdb() -> Any:
     try:
         return importlib.import_module("duckdb")
@@ -144,15 +197,85 @@ def _duckdb() -> Any:
 
 _SQL_LITERAL = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
 _OUTSIDE_EXPRESSION = re.compile(
-    r";|--|/\*|\*/|\b(?:select|from|with|pragma|set|attach|copy)\b", re.I
+    r";|--|/\*|\*/|\b(?:select|from|with|pragma|set|attach|copy)\b"
+    # The statements DuckDB also takes as a subquery, which open one: a
+    # column may be called `values`, but not directly after a parenthesis.
+    r"|\(\s*(?:values|pivot|unpivot|describe|show|summarize|table|call)\b",
+    re.I,
 )
+
+
+def _literal_end(text: str, start: int) -> int | None:
+    """Where the string literal DuckDB's tokenizer found at `start` ends, by DuckDB's rules."""
+    if text.startswith("$", start):
+        close = text.find("$", start + 1)
+        if close < 0:
+            return None
+        tag = text[start : close + 1]
+        end = text.find(tag, close + 1)
+        return None if end < 0 else end + len(tag)
+    escapes = text[start : start + 1] in ("e", "E")
+    quote_at = text.find("'", start)
+    if quote_at < 0 or quote_at - start > 1:
+        return None
+    i = quote_at + 1
+    while i < len(text):
+        if escapes and text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "'":
+            if text.startswith("'", i + 1):
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return None
+
+
+def _without_literals(text: str) -> str:
+    """`text` with every string literal replaced by ``0``, as DuckDB reads its literals.
+
+    A regular expression of Spark's quoting cannot know DuckDB's: a
+    dollar-quoted ``$$'$$`` or an escape string ``e'a\\''`` hid a quote, and
+    with it a subquery, from the screen while DuckDB ran it. DuckDB's own
+    tokenizer says where each literal starts; any doubt refuses.
+    """
+    predicate_module = importlib.import_module("deltaswamp.predicate")
+    duckdb = _duckdb()
+    tokenize = getattr(duckdb, "tokenize", None)
+    if tokenize is None:
+        return _SQL_LITERAL.sub(" 0 ", text)
+    try:
+        tokens = tokenize(text)
+    except Exception as exc:
+        raise predicate_module.PredicateError(
+            f"cannot read the predicate {text!r}: {exc}"
+        ) from None
+    string = getattr(getattr(duckdb, "token_type", None), "string_const", None)
+    out, pos = [], 0
+    starts = [start for start, _ in tokens]
+    for index, (start, kind) in enumerate(tokens):
+        if kind != string:
+            continue
+        end = _literal_end(text, start)
+        following = starts[index + 1] if index + 1 < len(starts) else len(text)
+        if end is None or end > following:
+            raise predicate_module.PredicateError(
+                f"cannot tell where a string literal ends in the predicate {text!r}"
+            )
+        out += [text[pos:start], " 0 "]
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _screen_expression(text: str) -> None:
     """Refuse text that could be more than one boolean expression over the row."""
     predicate_module = importlib.import_module("deltaswamp.predicate")
-    bare = _SQL_LITERAL.sub(" 0 ", text)
-    if "'" in bare or '"' in bare:
+    bare = _without_literals(text)
+    # Double-quoted names are identifiers to DuckDB, and hide nothing.
+    bare = re.sub(r"\"(?:[^\"]|\"\")*\"", " x ", bare)
+    if "'" in bare or '"' in bare or "$" in bare:
         raise predicate_module.PredicateError(f"unbalanced quotes in predicate {text!r}")
     found = _OUTSIDE_EXPRESSION.search(bare)
     if found is not None:
@@ -173,6 +296,7 @@ def _sandboxed_filter(table: Any, text: str) -> Any:
         )
     if table.num_rows == 0:
         return table
+    duckfilter = importlib.import_module("deltaswamp.engine.duckfilter")
     con = duckdb.connect(
         ":memory:",
         config={
@@ -180,11 +304,16 @@ def _sandboxed_filter(table: Any, text: str) -> Any:
             "autoinstall_known_extensions": False,
             "autoload_known_extensions": False,
             "lock_configuration": True,
+            # Evaluated as Spark does: overflow raises, FLOAT compares as DOUBLE.
+            **duckfilter.SPARK_CONFIG,
         },
     )
+    widened = duckfilter.spark_widened(table.schema)
+    rows = table.cast(widened) if widened is not None else table
     try:
+        importlib.import_module("deltaswamp.engine.dialect").install_duckdb_macros(con)
         # The relational API parses an expression list, never a statement.
-        result = con.from_arrow(table).project(f"CAST(({text}) AS BOOLEAN) AS __deltaswamp_keep")
+        result = con.from_arrow(rows).project(f"CAST(({text}) AS BOOLEAN) AS __deltaswamp_keep")
         result = result.arrow()
         if isinstance(result, pa.RecordBatchReader):
             result = result.read_all()
@@ -214,6 +343,8 @@ def _parse_predicate(predicate: str | None) -> Any:
     except predicate_module.PredicateError:
         if _duckdb() is None:
             raise
+        # DuckDB reads Spark SQL differently in places; respell it.
+        predicate = _duckdb_text(predicate)
         _screen_expression(predicate)
         return _SandboxedSql(predicate)
 
@@ -648,6 +779,81 @@ class _ExpiredUrlError(UnreachableTableError):
 _EXPIRED_STATUSES = frozenset({400, 401, 403})
 
 
+#: Opt-in for presigned URLs on plain http or on private, loopback and
+#: link-local addresses: a local sharing server in development or a test.
+ALLOW_PRIVATE_URLS_ENV = "DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS"
+
+
+def _private_urls_allowed() -> bool:
+    return os.environ.get(ALLOW_PRIVATE_URLS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _public_address(host: str) -> bool:
+    """Whether `host` (an IP literal) is a public unicast address."""
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return True  # a name: judged by the address it connects to
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return bool(address.is_global) and not address.is_multicast
+
+
+def _refuse_private_peer(sock: Any, host: str) -> None:
+    peer = sock.getpeername()[0]
+    if _public_address(peer) or _private_urls_allowed():
+        return
+    sock.close()
+    raise UnreachableTableError(
+        "read a shared data file",
+        f"the presigned URL's host {host} resolves to {peer}, a private, loopback or "
+        "link-local address; a sharing server's presigned URLs point at public object "
+        "storage",
+        f"set {ALLOW_PRIVATE_URLS_ENV}=1 for a sharing server on a private network",
+    )
+
+
+class _GuardedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        if not getattr(self, "_tunnel_host", None):
+            _refuse_private_peer(self.sock, self.host)
+
+
+class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        super().connect()
+        if not getattr(self, "_tunnel_host", None):
+            _refuse_private_peer(self.sock, self.host)
+
+
+class _GuardedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: Any) -> Any:
+        if req.has_proxy():
+            return super().http_open(req)  # the proxy resolves the name
+        return self.do_open(_GuardedHTTPConnection, req)
+
+
+class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: Any) -> Any:
+        if getattr(req, "_tunnel_host", None):
+            return super().https_open(req)
+        return self.do_open(_GuardedHTTPSConnection, req, context=getattr(self, "_context", None))
+
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    """Every redirect hop meets the rules the first URL did."""
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Any:
+        SharingEngine._check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class _UrlBook:
     """Presigned URLs by file key, re-issued by a fresh query when they expire.
 
@@ -701,11 +907,21 @@ class SharingEngine:
     supports_writer_properties = False
     supports_dynamic_overwrite = False
 
-    def __init__(self, *, request_timeout: float = 300.0, num_retries: int = 10) -> None:
+    def __init__(
+        self,
+        *,
+        request_timeout: float = 300.0,
+        num_retries: int = 10,
+        proxy_url: str | None = None,
+    ) -> None:
         """`request_timeout` bounds each presigned-file download, in seconds.
-        `num_retries` is passed to the client, which retries 429s and 5xxs."""
+        `num_retries` is passed to the client, which retries 429s and 5xxs.
+        `proxy_url` routes the downloads through a proxy (connect() passes the
+        connection's storage_options proxy_url, which the other engines'
+        object stores honour); without it the environment's proxy applies."""
         self._timeout = request_timeout
         self._num_retries = num_retries
+        self._proxy_url = proxy_url
 
     # ----------------------------------------------------------- capabilities
 
@@ -782,17 +998,63 @@ class SharingEngine:
                 operation,
                 ok=False,
                 reason="the table uses "
-                + ", ".join(sorted(_DELTA_FORMAT_FEATURES & table.reader_features))
+                + ", ".join(sorted(_delta_format_features(table)))
                 + ", which Delta Sharing serves only as Delta log actions, and the kernel "
                 "wrapper that replays them is not installed",
                 remedy="pip install delta-kernel-rust-sharing-wrapper",
             )
 
+        if (
+            operation is Operation.CDF
+            and table.table_id is not None
+            and str(
+                table.properties.get("delta.enableChangeDataFeed")
+                # Servers answering in parquet format drop the "delta."
+                # prefix; the official client accepts either key.
+                or table.properties.get("enableChangeDataFeed", "")
+            )
+            .strip()
+            .lower()
+            != "true"
+        ):
+            # The metadata the share served says so before any call: the
+            # server answered the query with an HTTP 400 while can() said ok.
+            return Capability(
+                operation,
+                ok=False,
+                reason="the shared table does not have change data feed enabled "
+                "(delta.enableChangeDataFeed is not true in the metadata the share serves), "
+                "so the server has no changes to serve",
+                remedy="ask the provider to set delta.enableChangeDataFeed=true on the table "
+                "and share it WITH HISTORY; changes are recorded from then on",
+            )
+        if operation in (Operation.TIME_TRAVEL, Operation.CDF):
+            # Whether the table was shared WITH HISTORY is the provider's
+            # setting, and no endpoint reports it before the query; so is a
+            # server's own limit on protocols it can replay. ok, with the
+            # dependency said, rather than a promise the server may break.
+            return Capability(
+                operation,
+                ok=True,
+                engine=self.kind,
+                reason="depends on the provider: the server serves earlier versions and "
+                "changes only for a table shared WITH HISTORY, and refuses otherwise",
+            )
+        if self._needs_delta_format(table) and operation is not Operation.DETAIL:
+            return Capability(
+                operation,
+                ok=True,
+                engine=self.kind,
+                reason="depends on the server: the table uses "
+                + ", ".join(sorted(_delta_format_features(table)))
+                + ", which only a server that answers in delta format can serve (the "
+                "open-source reference server refuses such tables)",
+            )
         return Capability(operation, ok=True, engine=self.kind)
 
     @staticmethod
     def _needs_delta_format(table: ResolvedTable) -> bool:
-        return bool(_DELTA_FORMAT_FEATURES & table.reader_features)
+        return bool(_delta_format_features(table))
 
     # --------------------------------------------------------------- plumbing
 
@@ -801,10 +1063,7 @@ class SharingEngine:
             raise UnreachableTableError(
                 "read the table through Delta Sharing", "it carries no sharing profile"
             )
-        rest = sharing_module("delta_sharing.rest_client")
-        return rest.DataSharingRestClient(
-            load_profile(table.sharing_profile), num_retries=self._num_retries
-        )
+        return rest_client(load_profile(table.sharing_profile), num_retries=self._num_retries)
 
     @staticmethod
     def _shared(table: ResolvedTable) -> Any:
@@ -852,7 +1111,32 @@ class SharingEngine:
 
     @staticmethod
     def _check_url(url: str) -> None:
-        scheme = urlparse(url).scheme.lower()
+        """Refuse a presigned URL this process must not fetch.
+
+        The server chooses these URLs, and this process fetches them with its
+        own network position: an http:// URL to 127.0.0.1 or 169.254.169.254
+        reached internal services and cloud metadata (SSRF). So a URL is
+        https, to a host that is not an IP literal outside public unicast;
+        the address a name resolves to is checked when it connects
+        (`_GuardedHTTPSConnection`), and so is every redirect hop. A local
+        development server opts in with ``DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS=1``.
+        """
+        parts = urlparse(url)
+        scheme = parts.scheme.lower()
+        if scheme == "http" and not _private_urls_allowed():
+            raise UnreachableTableError(
+                "read a shared data file",
+                "the sharing server issued a plain http:// URL, which anyone on the network "
+                "path can read or alter; presigned URLs are https",
+                f"set {ALLOW_PRIVATE_URLS_ENV}=1 for a local development server",
+            )
+        if parts.hostname and not _public_address(parts.hostname) and not _private_urls_allowed():
+            raise UnreachableTableError(
+                "read a shared data file",
+                f"the sharing server issued a URL to {parts.hostname}, a private, loopback or "
+                "link-local address, not to public object storage",
+                f"set {ALLOW_PRIVATE_URLS_ENV}=1 for a sharing server on a private network",
+            )
         if scheme not in ("https", "http"):
             # A presigned URL is always HTTP(S); anything else (file://, ftp://)
             # from a server would make this process read local or foreign
@@ -862,6 +1146,64 @@ class SharingEngine:
                 f"the sharing server issued a {scheme or 'relative'!s} URL, not an HTTP(S) "
                 "presigned URL",
             )
+        if not parts.hostname:
+            raise UnreachableTableError(
+                "read a shared data file",
+                "the sharing server issued an HTTP(S) URL with no host, not a presigned URL",
+            )
+
+    def _localize(self, actions: list[dict[str, Any]], root: Path, what: str) -> None:
+        """Download every file the actions name into `root`, and point them there.
+
+        The kernel wrapper resolves a delta response's paths itself, and it
+        takes an https URL without a signature-looking query for a path on
+        this machine: ``https://attacker.example/etc/secret.parquet`` read
+        the local /etc/secret.parquet. So it is never handed a server's URL.
+        Each is fetched here, over HTTP(S) only, and the log it replays names
+        the downloaded copies.
+        """
+        targets: list[tuple[dict[str, Any], str]] = []
+        for action in actions:
+            for kind in ("add", "remove", "cdc"):
+                body = action.get(kind)
+                if not isinstance(body, dict):
+                    continue
+                if body.get("path") is not None:
+                    targets.append((body, "path"))
+                dv = body.get("deletionVector")
+                if isinstance(dv, dict) and dv.get("storageType") == "p":
+                    targets.append((dv, "pathOrInlineDv"))
+        if not targets:
+            return
+        files = root / "files"
+        files.mkdir()
+        urls = sorted({str(holder[key]) for holder, key in targets})
+        for url in urls:
+            self._check_url(url)
+        local = {
+            url: files / f"{i:06d}{Path(urlparse(url).path).suffix[:16]}"
+            for i, url in enumerate(urls)
+        }
+
+        sizes: dict[str, int] = {}
+
+        def fetch(url: str) -> None:
+            payload = self._download(url)
+            local[url].write_bytes(payload)
+            sizes[url] = len(payload)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
+            for done in [pool.submit(fetch, url) for url in urls]:
+                done.result()
+        for holder, key in targets:
+            url = str(holder[key])
+            holder[key] = local[url].as_uri()
+            if key == "path" and "size" in holder:
+                # The kernel seeks the footer from the recorded size, so it
+                # must be the size of the copy it reads.
+                holder["size"] = sizes[url]
 
     @classmethod
     def _check_action_urls(cls, action: dict[str, Any]) -> None:
@@ -876,10 +1218,18 @@ class SharingEngine:
             if isinstance(dv, dict) and dv.get("storageType") == "p":
                 cls._check_url(str(dv.get("pathOrInlineDv", "")))
 
+    def _urlopen(self, url: str) -> Any:
+        handlers: list[Any] = [_GuardedHTTPHandler(), _GuardedHTTPSHandler(), _CheckedRedirect()]
+        if self._proxy_url:
+            handlers.append(
+                urllib.request.ProxyHandler({"http": self._proxy_url, "https": self._proxy_url})
+            )
+        return urllib.request.build_opener(*handlers).open(url, timeout=self._timeout)
+
     def _download(self, url: str) -> bytes:
         self._check_url(url)
         try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as response:
+            with self._urlopen(url) as response:
                 body: bytes = response.read()
                 return body
         except urllib.error.HTTPError as exc:
@@ -906,7 +1256,13 @@ class SharingEngine:
         *,
         key: Any = None,
         book: _UrlBook | None = None,
+        known: frozenset[str] | None = None,
     ) -> Any:
+        """One shared data file, conformed to `schema`.
+
+        `known` is every column of the table (lowercased), where `schema` is a
+        projection of it.
+        """
         parquet = importlib.import_module("pyarrow.parquet")
         pa = _pa()
         current = book.url(key, url) if book is not None else url
@@ -920,6 +1276,22 @@ class SharingEngine:
         source = pa.BufferReader(payload)
         file_names = parquet.ParquetFile(source).schema_arrow.names
         wanted = {f.name.lower() for f in schema}
+        stored = (known if known is not None else frozenset(wanted)) - {
+            str(k).lower() for k in (partition_values or {})
+        }
+        if file_names and stored and not any(name.lower() in stored for name in file_names):
+            # A column-mapped file names its columns physically (col-<uuid>).
+            # Conforming it to the logical schema null-filled every column, a
+            # wrong answer the caller could not tell from a table of NULLs.
+            raise UnreachableTableError(
+                "read a shared data file",
+                "the file holds none of the table's columns (it has "
+                f"{', '.join(file_names[:4])}{', ...' if len(file_names) > 4 else ''}): its "
+                "columns are physically named, as column mapping writes them, and a parquet "
+                "response cannot be mapped back to the logical names",
+                "the provider's server must answer in delta format for this table "
+                "(responseFormat=delta), which needs delta-kernel-rust-sharing-wrapper here",
+            )
         present = [name for name in file_names if name.lower() in wanted]
         source.seek(0)
         data = parquet.read_table(source, columns=present)
@@ -1016,6 +1388,7 @@ class SharingEngine:
         out = _project(full, columns)
         # The predicate may reference columns the caller did not ask for.
         read = full if predicate else out
+        known = frozenset(name.lower() for name in full.names)
         files = list(response.add_files)
         # Checked before streaming: an error raised inside the stream reaches
         # the caller only as pyarrow's ArrowInvalid.
@@ -1050,7 +1423,12 @@ class SharingEngine:
                 if remaining is not None and remaining <= 0:
                     return
                 rows = self._read_file(
-                    f.url, dict(f.partition_values or {}), read, key=f.id, book=book
+                    f.url,
+                    dict(f.partition_values or {}),
+                    read,
+                    key=f.id,
+                    book=book,
+                    known=known,
                 )
                 if node is not None:
                     rows = filter_arrow_exact(rows, node).select(out.names)
@@ -1100,6 +1478,8 @@ class SharingEngine:
         with tempfile.TemporaryDirectory(prefix="deltaswamp-sharing-") as root:
             log = Path(root) / "_delta_log"
             log.mkdir()
+            if check_urls:
+                self._localize(actions, Path(root), what)
             with (log / f"{0:020d}.json").open("w") as out:
                 out.write(json.dumps({"protocol": protocol}) + "\n")
                 out.write(json.dumps({"metaData": metadata}) + "\n")
@@ -1449,6 +1829,10 @@ class SharingEngine:
         with tempfile.TemporaryDirectory(prefix="deltaswamp-sharing-cdf-") as root:
             log = Path(root) / "_delta_log"
             log.mkdir()
+            if check_urls:
+                self._localize(
+                    [action for group in actions.values() for action in group], Path(root), what
+                )
             for version in range(first, last + 1):
                 path = log / f"{version:020d}.json"
                 with path.open("w") as out:

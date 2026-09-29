@@ -92,16 +92,25 @@ def test_positive_decimal_partitions_still_route_to_deltars(tmp_path: Path) -> N
     )
 
 
-def test_merge_negative_decimal_partition_refused_before_commit(tmp_path: Path) -> None:
+def test_merge_negative_decimal_partition_goes_to_the_kernel(tmp_path: Path) -> None:
+    # delta-rs would serialize -1.50 as "-1.-50"; the kernel's copy-on-write
+    # MERGE writes the partition value right.
+    _need_native()
     path = str(tmp_path / "t")
     conn = ds.connect()
     t = conn.write_table(path, pa.table({"p": _dec("2.25"), "v": [1]}), partition_by=["p"])
     source = pa.table({"p": _dec("-1.50"), "v": [2]})
-    with pytest.raises(errors.DeltaSwampError, match="negative_decimal_partition_values"):
+    result = (
         t.merge(source, "s.v = t.v", source_alias="s", target_alias="t")
-    # Nothing was committed, and the table still reads.
-    assert conn.table(path).version == 1
-    assert conn.table(path).count() == 1
+        .when_not_matched_insert_all()
+        .execute()
+    )
+    assert result.engine == "kernel"
+    assert "-1.-50" not in {pv["p"] for pv in _partition_values(path)}
+    assert sorted(conn.table(path).to_arrow().column("p").to_pylist()) == [
+        Decimal("-1.50"),
+        Decimal("2.25"),
+    ]
 
 
 def test_update_to_negative_decimal_partition_is_not_corrupted(tmp_path: Path) -> None:
@@ -459,14 +468,15 @@ def test_merge_insert_computes_generated_columns(tmp_path: Path) -> None:
     assert _by_id(t)[-1] == {"id": 3, "v": 1, "g": 6, "h": 4}
 
 
-def test_merge_generated_recompute_without_target_alias_is_refused(tmp_path: Path) -> None:
+def test_merge_generated_recompute_with_the_default_target_alias(tmp_path: Path) -> None:
+    # The target alias defaults to `target`, as on the kernel and the
+    # warehouse, so the generated columns can be recomputed without one.
     t = _generated_merge(tmp_path)
-    merger = t.merge(pa.table({"id": [2], "v": [5]}), "source.id = id", source_alias="source")
-    with pytest.raises(errors.InvalidArgumentError, match="target_alias"):
-        merger.when_matched_update(updates={"id": "source.id + 1"})
+    merger = t.merge(pa.table({"id": [2], "v": [5]}), "source.id = target.id")
+    merger.when_matched_update(updates={"id": "source.id + 1"}).execute()
     assert _by_id(t) == [
         {"id": 1, "v": 10, "g": 2, "h": 11},
-        {"id": 2, "v": 20, "g": 4, "h": 22},
+        {"id": 3, "v": 20, "g": 6, "h": 23},
     ]
 
 
@@ -490,7 +500,9 @@ def _vacuumed(tmp_path: Path) -> str:
     [
         lambda t: t.to_arrow(),
         lambda t: t.to_pandas(),
-        lambda t: t.count(),
+        # A predicate on a data column: a plain count() is answered from the
+        # log's numRecords without opening a data file.
+        lambda t: t.count(predicate="id >= 0"),
         lambda t: t.head(1),
         lambda t: list(t.scan()),
         lambda t: t.scan().read_all(),

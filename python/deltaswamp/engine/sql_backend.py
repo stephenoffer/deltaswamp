@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .._util import enum_value
-from ..errors import DeltaSwampError
+from ..errors import DeltaSwampError, PreflightError
 
 __all__ = [
     "ParameterBinder",
@@ -73,6 +73,83 @@ class SqlStatementError(DeltaSwampError):
             if v
         )
         super().__init__(f"{message} ({detail})" if detail else message)
+
+
+class SqlPermissionError(SqlStatementError, PreflightError):
+    """The warehouse refused a statement for a privilege the caller lacks.
+
+    Still a `SqlStatementError` (its codes and statement id are the
+    server's), and a `PreflightError`: a grant is missing, which no retry or
+    other engine fixes. `privilege` and `securable` name it where the
+    server's message does; `remedy` says what to ask for.
+    """
+
+    privilege: str | None = None
+    securable: str | None = None
+    remedy: str | None = None
+
+
+_PRIVILEGE = re.compile(
+    r"does not have ([A-Z][A-Z _]*?) (?:privilege )?on (\w+) "
+    r"(?:'([^']+)'|`([^`]+)`|(\S+?))(?:[.\s]|$)",
+    re.IGNORECASE,
+)
+
+
+def permission_error(exc: SqlStatementError) -> SqlPermissionError | None:
+    """`exc` as a SqlPermissionError when the server refused it for a privilege."""
+    code = str(exc.error_code or "").upper()
+    if (
+        exc.sql_state != "42501"
+        and "PERMISSION_DENIED" not in code
+        and "PERMISSION_DENIED" not in str(exc)
+    ):
+        return None
+    match = _PRIVILEGE.search(str(exc))
+    if match is not None:
+        privilege, kind = match.group(1).upper(), match.group(2).upper()
+        name = match.group(3) or match.group(4) or match.group(5)
+        remedy = f"ask an owner of {name} to GRANT {privilege} ON {kind} {name} TO you"
+    else:
+        privilege = kind = name = None
+        remedy = "ask the object's owner for the privilege the message names"
+    error = SqlPermissionError(
+        f"the warehouse refused the statement for a missing privilege: {exc}; {remedy}",
+        statement_id=exc.statement_id,
+        error_code=exc.error_code,
+        sql_state=exc.sql_state,
+        state=exc.state,
+    )
+    error.privilege, error.securable, error.remedy = privilege, name, remedy
+    return error
+
+
+def sdk_error(exc: Exception, where: str) -> DeltaSwampError:
+    """A databricks-sdk error from the warehouse path, as a DeltaSwampError.
+
+    The SDK's own NotFound / PermissionDenied escaped raw from a mistyped
+    warehouse id, a missing staging volume or a bad token, though every
+    public error is documented to be a DeltaSwampError.
+    """
+    from ..credentials.databricks import _error_kind
+    from ..errors import CredentialError, PreflightError, UnreachableTableError
+
+    kind = _error_kind(exc)
+    if kind == "unauthenticated":
+        return CredentialError(
+            f"{where} rejected the Databricks credentials (expired or invalid token, "
+            f"or the wrong workspace host): {exc}"
+        )
+    if kind == "not_found":
+        return UnreachableTableError(
+            f"use {where}",
+            f"it does not exist, or is not visible to this principal: {exc}",
+            "check the warehouse_id= / staging_volume= passed to ds.connect()",
+        )
+    if kind == "denied":
+        return PreflightError(f"access to {where} was denied: {exc}")
+    code = str(getattr(exc, "error_code", "") or "") or None
+    return SqlStatementError(f"{where} failed: {type(exc).__name__}: {exc}", error_code=code)
 
 
 class _DownloadError(SqlStatementError):
@@ -283,15 +360,20 @@ class SdkStatementBackend:
         # The deadline starts before the first call: that call itself blocks
         # for up to `wait_timeout`, which must not outlast `timeout`.
         deadline = None if self._timeout is None else self._clock() + self._timeout
-        response = api.execute_statement(
-            statement=statement,
-            warehouse_id=self._warehouse_id,
-            format=Format.ARROW_STREAM,
-            disposition=Disposition.EXTERNAL_LINKS,
-            wait_timeout=_bounded_wait(self._wait_timeout, self._timeout),
-            on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE,
-            parameters=items or None,
-        )
+        try:
+            response = api.execute_statement(
+                statement=statement,
+                warehouse_id=self._warehouse_id,
+                format=Format.ARROW_STREAM,
+                disposition=Disposition.EXTERNAL_LINKS,
+                wait_timeout=_bounded_wait(self._wait_timeout, self._timeout),
+                on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE,
+                parameters=items or None,
+            )
+        except DeltaSwampError:
+            raise
+        except Exception as exc:
+            raise sdk_error(exc, f"warehouse {self._warehouse_id}") from exc
         statement_id = getattr(response, "statement_id", None)
         try:
             response = self._wait(response, deadline)
@@ -299,10 +381,12 @@ class SdkStatementBackend:
             if exc.state not in _TERMINAL:
                 self._cancel(statement_id)
             raise
-        except BaseException:
+        except BaseException as exc:
             # Ctrl-C, a failed poll, anything: the statement must not be left
             # running on the warehouse (and billing) after we stop watching it.
             self._cancel(statement_id)
+            if isinstance(exc, Exception) and not isinstance(exc, DeltaSwampError):
+                raise sdk_error(exc, f"warehouse {self._warehouse_id}") from exc
             raise
         if not fetch:
             return None
@@ -423,7 +507,10 @@ class SdkStatementBackend:
 
         if schema is None:
             schema = _schema_from_manifest(manifest)
-        table = pa.Table.from_batches(batches, schema=schema)
+        if any(str(f.type) == "month_interval" for f in schema):
+            table = _year_month_text(schema, batches, manifest)
+        else:
+            table = pa.Table.from_batches(batches, schema=schema)
         expected = getattr(manifest, "total_row_count", None)
         if isinstance(expected, int) and table.num_rows != expected:
             raise SqlStatementError(
@@ -658,7 +745,7 @@ class _TypeParser:
                 units.append(self.take().upper())
             if units and all(u in _DAY_TIME_UNITS or u == "TO" for u in units):
                 return pa.duration("us")
-            return pa.string()  # YEAR-MONTH: no pyarrow factory; the warehouse sends text
+            return pa.string()  # YEAR-MONTH: read as text (`intervals.month_interval_text`)
         factory = _TYPE_NAMES.get(word)
         if factory is not None:
             return getattr(pa, factory)()
@@ -672,6 +759,26 @@ class _TypeParser:
                 if depth == 0:
                     break
         return pa.string()
+
+
+def _year_month_text(schema: Any, batches: list[Any], manifest: Any) -> Any:
+    """A result's year-month intervals as the text a direct read gives.
+
+    The warehouse sends them as Arrow's ``month_interval``, which pyarrow
+    cannot convert to Python, pandas, polars or Parquet (a bare KeyError).
+    The manifest's ``type_text`` names each column's qualifier.
+    """
+    import pyarrow as pa
+
+    from .intervals import month_interval_text
+
+    qualifiers = {}
+    columns = getattr(getattr(manifest, "schema", None), "columns", None) or []
+    for column in columns:
+        text = " ".join(str(getattr(column, "type_text", None) or "").upper().split())
+        if text.startswith("INTERVAL "):
+            qualifiers[str(column.name)] = text[len("INTERVAL ") :]
+    return month_interval_text(pa, schema, batches, qualifiers)
 
 
 def _schema_from_manifest(manifest: Any) -> Any:

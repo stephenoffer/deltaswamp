@@ -301,9 +301,17 @@ class TestCatalogManagedWithoutDatabricks:
         managed.table("main.sales.dml").update({"c": "'q'"}, predicate="id = 1")
         assert (1, "q") in self.rows(managed)
 
-    def test_arbitrary_expressions_are_refused(self, managed: Any) -> None:
-        with pytest.raises(Exception, match="only a literal or a column"):
-            managed.table("main.sales.dml").update({"id": "id + 1"})
+    def test_arbitrary_expressions(self, managed: Any) -> None:
+        # The kernel evaluates them itself (DuckDB, in Spark's dialect); what
+        # the dialect cannot translate faithfully is refused by the router,
+        # before the call, since delta-rs cannot open a catalog-managed table.
+        table = managed.table("main.sales.dml")
+        assert table.update({"c": "upper(c) || '!'"}, predicate="id % 2 = 1").engine == "kernel"
+        assert self.rows(managed) == [(1, "A!"), (2, "b"), (3, "C!"), (None, "d")]
+        managed.table("main.sales.dml").update({"c": "lower(substring(c, 1, 1))"})
+        assert self.rows(managed) == [(1, "a"), (2, "b"), (3, "c"), (None, "d")]
+        with pytest.raises(Exception, match="kernel: does not support"):
+            managed.table("main.sales.dml").update({"c": "split(c, ',')[0]"})
 
     def test_replace_where(self, managed: Any) -> None:
         managed.table("main.sales.dml").overwrite(

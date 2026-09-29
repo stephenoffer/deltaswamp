@@ -6,19 +6,33 @@
 //! its own (forked) build of the kernel.
 
 mod changes;
+mod checksum;
 mod commit;
+mod commit_time;
+mod confine;
+mod credential_slot;
 mod dml;
 mod error;
 mod files;
 mod functions;
+mod landed;
+mod logclean;
+mod manifest;
 mod partition;
+mod pending;
 mod predicate;
+mod rebase;
+mod restate;
 mod runtime;
 mod scan;
 mod snapshot;
 mod store;
+mod vacuum;
+mod writer;
 
 pub use error::{NativeError, Result};
+
+use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
@@ -54,6 +68,7 @@ pub const FEATURES: &[&str] = &[
     "uc_create_table_request",
     "checkpoint",
     "file_restricted_scan",
+    "legacy_calendar_files",
     // Distributed writes: workers produce data files, a coordinator commits
     // them as one transaction.
     "distributed_write",
@@ -61,7 +76,111 @@ pub const FEATURES: &[&str] = &[
     "deletion_vector_dml",
     // UPDATE writes rewritten rows' ids to the materialized row-id column.
     "materialized_row_ids",
+    // Raw commit files, for applying Delta's conflict rules on a lost race.
+    "commit_log",
+    // `commit_dml(data_change=False)`: compactions committed by the kernel.
+    "compaction",
+    // `operation_parameters=` and `blind_append=` on every commit, written
+    // into its commitInfo.
+    "commit_info_patch",
+    // A compaction streams its rows (`commit_dml` pulls them as it writes),
+    // commits past the value-constraint features, and file-restricted scans
+    // read files in the order given.
+    "streaming_compaction",
+    // `validate_retry_options`: retry storage options read as delta-rs reads them.
+    "retry_options",
+    // `vacuum_plan`/`delete_files`: VACUUM from the kernel's log replay.
+    "vacuum",
+    // `add_actions`/`missing_files`: RESTORE committed from the target's adds.
+    "restore",
+    // `Snapshot.commit_actions`: raw add/remove actions committed through a
+    // kernel transaction, so through the catalog on a catalog-managed table.
+    "commit_actions",
+    // Compactions and overwrites of row-tracked tables: removes staged by
+    // hand, and `scan(row_tracking=True)` rows written back with their ids
+    // and commit versions in the materialized columns.
+    "row_tracking_compaction",
+    // `commit_dml(add_tags=)`: tags on every add (a Z-order's ZCUBE_* tags),
+    // and files() lists each file's tags.
+    "add_tags",
+    // `<version>.crc` after every kernel commit, and `write_checksum()` for
+    // one another writer committed.
+    "write_checksum",
+    // `incremental_files(base_version)`: the file diff between two versions.
+    "incremental_files",
+    // `commits_adding`/`delete_uncommitted`: whether a distributed write's
+    // files landed, from the commits since it was planned, and removing
+    // them when they did not.
+    "uncommitted_files",
+    // `absolute_deletion_vector` and `copy_objects`: shallow and deep clones
+    // of path tables.
+    "path_clone",
+    // Copy-on-write DML of row-tracked tables: `commit_dml` stages the
+    // removes by hand and writes the rows' ids and commit versions it is
+    // given into the materialized columns, and `scan(row_positions=True,
+    // row_tracking=True)` reads both beside each row's position.
+    "row_tracking_dml",
+    // `constraints_checked=` on every data write: CHECK constraints evaluated
+    // by the caller over the rows written, and the write committed past the
+    // kernel's refusal of the checkConstraints feature.
+    "check_constraints",
+    // `append(metadata=, protocol=)`: a schema-evolving write, its rows and
+    // the table's new metaData in one commit.
+    "schema_evolution",
+    // `cleanup_log`: expired log cleanup below a retained checkpoint, by
+    // commit timestamps (in-commit timestamps where the table has them).
+    "log_cleanup",
+    // `write_symlink_manifest`: GENERATE symlink_format_manifest.
+    "symlink_manifest",
+    // `missing_data_files`: FSCK REPAIR from the kernel's file listing.
+    "fsck",
+    // `checkpoint()` and `write_checksum()` on a table carrying CHECK
+    // constraints, generated or identity columns, or invariants: written from
+    // a snapshot whose checked protocol sets those aside, with the table's own
+    // protocol and metadata in the files.
+    "value_constrained_checkpoint",
+    // `commit_timestamp`/`file_commit_timestamps`/`version_at` and
+    // `feed_versions`: commit times as Delta assigns them (file times made
+    // monotonic before in-commit timestamps), which every timestamp lookup
+    // resolves against.
+    "commit_timestamps",
+    // `set_credential_slot`/`remove_credential_slot`: stores built with a
+    // slot's key read their vended credential from it on every request, so
+    // a refresh published from Python reaches stores already built.
+    "credential_slots",
+    // `files(scan_rows=True)`, `Snapshot.planned` and `scan(scan_rows=)`: a
+    // worker reads planned files with no log listing or replay.
+    "planned_scan",
+    // `values_checked=` on every data write: generated columns, identity
+    // columns and invariants computed and checked by the caller over the
+    // rows written, and the write committed past the kernel's refusal of
+    // each (`restate::Checked`).
+    "values_checked",
+    // Writes, DML, checkpoints and checksums on tables carrying
+    // `checkpointProtection`, which binds only log cleanup
+    // (`restate::HISTORY_ONLY`).
+    "checkpoint_protection",
+    // `append(domain_metadata=)` and `commit_files(domain_metadata=)`: user
+    // domain metadata set in the same commit as the rows.
+    "domain_metadata",
+    // `Snapshot.resolve(template=)` and `rollback_create_table`: a table
+    // created by a distributed write, resolved by workers from a template
+    // version 0 before it exists, and undone if its data never lands.
+    "deferred_create",
 ];
+
+/// Publish a freshly vended credential (as storage options) in slot `slot`.
+#[pyfunction]
+#[pyo3(signature = (slot, options, expires_at = None))]
+fn set_credential_slot(slot: &str, options: HashMap<String, String>, expires_at: Option<f64>) {
+    credential_slot::set(slot, options, expires_at);
+}
+
+/// Forget slot `slot`; stores built from it keep the credential they last saw.
+#[pyfunction]
+fn remove_credential_slot(slot: &str) {
+    credential_slot::remove(slot);
+}
 
 #[pyfunction]
 fn kernel_version() -> &'static str {
@@ -113,9 +232,20 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_function(wrap_pyfunction!(create_table, m)?)?;
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::feed_versions, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::rollback_create_table, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::write_create_template, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::delete_create_template, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::create_published, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::absolute_deletion_vector, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::copy_objects, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::probe_put_if_absent, m)?)?;
+    m.add_function(wrap_pyfunction!(functions::validate_retry_options, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
+    m.add_function(wrap_pyfunction!(set_credential_slot, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_credential_slot, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_version, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_is_multithreaded, m)?)?;

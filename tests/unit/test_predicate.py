@@ -54,7 +54,7 @@ class TestExactFiltering:
             ("id = NULL", []),
             ("TRUE", [1, 2, 3, None]),
             ("id = 1.0", [1]),
-            ("city = 'it''s'", []),
+            ("city = 'it''s'", []),  # Spark: 'it' 's', i.e. 'its'
         ],
     )
     def test_where_semantics(self, table: object, predicate: str, expected: list[object]) -> None:

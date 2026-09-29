@@ -45,6 +45,8 @@ write, and the kernel writes several of them.
 The other way round, delta-rs wins outright. The kernel has no MERGE, no
 `replaceWhere`, no schema evolution on write, no OPTIMIZE, Z-ORDER, VACUUM,
 RESTORE, FSCK, CONVERT or manifest generation, and its log compaction is a stub.
+(deltaswamp builds MERGE, OPTIMIZE, VACUUM and RESTORE on the kernel itself,
+for the tables delta-rs cannot write.)
 
 So the kernel is the default reader and delta-rs the default for DML and
 maintenance. Two rows break the pattern: for `checkConstraints` and
@@ -90,6 +92,43 @@ schema merge, `OPTIMIZE FULL` or `CLUSTER BY AUTO` each maps to a
 `supports_<shape>` flag, and an engine without the flag is skipped before it can
 accept the call and fail halfway.
 
+There is one path from a call's arguments to that decision, and `can()` takes
+it too. `_request.derive(table, operation, args, data)` turns the arguments
+into a frozen `Request`: the operation the call really is (an append with
+`schema_mode="merge"` is MERGE_SCHEMA, an overwrite with a predicate is
+REPLACE_WHERE, a pinned handle's scan is TIME_TRAVEL), the needs the arguments
+and the data imply, and the shape each engine's `supports()` judges. There is
+one rule per operation. Every `Table` method builds its `Request` and routes it
+with `Table._route`. `t.can(op, **args)` builds the same `Request` from the same
+arguments and returns the router's verdict on it, so when `can()` says ok, the
+engine it names is the engine the call uses. `can()` takes the call's own
+argument names and refuses one the call would not take. It takes the data as
+`data=` (or `source=` for MERGE), and a MERGE's clauses as
+`clauses=["when_matched_update_all", ...]`. A method name such as `z_order`,
+`compact_logs`, `plan_write` or `plan_scan` works in place of the operation.
+
+A refusal that depends only on the table and the arguments belongs in
+`supports()` or in a need, not in the engine method. There it moves routing on
+to an engine that can serve the call, and `can()` reports it. Examples are the
+options a kernel write path does not implement (`_UNIMPLEMENTED_OPTIONS` in
+`engine/kernel.py`), a dynamic partition overwrite of an unpartitioned table,
+and the features Unity Catalog's committer requires. MERGE clauses are known
+only at `execute()`, so the builder routes once more with them before anything
+runs. That is how a MERGE with UPDATE clauses on an append-only table is
+refused, exactly as `can("merge", ..., clauses=[...])` refuses it.
+
+With `DELTASWAMP_STRICT_ROUTING=1` (the test suite sets it in
+`tests/conftest.py`), each engine the router hands out is wrapped. Suppose a
+serving method then raises a routing refusal (`UnreachableTableError`) while the
+router would have sent the same request to another engine. That refusal becomes
+`RoutingContractViolation`, a gap between `supports()` and the engine.
+`EngineLimitError` is exempt, because it is the declared read-time limit that
+`Table` hands to the next engine. The gaps still open are listed in
+`STRICT_ROUTING_GAPS` in `tests/conftest.py`, and those tests run with the check
+off. In each of them the request itself is wrong: a bad property value, a
+missing column, or a version the log does not hold. The error is raised as a
+routing refusal where `InvalidArgumentError` is meant.
+
 A Delta Sharing table has one way in, the sharing engine. So does an Iceberg
 table, through the catalog's Iceberg REST endpoint.
 
@@ -106,12 +145,19 @@ per snapshot, so a single scan that streams past its credential's lifetime
 fails. Refreshing inside Rust needs an `object_store::CredentialProvider` that
 calls back into Python, which is not built. Until then, a scan that starts with
 less than `KernelEngine.expiry_warning_seconds` of credential life raises
-`CredentialExpiryWarning`. `plan_scan()` and `to_ray_dataset()` avoid the
-problem, since each worker vends its own credential for its own slice.
+`CredentialExpiryWarning`. `plan_scan()` and `to_ray_dataset()` split the read,
+but by default a plan carries one storage credential vended on the driver, and
+a worker refuses it within a minute of its expiry. With
+`ship_catalog_auth=True` the plan carries the credential provider instead, and
+each worker vends its own credential for its own slice.
 
-Providers are picklable and credentials are not. `__getstate__` drops the live
-client, the cached credential and the lock, so a worker receives configuration,
-never a token.
+Providers are picklable and credentials are not: `Credentials` raises
+`TypeError` when pickled, and only a plan's `ShippedCredentials` carries one on
+purpose. A provider's `__getstate__` drops the live client, the cached
+credential and the lock. It keeps the catalog configuration (host, auth
+type, client id) but no literal secret, so a worker's SDK re-derives auth
+from its own environment; `connect(ship_credentials=True)` and a plan's
+`ship_catalog_auth=True` pickle the token or client secret too.
 
 Vending is per-table with no batch endpoint. Discovery therefore makes one
 `ListTables` call per schema rather than one lookup per table.
@@ -192,10 +238,18 @@ its existing vector, writes every vector into one file in the protocol's
 format, and commits through the kernel's `update_deletion_vectors`, with any
 rewritten or inserted rows added in the same transaction.
 
-Three cases follow Spark. A file left with no rows is removed, unless row
-tracking forbids removes, in which case it keeps a vector covering every row.
-A rewritten row on a row-tracked table has its old id written to the table's
-materialized row-id column, so its id survives the UPDATE. A DELETE commit adds
+Three cases follow Spark. A file left with no rows is removed; on a row-tracked
+table, where kernel 0.28 refuses removes, the remove is staged by hand with the
+file's `baseRowId` and `defaultRowCommitVersion`. A rewritten row on a
+row-tracked table has its old id written to the table's materialized row-id
+column, so its id survives the UPDATE.
+
+A table without deletion vectors enabled takes the same change copy-on-write:
+every file holding a touched row is removed (`whole_files`), and its other rows
+are read back by position and written again beside the new ones. That is how
+the kernel serves MERGE on tables delta-rs cannot write, and every DML on a
+row-tracked table: the kept rows bring their row ids and commit versions, which
+go to the materialized columns, so a file rewrite changes neither. A DELETE commit adds
 no data, so it needs no CDC files on a change-data-feed table: readers derive
 the deleted rows from the old and new vectors.
 
@@ -261,8 +315,6 @@ from the registry one. Mixing them yields two kernels and two incompatible
   would need them; DELETE through deletion vectors does not.
 - The change feed of a catalog-managed table. The kernel's `TableChanges`
   lists the log itself and would miss unpublished commits.
-- Incremental reads through the kernel's `incremental_scan`. `Table.changes()`
-  follows the change data feed instead.
 - Credential refresh inside a single long read.
 - Databricks server-side behavior: predictive optimization, auto compaction,
   row-level concurrency, UniForm metadata generation. The

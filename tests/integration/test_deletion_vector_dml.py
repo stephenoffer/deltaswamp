@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 from deltaswamp.capability import Engine, Operation
-from deltaswamp.errors import UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError
 
 pa = pytest.importorskip("pyarrow")
 deltalake = pytest.importorskip("deltalake")
@@ -179,7 +179,7 @@ class TestUpdate:
             pa.table({"id": [3, 30], "city": ["c", "cc"]}), predicate="id >= 3 AND id <= 30"
         )
         assert _values(conn, path, "id") == [1, 2, 3, 30]
-        with pytest.raises(UnreachableTableError, match="do not satisfy the predicate"):
+        with pytest.raises(InvalidArgumentError, match="do not satisfy the predicate"):
             conn.open_table(path).overwrite(
                 pa.table({"id": [99], "city": ["z"]}), predicate="id < 10"
             )
@@ -207,11 +207,18 @@ class TestRowTracking:
         conn.open_table(tracked).delete("id IN (2, 5, 6)")
         after = self._row_ids(conn, tracked)
         assert after == {k: v for k, v in before.items() if k not in (2, 5, 6)}
-        # Row tracking forbids removes here, so an emptied file keeps a full vector.
+        # Kernel will not stage a remove here, so an emptied file's is staged
+        # by hand; every remove, and every re-add under a new vector, keeps
+        # the file's baseRowId and defaultRowCommitVersion.
         actions = _last_commit(tracked)
-        removed = {a["remove"]["path"] for a in actions if "remove" in a}
-        added = {a["add"]["path"] for a in actions if "add" in a}
-        assert removed and removed <= added
+        removes = [a["remove"] for a in actions if "remove" in a]
+        assert removes
+        assert all(r.get("baseRowId") is not None for r in removes)
+        assert all(r.get("defaultRowCommitVersion") is not None for r in removes)
+        removed = {r["path"] for r in removes}
+        for add in (a["add"] for a in actions if "add" in a):
+            assert add["path"] in removed and add.get("deletionVector") is not None
+            assert add.get("baseRowId") is not None
 
     def test_update_keeps_the_updated_row_id(self, conn: Any, tracked: str) -> None:
         properties = conn.open_table(tracked).properties()
@@ -363,15 +370,25 @@ class TestMerge:
         skipping = merger._skipping(schema)
         assert skipping is not None and '"id"' in skipping
 
-    def test_tables_without_deletion_vectors_are_not_merged_here(
+    def test_tables_without_deletion_vectors_are_merged_copy_on_write(
         self, conn: Any, tmp_path: Any
     ) -> None:
         path = str(tmp_path / "plain")
         conn.create_table(path, pa.schema([("id", pa.int64())]))
-        verdict = conn.router.engines[Engine.KERNEL].supports(
-            Operation.MERGE, conn.open_table(path).resolved
+        conn.open_table(path).append(pa.table({"id": pa.array([1, 2], pa.int64())}))
+        kernel = conn.router.engines[Engine.KERNEL]
+        assert kernel.supports(Operation.MERGE, conn.open_table(path).resolved).ok
+        merger = kernel.merge(
+            conn.open_table(path).resolved,
+            pa.table({"id": pa.array([2, 3], pa.int64())}),
+            "t.id = s.id",
+            source_alias="s",
+            target_alias="t",
         )
-        assert not verdict.ok and "deletion vectors" in verdict.reason
+        merger.when_matched_delete().when_not_matched_insert_all().execute()
+        assert _values(conn, path, "id") == [1, 3]
+        assert _deltars_rows(path, "id") == [1, 3]
+        assert not _dv_files(path)
 
 
 def _z85(data: bytes) -> str:
@@ -418,7 +435,9 @@ class TestExistingVectorsAndFiles:
         assert add["deletionVector"]["storageType"] == "u"
         assert add["deletionVector"]["cardinality"] == 3
 
-    def test_files_without_statistics_are_rewritten(self, conn: Any, tmp_path: Any) -> None:
+    def test_files_without_statistics_take_vectors(self, conn: Any, tmp_path: Any) -> None:
+        # Databricks checkpoints carry no JSON stats; the row count a vector
+        # needs comes from the file's Parquet footer instead of a rewrite.
         from deltalake import write_deltalake
 
         path = str(tmp_path / "nostats")
@@ -434,9 +453,9 @@ class TestExistingVectorsAndFiles:
         assert conn.open_table(path).delete("id = 2")["num_deleted_rows"] == 1
         assert _values(conn, path, "id") == [1, 3, 4]
         assert _deltars_rows(path, "id") == [1, 3, 4]
-        actions = _last_commit(path)
-        assert any("remove" in a for a in actions)
-        assert all(not a["add"].get("deletionVector") for a in actions if "add" in a)
+        (add,) = [a["add"] for a in _last_commit(path) if "add" in a]
+        assert add["deletionVector"]["cardinality"] == 1
+        assert json.loads(add["stats"])["numRecords"] == 4
 
     def test_randomized_prefixes_put_the_vector_in_a_subdirectory(
         self, conn: Any, tmp_path: Any
@@ -470,7 +489,9 @@ class TestExistingVectorsAndFiles:
         assert conn.open_table(path).delete()["num_deleted_rows"] == 6
         assert conn.open_table(path).to_arrow().num_rows == 0
         assert _deltars_rows(path, "id") == []
-        adds = [a["add"] for a in _last_commit(path) if "add" in a]
-        assert adds and all(
-            a["deletionVector"]["cardinality"] == json.loads(a["stats"])["numRecords"] for a in adds
-        )
+        # Every file removed (the removes staged by hand, as kernel will not
+        # stage them on a row-tracked table), with its row-tracking fields.
+        actions = _last_commit(path)
+        assert not any("add" in a for a in actions)
+        removes = [a["remove"] for a in actions if "remove" in a]
+        assert removes and all(r.get("baseRowId") is not None for r in removes)

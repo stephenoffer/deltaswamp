@@ -11,7 +11,7 @@ of truth is `python/deltaswamp/capability.py` (features and operations) and
 |---|---|
 | `FEATURE_SUPPORT` | 36 table features x {kernel, delta-rs} x {read, write} |
 | `OPERATION_ENGINES` | 46 operations -> engines in preference order |
-| `PROPERTY_SUPPORT` | 30 table properties x {create, set} x engine |
+| `PROPERTY_SUPPORT` | 32 table properties x {create, set} x engine |
 | `FEATURE_DEPENDENCIES` | what the kernel enforces before a write |
 
 ## Read this before changing routing
@@ -29,20 +29,34 @@ The wire name for liquid clustering is `clustering`, not `clusteredTable`.
 
 `collations`, `checkpointProtection` and `icebergWriterCompatV1` exist in
 Databricks but have no kernel 0.28 variant at all. All three are writer-only, so
-both engines read these tables; kernel classifies them as Unknown, which blocks
-writes on both engines, so writes route to SQL or get refused. Databricks sets
-`icebergWriterCompatV1` on every `USING ICEBERG` table, which is catalog-managed
-Delta with UniForm underneath.
+both engines read these tables; kernel classifies them as Unknown and refuses
+to write them. `checkpointProtection` (Delta 4.0, added when a feature is
+dropped) binds only which history a writer may delete, so every kernel commit
+here -- appends, overwrites, distributed writes, DML, metadata changes,
+checkpoints -- sets it aside from the protocol the kernel checks, and expired
+log cleanup, the one operation it binds, refuses it. delta-rs still refuses it
+(delta-rs#4462). The other two block writes on both engines, so writes route to
+SQL or get refused. Databricks sets `icebergWriterCompatV1` on every
+`USING ICEBERG` table, which is catalog-managed Delta with UniForm underneath.
 
 Collations are the one place a read goes quietly wrong rather than failing:
 neither engine knows collation order, so `name = 'oslo'` compares bytes and
-misses `'Oslo'` under `UTF8_LCASE`. Predicate scans on a collated table never
-route to a direct engine.
+misses `'Oslo'` under `UTF8_LCASE`. Predicate scans that read a collated
+column never route to a direct engine.
 
 Several features are readable but only up to a point. Databricks adds
-`variantShredding` to every VARIANT table; the kernel reads such a table until
-`delta.enableVariantShredding` is switched on, then fails on every shredded
-file, so that property routes reads away from it. `geospatial` is gated off in
+`variantShredding` and `delta.enableVariantShredding=true` to every VARIANT
+table, and shreds each file whose values share a shape; the kernel fails on a
+shredded file, and nothing in the log says which files are. So the property
+routes reads that touch a VARIANT column away from the direct engines (to the
+warehouse, or a refusal naming it), while `count()` and reads of other columns
+stay direct. A shredded file met anyway, with the property off, is an
+`EngineLimitError`. VARIANT itself reads as JSON text on every engine, since
+that is all the warehouse sends, and writes take JSON text back.
+
+Collated columns are matched by name: a predicate that reads no collated
+column is still served directly; one that does, or that reads a nested field
+(whose collation the Arrow schema does not carry), goes to the warehouse. `geospatial` is gated off in
 this kernel build, and its `geometry(...)` schema type breaks both engines' log
 parsing, so those tables read through the warehouse only.
 
@@ -55,7 +69,45 @@ change data feeds.
 
 Two features run the other way. `checkConstraints` and `generatedColumns` are
 cases where delta-rs is the more capable engine, so routing must never assume
-kernel wins by default.
+kernel wins by default. delta-kernel refuses every write to a table carrying
+either, used or not (legacy writer versions 3 to 6 imply both). The kernel
+paths here evaluate every CHECK constraint in DuckDB over the rows they write
+(a NULL result passes, a FALSE one fails the write before anything is
+committed), and commit past the kernel's refusal of `checkConstraints`, and of
+`generatedColumns` where no column is generated; a constraint DuckDB cannot
+evaluate as Databricks does is refused up front. Checkpoints and version
+checksums write no row, so the kernel writes both past `checkConstraints`,
+`generatedColumns` (generated columns included), `identityColumns` and
+`invariants`, from a snapshot whose checked protocol sets them aside; each
+file's protocol and metadata come from the log, so they are the table's own,
+features and `delta.constraints.*` included.
+
+Appends and overwrites through the kernel -- local and distributed ones --
+also write tables whose generated columns, identity columns and invariants are
+in use (`engine/values.py`), each batch shaped before the native writer sees
+it, on the worker for a distributed write:
+
+- a generated column the data leaves out is computed from its expression in
+  DuckDB, and one it gives is checked to equal it (null-safe);
+- an invariant is evaluated with the CHECK constraints;
+- an identity column the data leaves out is numbered above the high-water
+  mark. A local append moves the mark in the commit that writes the rows. A
+  distributed write reserves `identity_tasks * identity_rows_per_task` values
+  in a metadata-only commit when it is planned, and each
+  `plan.write(data, task_index=i)` numbers its rows from slot `i`, so the job's
+  commit changes no metadata and rebases like any append. A value given for a
+  GENERATED ALWAYS column is refused; one given for GENERATED BY DEFAULT is
+  kept and does not move the mark, as in Spark;
+- a left-out column with a literal DEFAULT gets it.
+
+An expression DuckDB cannot evaluate as Databricks does refuses the write when
+it is planned. DELETE, UPDATE, MERGE and replaceWhere on such tables stay with
+delta-rs (generated columns, invariants) or the warehouse (identity columns).
+
+A full overwrite of a change-data-feed table commits through the kernel too:
+it removes and adds whole files, which readers take as deletes and inserts
+without CDC files, as Spark writes it (kernel 0.28 refuses any commit with
+both, so the removes are staged beside its actions).
 
 Unknown feature names must not raise. The kernel tolerates unknown writer-only
 features when reading, and so must deltaswamp, or the first table to adopt a
@@ -80,7 +132,7 @@ deduplicates, and save modes come from `Connection.write_table`.
 | idempotent write | `t.append(data, txn=(app_id, version))` | enforced here | neither engine deduplicates; verified against delta-rs 1.6.5 |
 | commit metadata | `t.append(data, commit_metadata={...})` | delta-rs | shows up in `history()` |
 | distributed write | `t.plan_write()` / `plan.write()` / `plan.commit()` | kernel | workers write files, the driver commits them as one version; refused at plan time, before any file is written |
-| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | kernel (deletion vectors), delta-rs, sql | on a table with deletion vectors enabled the kernel writes them, as Databricks does, catalog-managed and row-tracked tables included; elsewhere delta-rs is copy-on-write and the kernel's last resort is a bounded whole-table rewrite (no MERGE) |
+| DELETE / UPDATE / MERGE | `t.delete()`, `t.update()`, `t.merge()` | kernel (deletion vectors), delta-rs, sql | on a table with deletion vectors enabled the kernel writes them, as Databricks does, catalog-managed and row-tracked tables included; elsewhere delta-rs is copy-on-write, and the kernel's last resort is a bounded whole-table rewrite (DELETE, UPDATE) or a rewrite of the touched files (MERGE, and all DML on row-tracked tables, whose row ids it keeps) |
 
 ## Where every operation routes
 
@@ -95,7 +147,7 @@ serve.
 | `scan` | kernel, deltars, sharing, iceberg, sql | kernel reads through writer-only features delta-rs rejects |
 | `time_travel` | kernel, deltars, sharing, iceberg, sql | history_manager handles the ICT-enablement boundary |
 | `cdf` | kernel, deltars, sharing, sql | the kernel's TableChanges comes first: delta-rs cannot decode the CDF files Databricks writes (arrow-rs fails with 'cannot skip miniblock' on their DELTA_BINARY_PACKED pages), double-encodes a partition path containing '%' (a value 'a b' is looked up as k=a%2520b), and refuses column-mapped tables outright. Catalog-managed tables have no CDF outside Databricks |
-| `incremental` | *(none)* | reading only the files added since a version needs the kernel's incremental_scan, which is not bound yet; Table.changes() follows the change data feed instead |
+| `incremental` | *(none)* | Table.changes() follows the change data feed, and is routed as cdf() is; Table.added_since() reads the files the kernel's incremental scan lists, and is routed as a scan |
 | `history` | deltars, iceberg, sql | kernel exposes no history() API, only commit_range primitives |
 | `detail` | kernel, deltars, sharing, iceberg, sql | kernel CRC path gives O(1) stats with zero I/O when a .crc exists |
 | `files` | deltars, kernel | delta-rs lists add actions with stats; the kernel lists the files of tables delta-rs cannot open |
@@ -103,17 +155,17 @@ serve.
 | `overwrite` | deltars, kernel, iceberg, sql | delta-rs first; the kernel replaces a catalog-managed table in one commit |
 | `replace_where` | deltars, iceberg, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs, PyIceberg for Iceberg tables, the warehouse, and last a bounded whole-table rewrite through the kernel |
 | `create` | deltars, kernel | delta-rs creates path and external tables; the kernel takes over when the properties or clustering exceed what delta-rs accepts, and for managed tables, whose storage the catalog allocates through its staging-table API |
-| `merge_schema` | deltars, sql | kernel has no mergeSchema on the write path; the warehouse uses INSERT WITH SCHEMA EVOLUTION |
-| `delete` | deltars, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs copy-on-write, then the warehouse, and last a bounded whole-table rewrite through the kernel |
-| `update` | deltars, sql, kernel | deletion vectors plus new files through the kernel when the table enables them (row ids kept under row tracking); otherwise delta-rs, the warehouse, and last a bounded whole-table rewrite, with literal or column assignments |
-| `merge` | deltars, sql, kernel | deletion vectors through the kernel, with clauses evaluated in DuckDB, when the table enables them; otherwise delta-rs, then the warehouse, which merges from a source staged in a volume |
+| `merge_schema` | deltars, kernel, sql | delta-rs first; the kernel for tables it cannot write or whose column mapping it cannot extend, committing the rows and the widened schema together; the warehouse uses INSERT WITH SCHEMA EVOLUTION |
+| `delete` | deltars, sql, kernel | deletion vectors through the kernel when the table enables them; otherwise delta-rs copy-on-write, then the warehouse, and last a bounded whole-table rewrite through the kernel (on a row-tracked table, a rewrite of the touched files that keeps every row id) |
+| `update` | deltars, sql, kernel | deletion vectors plus new files through the kernel when the table enables them (row ids kept under row tracking); otherwise delta-rs, the warehouse, and last a bounded whole-table rewrite (on a row-tracked table, a rewrite of the touched files that keeps every row id). On the kernel, SET values and predicates beyond its grammar are evaluated by DuckDB in Spark's dialect when it binds them; what it cannot translate faithfully goes to delta-rs or the warehouse |
+| `merge` | deltars, sql, kernel | deletion vectors through the kernel, with clauses evaluated in DuckDB, when the table enables them; otherwise delta-rs, then the warehouse, which merges from a source staged in a volume, and last the kernel copy-on-write (touched files rewritten; row ids kept under row tracking) |
 | `add_column` | deltars, kernel, sql | delta-rs first; kernel for tables it cannot write |
 | `drop_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no DROP COLUMN |
 | `rename_column` | kernel, sql | metadata-only under column mapping, which the kernel path writes; delta-rs has no RENAME COLUMN |
 | `set_properties` | deltars, kernel, sql | delta-rs takes the keys it handles at create, probed against deltalake 1.6.5; it rejects column mapping, row tracking, in-commit timestamps and type widening, and enabling deletion vectors through it stamps a bogus variantType feature, so those go to the kernel |
 | `add_feature` | deltars, kernel, sql | delta-rs only for features it can then write, with their dependencies present; otherwise the kernel, which adds dependencies alongside |
 | `drop_feature` | sql | Databricks-only (DROP FEATURE ... TRUNCATE HISTORY) |
-| `add_constraint` | deltars, sql | kernel marks checkConstraints NotSupported for writes, and adding one means validating every existing row |
+| `add_constraint` | deltars, kernel, sql | delta-rs first; the kernel path for tables delta-rs cannot write, after checking every existing row in DuckDB |
 | `drop_constraint` | deltars, kernel, sql | a metadata-only change |
 | `unset_properties` | kernel, sql | delta-rs has no way to remove a property |
 | `set_comment` | deltars, kernel, sql | the table description in the Metadata action |
@@ -122,19 +174,19 @@ serve.
 | `set_not_null` | kernel, sql | needs every existing row checked for nulls before the commit |
 | `drop_not_null` | deltars, kernel, sql | a metadata-only change |
 | `cluster_by` | kernel, sql | the delta.clustering domain; delta-rs has no domain metadata support |
-| `optimize` | deltars, sql | kernel has no OPTIMIZE; the warehouse runs it on managed and clustered tables |
-| `zorder` | deltars, sql | kernel has no Z-ORDER |
-| `vacuum` | deltars, sql | kernel has no VACUUM |
-| `restore` | deltars, sql | kernel has no RESTORE |
-| `repair` | deltars, sql | kernel has no FSCK |
-| `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first |
+| `optimize` | kernel, deltars, sql | the kernel commits a compaction on the snapshot it read, so a concurrent one conflicts; delta-rs's OPTIMIZE commit rebases over it and duplicates the rows both compacted, so delta-rs hands it to the kernel. On row-tracked tables rows keep their ids and commit versions; on liquid-clustered ones it Z-orders by the clustering keys (`full=True` every file); column-mapped tables compact too. The warehouse runs it on managed tables |
+| `zorder` | kernel, deltars, sql | as OPTIMIZE: delta-rs's Z-ORDER commit duplicates rows under a concurrent one |
+| `vacuum` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel's log replay for the rest (clustering, row tracking, in-commit timestamps, type widening, vacuumProtocolCheck, ...) and for deletion-vector tables, whose vector files delta-rs cannot tell apart from orphans |
+| `restore` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel re-adds the target version's files as logged (deletion vectors, row ids) on deletion-vector tables, which delta-rs restores wrongly (delta-rs#4613), and the tables delta-rs cannot write |
+| `repair` | deltars, kernel, sql | delta-rs for tables it can commit to; the kernel removes the missing files as logged (row ids kept) on the rest |
+| `checkpoint` | deltars, kernel | delta-rs for tables it can open; the kernel for the rest, including catalog-managed tables, which it publishes first, and tables with CHECK constraints, generated or identity columns or invariants |
 | `log_compaction` | deltars | kernel's log_compaction_writer is a no-op stub (kernel#2337) |
 | `publish` | kernel | Snapshot::publish; only kernel implements staged->published |
 | `reorg` | sql | Databricks-only (REORG ... APPLY PURGE / UPGRADE UNIFORM) |
-| `clone` | sql | Databricks-only (shallow and deep CLONE) |
+| `clone` | kernel, sql | kernel: path table to a path (a raw version 0 over the source's files); Databricks for catalog tables |
 | `convert` | deltars | kernel has no CONVERT TO DELTA |
-| `generate` | deltars | kernel has no manifest generation |
-| `cleanup_metadata` | deltars | delta-rs removes log files older than delta.logRetentionDuration |
+| `generate` | deltars, kernel | delta-rs for tables it can open for writing; the kernel's file listing for the rest (clustering, row tracking, in-commit timestamps, type widening, defaults). Deletion vectors and column mapping are refused, as Spark refuses them |
+| `cleanup_metadata` | kernel, deltars | the kernel deletes log files older than delta.logRetentionDuration below a checkpoint every retained version reads from, by in-commit timestamps where the table has them, v2 checkpoints' sidecars included; delta-rs where the kernel cannot read the table |
 | `analyze` | sql | Databricks-only (ANALYZE TABLE ... COMPUTE [DELTA] STATISTICS) |
 | `sync_iceberg` | sql | Databricks-only (MSCK REPAIR TABLE ... SYNC METADATA regenerates UniForm Iceberg metadata) |
 | `refresh` | sql | Databricks-only (REFRESH of a materialized view or streaming table) |
@@ -154,35 +206,64 @@ to the kernel automatically.
 | Property | delta-rs create | delta-rs set | kernel create |
 |---|---|---|---|
 | `delta.appendOnly` | honored | honored | honored |
-| `delta.autoOptimize.autoCompact` *(Databricks-only)* | stored, inert | stored, inert | n/a |
-| `delta.autoOptimize.optimizeWrite` *(Databricks-only)* | stored, inert | stored, inert | n/a |
+| `delta.autoOptimize.autoCompact` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
+| `delta.autoOptimize.optimizeWrite` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
 | `delta.checkpoint.writeStatsAsJson` | stored, inert | stored, inert | honored |
 | `delta.checkpoint.writeStatsAsStruct` | honored | honored | honored |
 | `delta.checkpointInterval` | honored | honored | honored |
 | `delta.checkpointPolicy` | stored, inert | stored, inert | honored |
+| `delta.checkpointRetentionDuration` *(Databricks-only)* | rejected | rejected | stored (as v1) |
 | `delta.columnMapping.mode` | honored | rejected | honored |
+| `delta.compatibility.symlinkFormatManifest.enabled` *(Databricks-only)* | rejected | rejected | n/a |
 | `delta.dataSkippingNumIndexedCols` | honored | honored | honored |
-| `delta.dataSkippingStatsColumns` | stored, inert | stored, inert | honored |
+| `delta.dataSkippingStatsColumns` | top-level names only | top-level names only | honored |
 | `delta.deletedFileRetentionDuration` | honored | honored | honored |
 | `delta.enableChangeDataFeed` | honored | honored | honored |
 | `delta.enableDeletionVectors` | rejected | rejected | honored |
-| `delta.enableExpiredLogCleanup` | stored, inert | stored, inert | honored |
+| `delta.enableExpiredLogCleanup` | honored | honored | honored |
 | `delta.enableIcebergCompatV2` | rejected | rejected | n/a |
 | `delta.enableIcebergCompatV3` | rejected | rejected | honored |
 | `delta.enableInCommitTimestamps` | rejected | rejected | honored |
 | `delta.enableRowTracking` | rejected | rejected | honored |
 | `delta.enableTypeWidening` | rejected | rejected | honored |
-| `delta.isolationLevel` | honored | honored | n/a |
+| `delta.isolationLevel` | honored | honored | stored (as v1) |
 | `delta.logRetentionDuration` | honored | honored | honored |
 | `delta.minReaderVersion` | **crashes** | rejected | n/a |
 | `delta.minWriterVersion` | honored | honored | n/a |
 | `delta.parquet.compression.codec` | rejected | rejected | n/a |
 | `delta.parquet.format.version` | rejected | rejected | honored |
-| `delta.randomizeFilePrefixes` *(Databricks-only)* | stored, inert | stored, inert | n/a |
+| `delta.randomizeFilePrefixes` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
 | `delta.setTransactionRetentionDuration` | stored, inert | stored, inert | honored |
-| `delta.targetFileSize` | honored | honored | n/a |
-| `delta.tuneFileSizesForRewrites` *(Databricks-only)* | stored, inert | stored, inert | n/a |
+| `delta.targetFileSize` | honored (byte strings such as `128mb` too) | honored | stored (as v1) |
+| `delta.tuneFileSizesForRewrites` *(Databricks-only)* | stored, inert | stored, inert | stored (as v1) |
 | `delta.universalFormat.enabledFormats` *(Databricks-only)* | rejected | rejected | n/a |
+
+"stored (as v1)": delta-kernel refuses these keys in CREATE TABLE, so a
+kernel create commits version 0 without them and applies them at once as
+version 1 (a metadata commit, like set_properties); a catalog-managed create
+refuses them instead. `delta.dataSkippingStatsColumns` on delta-rs covers
+top-level leaf columns only (no nested fields or structs, and nothing under
+column mapping), so appends and overwrites of a table that sets it go to the
+kernel; delta-rs UPDATE/MERGE/OPTIMIZE still write the narrower stats. A
+table setting `delta.checkpoint.writeStatsAsJson=false` gets
+`writeStatsAsStruct=true` recorded with it (Spark's default for the unset
+key, which this library's checkpoint writers read as false); a table that
+already has JSON stats off and struct stats unset refuses `checkpoint()` and
+skips automatic checkpoints, which would otherwise keep no statistics.
+`delta.dataSkippingNumIndexedCols` counts differently per writer: the kernel
+counts leaf fields as Spark does (`s struct<a,b,c>, x` with 2 indexes `s.a`,
+`s.b`), delta-rs counts top-level columns and indexes every leaf of the ones
+it takes. Extra statistics are harmless; the clustering-column check assumes
+Spark's leaf counting, the stricter of the two.
+
+On an existing table, set_properties checks values the same way whichever
+engine serves it: a delta-rs ALTER is first run through the kernel path's
+checks, so `delta.targetFileSize=abc`, `delta.isolationLevel=snapshot`, a
+`delta.dataSkippingStatsColumns` entry naming no column, a hand-set
+`delta.minWriterVersion`, or `delta.enableChangeDataFeed=true` on a table with a
+`_change_type`/`_commit_version`/`_commit_timestamp` column are refused before
+anything is committed. The two Databricks-only keys above are stored by the
+kernel's metadata path (delta-rs rejects them) for Databricks to act on.
 
 Keys with no row follow three rules. A `delta.feature.<name>` signal is
 rejected by delta-rs and accepted by the kernel for the sixteen features in

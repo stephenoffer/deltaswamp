@@ -78,7 +78,7 @@ Delta feature is reached, and names the blocker for the few that aren't.
 ## Install
 
 ```bash
-pip install deltaswamp
+pip install 'deltaswamp[pyarrow]'               # the examples here need pyarrow
 pip install 'deltaswamp[pyarrow,polars,sql]'   # extras as needed
 ```
 

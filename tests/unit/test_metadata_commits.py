@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from deltaswamp.engine import metadata as m
-from deltaswamp.errors import UnreachableTableError
+from deltaswamp.errors import InvalidArgumentError, UnreachableTableError
 
 
 def _schema(*fields: dict[str, Any]) -> str:
@@ -194,7 +194,7 @@ class TestProperties:
         change = m.unset_properties(state(configuration={"a": "1"}), ["a", "missing"])
         assert change.metadata is not None
         assert "a" not in change.metadata["configuration"]
-        with pytest.raises(UnreachableTableError, match="no such property"):
+        with pytest.raises(InvalidArgumentError, match="no such property"):
             m.unset_properties(state(), ["missing"], if_exists=False)
 
     def test_unsetting_column_mapping_is_refused(self) -> None:
@@ -243,6 +243,7 @@ class TestColumns:
         s = state(
             _field("id", **{"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "c"}),
             configuration={"delta.columnMapping.mode": "name"},
+            protocol={"minReaderVersion": 2, "minWriterVersion": 5},
         )
         with pytest.raises(UnreachableTableError, match="at least one column"):
             m.drop_column(s, "id")
@@ -274,7 +275,7 @@ class TestColumns:
         assert zip_field["metadata"]["comment"] == "postal code"
 
     def test_unknown_column_is_named(self) -> None:
-        with pytest.raises(UnreachableTableError, match="no column 'nope'"):
+        with pytest.raises(InvalidArgumentError, match="no column 'nope'"):
             m.set_column_comment(state(), "nope", "x")
 
 

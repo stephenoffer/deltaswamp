@@ -95,6 +95,12 @@ class FakeServer:
 def server(monkeypatch: pytest.MonkeyPatch) -> FakeServer:
     fake = FakeServer()
     monkeypatch.setattr(urllib.request, "urlopen", fake.urlopen)
+    # The client opens through its own redirect-safe opener.
+    from deltaswamp.catalog import ossuc as _ossuc
+
+    monkeypatch.setattr(
+        _ossuc, "_open", lambda request, timeout: fake.urlopen(request, timeout=timeout)
+    )
     return fake
 
 

@@ -189,7 +189,9 @@ class MiniServer:
                 return self._send(200, lines, self._version())
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        ).start()
         return self
 
     def stop(self) -> None:
@@ -202,6 +204,13 @@ def _file(ids: list[int | None]) -> bytes:
     return _parquet(
         pa.table({"Id": pa.array(ids, pa.int64()), "s": pa.array([str(i) for i in ids])})
     )
+
+
+@pytest.fixture(autouse=True)
+def _local_presigned_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fake sharing servers here issue http:// URLs on 127.0.0.1, which a
+    # real one never does; the SSRF guard lets them through only on opt-in.
+    monkeypatch.setenv("DELTASWAMP_SHARING_ALLOW_PRIVATE_URLS", "1")
 
 
 @pytest.fixture

@@ -374,20 +374,23 @@ class TestCommitHttpErrors:
         [(404, "InvalidReferenceError"), (401, "CredentialError"), (403, "PreflightError")],
     )
     def test_statuses_become_library_errors(self, status: int, kind: str) -> None:
-        from deltaswamp.engine.kernel import _uc_commit_http_error
+        from deltaswamp.engine.boundary import _uc_commit_http_error
 
         message = (
             "Generic delta kernel error: UC update_table error: HTTP error "
             f'(status {status}): {{"message": "nope"}}'
         )
-        error = _uc_commit_http_error(message)
+        error = _uc_commit_http_error(ValueError(message))
         assert type(error).__name__ == kind
 
     def test_other_errors_are_left_alone(self) -> None:
-        from deltaswamp.engine.kernel import _uc_commit_http_error
+        from deltaswamp.engine.boundary import _uc_commit_http_error
 
-        assert _uc_commit_http_error("some unrelated ValueError") is None
-        assert _uc_commit_http_error("UC update_table error: HTTP error (status 500)") is None
+        assert _uc_commit_http_error(ValueError("some unrelated ValueError")) is None
+        assert (
+            _uc_commit_http_error(ValueError("UC update_table error: HTTP error (status 500)"))
+            is None
+        )
 
     def test_a_commit_refused_with_404_is_an_invalid_reference(self, oss: Any, uc: Any) -> None:
         from deltaswamp.errors import InvalidReferenceError

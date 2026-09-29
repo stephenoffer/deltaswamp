@@ -40,12 +40,13 @@ from ..capability import (
     TableFeature,
     feature_from_wire,
 )
-from ..errors import UnreachableTableError
+from ..errors import DeltaSwampError, InvalidArgumentError, UnreachableTableError
 
 __all__ = [
     "Change",
     "TableState",
     "add_columns",
+    "add_constraints",
     "add_feature",
     "alter_column_type",
     "arrow_to_delta_schema",
@@ -53,6 +54,7 @@ __all__ = [
     "cluster_by",
     "drop_column",
     "drop_constraint",
+    "merge_schema",
     "rename_column",
     "set_column_comment",
     "set_comment",
@@ -239,9 +241,11 @@ def _find(schema: dict[str, Any], path: list[str]) -> tuple[list[dict[str, Any]]
             (i for i, f in enumerate(container) if f["name"].lower() == name.lower()), None
         )
         if index is None:
-            raise _refuse(
-                f"find column {'.'.join(path)}",
-                f"the table has no column {'.'.join(path[: depth + 1])!r}",
+            # The caller's mistake, not a table no engine can serve: as
+            # UnreachableTableError it invited a fallback that cannot help.
+            raise InvalidArgumentError(
+                f"cannot find column {'.'.join(path)}: the table has no column "
+                f"{'.'.join(path[: depth + 1])!r}"
             )
         if depth == len(path) - 1:
             return container, index
@@ -275,6 +279,49 @@ def _walk(datatype: Any) -> Iterable[dict[str, Any]]:
     elif kind == "map":
         yield from _walk(datatype["keyType"])
         yield from _walk(datatype["valueType"])
+
+
+#: Column metadata keys (or key prefixes, ending in ".") and the writer
+#: feature a table whose schema carries one must support. Readers take the
+#: protocol, not the metadata, as the word on what a column means: a
+#: generation expression on a table without generatedColumns is just a
+#: string, so every writer is free to store any value in that column.
+_COLUMN_FEATURES: tuple[tuple[str, str], ...] = (
+    (_GENERATION, "generatedColumns"),
+    ("delta.identity.", "identityColumns"),
+    ("CURRENT_DEFAULT", "allowColumnDefaults"),
+    ("delta.invariants", "invariants"),
+)
+
+
+def column_features(schema: Mapping[str, Any]) -> set[str]:
+    """Writer features the column metadata of a Delta schema declares."""
+    found: set[str] = set()
+    for f in _walk(dict(schema)):
+        for key in f.get("metadata") or {}:
+            for marker, feature in _COLUMN_FEATURES:
+                if key == marker or (marker.endswith(".") and key.startswith(marker)):
+                    found.add(feature)
+    return found
+
+
+def create_schema_features(schema: Any) -> set[str] | None:
+    """Features a create's schema needs, from its types and column metadata.
+
+    None when the schema cannot be inspected here (no pyarrow, or a Delta
+    schema object): the engine then works on it unchecked, as before.
+    """
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return None
+    if not isinstance(schema, pa.Schema):
+        return None
+    try:
+        delta = arrow_to_delta_schema(schema)
+    except DeltaSwampError:
+        return None
+    return column_features(delta) | _type_features(delta)
 
 
 def _physical_name(f: Mapping[str, Any]) -> str:
@@ -495,7 +542,7 @@ def _structs_in(datatype: Any) -> Iterable[dict[str, Any]]:
 def _max_column_id(state: TableState) -> int:
     """The highest column-mapping id in use: the recorded maximum or any field's."""
     recorded = state.configuration.get(_CM_MAX)
-    highest = int(recorded) if recorded not in (None, "") else 0
+    highest = int(recorded) if recorded else 0
     for f in _walk(state.schema):
         value = (f.get("metadata") or {}).get(_CM_ID)
         if value is not None:
@@ -639,6 +686,15 @@ def _require_column_mapping(state: TableState, operation: str) -> None:
             "without it the column's name is also its name in every Parquet file",
             "set_properties({'delta.columnMapping.mode': 'name'}) first",
         )
+    if "columnMapping" not in supported_features(state.protocol):
+        # The property without the feature: writers keep logical names in the
+        # data files, so a rename would orphan the column's data.
+        raise _refuse(
+            operation,
+            "the table sets delta.columnMapping.mode, but its protocol does not support "
+            "the columnMapping feature, so its data files are keyed by logical column names",
+            "rewrite the table into a new one created with column mapping",
+        )
 
 
 # ------------------------------------------------------------------ operations
@@ -697,6 +753,29 @@ def set_nullability(state: TableState, column: str, nullable: bool) -> Change:
 
 def _cdf_enabled(configuration: Mapping[str, str]) -> bool:
     return str(configuration.get("delta.enableChangeDataFeed", "false")).lower() == "true"
+
+
+def cdf_name_clash(names: Iterable[str], properties: Mapping[str, Any] | None) -> list[str]:
+    """The column names the change data feed reserves, if `properties` enable it.
+
+    For the routes that do not compute a metadata change here (a delta-rs
+    create, a schema-evolving write): the feed then failed every DML and read
+    after reporting success.
+    """
+    enabled = any(
+        str(key).lower() == "delta.enablechangedatafeed" and str(value).lower() == "true"
+        for key, value in (properties or {}).items()
+    )
+    return [name for name in names if enabled and name.lower() in _CDF_RESERVED]
+
+
+def cdf_clash_error(operation: str, clash: list[str]) -> UnreachableTableError:
+    return _refuse(
+        operation,
+        f"the change data feed reserves the column names {sorted(_CDF_RESERVED)}, "
+        f"and the schema has {clash}",
+        "rename those columns, or leave delta.enableChangeDataFeed off",
+    )
 
 
 def add_columns(state: TableState, new_fields: list[dict[str, Any]]) -> Change:
@@ -766,6 +845,162 @@ def add_columns(state: TableState, new_fields: list[dict[str, Any]]) -> Change:
     return Change(
         "ADD COLUMNS",
         {"columns": json.dumps([f["name"] for f in added])},
+        protocol=with_features(state.protocol, features) if features else None,
+        metadata=metadata,
+    )
+
+
+def merge_schema(state: TableState, arrow_schema: Any) -> Change:
+    """schema_mode='merge': the table's schema widened to take a write's columns.
+
+    What Spark's mergeSchema does: a column the data has and the table does
+    not is added (nullable, at the end), at the top level and inside structs,
+    arrays of structs and maps of them; a column the data leaves out stays,
+    NULL in the new rows. Under column mapping every new field gets the next
+    id and a fresh physical name, and `delta.columnMapping.maxColumnId` moves
+    past them. A column whose data type is wider than the table's is widened
+    only where the table enables type widening (and the widening is one the
+    protocol allows), and recorded in the field's `delta.typeChanges`, as
+    Databricks does; elsewhere it is refused. A narrower type is the table's
+    own, cast losslessly by the write. Returns a Change whose metadata is None
+    when the table already takes the data as it is.
+    """
+    schema = state.schema
+    configuration = state.configuration
+    column_mapping = state.column_mapping_mode in ("name", "id")
+    widening = configuration.get("delta.enableTypeWidening", "false").lower() == "true"
+    partitions = {p.lower() for p in state.metadata.get("partitionColumns") or []}
+    operation = "write with schema_mode='merge'"
+    added: list[dict[str, Any]] = []
+    widened: list[str] = []
+
+    def new_field(f: Any, path: str) -> dict[str, Any]:
+        try:
+            out = arrow_to_delta_field(f)
+        except UnreachableTableError as exc:
+            raise _refuse(f"add column {path}", str(exc.reason)) from None
+        comment = (out.get("metadata") or {}).get("comment")
+        # Only a comment is carried: a generation expression, an identity or
+        # a default declared in the data's schema would need its feature and
+        # its values computed, which Spark refuses on schema evolution too.
+        out["metadata"] = {"comment": comment} if comment is not None else {}
+        out["nullable"] = True
+        top = "." not in path
+        if top and path.lower() in _CDF_RESERVED and _cdf_enabled(configuration):
+            raise cdf_clash_error(operation, [path])
+        added.append(out)
+        return out
+
+    def merge_fields(
+        fields: list[dict[str, Any]], data_type: Any, path: str, *, nested: bool = False
+    ) -> None:
+        by_name = {f["name"].lower(): f for f in fields}
+        # A pyarrow Schema or StructType: both iterate their fields.
+        for f in data_type:
+            where = f"{path}.{f.name}" if path else f.name
+            current = by_name.get(f.name.lower())
+            if current is None:
+                fields.append(new_field(f, where))
+                by_name[f.name.lower()] = fields[-1]
+                continue
+            old = current["type"]
+            merged = merge_type(old, f.type, where, nested=nested)
+            if merged is not None:
+                current["type"] = merged
+                meta = current.setdefault("metadata", {})
+                history = list(meta.get(_TYPE_CHANGES) or [])
+                history.append({"fromType": old, "toType": merged})
+                meta[_TYPE_CHANGES] = history
+                widened.append(merged)
+
+    def merge_type(table_type: Any, data_type: Any, where: str, *, nested: bool) -> Any:
+        """The table's primitive type widened to take `data_type`, or None if it takes
+        it as it is. Structs (anywhere) are merged in place; `nested` is True inside
+        an array or a map, where a type is not widened."""
+        import pyarrow as pa
+
+        if isinstance(table_type, dict):
+            kind = table_type.get("type")
+            if kind == "struct" and pa.types.is_struct(data_type):
+                merge_fields(_fields(table_type), data_type, where, nested=nested)
+            elif kind == "array" and (
+                pa.types.is_list(data_type) or pa.types.is_large_list(data_type)
+            ):
+                merge_type(
+                    table_type["elementType"], data_type.value_type, f"{where}.element", nested=True
+                )
+            elif kind == "map" and pa.types.is_map(data_type):
+                merge_type(table_type["keyType"], data_type.key_type, f"{where}.key", nested=True)
+                merge_type(
+                    table_type["valueType"], data_type.item_type, f"{where}.value", nested=True
+                )
+            # A type of another kind is the write's to refuse: nothing changes here.
+            return None
+        if not isinstance(table_type, str):
+            return None
+        try:
+            data_name = arrow_to_delta_type(data_type)
+        except UnreachableTableError:
+            return None  # e.g. an unsigned integer, which the write widens itself
+        if not isinstance(data_name, str):
+            return None
+        data_name = data_name.replace(" ", "")
+        old = table_type.replace(" ", "")
+        if data_name == old or not _widening_allowed(old, data_name):
+            return None
+        if not widening:
+            raise _refuse(
+                f"write {data_name} values into column {where} ({old})",
+                "the data's type is wider than the column's, and widening a column's type "
+                "needs type widening, which the table does not enable",
+                "set_properties({'delta.enableTypeWidening': 'true'}) first, or cast the "
+                f"data to {old}",
+            )
+        if nested:
+            raise _refuse(
+                f"widen {where} from {old} to {data_name}",
+                "widening an array element or a map key or value is not supported on write",
+                f"cast the data to {old}",
+            )
+        if where.lower() in partitions:
+            raise _refuse(
+                f"widen partition column {where} from {old} to {data_name}",
+                "its stored values (strings in the log) are parsed with the column's type",
+                f"cast the data to {old}",
+            )
+        dependents = [
+            d
+            for d in _dependents(state, where.split(".")[-1])
+            if d != "delta.dataSkippingStatsColumns"
+        ]
+        if dependents:
+            raise _refuse(
+                f"widen {where} from {old} to {data_name}",
+                f"it is referenced by {', '.join(dependents)}",
+                f"cast the data to {old}",
+            )
+        return data_name
+
+    merge_fields(_fields(schema), arrow_schema, "")
+    if not added and not widened:
+        return Change("WRITE", {})
+    for f in added:
+        # Each one on its own: new fields of different structs are no siblings,
+        # and a sibling the struct already had was matched, not added.
+        _check_names([f], operation, column_mapping=column_mapping)
+    if column_mapping:
+        next_id = _assign_ids(
+            added, _max_column_id(state) + 1, physical=lambda _f: f"col-{uuid.uuid4()}"
+        )
+        configuration[_CM_MAX] = str(next_id - 1)
+    features: set[str] = {"typeWidening"} if widened else set()
+    for datatype in [f["type"] for f in added] + widened:
+        features |= _type_features(datatype)
+    metadata = _new_metadata(state, schema)
+    metadata["configuration"] = configuration
+    return Change(
+        "WRITE",
+        {"mergeSchema": "true"},
         protocol=with_features(state.protocol, features) if features else None,
         metadata=metadata,
     )
@@ -857,6 +1092,15 @@ def rename_column(state: TableState, old: str, new: str) -> Change:
         )
     if leaf == current:
         return Change("RENAME COLUMN", {"oldColumnPath": old, "newColumnPath": new})
+    if leaf.lower() == current.lower():
+        # Column names are case-insensitive, so this renames a column to
+        # itself; Databricks refuses it, and the same call must not succeed
+        # here and fail on the warehouse.
+        raise _refuse(
+            f"rename column {old} to {new}",
+            "the new name differs only in case, and column names are case-insensitive",
+            "rename it to a different name, then to the new spelling",
+        )
     dependents = _dependents(state, current)
     if dependents:
         raise _refuse(
@@ -925,6 +1169,129 @@ _TYPE_ALIASES = {
 }
 
 
+#: SQL and Arrow spellings of Delta's primitive types, for `{name: type}`.
+_TYPE_NAME_ALIASES = {
+    **_TYPE_ALIASES,
+    "bool": "boolean",
+    "varchar": "string",
+    "char": "string",
+    "text": "string",
+    "int64": "long",
+    "int32": "integer",
+    "int16": "short",
+    "int8": "byte",
+    "float32": "float",
+    "float64": "double",
+    "utf8": "string",
+    "large_string": "string",
+    "timestampntz": "timestamp_ntz",
+    "date32": "date",
+}
+
+_DELTA_PRIMITIVE_NAMES = frozenset(
+    {
+        "string",
+        "long",
+        "integer",
+        "short",
+        "byte",
+        "float",
+        "double",
+        "boolean",
+        "binary",
+        "date",
+        "timestamp",
+        "timestamp_ntz",
+        "variant",
+    }
+)
+
+
+def _split_top(text: str, sep: str) -> list[str]:
+    """Split on `sep` outside <...> and (...)."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts]
+
+
+def sql_type_to_delta(text: str) -> Any:
+    """A type as written in SQL (``bigint``, ``varchar(10)``, ``array<int>``,
+    ``struct<a:int>``) or Delta's own spelling, as Delta schema JSON.
+
+    Raises ValueError naming the part it cannot read. Shared by every engine,
+    so a `{name: type}` argument means the same thing wherever it is served.
+    """
+    raw = text
+    text = text.strip()
+    lowered = text.lower()
+    for kind in ("array", "map", "struct"):
+        if lowered.startswith(kind) and lowered[len(kind) :].lstrip().startswith("<"):
+            inner = text[text.index("<") + 1 :]
+            if not inner.endswith(">"):
+                raise ValueError(f"{raw!r} has unbalanced < >")
+            inner = inner[:-1].strip()
+            if kind == "array":
+                return {
+                    "type": "array",
+                    "elementType": sql_type_to_delta(inner),
+                    "containsNull": True,
+                }
+            if kind == "map":
+                pair = _split_top(inner, ",")
+                if len(pair) != 2:
+                    raise ValueError(f"{raw!r}: a map takes a key type and a value type")
+                return {
+                    "type": "map",
+                    "keyType": sql_type_to_delta(pair[0]),
+                    "valueType": sql_type_to_delta(pair[1]),
+                    "valueContainsNull": True,
+                }
+            fields = []
+            for member in _split_top(inner, ","):
+                name, colon, member_type = member.partition(":")
+                if not colon:
+                    # `struct<a int>` is also accepted by Spark.
+                    name, _, member_type = member.partition(" ")
+                name = name.strip().strip("`")
+                if not name or not member_type.strip():
+                    raise ValueError(f"{raw!r}: struct member {member!r} needs a name and a type")
+                fields.append(
+                    {
+                        "name": name,
+                        "type": sql_type_to_delta(member_type),
+                        "nullable": True,
+                        "metadata": {},
+                    }
+                )
+            return {"type": "struct", "fields": fields}
+    compact = lowered.replace(" ", "")
+    head, paren, args = compact.partition("(")
+    head = _TYPE_NAME_ALIASES.get(head, head)
+    if head == "decimal":
+        if not paren:
+            return "decimal(10,0)"
+        match = re.fullmatch(r"(\d+)(?:,(\d+))?\)", args)
+        if match is None:
+            raise ValueError(f"{raw!r} is not a decimal type")
+        precision, scale = int(match.group(1)), int(match.group(2) or 0)
+        if not 0 < precision <= 38 or scale > precision:
+            raise ValueError(f"{raw!r} is outside Delta's decimal range (precision 1-38)")
+        return f"decimal({precision},{scale})"
+    if paren and head == "string":
+        return "string"  # varchar(n) / char(n): Delta stores a plain string
+    if not paren and head in _DELTA_PRIMITIVE_NAMES:
+        return head
+    raise ValueError(f"{raw!r} is not a Delta or SQL type")
+
+
 def _normalise_type(name: str) -> str:
     text = name.strip().lower().replace(" ", "")
     head, paren, tail = text.partition("(")
@@ -939,6 +1306,11 @@ def _normalise_type(name: str) -> str:
 def alter_column_type(state: TableState, column: str, new_type: str) -> Change:
     """Widen a column's type without rewriting data (the typeWidening feature)."""
     config = state.configuration
+    current = _find(state.schema, _split(column))
+    if current[0][current[1]]["type"] == _normalise_type(new_type):
+        # The type it already has (`bigint` for a long): nothing to change,
+        # as Spark treats it, rather than a refusal to "change" it.
+        return Change("CHANGE COLUMN", {"column": column, "type": _normalise_type(new_type)})
     if config.get("delta.enableTypeWidening", "false").lower() != "true":
         raise _refuse(
             f"change the type of {column}",
@@ -961,7 +1333,19 @@ def alter_column_type(state: TableState, column: str, new_type: str) -> Change:
     if len(path) == 1 and target["name"].lower() in {
         p.lower() for p in state.metadata.get("partitionColumns") or []
     }:
-        raise _refuse(f"change the type of {column}", "it is a partition column")
+        # Partition values are strings in the add actions, parsed with the
+        # column's current type: "7" is as good a long as an int, and
+        # Databricks widens numeric partition columns. But the kernel refuses
+        # "1.50" as decimal(7,3) -- a scale change leaves every stored value
+        # unparseable -- and a date's "2024-01-01" is not a timestamp_ntz.
+        old_dec, new_dec = _DECIMAL.fullmatch(old_type), _DECIMAL.fullmatch(new_type)
+        old_scale = int(old_dec.group(2)) if old_dec else 0
+        if old_type == "date" or (new_dec is not None and int(new_dec.group(2)) != old_scale):
+            raise _refuse(
+                f"change the type of {column} from {old_type} to {new_type}",
+                "it is a partition column, and its stored values (strings in the log) "
+                "would not parse as the new type",
+            )
     # Spark refuses a type change under a CHECK constraint or a generated
     # column: the expression was validated against the old type, and a
     # generated column's stored type no longer matches what it computes.
@@ -987,6 +1371,50 @@ def alter_column_type(state: TableState, column: str, new_type: str) -> Change:
         {"column": column, "type": new_type},
         protocol=with_features(state.protocol, features),
         metadata=_new_metadata(state, schema),
+    )
+
+
+def add_constraints(state: TableState, constraints: Mapping[str, str]) -> Change:
+    """ADD CONSTRAINT ... CHECK. The caller must have checked every existing row.
+
+    Names are stored lower-cased, as Spark stores them (`delta.constraints.<name>`),
+    and one the table already has is refused, as Spark refuses it. The
+    protocol gains `checkConstraints`: a table on table features lists it, and
+    a legacy one below writer version 3 moves to 3, which implies it, as
+    Spark upgrades one.
+    """
+    configuration = state.configuration
+    existing = {k.lower() for k in configuration}
+    added: dict[str, str] = {}
+    for name, expression in constraints.items():
+        if not isinstance(name, str) or not name.strip():
+            raise InvalidArgumentError(f"constraint names must be non-empty, not {name!r}")
+        key = f"delta.constraints.{name.lower()}"
+        if key in existing or key in added:
+            raise InvalidArgumentError(
+                f"cannot add constraint {name}: the table already has a constraint with "
+                f"that name; drop_constraint({name!r}) first"
+            )
+        added[key] = str(expression)
+    if not added:
+        return Change("ADD CONSTRAINT", {})
+    configuration.update(added)
+    metadata = _new_metadata(state)
+    metadata["configuration"] = configuration
+    protocol: dict[str, Any] | None
+    writer = int(state.protocol.get("minWriterVersion", 1))
+    if writer >= 7:
+        protocol = with_features(state.protocol, {"checkConstraints"})
+    elif writer < 3:
+        protocol = {**state.protocol, "minWriterVersion": 3}
+    else:
+        protocol = None
+    (name, expression), *_ = constraints.items()
+    return Change(
+        "ADD CONSTRAINT",
+        {"name": name, "expr": expression} if len(constraints) == 1 else {},
+        protocol=protocol,
+        metadata=metadata,
     )
 
 
@@ -1136,7 +1564,9 @@ def cluster_by(state: TableState, columns: list[str] | str | None) -> Change:
         for depth, part in enumerate(path):
             found = next((f for f in container if f["name"].lower() == part.lower()), None)
             if found is None:
-                raise _refuse(f"cluster by {column}", f"the table has no column {column!r}")
+                raise InvalidArgumentError(
+                    f"cannot cluster by {column}: the table has no column {column!r}"
+                )
             names.append(_physical_name(found))
             if depth < len(path) - 1:
                 if not (isinstance(found["type"], dict) and found["type"].get("type") == "struct"):
@@ -1250,7 +1680,9 @@ _KNOWN_KEYS = frozenset(
         "delta.checkpoint.writeStatsAsStruct",
         "delta.checkpointInterval",
         "delta.checkpointPolicy",
+        "delta.checkpointRetentionDuration",
         "delta.columnMapping.mode",
+        "delta.compatibility.symlinkFormatManifest.enabled",
         "delta.dataSkippingNumIndexedCols",
         "delta.dataSkippingStatsColumns",
         "delta.deletedFileRetentionDuration",
@@ -1277,6 +1709,7 @@ _BOOLEAN_KEYS = frozenset(
         "delta.autoOptimize.optimizeWrite",
         "delta.checkpoint.writeStatsAsJson",
         "delta.checkpoint.writeStatsAsStruct",
+        "delta.compatibility.symlinkFormatManifest.enabled",
         "delta.enableChangeDataFeed",
         "delta.enableDeletionVectors",
         "delta.enableExpiredLogCleanup",
@@ -1297,6 +1730,7 @@ _INTEGER_KEYS: dict[str, int] = {
 }
 _DURATION_KEYS = frozenset(
     {
+        "delta.checkpointRetentionDuration",
         "delta.deletedFileRetentionDuration",
         "delta.logRetentionDuration",
         "delta.setTransactionRetentionDuration",
@@ -1533,7 +1967,9 @@ def unset_properties(state: TableState, keys: Iterable[str], *, if_exists: bool 
         if key not in configuration:
             if if_exists:
                 continue
-            raise _refuse(f"unset {key}", "the table has no such property")
+            raise InvalidArgumentError(
+                f"cannot unset {key}: the table has no such property (if_exists=True ignores it)"
+            )
         del configuration[key]
         removed.append(key)
     if not removed:
@@ -1724,6 +2160,9 @@ def initial_actions(
     column_mapping = config.get(_CM_MODE, "none").lower() in ("name", "id")
     _check_names(_fields(schema), "create the table", column_mapping=column_mapping)
     features |= _type_features(schema)
+    # Generated, identity and default columns (and invariants) only mean
+    # anything under their feature; left out, the next writer stores any value.
+    features |= column_features(schema)
     if column_mapping:
         features.add("columnMapping")
         last = _assign_ids(_fields(schema), 1, physical=lambda _f: f"col-{uuid.uuid4()}")

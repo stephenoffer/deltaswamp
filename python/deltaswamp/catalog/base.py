@@ -14,7 +14,7 @@ catalog:
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -197,6 +197,12 @@ class ResolvedTable:
     has_invariants: bool = False
     has_check_constraints: bool = False
     has_generated_columns: bool = False
+    #: A partition column of type binary. delta-rs serialises such values in
+    #: a form no other engine here reads back (b"ab" -> "\\u0061\\u0062").
+    has_binary_partitions: bool = False
+    #: A DATE or TIMESTAMP column anywhere in the schema, which a file Spark
+    #: wrote in its legacy calendar may hold shifted. True until known.
+    has_datetime_columns: bool = True
 
     # Set when reading the log failed on every engine. The router then refuses
     # direct-storage operations with this as the reason, instead of routing on
@@ -223,6 +229,10 @@ class ResolvedTable:
     # Catalog-managed state, supplied to SnapshotBuilder.
     log_tail: tuple[LogTailEntry, ...] = ()
     max_catalog_version: int | None = None
+    #: A table a distributed write will create, not there yet: its version 0
+    #: as a template commit, `(url, last_modified_millis, size)`, which the
+    #: kernel resolves in place of the log (see `Connection.plan_write`).
+    pending_commit: tuple[str, int, int] | None = None
 
     credential_provider: CredentialProvider | None = None
 
@@ -233,6 +243,39 @@ class ResolvedTable:
     #: tables reached through a share, whose files are served as presigned URLs
     #: and are not addressable by a storage location at all.
     sharing_profile: str | None = field(default=None, repr=False)
+    #: Re-reads a catalog-managed table's ratified commit tail: a callable
+    #: taking this table and returning it with the catalog's current
+    #: `log_tail` and `max_catalog_version`. Set by the catalog that resolved
+    #: the table, so an engine can rebase a commit that lost a race to the
+    #: catalog's next version. Never pickled: it holds the catalog's client,
+    #: and a worker must not reach the catalog.
+    commit_tail: Any = field(default=None, repr=False, compare=False)
+
+    def __getstate__(self) -> list[Any]:
+        return [None if f.name == "commit_tail" else getattr(self, f.name) for f in fields(self)]
+
+    def __setstate__(self, state: list[Any]) -> None:
+        for f, value in zip(fields(self), state, strict=True):
+            object.__setattr__(self, f.name, value)
+
+    def with_fresh_commit_tail(self) -> ResolvedTable | None:
+        """This table with the catalog's commit tail re-read, or None if it cannot be.
+
+        None for a table that is not catalog-managed, or whose catalog left no
+        way to re-read it (a table unpickled on a worker). A table dropped and
+        re-created under the same name since is an error, not a fresh tail.
+        """
+        if not self.is_catalog_managed or self.commit_tail is None:
+            return None
+        fresh = self.commit_tail(self)
+        if self.table_id and fresh.table_id and self.table_id != fresh.table_id:
+            from ..errors import CorruptTableError
+
+            raise CorruptTableError(
+                f"{self.ref} was dropped and re-created since this operation read it "
+                f"(its table id is now {fresh.table_id!r}); run it again against the new table"
+            )
+        return fresh
 
     @property
     def features(self) -> frozenset[str]:
@@ -317,6 +360,28 @@ class ResolvedTable:
     @property
     def is_iceberg(self) -> bool:
         return (self.data_source_format or "").upper() == "ICEBERG"
+
+    @property
+    def is_managed_iceberg(self) -> bool:
+        """An Iceberg table the catalog takes writes for through Iceberg REST.
+
+        Databricks' managed Iceberg (``CREATE TABLE ... USING ICEBERG``) is
+        reported by Unity Catalog as DELTA: it keeps a catalog-managed Delta
+        log written with ``icebergWriterCompatV1``, beside Iceberg metadata
+        the catalog maintains on every commit. Reading only the format made
+        it look like UniForm, whose Iceberg view is read-only, so appends were
+        refused although the catalog's Iceberg endpoint accepts them.
+        """
+        if self.is_iceberg:
+            return True
+        # V3 (Iceberg v3 tables) is set in place of V1, not beside it.
+        return self.is_catalog_managed and any(
+            str(self.properties.get(key, "")).strip().lower() == "true"
+            for key in (
+                "delta.enableIcebergWriterCompatV1",
+                "delta.enableIcebergWriterCompatV3",
+            )
+        )
 
     @property
     def is_view_like(self) -> bool:
