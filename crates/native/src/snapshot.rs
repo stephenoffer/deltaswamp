@@ -1111,6 +1111,8 @@ impl PySnapshot {
         metadata = None,
         protocol = None,
         constraints_checked = false,
+        values_checked = None,
+        domain_metadata = None,
     ))]
     fn append(
         &self,
@@ -1127,7 +1129,11 @@ impl PySnapshot {
         metadata: Option<String>,
         protocol: Option<String>,
         constraints_checked: bool,
+        values_checked: Option<Vec<String>>,
+        domain_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<u64> {
+        let constraints_checked =
+            crate::restate::Checked::from_args(constraints_checked, values_checked)?;
         let reader = data.into_reader()?;
 
         let version = py.detach(|| {
@@ -1148,6 +1154,7 @@ impl PySnapshot {
                 commit::CommitInfoPatch {
                     operation_parameters,
                     blind_append,
+                    domains: domain_metadata,
                     ..Default::default()
                 },
                 &crate::restate::Restatement {
@@ -1167,14 +1174,17 @@ impl PySnapshot {
     /// coordinator that gives up leaves them as garbage. Decide whether the
     /// commit can succeed *before* the first worker runs -- that is what
     /// `Table.can(...)` is for.
-    #[pyo3(signature = (data, uc = None, constraints_checked = false))]
+    #[pyo3(signature = (data, uc = None, constraints_checked = false, values_checked = None))]
     fn write_files(
         &self,
         py: Python<'_>,
         data: PyRecordBatchReader,
         uc: Option<UcCommitConfig>,
         constraints_checked: bool,
+        values_checked: Option<Vec<String>>,
     ) -> PyResult<Vec<u8>> {
+        let constraints_checked =
+            crate::restate::Checked::from_args(constraints_checked, values_checked)?;
         let reader = data.into_reader()?;
         let batches: std::result::Result<Vec<_>, _> = reader.collect();
         let batches = batches.map_err(NativeError::from)?;
@@ -1225,6 +1235,8 @@ impl PySnapshot {
         operation_parameters = None,
         blind_append = None,
         constraints_checked = false,
+        values_checked = None,
+        domain_metadata = None,
     ))]
     fn commit_files(
         &self,
@@ -1239,7 +1251,11 @@ impl PySnapshot {
         operation_parameters: Option<HashMap<String, String>>,
         blind_append: Option<bool>,
         constraints_checked: bool,
+        values_checked: Option<Vec<String>>,
+        domain_metadata: Option<HashMap<String, String>>,
     ) -> PyResult<u64> {
+        let constraints_checked =
+            crate::restate::Checked::from_args(constraints_checked, values_checked)?;
         let version = py.detach(|| {
             commit::commit_files(
                 self.inner.clone(),
@@ -1254,6 +1270,7 @@ impl PySnapshot {
                 commit::CommitInfoPatch {
                     operation_parameters,
                     blind_append,
+                    domains: domain_metadata,
                     ..Default::default()
                 },
                 constraints_checked,
@@ -1290,6 +1307,7 @@ impl PySnapshot {
         blind_append = None,
         add_tags = None,
         constraints_checked = false,
+        values_checked = None,
     ))]
     fn commit_dml(
         &self,
@@ -1307,7 +1325,10 @@ impl PySnapshot {
         blind_append: Option<bool>,
         add_tags: Option<HashMap<String, String>>,
         constraints_checked: bool,
+        values_checked: Option<Vec<String>>,
     ) -> PyResult<(u64, u64, usize, usize)> {
+        let constraints_checked =
+            crate::restate::Checked::from_args(constraints_checked, values_checked)?;
         let deletions = deletions.into_reader()?;
         let data = data.map(|d| d.into_reader()).transpose()?;
         let outcome = py.detach(|| -> Result<dml::DmlOutcome> {

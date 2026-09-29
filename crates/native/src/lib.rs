@@ -132,6 +132,18 @@ pub const FEATURES: &[&str] = &[
     // monotonic before in-commit timestamps), which every timestamp lookup
     // resolves against.
     "commit_timestamps",
+    // `values_checked=` on every data write: generated columns, identity
+    // columns and invariants computed and checked by the caller over the
+    // rows written, and the write committed past the kernel's refusal of
+    // each (`restate::Checked`).
+    "values_checked",
+    // Writes, DML, checkpoints and checksums on tables carrying
+    // `checkpointProtection`, which binds only log cleanup
+    // (`restate::HISTORY_ONLY`).
+    "checkpoint_protection",
+    // `append(domain_metadata=)` and `commit_files(domain_metadata=)`: user
+    // domain metadata set in the same commit as the rows.
+    "domain_metadata",
 ];
 
 #[pyfunction]

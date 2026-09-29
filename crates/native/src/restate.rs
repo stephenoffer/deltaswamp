@@ -14,10 +14,16 @@
 //!   the table holds a constraint). The caller evaluates every constraint over
 //!   every row it writes, as Spark does, and says so.
 //!
-//! Both start the transaction on a restated snapshot: the same log segment and
-//! version, with the evolved metadata and protocol, and with
-//! `checkConstraints` set aside from the protocol the kernel checks the write
-//! against when the caller has checked them. The metadata and protocol the
+//! * A write to a table whose generated columns, identity columns or
+//!   invariants the caller computed and checked over every row (see
+//!   [`Checked`]), all of which the kernel refuses to write.
+//! * A write to a table carrying `checkpointProtection`, which kernel 0.28 does
+//!   not know and so refuses (see [`HISTORY_ONLY`]).
+//!
+//! All start the transaction on a restated snapshot: the same log segment and
+//! version, with the evolved metadata and protocol, and with the features the
+//! caller evaluated set aside from the protocol the kernel checks the write
+//! against. The metadata and protocol the
 //! commit really writes go in as actions of their own, after the kernel's;
 //! the protocol set aside is never written anywhere. The commit's conflict
 //! check is the object store's put-if-absent of the next version, as for any
@@ -33,6 +39,66 @@ use delta_kernel::FilteredEngineData;
 use crate::commit::{CommitInfoPatch, SharedEngine};
 use crate::error::{NativeError, Result};
 
+/// Which value constraints the caller evaluated over every row a commit writes.
+///
+/// Each stands in for the kernel's refusal of the matching feature:
+///
+/// * `constraints`: every CHECK constraint held (`checkConstraints`).
+/// * `generated`: every generated column holds its generation expression's
+///   value, computed where the data left it out (`generatedColumns`).
+/// * `invariants`: every column invariant held (`invariants`).
+/// * `identity`: every identity column's value was generated here, within a
+///   range the table's high-water mark already covers, or given where the
+///   column allows it (`identityColumns`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Checked {
+    pub constraints: bool,
+    pub generated: bool,
+    pub invariants: bool,
+    pub identity: bool,
+}
+
+impl Checked {
+    /// `constraints_checked=` and `values_checked=` as the binding takes them.
+    ///
+    /// Unknown names are refused rather than ignored: a newer caller naming a
+    /// check this build cannot set aside must not write past the kernel.
+    pub fn from_args(constraints: bool, values: Option<Vec<String>>) -> Result<Self> {
+        let mut checked = Checked {
+            constraints,
+            ..Default::default()
+        };
+        for name in values.unwrap_or_default() {
+            match name.as_str() {
+                "checkConstraints" => checked.constraints = true,
+                "generatedColumns" => checked.generated = true,
+                "invariants" => checked.invariants = true,
+                "identityColumns" => checked.identity = true,
+                other => {
+                    return Err(NativeError::Invalid(format!(
+                        "values_checked names {other:?}, which this build cannot set aside"
+                    )))
+                }
+            }
+        }
+        Ok(checked)
+    }
+
+    /// Whether the caller checked anything at all.
+    pub fn any(&self) -> bool {
+        self.constraints || self.generated || self.invariants || self.identity
+    }
+}
+
+impl From<bool> for Checked {
+    fn from(constraints: bool) -> Self {
+        Checked {
+            constraints,
+            ..Default::default()
+        }
+    }
+}
+
 /// What a write commits beside its data, and what it leaves the kernel to check.
 #[derive(Debug, Clone, Default)]
 pub struct Restatement {
@@ -40,17 +106,39 @@ pub struct Restatement {
     pub metadata: Option<String>,
     /// The `protocol` the commit writes, as log JSON, in place of the table's.
     pub protocol: Option<String>,
-    /// Every CHECK constraint was evaluated over every row the commit writes.
-    /// The kernel's refusal of `checkConstraints` is then set aside, and of
-    /// `generatedColumns` where no column is generated (see [`checked_features`]).
-    pub constraints_checked: bool,
+    /// The value constraints the caller evaluated over every row the commit
+    /// writes; the kernel's refusal of each is set aside (see
+    /// [`checked_features`]).
+    pub constraints_checked: Checked,
 }
 
 impl Restatement {
-    /// Whether the write goes ahead on the table's own snapshot.
+    /// Whether the write goes ahead on the table's own snapshot (unless the
+    /// table carries a [`HISTORY_ONLY`] feature).
     pub fn is_empty(&self) -> bool {
-        self.metadata.is_none() && self.protocol.is_none() && !self.constraints_checked
+        self.metadata.is_none() && self.protocol.is_none() && !self.constraints_checked.any()
     }
+}
+
+/// Features that bind only what a writer deletes from the log, never a commit.
+///
+/// `checkpointProtection` (Delta 4.0, added when a feature is dropped) says
+/// that commits and checkpoints before
+/// `delta.requireCheckpointProtectionBeforeVersion` may be removed only all
+/// together, up to a checkpoint. A data, metadata or DML commit removes
+/// nothing from the log, and a checkpoint of the latest version adds one;
+/// kernel 0.28 has no variant for the feature, reads it as Unknown and
+/// refuses every write. Expired log cleanup, the one operation the feature
+/// binds, refuses it itself (`crate::logclean`).
+pub(crate) const HISTORY_ONLY: &[&str] = &["checkpointProtection"];
+
+/// Whether `protocol` lists any of `features` among its writer features.
+fn lists_any(protocol: &Protocol, features: &[&str]) -> bool {
+    protocol.writer_features().is_some_and(|listed| {
+        listed
+            .iter()
+            .any(|f| features.contains(&f.to_string().as_str()))
+    })
 }
 
 /// The writer features a legacy writer version implies, in protocol order.
@@ -83,8 +171,12 @@ fn without_features(protocol: &Protocol, set_aside: &[&str]) -> Result<Option<Pr
     let writer = protocol.min_writer_version();
     let listed: Vec<String> = match protocol.writer_features() {
         Some(features) => features.iter().map(|f| f.to_string()).collect(),
+        // A legacy feature is supported only where both versions reach it:
+        // columnMapping, the one reader-writer feature here, needs reader 2,
+        // and delta-rs writes (1, 6) tables that have none of it.
         None => legacy_writer_features(writer)
             .into_iter()
+            .filter(|f| *f != "columnMapping" || protocol.min_reader_version() >= 2)
             .map(str::to_string)
             .collect(),
     };
@@ -127,7 +219,9 @@ pub(crate) fn restated_snapshot(
 
     let config = snapshot.table_configuration();
     let protocol = protocol.unwrap_or_else(|| config.protocol().clone());
-    let checked = without_features(&protocol, set_aside)?;
+    // Every restated snapshot sets these aside: no commit is bound by them.
+    let set_aside: Vec<&str> = set_aside.iter().chain(HISTORY_ONLY).copied().collect();
+    let checked = without_features(&protocol, &set_aside)?;
     if metadata.is_none() && checked.is_none() && &protocol == config.protocol() {
         return Ok(snapshot.clone());
     }
@@ -188,10 +282,30 @@ pub(crate) fn log_writing_snapshot(snapshot: &SnapshotRef) -> Result<SnapshotRef
     {
         return Ok(snapshot.clone());
     }
+    // A checkpoint below the protected version would be one the feature's
+    // all-or-nothing cleanup rule does not account for. That version is the
+    // one a feature was dropped at, so the latest is never below it; refused
+    // rather than assumed.
+    let config = snapshot.table_configuration();
+    if lists_any(config.protocol(), HISTORY_ONLY) {
+        let protected = config
+            .metadata()
+            .configuration()
+            .get("delta.requireCheckpointProtectionBeforeVersion")
+            .and_then(|v| v.parse::<u64>().ok());
+        if let Some(below) = protected.filter(|below| snapshot.version() < *below) {
+            return Err(NativeError::Invalid(format!(
+                "the table's checkpointProtection covers versions below {below}, and this \
+                 snapshot is version {}",
+                snapshot.version()
+            )));
+        }
+    }
     restated_snapshot(snapshot, VALUE_CONSTRAINTS, None, None)
 }
 
-/// The features a caller's own evaluation stands in for.
+/// The features a caller's own evaluation of CHECK constraints stands in for.
+#[cfg(test)]
 const CHECKED: &[&str] = &["checkConstraints"];
 
 /// Whether any field of the schema in `schema_string` (nested ones included)
@@ -216,17 +330,28 @@ fn declares(schema_string: &str, key: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// What a checked write sets aside: [`CHECKED`], and `generatedColumns` when
-/// no column of `schema_string` is generated.
+/// What a checked write sets aside: each feature `checked` says the caller
+/// evaluated, and `generatedColumns` / `identityColumns` when no column of
+/// `schema_string` is generated / an identity column, as there is then no
+/// value for anyone to compute.
 ///
-/// Legacy writer versions 4 to 6 imply `generatedColumns` whatever the
-/// schema, and the kernel refuses the feature: every column-mapped table
-/// Databricks or delta-rs created at (2, 5) was refused, though no column of
-/// it had a generation expression for the kernel to compute.
-fn checked_features(schema_string: &str) -> Vec<&'static str> {
-    let mut features = CHECKED.to_vec();
-    if !declares(schema_string, "delta.generationExpression") {
+/// Legacy writer versions 4 to 6 imply `generatedColumns` (and 6
+/// `identityColumns`) whatever the schema, and the kernel refuses both: every
+/// column-mapped table Databricks or delta-rs created at (2, 5) was refused,
+/// though no column of it had a generation expression for the kernel to compute.
+fn checked_features(schema_string: &str, checked: Checked) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if checked.constraints {
+        features.push("checkConstraints");
+    }
+    if checked.generated || !declares(schema_string, "delta.generationExpression") {
         features.push("generatedColumns");
+    }
+    if checked.identity || !declares(schema_string, "delta.identity.start") {
+        features.push("identityColumns");
+    }
+    if checked.invariants {
+        features.push("invariants");
     }
     features
 }
@@ -243,7 +368,8 @@ pub(crate) fn writing_snapshot(
     use delta_kernel::actions::{LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA};
     use delta_kernel::IntoEngineData;
 
-    if restatement.is_empty() {
+    if restatement.is_empty() && !lists_any(snapshot.table_configuration().protocol(), HISTORY_ONLY)
+    {
         return Ok(snapshot.clone());
     }
     let parse = |what: &str, text: &str| -> Result<serde_json::Value> {
@@ -276,7 +402,7 @@ pub(crate) fn writing_snapshot(
             ));
         }
     }
-    let set_aside = if restatement.constraints_checked {
+    let set_aside = if restatement.constraints_checked.any() {
         let schema = match &metadata {
             Some(new) => new.schema_string().clone(),
             None => snapshot
@@ -285,8 +411,9 @@ pub(crate) fn writing_snapshot(
                 .schema_string()
                 .clone(),
         };
-        checked_features(&schema)
+        checked_features(&schema, restatement.constraints_checked)
     } else {
+        // HISTORY_ONLY alone, which restated_snapshot always adds.
         Vec::new()
     };
     let restated = restated_snapshot(snapshot, &set_aside, metadata.clone(), protocol.clone())?;
@@ -361,6 +488,24 @@ mod tests {
 
         let plain = protocol(serde_json::json!({"minReaderVersion": 1, "minWriterVersion": 2}));
         assert!(without_features(&plain, CHECKED).unwrap().is_none());
+
+        // Writer 6 under reader 1 (as delta-rs writes it) has no column
+        // mapping, which needs reader 2: the restatement does not claim it.
+        let reader_one =
+            protocol(serde_json::json!({"minReaderVersion": 1, "minWriterVersion": 6}));
+        let restated = without_features(&reader_one, &["identityColumns"])
+            .unwrap()
+            .unwrap();
+        let features: Vec<String> = restated
+            .writer_features()
+            .unwrap()
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        assert!(
+            !features.contains(&"columnMapping".to_string()),
+            "{features:?}"
+        );
     }
 
     /// A table carrying every value-constraint feature: CHECK constraints, a
@@ -501,12 +646,30 @@ mod tests {
     #[test]
     fn generated_columns_are_set_aside_only_where_none_is_declared() {
         let plain = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}"#;
+        let constraints = Checked::from(true);
         assert_eq!(
-            checked_features(plain),
-            ["checkConstraints", "generatedColumns"]
+            checked_features(plain, constraints),
+            ["checkConstraints", "generatedColumns", "identityColumns"]
         );
         let nested = r#"{"type":"struct","fields":[{"name":"s","type":{"type":"struct","fields":[{"name":"g","type":"long","nullable":true,"metadata":{"delta.generationExpression":"1"}}]},"nullable":true,"metadata":{}}]}"#;
-        assert_eq!(checked_features(nested), ["checkConstraints"]);
-        assert_eq!(checked_features("not json"), ["checkConstraints"]);
+        assert_eq!(
+            checked_features(nested, constraints),
+            ["checkConstraints", "identityColumns"]
+        );
+        assert_eq!(
+            checked_features("not json", constraints),
+            ["checkConstraints"]
+        );
+        // A declared generated column is set aside only when the caller computed it.
+        let computed = Checked {
+            generated: true,
+            invariants: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            checked_features(nested, computed),
+            ["generatedColumns", "identityColumns", "invariants"]
+        );
+        assert!(Checked::from_args(false, Some(vec!["nope".into()])).is_err());
     }
 }
