@@ -63,7 +63,7 @@ resolution, vending, then reads and writes.
 | SQL fallback | warns when it serves a request |
 | Lifecycle | exists, list, drop |
 | Conformance sweep | walks the whole schema and checks every claim against reality |
-| Distributed plans | a pickled `plan_scan` / `plan_changes` read in a separate process with no Databricks auth (managed, deletion-vector, change-feed and catalog-managed tables); `plan_write` on a managed table written or refused at planning (`tests/live/test_live_ray_tooling.py`) |
+| Distributed plans | a pickled `plan_scan` / `plan_changes` read in a separate process with no Databricks auth (managed, deletion-vector, change-feed and catalog-managed tables; a table behind a row filter and a column mask, and a view over it, read by result chunk through the warehouse, links refreshed with shipped auth); `plan_write` on a managed table written or refused at planning (`tests/live/test_live_ray_tooling.py`) |
 
 Each test creates what it needs under a random name and drops it afterward,
 even when it fails. Anything your workspace cannot verify is skipped with a
