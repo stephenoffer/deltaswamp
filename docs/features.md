@@ -60,7 +60,8 @@ Several values in one cell are a routing chain, tried in order.
 | Deletion vectors on read | all | kernel, delta-rs | applied before any reordering |
 | Views, MVs, metric views, row-filtered tables | DBR | warehouse | vending refuses them; only the warehouse can evaluate them |
 | Shallow clones | DBR, Spark | warehouse | absolute paths into the source defeat credential scoping |
-| Distributed scan | Spark, kernel | kernel | `plan_scan()` / `to_ray_dataset()`; per-file splits pinned to a version |
+| Distributed scan | Spark, kernel | kernel | `plan_scan()` / `to_ray_dataset()`; per-file splits pinned to a version, each carrying the kernel's scan row, so workers read with no log listing or replay and no catalog call. See [Ray Data](ray-data.md) |
+| Distributed change feed | Spark | kernel | `plan_changes()`: runs of whole commits per split; refused on catalog-managed tables |
 | Incremental / streaming read | DBR, Spark | native over CDF | `Table.changes()` follows the change feed version by version; `changes(..., include_snapshot=True)` first yields the table at the start version as inserts |
 | Incremental read without CDF (rows added since a version) | kernel | kernel | `Table.added_since(version)` reads the files the kernel's incremental scan lists as added; refused when the range removed files, unless `only_appends=True` |
 
@@ -78,12 +79,12 @@ Several values in one cell are a routing chain, tried in order.
 | Idempotent writes (txnAppId) | DBR, Spark | native | checked here; delta-rs records but does not enforce |
 | DELETE / UPDATE | DBR, Spark, delta-rs | kernel (deletion vectors), delta-rs, warehouse | deletion vectors on tables that enable them; otherwise delta-rs copy-on-write, and last a bounded whole-table rewrite through the kernel. A row-tracked table without deletion vectors gets a kernel rewrite of only the touched files, which keeps every row id. The kernel evaluates predicates and SET values beyond its grammar (arithmetic, functions, CASE, nested fields) with DuckDB in Spark's dialect, with ANSI overflow and division-by-zero errors |
 | MERGE | DBR, Spark, delta-rs | kernel (deletion vectors or copy-on-write), delta-rs, warehouse | one clause API for all three; the kernel evaluates clauses with DuckDB (`deltaswamp[duckdb]`), the warehouse merges from a staged source. On tables delta-rs cannot write (in-commit timestamps, clustering, type widening, column defaults, row tracking, legacy-calendar files) and that do not enable deletion vectors, the kernel removes each touched file and writes its other rows again beside the new ones |
-| DML on catalog-managed tables | DBR | kernel (deletion vectors), warehouse | DELETE/UPDATE/replaceWhere/MERGE as deletion vectors through UCCommitter; row ids kept on row-tracked tables. Without deletion vectors, DELETE/UPDATE/replaceWhere are a bounded rewrite and MERGE a copy-on-write of the touched files |
+| DML on catalog-managed tables | DBR | kernel (deletion vectors), warehouse | DELETE/UPDATE/replaceWhere/MERGE as deletion vectors through UCCommitter; row ids kept on row-tracked tables. Without deletion vectors, a copy-on-write of the touched files, bounded by `dml_max_bytes`. A commit that loses a race re-reads the catalog's tail and rebases over blind appends |
 | Deletion-vector authoring | DBR, Spark | kernel | bitmaps computed here, written in the protocol's file format, committed through the kernel's DV update; a second DELETE unions with the existing vector; files left empty are removed |
 | Row-id preservation on DELETE / UPDATE / MERGE / replaceWhere | DBR, Spark | kernel | updated rows' ids are written to the table's materialized row-id column; a copy-on-write rewrite also writes the kept rows' ids and commit versions to the materialized columns, and inserted rows get fresh ids above the high-water mark. Removes (staged by hand, as kernel 0.28 refuses them there) and re-adds carry each file's `baseRowId` and `defaultRowCommitVersion` |
 | DML + CDF | DBR, Spark | kernel (DELETE), delta-rs, warehouse | a deletion-vector DELETE needs no CDC files; UPDATE and MERGE on a CDF table need CDC files the kernel cannot write |
 | Row-level concurrency | DBR | — | a Databricks conflict-detection feature |
-| Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction. Catalog-managed tables included |
+| Distributed write | Spark | kernel | `plan_write()`: workers write files, the driver commits them in one transaction, rebased and retried, idempotent after a lost response; `abort()` deletes the files of a write that cannot commit. Catalog-managed tables included. See [Ray Data](ray-data.md) |
 | COPY INTO / Auto Loader | DBR | warehouse (`Connection.sql(engine="warehouse")`) | ingestion, not table access |
 
 ## Schema and table DDL
@@ -98,6 +99,7 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 | CREATE (path / external) | all | delta-rs, kernel | kernel for properties delta-rs rejects and for liquid clustering |
 | CREATE managed (catalog-managed) | DBR, UC API | kernel + UC API | staging-table flow; see [Unity Catalog](#unity-catalog) |
 | Register an existing external table | DBR, UC API | SDK | writes nothing unless the log exists |
+| CREATE by a distributed write | DBR, Spark | kernel + UC API | `Connection.plan_write(name, schema=...)`: the table appears at commit with its data, and a failed job leaves none. See [Ray Data](ray-data.md) |
 | ADD COLUMNS | all | delta-rs, native, warehouse | native for tables delta-rs cannot write |
 | RENAME / DROP COLUMN | DBR, Spark | native, warehouse | metadata-only under column mapping |
 | Enable column mapping | DBR, Spark | native | none -> name only; existing names become physical names |
@@ -112,7 +114,7 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 | CLUSTER BY AUTO | DBR | warehouse | predictive optimization chooses keys |
 | Primary / foreign keys | UC | SDK | informational constraints |
 | Row filters, column masks | UC | warehouse | |
-| Identity, generated, default columns | DBR, Spark | declared at create | kernel create; writes respect them where the engine does |
+| Identity, generated, default columns | DBR, Spark | kernel, delta-rs | the kernel computes and checks them on every append and on workers of a distributed write (DuckDB for expressions; unevaluable ones refused at planning). A distributed write reserves identity values at planning, one slot per task. DML on such tables stays with delta-rs or the warehouse |
 
 ## Table features
 
@@ -123,8 +125,10 @@ refuses seven reader-writer features: `catalogManaged` and its preview, type
 widening and variant shredding (two spellings each), and `vacuumProtocolCheck`.
 Writer-only features such as `domainMetadata` (so every liquid-clustered and
 row-tracked table) and in-commit timestamps block its writes but not its reads.
-Collations, checkpoint protection and `icebergWriterCompatV1` have no kernel
-variant; all three are writer-only, so both engines read and neither writes.
+Collations and `icebergWriterCompatV1` have no kernel variant; both are
+writer-only, so both engines read and neither writes. Checkpoint protection has
+no kernel variant either, but it binds only log cleanup, so the kernel path
+writes through it and refuses only history truncation.
 
 ## Maintenance and the log
 
@@ -133,10 +137,10 @@ variant; all three are writer-only, so both engines read and neither writes.
 | OPTIMIZE (compaction) | all | kernel, warehouse | committed by the kernel on the snapshot it planned from, so concurrent runs never compact a file twice (delta-rs's own commit duplicates their rows; a delta-rs connection hands it to the kernel). Legacy-calendar and INT96 files are rewritten with correct values and a Spark footer. Row-tracked tables keep every row's `_metadata.row_id` and `row_commit_version` (written into the materialized columns, as Databricks does); column-mapped tables (name and id) get physical names and field ids. `min_file_size` and `sort_by` shape a bin-packing. Refused with `writer_properties`/`min_commit_interval` |
 | OPTIMIZE ZORDER BY | DBR, Spark, delta-rs | kernel, warehouse | as above; top-level columns with statistics only (not STRUCT/ARRAY/MAP). Incremental: files tagged `ZCUBE_*` by an earlier Z-order of the same columns, in cubes of at least `min_cube_size` (default the target size), are left alone; the tags are Databricks', which takes the kernel's cubes as its own |
 | OPTIMIZE on liquid-clustered tables, OPTIMIZE FULL | DBR | kernel, warehouse | the kernel Z-orders over the `delta.clustering` keys, incrementally as above (`full=True` rewrites every file); the domain is left as it is. Not Databricks' clustering tree, which Databricks keeps to itself |
-| OPTIMIZE on managed tables | DBR | warehouse | Databricks forbids external writes to managed tables |
+| OPTIMIZE on managed tables | DBR | kernel, warehouse | catalog-managed tables: committed through UCCommitter, re-planned over a blind append. Managed tables without catalog commits: warehouse, as Databricks refuses them external writes |
 | VACUUM (standard and LITE) | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | dry run by default here. The kernel plans it from its log replay, as Spark's VACUUM does, on deletion-vector tables and on every table delta-rs cannot commit to (clustering, row tracking, in-commit timestamps, type widening, `vacuumProtocolCheck`, ...), and commits VACUUM START/END |
-| VACUUM on managed tables | DBR | warehouse | Databricks forbids external VACUUM on managed tables |
-| RESTORE | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | the kernel serves deletion-vector tables (delta-rs leaves DV changes in place, delta-rs#4613), column-mapped tables and the tables delta-rs cannot write; restored files keep their row ids, and the target's schema and properties come back |
+| VACUUM on managed tables | DBR | kernel, warehouse | catalog-managed tables: dry run by default; a real run needs `allow_catalog_managed=True` and commits VACUUM START/END through UCCommitter, since deleting files is the catalog's policy to allow |
+| RESTORE | DBR, Spark, delta-rs | delta-rs, kernel, warehouse | the kernel serves deletion-vector tables (delta-rs leaves DV changes in place, delta-rs#4613), column-mapped tables and the tables delta-rs cannot write; restored files keep their row ids, and the target's schema and properties come back. On catalog-managed tables it commits through UCCommitter, rebased over a concurrent append; a target whose metadata differs is refused, as the catalog refuses metadata changes |
 | FSCK REPAIR | DBR, delta-rs | delta-rs, kernel, warehouse | the kernel serves the tables delta-rs cannot commit to: live files whose data file is gone are removed as logged (row ids and deletion vectors kept), `dataChange` true as delta-rs removes them; refused on shallow clones, and (except a dry run) on append-only and Iceberg-enabled tables |
 | Checkpoint | all | delta-rs, kernel | the kernel checkpoints catalog-managed tables, publishing first, and the tables delta-rs cannot open whose protocol carries CHECK constraints, generated or identity columns or invariants (a checkpoint writes no row for them to bind); the checkpoint holds the table's own protocol and metadata. Only an unknown writer feature, `icebergCompatV1`/`V2` and the like still refuse it |
 | Version checksums (`.crc`) | DBR, Spark, kernel | kernel, delta-rs | written after every commit where the previous one is at most 100 versions back (or the log is short), on tables with CHECK constraints or generated columns too, and at every kernel checkpoint of such a table; delta-rs writes none itself (delta-rs#4190) |
@@ -156,7 +160,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | Feature | Where it exists | deltaswamp | Notes |
 |---|---|---|---|
 | Name resolution, capability manifest | UC API | SDK | the manifest decides external eligibility before any read |
-| Credential vending (table) | UC API | SDK | two refresh clocks; picklable providers |
+| Credential vending (table) | UC API | SDK | two refresh clocks; picklable providers shared per process; the native store reads a refreshable slot on every request; S3 region per bucket |
 | Credential vending (path) | UC API | SDK | for creating external tables |
 | Catalog-managed commits | UC API | kernel | `/delta/v1`, 409 vs 429 distinguished |
 | Managed-table creation | UC API | kernel + UC API | staging table, v0 commit, finalize |
@@ -195,7 +199,7 @@ variant; all three are writer-only, so both engines read and neither writes.
 | pandas | `to_pandas` | |
 | Polars | `to_polars(lazy=...)` | works on tables `polars.scan_delta` cannot open |
 | DuckDB | `to_duckdb`, `Connection.sql` | the same, for DuckDB's delta extension |
-| Ray | `to_ray_dataset` | a Ray Data datasource; workers read byte-balanced groups of files with the plan's storage credential (or vend their own with `ship_catalog_auth=True`) |
+| Ray | `to_ray_dataset`, `plan_scan`, `plan_changes`, `plan_write` | a Ray Data datasource; workers read byte-balanced groups of files with the plan's storage credential, refreshed from `credential_source=` or shipped catalog auth. The building blocks for `read_delta`/`write_delta` are in [Ray Data](ray-data.md) |
 | Daft | `to_daft` | |
 | Cross-catalog SQL | `Connection.sql(query, tables=...)` | join a catalog-managed table with a Glue table and a path |
 
