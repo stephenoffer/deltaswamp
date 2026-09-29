@@ -941,6 +941,15 @@ class _Renderer:
         return self.raw(node.tokens)
 
     def r_num(self, node: _Num) -> str:
+        if self.duck and node.suffix in ("", "L") and node.digits.isdigit():
+            # Spark types an integer literal INT (BIGINT past INT, or with L).
+            # DuckDB narrows one to the other side's type, so for a TINYINT
+            # `b` = 127, `b + 1 - 1` overflowed TINYINT where Spark gives 127.
+            value = int(node.digits)
+            if node.suffix == "" and value <= 2**31 - 1:
+                return f"CAST({node.digits} AS INTEGER)"
+            if value <= 2**63 - 1:
+                return f"CAST({node.digits} AS BIGINT)"
         return _number(node.digits, node.suffix, self.target)
 
     def r_str(self, node: _Str) -> str:

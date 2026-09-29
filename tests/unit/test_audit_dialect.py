@@ -240,3 +240,30 @@ def test_variant_refuses_what_parse_json_refuses(text: str) -> None:
 
     with pytest.raises(InvalidArgumentError):
         _variant.variant_column(pa, pa.array([text]))
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        # A SQL warehouse (ANSI mode): an integer literal is an INT, so a
+        # TINYINT plus 1 is an INT, and 127 + 1 - 1 is 127. DuckDB narrowed the
+        # literal to TINYINT and overflowed.
+        ("CAST(127 AS TINYINT) + 1 - 1", 127),
+        ("CAST(32767 AS SMALLINT) * 2", 65534),
+        ("CAST(2147483647 AS INT) + 1", ERROR),  # ARITHMETIC_OVERFLOW
+        ("CAST(2147483647 AS INT) + 1L", 2147483648),
+        ("2147483648 + 1", 2147483649),  # a BIGINT literal
+        ("CAST(10 AS INT) / 0", ERROR),  # DIVIDE_BY_ZERO
+        ("CAST(10 AS INT) % 0", ERROR),  # REMAINDER_BY_ZERO
+    ],
+)
+def test_integer_literals_are_typed_as_spark_types_them(text: str, want: Any) -> None:
+    con = duckdb.connect(config={"disabled_optimizers": "expression_rewriter"})
+    D.install_duckdb_macros(con)
+    try:
+        got = con.sql(f"SELECT ({D.to_duckdb(text)})").fetchone()[0]
+    except duckdb.Error:
+        got = ERROR
+    finally:
+        con.close()
+    assert _same(got, want), (text, got, want)
