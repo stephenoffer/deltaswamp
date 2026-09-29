@@ -187,7 +187,12 @@ def _active_features(table: ResolvedTable) -> frozenset[TableFeature]:
 
 
 def _operation_blocker(
-    kind: EngineKind, operation: Operation, table: ResolvedTable, engine: object = None
+    kind: EngineKind,
+    operation: Operation,
+    table: ResolvedTable,
+    engine: object = None,
+    uniform_writes: str | None = None,
+    sync_reachable: bool = False,
 ) -> str | None:
     """Why `kind` cannot run `operation` on this table although it handles every feature."""
     if (
@@ -213,9 +218,31 @@ def _operation_blocker(
                 "the table is managed Iceberg (USING ICEBERG): its Iceberg metadata is the "
                 "table of record, and a Delta commit would not reach it"
             )
+        if uniform_writes == "stale":
+            if operation is Operation.VACUUM:
+                return (
+                    "the table has UniForm Iceberg metadata, which this connection leaves "
+                    "stale (uniform_writes='stale'), and VACUUM would delete files an "
+                    "Iceberg snapshot not yet regenerated may still read; connect with "
+                    "uniform_writes='sync', or run it from Databricks"
+                )
+            return None
+        if uniform_writes == "sync":
+            if sync_reachable:
+                return None
+            return (
+                "the table has UniForm Iceberg metadata, and uniform_writes='sync' "
+                "regenerates it through a SQL warehouse after each commit, which this "
+                "connection cannot reach for this table (it needs a Databricks catalog "
+                "name and allow_sql_fallback=True)"
+            )
         return (
-            "the table has UniForm Iceberg metadata enabled, and only Databricks regenerates "
-            "it after a write, so the Iceberg view would silently go stale"
+            "the table has UniForm Iceberg metadata, which only Databricks regenerates "
+            "after a write, so the Iceberg view would go stale; connect with "
+            "ds.connect(..., uniform_writes='sync') to regenerate it through the "
+            "warehouse after each commit (MSCK REPAIR TABLE ... SYNC METADATA), or "
+            "uniform_writes='stale' to leave Iceberg readers on the last regenerated "
+            "version until it is synced"
         )
     if (
         kind in _DIRECT_ENGINES
@@ -651,6 +678,19 @@ class Router:
     #: that name the *Databricks* workspace held. False for every catalog but
     #: Databricks, so the warehouse is never asked and never suggested.
     warehouse_catalog: bool = True
+    #: How a direct engine's commit to a UniForm table treats its Iceberg
+    #: metadata: None refuses it, "sync" regenerates it through the warehouse
+    #: after each commit, "stale" leaves it (see `UNIFORM_STALE_WRITES`).
+    uniform_writes: str | None = None
+
+    def uniform_sync_reachable(self, table: ResolvedTable) -> bool:
+        """Whether MSCK REPAIR TABLE ... SYNC METADATA can run for `table` here."""
+        return bool(
+            self.allow_sql_fallback
+            and self.warehouse_catalog
+            and EngineKind.SQL in self.engines
+            and table.ref.kind is RefKind.CATALOG
+        )
 
     def __post_init__(self) -> None:
         # Every engine is handed out behind the one error boundary, however it
@@ -885,7 +925,14 @@ class Router:
                 )
                 continue
 
-            blocker = _operation_blocker(kind, operation, table, engine)
+            blocker = _operation_blocker(
+                kind,
+                operation,
+                table,
+                engine,
+                self.uniform_writes,
+                self.uniform_sync_reachable(table),
+            )
             if blocker is not None:
                 reasons.append(f"{kind.value}: {blocker}")
                 continue

@@ -56,9 +56,37 @@ that is all the warehouse sends, and writes take JSON text back.
 
 Collated columns are matched by name: a predicate that reads no collated
 column is still served directly; one that does, or that reads a nested field
-(whose collation the Arrow schema does not carry), goes to the warehouse. `geospatial` is gated off in
-this kernel build, and its `geometry(...)` schema type breaks both engines' log
-parsing, so those tables read through the warehouse only.
+(whose collation the Arrow schema does not carry), goes to the warehouse.
+
+`geospatial` (Databricks' GEOMETRY and GEOGRAPHY, protocol RFC
+delta-io/delta#4725) parses in this kernel build (`geo-type-in-dev`), but the
+kernel's engine converts neither type to Arrow and the kernel refuses to write
+the feature. The binding hands the kernel a view of the table in which each geo
+column is `binary` -- what the Parquet column is -- with its real type in the
+field's metadata (`deltaswamp.geospatial.type`); the protocol and the log are
+untouched. Reads return WKB. Appends, overwrites, distributed writes, DML and
+compaction write WKB typed GEOMETRY or GEOGRAPHY in Parquet, as Databricks
+does, and no min/max statistics for geo columns (optional in the RFC, so no
+file is skipped by a geo predicate). Refused when planned: geo values inside
+an array or map (no field carries their type), a schema change, metadata
+commits, and the change data feed (the kernel's TableChanges reads the geo
+types itself). delta-rs refuses the feature.
+
+`icebergCompatV1` and `icebergCompatV2` are refused by kernel 0.28, which writes
+only V3 -- whose rules include every V2 rule. Commits here set them aside and
+keep their writer rules: partition values are materialized in every data file
+(the kernel's `materializePartitionColumns` takes their place in the checked
+protocol), the kernel's physical schema writes column-mapping and nested
+field ids (`delta.columnMapping.nested.ids`) into Parquet, every add carries
+`numRecords`, timestamps are INT64, and DML is copy-on-write (the features
+forbid deletion vectors). A table breaking a table-level rule (column mapping
+off, deletion vectors on, for V1 a partition column before a data column or an
+array or map) is refused, as is any schema change: those stay with
+Databricks, which keeps the Iceberg conversion in step. A UniForm table
+(`delta.universalFormat.enabledFormats=iceberg`) additionally needs
+`ds.connect(uniform_writes=...)`: "sync" regenerates its Iceberg metadata
+through the warehouse after each commit, "stale" leaves Iceberg readers on the
+last converted version.
 
 Row filters and column masks make Unity Catalog refuse credential vending, yet
 the capability manifest keeps `HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT` on such

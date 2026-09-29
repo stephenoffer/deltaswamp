@@ -341,12 +341,30 @@ def test_kernel_checkpoint_refuses_unwritable_writer_features() -> None:
         location="/tmp/t",
         min_reader_version=3,
         min_writer_version=7,
-        writer_features=frozenset({"identityColumns", "icebergCompatV1"}),
+        writer_features=frozenset({"identityColumns", "collations"}),
     )
     verdict = router.capability(Operation.CHECKPOINT, table)
     # identityColumns binds only the values written, which a checkpoint has none of.
-    assert not verdict.ok and "icebergCompatV1" in verdict.reason
+    assert not verdict.ok and "collations" in verdict.reason
     assert "identityColumns" not in verdict.reason
+
+
+def test_kernel_checkpoints_an_iceberg_compat_table() -> None:
+    """IcebergCompatV1/V2 bind how data files are written; a checkpoint writes none."""
+    from deltaswamp.engine.kernel import KernelEngine
+
+    if not KernelEngine.available():
+        pytest.skip("native extension not built")
+    router = Router(engines={Engine.KERNEL: KernelEngine()})
+    for feature in ("icebergCompatV1", "icebergCompatV2"):
+        table = ResolvedTable(
+            ref=parse_ref("/tmp/t"),
+            location="/tmp/t",
+            min_reader_version=2,
+            min_writer_version=7,
+            writer_features=frozenset({"columnMapping", feature}),
+        )
+        assert router.capability(Operation.CHECKPOINT, table).ok
 
 
 @needs_native

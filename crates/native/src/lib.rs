@@ -15,6 +15,7 @@ mod dml;
 mod error;
 mod files;
 mod functions;
+mod geo;
 mod landed;
 mod logclean;
 mod manifest;
@@ -170,6 +171,12 @@ pub const FEATURES: &[&str] = &[
     // `commit_files(create_template=)`: a created table's version 0 written
     // with the job's files in one put-if-absent (`commit::VersionZeroCommitter`).
     "create_with_data",
+    // Reads and writes of `geospatial` tables: geo columns as WKB binary,
+    // written with Parquet's GEOMETRY/GEOGRAPHY logical types (`geo`).
+    "geospatial",
+    // Writes to IcebergCompatV1/V2 tables, partition values materialized in
+    // every data file as the features require (`restate::ICEBERG_COMPAT`).
+    "iceberg_compat_writes",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.

@@ -857,6 +857,9 @@ pub fn commit_actions(
         extra_actions: extra,
         ..Default::default()
     };
+    // Raw file actions carry no values the kernel would check: the features
+    // it refuses but a caller keeps (`crate::restate`) are set aside alike.
+    let snapshot = crate::restate::restated_snapshot(&snapshot, &[], None, None)?;
     let transaction = begin_transaction(
         snapshot,
         &engine,

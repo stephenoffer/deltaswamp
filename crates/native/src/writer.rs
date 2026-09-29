@@ -163,9 +163,29 @@ fn columns_with_nan(batch: &RecordBatch) -> HashSet<String> {
 }
 
 /// `batch` as the bytes of one Parquet file with the footer described above.
+#[cfg(test)]
 pub fn encode(batch: &RecordBatch, codec: Compression) -> DeltaResult<Vec<u8>> {
+    encode_typed(batch, codec, None)
+}
+
+/// [`encode`], with the geospatial columns of `physical` (the table's
+/// physical schema, as the batch is laid out) typed GEOMETRY or GEOGRAPHY in
+/// Parquet (see `crate::geo`).
+pub fn encode_typed(
+    batch: &RecordBatch,
+    codec: Compression,
+    physical: Option<&StructType>,
+) -> DeltaResult<Vec<u8>> {
     let mut buffer = vec![];
-    let options = writer_options(codec, &batch.schema(), &columns_with_nan(batch))?;
+    let mut options = writer_options(codec, &batch.schema(), &columns_with_nan(batch))?;
+    if let Some(physical) = physical {
+        let converted = ArrowSchemaConverter::new().convert(&batch.schema())?;
+        if let Some(typed) = crate::geo::parquet_schema(physical, &converted)
+            .map_err(|e| Error::generic(e.to_string()))?
+        {
+            options = options.with_parquet_schema(typed);
+        }
+    }
     let mut writer = ArrowWriter::try_new_with_options(&mut buffer, batch.schema(), options)?;
     writer.write(batch)?;
     writer.close()?; // the footer is written on close
@@ -258,7 +278,7 @@ pub async fn write_physical(
         write_context.stats_columns(),
         write_context.physical_schema().as_ref(),
     )?;
-    let buffer = encode(batch, codec)?;
+    let buffer = encode_typed(batch, codec, Some(write_context.physical_schema().as_ref()))?;
     let size = u64::try_from(buffer.len())
         .map_err(|_| Error::generic("unable to convert usize to u64"))?;
 

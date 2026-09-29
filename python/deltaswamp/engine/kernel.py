@@ -147,6 +147,75 @@ _UNIMPLEMENTED_OPTIONS: dict[Operation, frozenset[str]] = {
 }
 
 
+def _is_geo_type(value: Any) -> bool:
+    text = str(value).strip().lower()
+    return (text.startswith("geometry(") or text.startswith("geography(")) and text.endswith(")")
+
+
+def _geo_in_containers(schema: Any, inside: bool = False) -> bool:
+    """Whether a Delta schema (as parsed JSON) holds a geo type inside an array
+    or a map, which no data file written here can type as geospatial."""
+    if isinstance(schema, dict):
+        container = any(k in schema for k in ("elementType", "keyType", "valueType"))
+        if (inside or container) and any(
+            _is_geo_type(schema.get(k)) for k in ("type", "elementType", "keyType", "valueType")
+        ):
+            return True
+        return any(_geo_in_containers(v, inside or container) for v in schema.values())
+    if isinstance(schema, list):
+        return any(_geo_in_containers(v, inside) for v in schema)
+    return False
+
+
+def _has_nested_type(schema: Any) -> bool:
+    """Whether a Delta schema (as parsed JSON) holds an array or a map anywhere."""
+    if isinstance(schema, dict):
+        if schema.get("type") in ("array", "map"):
+            return True
+        return any(_has_nested_type(v) for v in schema.values())
+    if isinstance(schema, list):
+        return any(_has_nested_type(v) for v in schema)
+    return False
+
+
+#: Metadata operations left to Databricks on an IcebergCompatV1/V2 table: each
+#: can change the schema or a feature in a way the Iceberg conversion must
+#: follow (a new array or map column needs nested field ids, a type change
+#: must be one Iceberg allows, a feature may be one the compat forbids).
+_ICEBERG_COMPAT_DDL: frozenset[Operation] = frozenset(
+    {
+        Operation.ADD_COLUMN,
+        Operation.ALTER_COLUMN_TYPE,
+        Operation.ADD_FEATURE,
+        Operation.CLUSTER_BY,
+    }
+)
+
+#: Properties whose change would break an IcebergCompatV1/V2 table's rules.
+_ICEBERG_COMPAT_PROPERTIES: frozenset[str] = frozenset(
+    {
+        "delta.enabledeletionvectors",
+        "delta.columnmapping.mode",
+        "delta.enableicebergcompatv1",
+        "delta.enableicebergcompatv2",
+        "delta.enableicebergcompatv3",
+        "delta.enablerowtracking",
+    }
+)
+
+
+def _iceberg_compat_version(table: ResolvedTable) -> int | None:
+    """1 or 2 when the table lists and enables IcebergCompatV1 / V2, else None."""
+    for version in (2, 1):
+        listed = f"icebergCompatV{version}" in table.effective_writer_features
+        enabled = (
+            str(table.properties.get(f"delta.enableIcebergCompatV{version}", "")).lower() == "true"
+        )
+        if listed and enabled:
+            return version
+    return None
+
+
 def _schema_mode_refusal(operation: Operation, shape: dict[str, Any]) -> str | None:
     """Why the kernel cannot take the write's `schema_mode` (or MERGE's merge_schema)."""
     mode = shape.get("schema_mode")
@@ -865,6 +934,109 @@ class KernelEngine:
 
     # ----------------------------------------------------------- capabilities
 
+    def _logged_schema(self, table: ResolvedTable) -> Any:
+        """The table's schema as its log records it (parsed JSON), or None."""
+        try:
+            return json.loads(json.loads(self.snapshot(table).metadata_json())["schemaString"])
+        except Exception:
+            return None
+
+    def _geo_refusal(
+        self, operation: Operation, table: ResolvedTable, shape: dict[str, Any]
+    ) -> Capability | None:
+        """What the kernel cannot do on a `geospatial` table (see `crate::geo`)."""
+        if TableFeature.GEOSPATIAL.value not in table.effective_reader_features:
+            return None
+
+        def refused(reason: str) -> Capability:
+            return Capability(operation, ok=False, reason=reason, remedy=SQL_FALLBACK_REMEDY)
+
+        if not _native_has("geospatial"):
+            return refused("the installed native extension cannot read geospatial tables")
+        if operation is Operation.CDF:
+            return refused(
+                "the kernel's change feed reads the table's geometry and geography columns "
+                "with types its engine cannot convert"
+            )
+        if operation in READ_OPERATIONS or operation in METADATA_OPERATIONS:
+            # Metadata operations are refused by the write gate below
+            # (geospatial is a metadata blocker).
+            return None
+        if (
+            operation is Operation.MERGE_SCHEMA
+            or shape.get("schema_mode") is not None
+            or shape.get("merge_schema")
+        ):
+            return refused("a write to a geospatial table here cannot change its schema")
+        if _geo_in_containers(self._logged_schema(table)):
+            return refused(
+                "the table holds geometry or geography values inside an array or map, which "
+                "no data file written here can type as geospatial"
+            )
+        return None
+
+    def _iceberg_compat_refusal(
+        self, operation: Operation, table: ResolvedTable, shape: dict[str, Any]
+    ) -> Capability | None:
+        """Whether a commit here keeps an IcebergCompatV1/V2 table's writer rules.
+
+        The data rules are kept on the native side (`restate::ICEBERG_COMPAT`);
+        the table-level ones are checked here: column mapping on, deletion
+        vectors off, no schema change the Iceberg conversion cannot follow, and
+        for V1 no array or map and partition columns after the data columns.
+        """
+        if operation in READ_OPERATIONS:
+            return None
+        version = _iceberg_compat_version(table)
+        if version is None:
+            return None
+        feature = f"IcebergCompatV{version}"
+
+        def refused(reason: str) -> Capability:
+            return Capability(
+                operation, ok=False, reason=f"{feature}: {reason}", remedy=SQL_FALLBACK_REMEDY
+            )
+
+        if not _native_has("iceberg_compat_writes"):
+            return refused("the installed native extension cannot write IcebergCompat tables")
+        mode = str(table.properties.get("delta.columnMapping.mode", "none")).strip().lower()
+        if mode not in ("name", "id"):
+            return refused(
+                f"the table's column mapping mode is {mode!r}, and the feature requires name or id"
+            )
+        if str(table.properties.get("delta.enableDeletionVectors", "")).lower() == "true":
+            return refused("the table enables deletion vectors, which the feature forbids")
+        if operation in _ICEBERG_COMPAT_DDL:
+            return refused(
+                f"{operation.value} may change the schema or a feature in a way the Iceberg "
+                "conversion must follow; Databricks keeps the two in step"
+            )
+        if operation is Operation.SET_PROPERTIES or operation is Operation.UNSET_PROPERTIES:
+            keys = shape.get("properties") or shape.get("keys") or ()
+            touched = sorted(k for k in keys if str(k).lower() in _ICEBERG_COMPAT_PROPERTIES)
+            if touched:
+                return refused(f"changing {', '.join(touched)} would break the feature's rules")
+        if (
+            operation is Operation.MERGE_SCHEMA
+            or shape.get("schema_mode") is not None
+            or shape.get("merge_schema")
+        ):
+            return refused("a write here cannot change the schema of an IcebergCompat table")
+        if version == 1 and operation not in METADATA_OPERATIONS:
+            schema = self._logged_schema(table)
+            if schema is None:
+                return refused("the table's schema could not be read")
+            if _has_nested_type(schema):
+                return refused("the table holds an array or map, which the feature forbids")
+            names = [f.get("name") for f in schema.get("fields", [])]
+            partitions = list(table.partition_columns)
+            if partitions and names[-len(partitions) :] != partitions:
+                return refused(
+                    "the table's partition columns are not its last columns, and the feature "
+                    "requires them after the data columns in every data file"
+                )
+        return None
+
     def supports(self, operation: Operation, table: ResolvedTable, **shape: Any) -> Capability:
         if not self.available():
             return Capability(
@@ -960,6 +1132,13 @@ class KernelEngine:
                     + ", ".join(sorted(blockers))
                 ),
             )
+
+        # Explicit None checks: a refused Capability is falsy.
+        special = self._geo_refusal(operation, table, shape)
+        if special is None:
+            special = self._iceberg_compat_refusal(operation, table, shape)
+        if special is not None:
+            return special
 
         if operation in (Operation.OPTIMIZE, Operation.ZORDER):
             # Its own gate, not the write gate below: see _compaction_capability.
@@ -1088,6 +1267,20 @@ class KernelEngine:
                 ):
                     # Binds only log cleanup, which refuses it itself; every
                     # commit here is written past the kernel's refusal of it.
+                    continue
+                elif (
+                    feature in (TableFeature.ICEBERG_COMPAT_V1, TableFeature.ICEBERG_COMPAT_V2)
+                    and _native_has("iceberg_compat_writes")
+                    and not metadata_only
+                ):
+                    # Kept by `_iceberg_compat_refusal` and the native write.
+                    continue
+                elif (
+                    feature is TableFeature.GEOSPATIAL
+                    and _native_has("geospatial")
+                    and not metadata_only
+                ):
+                    # Written as binary, typed in Parquet (`_geo_refusal`).
                     continue
                 elif metadata_only:
                     # A metadata-only commit writes no data, so features that

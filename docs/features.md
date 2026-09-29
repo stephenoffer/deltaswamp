@@ -119,8 +119,9 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 ## Table features
 
 `docs/conformance.md` has the full per-engine matrix for all 36 features.
-In summary: the kernel reads every standard feature except geospatial and
-adaptiveMetadata-preview (both gated off in this build). For reads, delta-rs
+In summary: the kernel reads every standard feature except
+adaptiveMetadata-preview (gated off in this build); geospatial columns read as
+WKB binary. For reads, delta-rs
 refuses seven reader-writer features: `catalogManaged` and its preview, type
 widening and variant shredding (two spellings each), and `vacuumProtocolCheck`.
 Writer-only features such as `domainMetadata` (so every liquid-clustered and
@@ -188,7 +189,9 @@ writes through it and refuses only history truncation.
 | Delta Sharing CDF, time travel | open protocol | sharing | when the provider shares history |
 | Managed / foreign Iceberg tables | UC | iceberg | read and write through UC's Iceberg REST endpoint |
 | UniForm tables as Iceberg | DBR | iceberg (read) | the Delta path remains the default |
-| UniForm metadata generation | DBR | warehouse (`sync_iceberg`) | external writes to UniForm tables are refused, since they would stale it |
+| Writes to UniForm / IcebergCompatV1-V2 tables | DBR, Spark | kernel | partition values materialized, nested field ids, `numRecords`, copy-on-write DML; schema changes stay with Databricks. A UniForm table needs `ds.connect(uniform_writes="sync")` (Iceberg metadata regenerated through the warehouse after each commit) or `"stale"` (Iceberg readers stay on the last converted version) |
+| UniForm metadata generation | DBR | warehouse (`sync_iceberg`) | `MSCK REPAIR TABLE ... SYNC METADATA`, which Databricks documents for writes by clients that do not generate Iceberg metadata |
+| Geometry and geography columns | DBR | kernel | read and written as WKB binary, typed GEOMETRY/GEOGRAPHY in Parquet as Databricks writes them; not inside arrays or maps, no change feed, no schema changes |
 | Compatibility mode copy | DBR | reported | `ResolvedTable.compatibility_mode_location` |
 
 ## Compute integrations
@@ -210,7 +213,7 @@ writes through it and refuses only history truncation.
 | UPDATE, MERGE and replaceWhere on a change-data-feed table the kernel alone can write | the kernel cannot write CDC files, and those commits need them; DELETE through deletion vectors does not |
 | CDF on catalog-managed tables outside Databricks | the kernel's `TableChanges` takes no catalog commit tail |
 | Databricks server-side behavior (predictive optimization, auto compaction, row-level concurrency, Photon, CLUSTER BY AUTO) | these are things a Databricks cluster does, not table formats; the warehouse fallback is the only way in |
-| UniForm metadata generation outside Databricks | Databricks-only |
+| UniForm metadata generation outside Databricks | Databricks-only; `uniform_writes="sync"` asks the warehouse after each commit |
 | Managed-table creation and catalog-managed commits on Databricks | Databricks allowlists which connectors may write through the UC Delta API, by User-Agent |
 | Writes to UC managed tables without `HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT` | a per-table decision by the catalog; the warehouse fallback serves them |
 

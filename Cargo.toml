@@ -15,7 +15,9 @@ repository = "https://github.com/stephenoffer/deltaswamp"
 #
 # NOTE: these resolve to the git source via [patch.crates-io] below, NOT to
 # crates.io. That is forced, not a preference -- see the patch section.
-delta_kernel = { version = "=0.28.0", features = ["arrow-59", "internal-api"] }
+# geo-type-in-dev: the kernel parses GEOMETRY/GEOGRAPHY types (reads of
+# `geospatial` tables); `crate::geo` makes them binary for its engine.
+delta_kernel = { version = "=0.28.0", features = ["arrow-59", "internal-api", "geo-type-in-dev"] }
 delta_kernel_default_engine = { version = "=0.28.0", features = ["arrow-59", "rustls"] }
 
 # The Unity Catalog kernel crates are NOT published to crates.io (in-tree only).

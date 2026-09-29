@@ -359,6 +359,10 @@ class WritePlan:
     #: pickled -- as workers only write files, resolving the table from its
     #: template version 0 (`table.pending_commit`).
     create: Any = None
+    #: Called with the engine kind after a commit lands, on the driver: what
+    #: keeps a UniForm table's Iceberg metadata (`Table._after_commit`).
+    #: Driver-only, never pickled.
+    after_commit: Any = None
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
@@ -380,6 +384,7 @@ class WritePlan:
         fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
         # A worker never commits, so it never creates the table either.
         fields["create"] = None
+        fields["after_commit"] = None
         if not self.ship_catalog_auth:
             fields["table"] = _for_workers(self.table, write=True, source=self.credential_source)
             fields["catalog"] = None
@@ -481,6 +486,33 @@ class WritePlan:
         }
 
     def commit(
+        self,
+        fragments: Iterable[bytes],
+        *,
+        operation: str | None = "WRITE",
+        retries: int | None = None,
+        allow_concurrent_overwrite: bool = False,
+        allow_empty_overwrite: bool = False,
+        abort_on_failure: bool = True,
+    ) -> int:
+        """Driver side: commit every fragment as one transaction.
+
+        See `_commit_fragments` for the whole contract; on a UniForm table the
+        connection's `uniform_writes` then applies to the commit.
+        """
+        version = self._commit_fragments(
+            fragments,
+            operation=operation,
+            retries=retries,
+            allow_concurrent_overwrite=allow_concurrent_overwrite,
+            allow_empty_overwrite=allow_empty_overwrite,
+            abort_on_failure=abort_on_failure,
+        )
+        if self.after_commit is not None:
+            self.after_commit(getattr(self.engine, "kind", None))
+        return version
+
+    def _commit_fragments(
         self,
         fragments: Iterable[bytes],
         *,

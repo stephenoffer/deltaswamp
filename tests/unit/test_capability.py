@@ -166,8 +166,8 @@ class TestEasilyMissedFacts:
     def test_collations_are_writer_only(self) -> None:
         assert FEATURE_SUPPORT[TableFeature.COLLATIONS].kind is FeatureKind.WRITER
 
-    def test_geospatial_is_not_kernel_readable(self) -> None:
-        assert FEATURE_SUPPORT[TableFeature.GEOSPATIAL].kernel_read is Support.NO
+    def test_geospatial_is_not_delta_rs_readable(self) -> None:
+        assert FEATURE_SUPPORT[TableFeature.GEOSPATIAL].deltars_read is Support.NO
 
     def test_checkconstraints_deltars_ahead_of_kernel(self) -> None:
         """A case where delta-rs is the more capable engine, so routing must not

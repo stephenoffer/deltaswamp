@@ -10,8 +10,8 @@ from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ._util import check_keywords
+from .capability import UNIFORM_WRITE_MODES, Operation
 from .capability import Engine as EngineKind
-from .capability import Operation
 from .catalog import Catalog, ResolvedTable
 from .catalog.filesystem import FilesystemCatalog
 from .catalog.registry import catalog_for_uri
@@ -55,6 +55,7 @@ def connect(
     default_schema: str | None = None,
     iceberg_properties: dict[str, str] | None = None,
     ship_credentials: bool = False,
+    uniform_writes: str | None = None,
 ) -> Connection:
     """Open a connection.
 
@@ -92,6 +93,15 @@ def connect(
     secret (a token, a client secret): a worker re-derives Databricks auth
     from its own environment. `ship_credentials=True` pickles them too, for
     workers that have no auth of their own.
+
+    `uniform_writes` says what a write here does to a UniForm table's Iceberg
+    metadata, which only Databricks regenerates. Unset, such writes are
+    refused. ``"sync"`` regenerates it through the SQL warehouse after each
+    commit (``MSCK REPAIR TABLE ... SYNC METADATA``; needs
+    `allow_sql_fallback=True`), so Iceberg readers see every commit.
+    ``"stale"`` writes and warns: Iceberg readers keep reading the last
+    regenerated version until Databricks next writes the table or someone
+    runs `Table.sync_iceberg()`; Delta readers see every commit either way.
     """
     if not isinstance(allow_sql_fallback, bool):
         # The fallback costs money, so it is on only when asked for exactly.
@@ -99,6 +109,10 @@ def connect(
         # and switched it on.
         raise InvalidArgumentError(
             f"allow_sql_fallback must be True or False, not {allow_sql_fallback!r}"
+        )
+    if uniform_writes is not None and uniform_writes not in UNIFORM_WRITE_MODES:
+        raise InvalidArgumentError(
+            f"uniform_writes is 'sync', 'stale' or None, not {uniform_writes!r}"
         )
     if catalog is not None and uri is not None and str(uri).strip():
         # The URI was silently ignored: ds.connect("hms://...", catalog=cat)
@@ -192,6 +206,7 @@ def connect(
             engines=engines,
             allow_sql_fallback=allow_sql_fallback,
             warehouse_catalog=warehouse_catalog,
+            uniform_writes=uniform_writes,
         ),
         default_catalog=default_catalog,
         default_schema=default_schema,

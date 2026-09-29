@@ -20,8 +20,9 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
 "commit_timestamps", "credential_slots", "planned_scan", "values_checked",
-"checkpoint_protection", "domain_metadata", "deferred_create", "create_with_data". Gate on
-this list, not `hasattr`, so a stale build refuses cleanly.
+"checkpoint_protection", "domain_metadata", "deferred_create", "create_with_data",
+"geospatial", "iceberg_compat_writes". Gate on this list, not `hasattr`, so a stale build
+refuses cleanly.
 """
 
 def kernel_version() -> str:
