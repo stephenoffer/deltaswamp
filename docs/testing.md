@@ -27,6 +27,35 @@ protocol, and `tests/integration/test_catalog_managed.py` builds a table whose
 newest commit exists only as a staged file, which only a catalog-aware reader
 can open.
 
+### Object-store emulators
+
+`tests/integration/test_emulators.py` runs the kernel against GCS and Azure
+emulators: reads, appends, overwrites, DML (copy-on-write and deletion
+vectors), OPTIMIZE, checkpoints, put-if-absent (two plans racing to commit),
+a distributed write whose worker is a separate interpreter holding only the
+pickled plan, credentials in the shape Unity Catalog vends them, and a planned
+read that outlives its credential. Both stores are opt-in:
+
+```bash
+DELTASWAMP_TEST_GCS_EMULATOR=1 pytest tests/integration/test_emulators.py
+npx azurite-blob --blobPort 10000 --skipApiVersionCheck &
+DELTASWAMP_TEST_AZURITE=http://127.0.0.1:10000 pytest tests/integration/test_emulators.py
+```
+
+| | GCS (`tests/gcs_emulator.py`, in-process) | Azure (Azurite) |
+|---|---|---|
+| Protocol | the XML API object_store 0.13 speaks: object PUT/GET/HEAD/DELETE with ranges, `list-type=2` listings, copies, XML multipart | the Blob API, Azurite's implementation |
+| Put-if-absent | `x-goog-if-generation-match: 0` refused with 412 when the object exists | `If-None-Match: *` |
+| Credential expiry | a bearer token is valid only for the lifetime the test gives it; after that, 401 | the SAS `se` expiry and signature, checked by Azurite |
+| Not checked | GCS's own consistency, IAM, real token issuance | user-delegation SAS (the tests sign an account SAS with Azurite's key), AAD |
+
+fake-gcs-server and gcp-storage-emulator cannot stand in for the GCS
+emulator: neither takes an XML-API object PUT with `x-goog-if-generation-match`
+or answers a `list-type=2` listing. Two GCS checks run on every
+`pytest` without the variable, against the in-process emulator: a create
+beside another table's files is refused, and a dead token is reported as the
+storage's 401.
+
 ## Live Databricks, with a personal access token
 
 `tests/live` is opt-in. It creates and drops tables in a real metastore, which
