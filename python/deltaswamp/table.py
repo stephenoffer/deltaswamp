@@ -2018,6 +2018,7 @@ class Table:
         txn: tuple[str, int] | None = None,
         commit_metadata: dict[str, Any] | None = None,
         ship_catalog_auth: bool = False,
+        supplies_defaults: bool = False,
     ) -> Any:
         """Plan a distributed write, refusing now if the table will not accept it.
 
@@ -2040,6 +2041,12 @@ class Table:
 
         `mode` is ``append`` or ``overwrite``; overwrite removes every file
         visible in the planned snapshot in the same commit.
+
+        A column with a literal DEFAULT that a batch leaves out gets the
+        default, as with `append`. A DEFAULT only Databricks can evaluate
+        (``current_timestamp()``) cannot be filled on a worker, so such a table
+        is refused here unless ``supplies_defaults=True`` promises every batch
+        carries those columns.
         """
         from .distributed import WritePlan, _commit_metadata_arg
 
@@ -2069,6 +2076,7 @@ class Table:
                 "raise the txn version, or drop txn= to write unconditionally",
             )
         engine = self._route(request)
+        default_fields = self._planned_defaults(supplies_defaults)
         identity = None
         if isinstance(engine, KernelEngine) and self.version is not None:
             # Read from storage, not the cache: this is the identity every
@@ -2082,6 +2090,7 @@ class Table:
             variant_paths=tuple(sorted(self._variant_paths())),
             interval_paths=self._interval_plan(),
             table_identity=identity,
+            default_fields=default_fields,
             mode=mode,
             version=self.version,
             txn=txn,
@@ -2093,6 +2102,36 @@ class Table:
                 else None
             ),
         )
+
+    def _planned_defaults(self, supplied: bool) -> tuple[Any, ...]:
+        """The fields a planned write fills from a literal DEFAULT (see `plan_write`)."""
+        if not self._enrich().writer_features & {"allowColumnDefaults"}:
+            return ()
+        try:
+            import pyarrow as pa
+
+            target = self.schema()
+        except (ImportError, DeltaSwampError):
+            return ()
+        literal: list[Any] = []
+        evaluated: list[str] = []
+        for field in target:
+            if _column_default(field) is None:
+                continue
+            if _default_column(pa, field, 1) is not None:
+                literal.append(field)
+            else:
+                evaluated.append(field.name)
+        if evaluated and not supplied:
+            raise UnreachableTableError(
+                "plan a distributed write",
+                f"column(s) {', '.join(evaluated)} default to an expression only Databricks "
+                "evaluates, and a worker would write the batches that leave them out with "
+                "nothing to fill them",
+                "include those columns in every batch and plan with supplies_defaults=True, "
+                "or write through Table.append with allow_sql_fallback=True",
+            )
+        return tuple(literal)
 
     def plan_scan(
         self,

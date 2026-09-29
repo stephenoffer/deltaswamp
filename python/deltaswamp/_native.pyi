@@ -17,9 +17,9 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "distributed_write", "deletion_vector_dml", "materialized_row_ids", "commit_log",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
-"path_clone", "row_tracking_dml", "check_constraints", "schema_evolution", "log_cleanup",
-"symlink_manifest", "fsck", "value_constrained_checkpoint", "commit_timestamps". Gate on
-this list, not `hasattr`, so a stale build refuses cleanly.
+"uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints", "schema_evolution",
+"log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint", "commit_timestamps".
+Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:

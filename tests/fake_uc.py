@@ -77,6 +77,9 @@ class FakeUnityCatalog:
         self.tables: dict[str, FakeTable] = {}
         #: Set to a status code to make the next commit fail that way.
         self.next_commit_status: int | None = None
+        #: Set to a status code to make the next commit take effect and then
+        #: answer with that status: a ratification whose response was lost.
+        self.next_commit_status_after_ratify: int | None = None
         #: Every commit body received, for assertions.
         self.commit_log: list[dict[str, Any]] = []
         #: Every request, as (method, path-with-query, body), for assertions.
@@ -241,6 +244,10 @@ class FakeUnityCatalog:
                     }
                     return self._send(code, {"message": messages.get(code, "error")})
                 catalog._ratify(self.path, body)
+                if catalog.next_commit_status_after_ratify is not None:
+                    code = catalog.next_commit_status_after_ratify
+                    catalog.next_commit_status_after_ratify = None
+                    return self._send(code, {"message": "error"})
                 return self._send(200, {})
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)

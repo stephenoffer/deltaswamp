@@ -82,8 +82,8 @@ def test_a_retry_after_an_ambiguous_commit_does_not_add_the_files_again(
         raise TransientCommitError("timed out after the put")
 
     monkeypatch.setattr(plan.engine, "commit_files", lands_then_fails)
-    with pytest.raises(UnreachableTableError, match="already in the table"):
-        plan.commit([fragment], retries=2)
+    # The retry finds the files in the commit that landed and returns it.
+    assert plan.commit([fragment], retries=2) == 1
     assert len(calls) == 1
     t = conn.open_table(loc)
     assert t.version == 1, "exactly one commit"
@@ -380,13 +380,52 @@ def test_catalog_refusals_carry_a_typed_native_error(
 
 
 def test_a_catalog_5xx_is_transient_and_not_retried_blindly(uc_conn: Any) -> None:
-    """A 5xx may have been ratified; it is transient, and a catalog table is not re-sent."""
+    """A 5xx may have been ratified; it is transient, and the files are kept."""
     uc, conn = uc_conn
     plan = conn.table("main.sales.cm").plan_write()
     fragment = plan.write(pa.table({"id": [1]}))
     uc.next_commit_status = 503
-    with pytest.raises(TransientCommitError, match="may or may not"):
-        plan.commit([fragment], retries=3)
+    with pytest.raises(TransientCommitError, match="may or may not") as caught:
+        plan.commit([fragment], retries=0)
+    assert "commit the same fragments again" in str(caught.value)
+    # Nothing was deleted: the same fragments commit once the catalog answers.
+    plan.commit([fragment])
+    assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [1]
+
+
+def test_a_catalog_managed_write_is_aborted_only_where_the_catalog_is_known(
+    uc_conn: Any,
+) -> None:
+    """A worker's copy of the plan has no catalog, so it cannot tell what was ratified."""
+    import pickle
+
+    _, conn = uc_conn
+    plan = conn.table("main.sales.cm").plan_write()
+    fragment = plan.write(pa.table({"id": [1]}))
+    with pytest.raises(UnreachableTableError, match="catalog-managed"):
+        pickle.loads(pickle.dumps(plan)).abort([fragment])
+    assert plan.abort([fragment]) == 1
+    committed = plan.write(pa.table({"id": [2]}))
+    plan.commit([committed])
+    with pytest.raises(UnreachableTableError, match="committed"):
+        plan.abort([committed])
+    assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [2]
+
+
+def test_a_catalog_5xx_is_retried_after_checking_the_commit_did_not_land(uc_conn: Any) -> None:
+    """Each attempt re-reads the ratified tail, so a retry after a 5xx cannot commit twice."""
+    uc, conn = uc_conn
+    plan = conn.table("main.sales.cm").plan_write()
+    fragment = plan.write(pa.table({"id": [1]}))
+    uc.next_commit_status = 503  # refused outright: the retry commits
+    plan.commit([fragment], retries=3)
+    fragment = plan.write(pa.table({"id": [2]}))
+    before = len(uc.commit_log)
+    uc.next_commit_status_after_ratify = 503  # ratified, the answer lost
+    version = plan.commit([fragment], retries=3)
+    assert len(uc.commit_log) == before + 1, "the landed commit is not sent again"
+    t = conn.table("main.sales.cm")
+    assert (t.version, sorted(t.to_arrow().to_pydict()["id"])) == (version, [1, 2])
 
 
 def test_native_input_errors_are_a_distinct_value_error(conn: Any) -> None:
@@ -480,15 +519,21 @@ def test_ray_input_files_are_full_paths(conn: Any) -> None:
 
 
 def test_committing_the_same_fragments_again_is_refused(conn: Any) -> None:
-    """A restarted driver re-committing saved fragments re-added every file."""
+    """A restarted driver re-committing saved fragments re-added every file.
+
+    Committing them again finds them in the commit that landed and returns its
+    version, adding nothing -- through a plan made after that commit too: the
+    fragments record the version they were written at.
+    """
     loc = _table(conn)
     plan = conn.open_table(loc).plan_write()
     fragment = plan.write(_rows(2))
-    plan.commit([fragment])
-    with pytest.raises(UnreachableTableError, match="already in the table"):
-        conn.open_table(loc).plan_write().commit([fragment])
+    assert plan.commit([fragment]) == 1
+    assert plan.commit([fragment]) == 1
+    conn.open_table(loc).append(_rows(1, 7))
+    assert conn.open_table(loc).plan_write().commit([fragment]) == 1
     t = conn.open_table(loc)
-    assert (t.version, t.count()) == (1, 2)
+    assert (t.version, t.count()) == (2, 3)
 
 
 # ------------------------------------------------------------------ what a plan ships

@@ -22,7 +22,7 @@ from typing import Any, ClassVar, cast
 
 from ._util import commit_backoff
 
-__all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance"]
+__all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance", "merge_fragments"]
 
 
 @dataclass(frozen=True)
@@ -175,6 +175,9 @@ class WritePlan:
     #: snapshot, and the commit reads a fresh one; both must be this table,
     #: not one dropped and re-created at the same path since planning.
     table_identity: str | None = None
+    #: The top-level columns with a literal DEFAULT, as Arrow fields: a batch
+    #: that leaves one out gets the default, as `Table.append` fills it.
+    default_fields: tuple[Any, ...] = ()
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
@@ -182,7 +185,8 @@ class WritePlan:
     #: so the default matches `KernelEngine.append_commit_retries` (and
     #: delta-rs), with a jittered backoff between attempts, rather than leaving
     #: every connector to write the same loop. An overwrite gets none, and so
-    #: does a catalog-managed table, which cannot rebase here.
+    #: does a catalog-managed table resolved without its catalog, which cannot
+    #: re-read its commit tail.
     default_append_retries: ClassVar[int] = 15
 
     @property
@@ -227,6 +231,10 @@ class WritePlan:
                 data = pa.Table.from_pylist(data)
             elif all(isinstance(b, pa.RecordBatch) for b in data):
                 data = pa.Table.from_batches(data)
+        if self.default_fields:
+            # Left to the kernel, a batch without a defaulted column failed
+            # on every worker, after planning had accepted the write.
+            data = _with_defaults(data, self.default_fields)
         if self.variant_paths:
             import pyarrow as pa
 
@@ -263,6 +271,7 @@ class WritePlan:
         retries: int | None = None,
         allow_concurrent_overwrite: bool = False,
         allow_empty_overwrite: bool = False,
+        abort_on_failure: bool = True,
     ) -> int:
         """Driver side: commit every fragment as one transaction.
 
@@ -274,41 +283,46 @@ class WritePlan:
         do collide: four committing at once leaves one winner and three
         conflicts. Rebasing an append is always correct, so `retries` defaults
         to `default_append_retries` and the losers simply commit at the next
-        version. Pass `retries=0` to see the conflict instead.
+        version. Pass `retries=0` to see the conflict instead. A
+        catalog-managed table planned through its catalog rebases the same
+        way: every attempt re-reads the catalog's commit tail.
 
         An overwrite is the opposite: it removes what it finds, so committing
         against a table that has moved on would discard a writer that arrived
         after planning. That is refused unless `allow_concurrent_overwrite` says
-        the last writer should win.
+        the last writer should win. Left as None, `retries` is 0 for one.
 
-        On a catalog-managed table the catalog arbitrates and can still reject
-        the commit outright. The table is untouched when it does, and the
-        fragments stay valid: they describe data files, which carry no version,
-        so the same fragments can be committed again against a fresh snapshot.
-        `retries` re-attempts that here for tables this library commits itself;
-        a catalog-managed table has to be re-opened through its catalog first,
-        and says so rather than spinning against a stale commit tail. Left as
-        None, an ordinary append on a path table gets `default_append_retries`;
-        an overwrite gets none, because retrying one means overwriting the
-        writer that just won.
+        `fragments` may be any iterable, a generator included; they are merged
+        as they arrive (see `merge_fragments`), so the driver never holds one
+        schema per worker.
+
+        Every attempt first checks whether these files already landed -- a
+        commit reported as failed can have taken effect (a put or a catalog
+        call that timed out after it did), and a restarted driver may commit
+        its saved fragments again. It reads only the commits made since the
+        write was planned. When they did land, the version they landed at is
+        returned and nothing is committed again.
 
         A concurrent change to the schema (other than adding a nullable
         column), partitioning or column mapping is never retried: the
         fragments' files were written for the old layout, so the commit raises
         `MetadataChangedError` and the write must be planned again.
 
+        When the commit fails for certain -- refused before anything was
+        written, `MetadataChangedError`, an overwrite whose table moved, or a
+        conflict on every attempt -- the fragments' files are deleted
+        (`abort`), since nothing will ever reference them; pass
+        ``abort_on_failure=False`` to keep them for another commit. A failure
+        whose outcome is unknown (`TransientCommitError`: a timeout or a 5xx)
+        never deletes anything: commit the same fragments again, which returns
+        the version if the first attempt landed, and abort only after that.
+
         No fragments with any files (every worker's data was empty) commits
         nothing: an append returns the current version without adding an
         empty one, and an overwrite -- which would empty the table -- is
         refused unless `allow_empty_overwrite=True` says that is intended.
         """
-        from .errors import (
-            CommitConflictError,
-            InvalidArgumentError,
-            MetadataChangedError,
-            TransientCommitError,
-            UnreachableTableError,
-        )
+        from .errors import InvalidArgumentError
 
         collected = _fragments_arg(fragments)
         # None was recorded in the log as "UNKNOWN", and "" as a blank
@@ -320,18 +334,44 @@ class WritePlan:
                 f"operation must be a non-empty string such as 'WRITE', not {operation!r}"
             )
         if retries is None:
-            # Only an ordinary append gets them. Retrying an overwrite means
-            # overwriting the writer that just won, and a catalog-managed table
-            # cannot rebase here at all -- it would spin against the commit tail
-            # captured when it was resolved, so defaulting to a retry that
-            # cannot work would only change which error the caller sees.
-            retries = (
-                0
-                if (self.overwrite or self.table.is_catalog_managed)
-                else self.default_append_retries
-            )
+            # Retrying an overwrite means overwriting the writer that just
+            # won. A catalog-managed table rebases only through its catalog:
+            # without it, the commit tail captured at resolution would make
+            # every retry lose again.
+            rebases = not self.table.is_catalog_managed or self.catalog is not None
+            retries = self.default_append_retries if rebases and not self.overwrite else 0
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
             raise InvalidArgumentError(f"retries must be a non-negative int, not {retries!r}")
+        try:
+            return self._commit(
+                collected,
+                operation=operation,
+                retries=retries,
+                allow_concurrent_overwrite=allow_concurrent_overwrite,
+                allow_empty_overwrite=allow_empty_overwrite,
+            )
+        except _CertainFailure as failure:
+            if abort_on_failure:
+                self._abort_after(collected, failure.error)
+            raise failure.error from failure.error.__cause__
+
+    def _commit(
+        self,
+        collected: list[bytes],
+        *,
+        operation: str,
+        retries: int,
+        allow_concurrent_overwrite: bool,
+        allow_empty_overwrite: bool,
+    ) -> int:
+        """`commit`'s attempts. A failure that surely committed nothing is a `_CertainFailure`."""
+        from .errors import (
+            CommitConflictError,
+            MetadataChangedError,
+            TransientCommitError,
+            UnreachableTableError,
+        )
+
         if not any(collected):
             # A job whose workers all produced nothing added an empty version
             # on every call (and every retry of the job), and an overwrite
@@ -349,6 +389,7 @@ class WritePlan:
                 version_now = self.engine.detail(current).get("version")
                 if version_now is not None:
                     return int(version_now)
+        paths, written_at = _fragment_files(collected)
         attempts = retries + 1
         last: Exception | None = None
         conflict_version = -1
@@ -360,23 +401,21 @@ class WritePlan:
         for attempt in range(attempts):
             refreshed = self._with_fresh_tail(table)
             table = refreshed if refreshed is not None else table
-            if (attempt or not self.overwrite) and self._already_landed(table, collected):
-                # A commit reported as failed can still have landed (a put
-                # that timed out after it was written), and a driver that
-                # restarts may commit its saved fragments a second time.
-                # Re-committing added every file again in a new version: the
-                # change feed reported the rows twice.
-                raise UnreachableTableError(
-                    "commit these fragments",
-                    "their files are already in the table, so an earlier commit landed "
-                    + (f"after all ({last})" if last is not None else "them before"),
-                    "check the table's history; do not commit these fragments again",
-                )
+            # Every attempt, the first and an overwrite's included: a driver
+            # that restarts commits its saved fragments with nothing to say an
+            # earlier run landed them, and an overwrite committed twice added
+            # and removed the same files in one version.
+            landed = self._landed_version(table, paths, written_at)
+            if landed is not None:
+                return landed
             # Re-checked every attempt, not once: losing a race means the table
             # moved by definition, so a retry is exactly when an overwrite is
             # most likely to be discarding someone.
             if self.overwrite and not allow_concurrent_overwrite:
-                self._refuse_if_the_table_moved(table)
+                try:
+                    self._refuse_if_the_table_moved(table)
+                except UnreachableTableError as exc:
+                    raise _CertainFailure(exc) from None
             try:
                 version: int = self._backfilled(
                     lambda target: self.engine.commit_files(
@@ -391,16 +430,19 @@ class WritePlan:
                     ),
                     table,
                 )
-            except MetadataChangedError:
-                # The files do not fit the table any more: no retry can help.
-                raise
+            except MetadataChangedError as exc:
+                # The files do not fit the table any more: no retry can help,
+                # and nothing was committed.
+                raise _CertainFailure(exc) from None
             except TransientCommitError as exc:
-                # Nobody won the version and the table is unchanged, so the
-                # very same commit can go again -- which `retries` promises.
-                # Not on a catalog-managed table: a failed ratification call
-                # may have landed, and only the catalog can say.
+                # Nobody is known to have won the version, so the same commit
+                # can go again -- which `retries` promises. The landed check
+                # at the top of the next attempt settles whether this one took
+                # effect after all, a catalog's ratification included, so a
+                # catalog-managed table planned through its catalog retries too.
                 last = exc
-                if attempts == 1 or self.table.is_catalog_managed:
+                if attempts == 1 or (self.table.is_catalog_managed and self.catalog is None):
+                    _unknown_outcome(exc)
                     raise
                 commit_backoff(attempt)
                 continue
@@ -412,29 +454,132 @@ class WritePlan:
                     # Diverting to a different error type here would hide it
                     # from a caller catching CommitConflictError, which is what
                     # every other write path raises.
-                    raise
+                    raise _CertainFailure(exc) from None
                 if self.table.is_catalog_managed and self.catalog is None:
                     # The ratified tail and the version ceiling were captured
                     # when the table was resolved, and with no catalog to
                     # re-read them from, a retry would race the same stale view.
-                    raise UnreachableTableError(
+                    refusal = UnreachableTableError(
                         "retry the commit",
                         "this table is catalog-managed, and its commit tail was captured "
                         f"when it was resolved, so a retry here would reuse it ({exc})",
                         "re-open the table through the catalog and commit the same "
-                        "fragments against the fresh snapshot -- they stay valid",
-                    ) from exc
+                        "fragments against the fresh snapshot (with abort_on_failure=False "
+                        "here, so they are kept)",
+                    )
+                    refusal.__cause__ = exc
+                    raise _CertainFailure(refusal) from None
                 # Losers retrying at once collide again; spread them out.
                 commit_backoff(attempt)
                 continue
             return version
 
         if isinstance(last, TransientCommitError):
-            raise last
-        raise CommitConflictError(
-            conflict_version,
-            f"another writer committed first on each of {attempts} attempts ({last}). "
-            "The fragments are still valid: re-open the table and commit them again.",
+            raise _unknown_outcome(last)
+        raise _CertainFailure(
+            CommitConflictError(
+                conflict_version,
+                f"another writer committed first on each of {attempts} attempts ({last}). "
+                "Nothing was committed.",
+            )
+        )
+
+    def abort(self, fragments: Iterable[bytes]) -> int:
+        """Delete the data files `fragments` describe; the number deleted.
+
+        For a write that will not be committed: a failed or cancelled job
+        (a Ray datasink's ``on_write_failed``), or a `commit` that raised
+        `TransientCommitError` and, committed again, still did not land.
+        `commit` already aborts on a failure that certainly committed nothing.
+
+        Refused when any of the files is in a commit made since the write was
+        planned -- deleting a committed file would corrupt the table -- or
+        when that cannot be told. Files that cannot be deleted are logged,
+        not raised: an abort is cleanup, and the job's own error matters more.
+        """
+        from .errors import UnreachableTableError
+
+        collected = _fragments_arg(fragments)
+        paths, written_at = _fragment_files(collected)
+        if not paths:
+            return 0
+        if self.table.is_catalog_managed and self.catalog is None:
+            # Only the catalog knows its newest commits: the tail captured at
+            # resolution cannot show that these files were committed since.
+            raise UnreachableTableError(
+                "abort these fragments",
+                "the table is catalog-managed and this plan has no catalog to read its "
+                "newest commits from, so whether the files were committed cannot be told",
+                "abort through the plan returned by plan_write() on the driver",
+            )
+        table = self._with_fresh_tail(self.table) or self.table
+        if self._landed_version(table, paths, written_at) is not None:
+            raise UnreachableTableError(
+                "abort these fragments",
+                "their files were committed, so deleting them would corrupt the table",
+                "leave them; the write succeeded",
+            )
+        failed = self.engine.delete_uncommitted(table, sorted(paths))
+        if failed:
+            import logging
+
+            logging.getLogger("deltaswamp").warning(
+                "abort could not delete %d of %d uncommitted data file(s) (VACUUM will): %s",
+                len(failed),
+                len(paths),
+                "; ".join(failed[:10]),
+            )
+        return len(paths) - len(failed)
+
+    def _abort_after(self, collected: list[bytes], error: Exception) -> None:
+        """`abort` after `error`, which stays the one raised; a failed abort is logged."""
+        import logging
+
+        try:
+            deleted = self.abort(collected)
+        except Exception as exc:
+            logging.getLogger("deltaswamp").warning(
+                "the commit failed (%s) and its data files could not be deleted: %s", error, exc
+            )
+            return
+        if deleted:
+            logging.getLogger("deltaswamp").info(
+                "the commit failed, so its %d data file(s) were deleted", deleted
+            )
+
+    def _landed_version(self, table: Any, paths: set[str], written_at: int | None) -> int | None:
+        """The version these files landed at, or None if they did not.
+
+        Reads only the commits after the files were written (`written_at`,
+        from the fragments; else the planned version), so fragments committed
+        again through a later plan are still found. Raises when that cannot
+        be told (a commit since was cleaned up), or when only some of the
+        files landed -- neither is a reason to commit them again.
+        """
+        from .errors import InvalidArgumentError, UnreachableTableError
+
+        if not paths:
+            return None
+        check = getattr(self.engine, "commits_adding", None)
+        if not callable(check):
+            return None  # an engine without distributed writes has nothing to find
+        after = min((v for v in (written_at, self.version) if v is not None), default=0)
+        try:
+            found = check(table, after, sorted(paths))
+        except Exception as exc:
+            raise UnreachableTableError(
+                "commit these fragments",
+                f"whether an earlier commit already landed them cannot be told ({exc})",
+                "check the table's history for these files before committing again",
+            ) from exc
+        if not found:
+            return None
+        if len(found) == 1 and found[0][1] == len(paths):
+            return int(found[0][0])
+        raise InvalidArgumentError(
+            f"only some of these fragments' files are in the table (commits "
+            f"{sorted(v for v, _ in found)} add {sum(n for _, n in found)} of {len(paths)}); "
+            "they were committed in part elsewhere, so they cannot be committed again"
         )
 
     def _backfilled(self, commit: Any, table: Any) -> int:
@@ -464,25 +609,6 @@ class WritePlan:
             refreshed = self._with_fresh_tail(table)
             result = commit(refreshed if refreshed is not None else table)
             return result
-
-    def _already_landed(self, table: Any, fragments: list[bytes]) -> bool:
-        """Whether any fragment's data file is already live in the table."""
-        from urllib.parse import unquote
-
-        try:
-            import pyarrow as pa
-
-            ours: set[str] = set()
-            for fragment in fragments:
-                if fragment:
-                    paths = pa.ipc.open_stream(fragment).read_all().column("path")
-                    ours.update(unquote(p) for p in paths.to_pylist() if p)
-            if not ours:
-                return False
-            live = pa.table(self.engine.files(table)).column("path").to_pylist()
-        except Exception:
-            return False  # cannot tell; commit as before
-        return any(p is not None and unquote(p) in ours for p in live)
 
     def _with_fresh_tail(self, table: Any) -> Any:
         """`table` with its catalog commit tail re-read, or None when not applicable."""
@@ -586,8 +712,8 @@ def _commit_metadata_arg(metadata: Any) -> dict[str, str] | None:
     return out
 
 
-def _fragments_arg(fragments: Any) -> list[Any]:
-    """The fragments to commit, checked before anything is sent to the log.
+def _checked_fragments(fragments: Any, what: str = "commit") -> Iterator[bytes]:
+    """Each fragment as bytes, checked as it arrives.
 
     `commit(fragment)` with one bare fragment iterated its bytes as ints and
     failed deep in the binding, and a worker that returned None (or a str)
@@ -597,20 +723,226 @@ def _fragments_arg(fragments: Any) -> list[Any]:
 
     if isinstance(fragments, (bytes, bytearray, memoryview)):
         raise InvalidArgumentError(
-            "commit() takes a list of fragments; wrap a single one: commit([fragment])"
+            f"{what}() takes a list of fragments; wrap a single one: {what}([fragment])"
         )
     if fragments is None or isinstance(fragments, (str, dict)):
         raise InvalidArgumentError(
-            f"commit() takes a list of fragments from plan.write(), not {type(fragments).__name__}"
+            f"{what}() takes a list of fragments from plan.write(), not {type(fragments).__name__}"
         )
-    collected = list(fragments)
-    for index, fragment in enumerate(collected):
+    for index, fragment in enumerate(fragments):
         if not isinstance(fragment, (bytes, bytearray, memoryview)):
             raise InvalidArgumentError(
                 f"fragment {index} is a {type(fragment).__name__}, not the bytes "
                 "plan.write() returns; did that worker fail?"
             )
-    return [bytes(f) for f in collected]
+        yield bytes(fragment)
+
+
+def _fragments_arg(fragments: Any) -> list[bytes]:
+    """The fragments to commit, checked and merged as they arrive.
+
+    A fragment is an Arrow IPC stream: a schema (the add-metadata columns,
+    per-column stats included, and the layout the files were written under)
+    and a batch of a few rows, each batch message describing every nested
+    buffer. At a row or two per task that was ten kilobytes per fragment, and
+    20k tasks held 600 MiB on the driver. Consecutive fragments of one plan
+    are concatenated into a few large ones as they are read; one that does not
+    decode, or carries a different schema, is passed on as it is for the
+    commit to name.
+    """
+    out: list[bytes] = []
+    merger = _Merger()
+    for fragment in _checked_fragments(fragments):
+        if not fragment:
+            continue  # no files
+        try:
+            merged = merger.add(fragment)
+        except _NotMergeable:
+            out.extend(merger.flush())
+            out.append(fragment)
+            continue
+        out.extend(merged)
+    out.extend(merger.flush())
+    return out
+
+
+class _NotMergeable(Exception):
+    """A fragment that does not decode, left for the commit to name."""
+
+
+class _Merger:
+    """Concatenates fragments of one schema into few, large ones."""
+
+    #: Pending batches are concatenated once there are this many.
+    COMBINE_EVERY = 512
+    #: A merged fragment is cut once it holds this many rows (files).
+    ROWS = 250_000
+
+    def __init__(self) -> None:
+        self.schema: Any = None
+        self.batches: list[Any] = []
+        self.rows = 0
+
+    def add(self, fragment: bytes) -> list[bytes]:
+        """Take `fragment`; the merged fragments that are complete because of it."""
+        import pyarrow as pa
+
+        try:
+            reader = pa.ipc.open_stream(fragment)
+            schema = reader.schema
+            batches = list(reader)
+        except Exception as exc:
+            raise _NotMergeable() from exc
+        done: list[bytes] = []
+        if self.schema is not None and not schema.equals(self.schema, check_metadata=True):
+            done = self.flush()
+        self.schema = schema
+        self.batches.extend(b for b in batches if b.num_rows)
+        self.rows += sum(b.num_rows for b in batches)
+        if len(self.batches) >= self.COMBINE_EVERY:
+            self.batches = self._combined()
+        if self.rows >= self.ROWS:
+            done.extend(self.flush())
+        return done
+
+    def _combined(self) -> list[Any]:
+        import pyarrow as pa
+
+        if len(self.batches) <= 1:
+            return self.batches
+        table = pa.Table.from_batches(self.batches, schema=self.schema).combine_chunks()
+        return list(table.to_batches())
+
+    def flush(self) -> list[bytes]:
+        """The pending fragments as one, if any."""
+        import pyarrow as pa
+
+        if self.schema is None:
+            return []
+        batches = self._combined()
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, self.schema) as writer:
+            for batch in batches:
+                writer.write_batch(batch)
+        self.schema, self.batches, self.rows = None, [], 0
+        return [sink.getvalue().to_pybytes()]
+
+
+def merge_fragments(fragments: Iterable[bytes]) -> bytes:
+    """Merge fragments from one plan's workers into one fragment.
+
+    For combining results before they reach the driver -- a tree reduction
+    over a large job -- so the driver receives a few fragments rather than
+    one per task. `commit` accepts the result like any other fragment, and
+    merges what it is given too. Fragments from different plans (another
+    table, or one written under a different layout) are refused.
+    """
+    import pyarrow as pa
+
+    from .errors import InvalidArgumentError
+
+    merger = _Merger()
+    merger.ROWS = 2**62  # one fragment, however large
+    for index, fragment in enumerate(_checked_fragments(fragments, "merge_fragments")):
+        if not fragment:
+            continue
+        try:
+            schema = pa.ipc.open_stream(fragment).schema
+        except Exception as exc:
+            raise InvalidArgumentError(
+                f"fragment {index} is not a fragment plan.write() produced ({exc})"
+            ) from exc
+        if merger.schema is not None and not schema.equals(merger.schema, check_metadata=True):
+            raise InvalidArgumentError(
+                f"fragment {index} was written for a different table or layout than the "
+                "first; merge only the fragments of one plan"
+            )
+        merger.add(fragment)
+    merged = merger.flush()
+    return merged[0] if merged else b""
+
+
+def _fragment_files(fragments: list[bytes]) -> tuple[set[str], int | None]:
+    """The data file paths `fragments` describe, and the earliest version they were written at.
+
+    The version is None when a fragment does not record it (one written by
+    an older release).
+    """
+    import pyarrow as pa
+
+    from .engine.kernel import FRAGMENT_WRITTEN_AT
+
+    paths: set[str] = set()
+    earliest: int | None = None
+    unrecorded = False
+    for fragment in fragments:
+        if not fragment:
+            continue
+        try:
+            table = pa.ipc.open_stream(fragment).read_all()
+        except Exception:
+            continue  # the commit names a malformed fragment itself
+        if "path" in table.column_names:
+            paths.update(p for p in table.column("path").to_pylist() if p)
+        written = (table.schema.metadata or {}).get(FRAGMENT_WRITTEN_AT.encode())
+        try:
+            at = int(written) if written is not None else None
+        except ValueError:
+            at = None
+        if at is None:
+            unrecorded = True
+        elif earliest is None or at < earliest:
+            earliest = at
+    return paths, None if unrecorded else earliest
+
+
+def _with_defaults(data: Any, fields: tuple[Any, ...]) -> Any:
+    """`data` with each of `fields` it leaves out filled with the column's literal DEFAULT."""
+    import pyarrow as pa
+
+    from .table import _default_column
+
+    if isinstance(data, pa.RecordBatch):
+        data = pa.Table.from_batches([data])
+    elif not isinstance(data, pa.Table) and type(data).__name__ == "DataFrame":
+        try:
+            data = pa.Table.from_pandas(data, preserve_index=False)
+        except Exception:
+            return data
+    if not isinstance(data, pa.Table):
+        return data
+    present = {name.lower() for name in data.column_names}
+    for field in fields:
+        if field.name.lower() in present:
+            continue
+        column = _default_column(pa, field, data.num_rows)
+        if column is not None:
+            data = data.append_column(field, column)
+    return data
+
+
+class _CertainFailure(Exception):
+    """A commit failure that certainly committed nothing; carries the error to raise."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _unknown_outcome(exc: Exception) -> Exception:
+    """`exc` (a TransientCommitError), saying what to do with the fragments."""
+    from .errors import TransientCommitError
+
+    if not isinstance(exc, TransientCommitError):
+        return exc
+    note = (
+        " Whether the commit took effect is unknown, so its data files were kept: commit "
+        "the same fragments again (a landed commit is recognized and its version "
+        "returned), and abort them only if that says they did not land."
+    )
+    if note not in str(exc):
+        exc.args = (str(exc) + note, *exc.args[1:])
+    return exc
 
 
 def _rebuild(cls: type, fields: dict[str, Any]) -> Any:

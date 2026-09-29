@@ -5238,7 +5238,7 @@ class KernelEngine:
         # Record the layout these files were written under, from the very
         # snapshot that wrote them, so the commit can tell whether the table
         # still has it.
-        return _stamp_fragment(result, _write_layout(snapshot))
+        return _stamp_fragment(result, _write_layout(snapshot), int(snapshot.version))
 
     def commit_files(
         self,
@@ -5304,6 +5304,27 @@ class KernelEngine:
             )
         self._maybe_checkpoint(table, committed, snapshot)
         return committed
+
+    def commits_adding(
+        self, table: ResolvedTable, after: int, paths: list[str]
+    ) -> list[tuple[int, int]]:
+        """`(version, n)` for each commit after `after` that adds any of `paths`.
+
+        Reads only the commits since `after` on a fresh snapshot (a
+        catalog-managed table's ratified tail included), not the live file
+        list. Raises when one of them can no longer be read.
+        """
+        snapshot = self.snapshot(table, write=True)
+        with translating(EngineKind.KERNEL, "check whether the files were committed"):
+            found = snapshot.commits_adding(max(int(after), 0), list(paths))
+        return [(int(v), int(n)) for v, n in found]
+
+    def delete_uncommitted(self, table: ResolvedTable, paths: list[str]) -> list[str]:
+        """Delete data files no commit references; the ones that could not be, with why."""
+        snapshot = self.snapshot(table, write=True)
+        with translating(EngineKind.KERNEL, "delete uncommitted files"):
+            failed: list[str] = snapshot.delete_uncommitted(list(paths))
+        return failed
 
     def execute_scan(
         self,
@@ -5442,6 +5463,11 @@ def _restored_metadata(
 #: under, as JSON. Added here, beside the native table-identity keys.
 _FRAGMENT_LAYOUT = "deltaswamp.write_layout"
 
+#: Fragment schema-metadata key: the table version its files were written at.
+#: No commit before it can hold them, so whether they already landed is read
+#: from the commits after it -- whichever plan they are committed through.
+FRAGMENT_WRITTEN_AT = "deltaswamp.written_at"
+
 
 def _write_layout(snapshot: Any) -> str | None:
     """What a data file written on `snapshot` depends on, as canonical JSON.
@@ -5552,16 +5578,19 @@ def _layout_still_fits(written: str, current: str) -> bool:
     return True
 
 
-def _stamp_fragment(fragment: bytes, layout: str | None) -> bytes:
-    """`fragment` with `layout` added to its schema metadata."""
-    if not fragment or layout is None:
+def _stamp_fragment(fragment: bytes, layout: str | None, version: int | None = None) -> bytes:
+    """`fragment` with `layout`, and the `version` it was written at, in its schema metadata."""
+    if not fragment or (layout is None and version is None):
         return fragment  # no files, or nothing to record
     import pyarrow as pa
 
     reader = pa.ipc.open_stream(fragment)
-    schema = reader.schema.with_metadata(
-        {**(reader.schema.metadata or {}), _FRAGMENT_LAYOUT.encode(): layout.encode()}
-    )
+    stamps = {}
+    if layout is not None:
+        stamps[_FRAGMENT_LAYOUT.encode()] = layout.encode()
+    if version is not None:
+        stamps[FRAGMENT_WRITTEN_AT.encode()] = str(int(version)).encode()
+    schema = reader.schema.with_metadata({**(reader.schema.metadata or {}), **stamps})
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, schema) as writer:
         for batch in reader:

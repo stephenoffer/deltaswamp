@@ -458,7 +458,18 @@ class TestCommitFailuresReachCallersAsLibraryErrors:
         fragment = plan.write(pa.table({"id": [1]}))
         uc.next_commit_status = 409
         with pytest.raises(CommitConflictError):
-            plan.commit([fragment])
+            plan.commit([fragment], retries=0)
+
+    def test_a_distributed_append_rebases_over_a_conflict_by_default(
+        self, uc_and_conn: Any
+    ) -> None:
+        """Planned through its catalog, a catalog-managed append retries like any other."""
+        uc, conn = uc_and_conn
+        plan = conn.table("main.sales.cm").plan_write()
+        fragment = plan.write(pa.table({"id": [1]}))
+        uc.next_commit_status = 409
+        plan.commit([fragment])
+        assert conn.table("main.sales.cm").to_arrow().to_pydict()["id"] == [1]
 
     def test_retrying_a_catalog_managed_commit_says_to_re_open(self, uc_and_conn: Any) -> None:
         """A retry re-reads the commit tail from the catalog, so it can succeed.
