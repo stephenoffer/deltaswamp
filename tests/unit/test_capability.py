@@ -147,16 +147,20 @@ class TestEasilyMissedFacts:
         assert row.kernel_write is Support.YES
         assert row.deltars_write is Support.PARTIAL
 
-    @pytest.mark.parametrize(
-        "feature",
-        [TableFeature.COLLATIONS, TableFeature.CHECKPOINT_PROTECTION],
-    )
+    @pytest.mark.parametrize("feature", [TableFeature.COLLATIONS])
     def test_features_with_no_kernel_variant_block_both_engines(
         self, feature: TableFeature
     ) -> None:
         """No kernel 0.28 variant -> classified Unknown -> writes blocked."""
         row = FEATURE_SUPPORT[feature]
         assert row.kernel_write is Support.NO
+        assert row.deltars_write is Support.NO
+
+    def test_checkpoint_protection_is_written_past_on_the_kernel(self) -> None:
+        """Unknown to kernel 0.28 too, but it binds only log cleanup: the kernel
+        paths set it aside for every commit, and delta-rs still refuses it."""
+        row = FEATURE_SUPPORT[TableFeature.CHECKPOINT_PROTECTION]
+        assert row.kernel_write is Support.PARTIAL
         assert row.deltars_write is Support.NO
 
     def test_collations_are_writer_only(self) -> None:

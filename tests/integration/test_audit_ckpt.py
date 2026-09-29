@@ -28,7 +28,7 @@ deltalake = pytest.importorskip("deltalake")
 ds = pytest.importorskip("deltaswamp")
 
 from deltaswamp.capability import Engine  # noqa: E402
-from deltaswamp.errors import InvalidArgumentError, UnreachableTableError  # noqa: E402
+from deltaswamp.errors import InvalidArgumentError  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not ds.has_native(), reason="native extension not built")
 
@@ -317,15 +317,21 @@ def _add_generated_column(path: str) -> int:
 def test_a_real_generated_column_is_checkpointed_but_not_written(
     conn: Any, tmp_path: Any, monkeypatch: Any
 ) -> None:
-    """A checkpoint computes no generated value, so the kernel takes it; a write
-    would have to, so it is still refused (and delta-rs lacks inCommitTimestamp)."""
+    """A checkpoint computes no generated value, so the kernel takes it. A write
+    has to, and the kernel paths compute and check it (delta-rs lacks
+    inCommitTimestamp)."""
+    from deltaswamp.errors import InvalidArgumentError
+
     monkeypatch.setenv("DELTASWAMP_STRICT_ROUTING", "1")
     path = _constrained(conn, tmp_path, appends=2)
     version = _add_generated_column(path)
     t = conn.open_table(path)
-    assert not t.can("append").ok
-    with pytest.raises(UnreachableTableError):
-        t.append(pa.table({"id": pa.array([9], pa.int64()), "g": pa.array([18], pa.int64())}))
+    assert t.can("append").engine is Engine.KERNEL
+    with pytest.raises(InvalidArgumentError, match="generated column g"):
+        t.append(pa.table({"id": pa.array([9], pa.int64()), "g": pa.array([19], pa.int64())}))
+    t.append(pa.table({"id": pa.array([9], pa.int64())}))
+    version += 1
+    t = conn.open_table(path)
     verdict = t.can("checkpoint")
     assert verdict.ok and verdict.engine is Engine.KERNEL, verdict
     t.checkpoint()
@@ -334,7 +340,7 @@ def test_a_real_generated_column_is_checkpointed_but_not_written(
     field = json.loads(rows["metaData"]["schemaString"])["fields"][-1]
     assert field["metadata"]["delta.generationExpression"] == "id * 2"
     assert (_log(path) / f"{version:020d}.crc").exists()
-    assert _ids(conn, path) == list(range(4))
+    assert _ids(conn, path) == [*range(4), 9]
 
 
 def test_write_checksum_counts_a_constrained_table(conn: Any, tmp_path: Any) -> None:

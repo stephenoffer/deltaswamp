@@ -257,10 +257,10 @@ class TestNoAlterStrandsALegacyTable:
         t.append(data)
         assert conn.open_table(path).count() == 2
 
-    def test_refused_where_a_column_is_generated(self, conn: Any, tmp_path: Any) -> None:
+    def test_allowed_where_a_column_is_generated(self, conn: Any, tmp_path: Any) -> None:
+        """The kernel appends to a clustered table and computes generated columns,
+        so clustering one no longer strands it."""
         import os
-
-        from deltaswamp.errors import UnreachableTableError
 
         from tests.contract.tables import BY_NAME
 
@@ -269,12 +269,10 @@ class TestNoAlterStrandsALegacyTable:
         BY_NAME["generated"].build(conn, path)
         t = conn.open_table(path)
         before = t.version
-        verdict = t.can("cluster_by", columns=["id"])
-        assert not verdict.ok
-        assert "no local engine able to write" in verdict.reason
-        with pytest.raises(UnreachableTableError, match="no local engine able to write"):
-            t.cluster_by(["id"])
-        assert conn.open_table(path).version == before
+        assert t.can("cluster_by", columns=["id"]).ok
+        t.cluster_by(["id"])
+        assert conn.open_table(path).version == before + 1
+        assert conn.open_table(path).can("append").ok
 
     def test_a_feature_delta_rs_writes_is_still_allowed(self, conn: Any, tmp_path: Any) -> None:
         path = str(tmp_path / "t")

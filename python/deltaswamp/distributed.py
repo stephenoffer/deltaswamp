@@ -175,6 +175,16 @@ class WritePlan:
     #: snapshot, and the commit reads a fresh one; both must be this table,
     #: not one dropped and re-created at the same path since planning.
     table_identity: str | None = None
+    #: Identity values reserved for this write when it was planned, as
+    #: (column, first, step, count) blocks, and the number of equal slots
+    #: each is cut into: `write(data, task_index=i)` draws from slot i.
+    identity_blocks: tuple[tuple[str, int, int, int], ...] = ()
+    identity_slots: int = 0
+    #: Tells this plan's identity slots apart from another's in one process.
+    plan_id: str = ""
+    #: User domain metadata the commit sets beside the rows (domain ->
+    #: configuration), checked when the write was planned.
+    domain_metadata: dict[str, str] | None = None
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
@@ -203,16 +213,23 @@ class WritePlan:
             fields["catalog"] = shipping(fields["catalog"])
         return (_rebuild, (type(self), fields))
 
-    def write(self, data: Any) -> bytes:
+    def write(self, data: Any, *, task_index: int | None = None) -> bytes:
         """Worker side: write `data` as files, returning a fragment to send back.
 
         The files are durable when this returns but belong to no version yet.
         Every fragment must reach `commit()` or the files are orphaned.
+
+        `task_index` is this worker task's number, from 0 to the plan's
+        ``identity_tasks - 1`` (a Ray datasink's ``ctx.task_idx``): on a table
+        with identity columns it picks the slot of reserved values the task's
+        rows are numbered from. Calls with one index must come from one
+        process, which hands them successive values of the slot.
         """
         from .errors import InvalidArgumentError
 
         if data is None:
             raise InvalidArgumentError("plan.write() needs data; got None")
+        identity = self._identity_slot(task_index)
         from ._util import not_table_data
 
         refusal = not_table_data(data)
@@ -251,9 +268,36 @@ class WritePlan:
         # At the planned version: resolved once per process and reused by
         # every later write(), where the latest snapshot cost a log replay
         # per call (0.6 s each, 5000 commits past a checkpoint).
-        identity = {"table_identity": self.table_identity} if self.table_identity else {}
-        result: bytes = self.engine.write_files(self.table, data, version=self.version, **identity)
+        kwargs: dict[str, Any] = {}
+        if self.table_identity:
+            kwargs["table_identity"] = self.table_identity
+        if identity:
+            kwargs["identity"] = identity
+        result: bytes = self.engine.write_files(self.table, data, version=self.version, **kwargs)
         return result
+
+    def _identity_slot(self, task_index: int | None) -> dict[str, Any] | None:
+        """The cursor over task `task_index`'s slot of each reserved identity block."""
+        if not self.identity_blocks:
+            return None
+        from .engine.values import IdentityBlock, slot_cursor
+        from .errors import InvalidArgumentError
+
+        if task_index is None or isinstance(task_index, bool) or int(task_index) != task_index:
+            raise InvalidArgumentError(
+                "the table has identity columns, so plan.write() needs task_index= (0 to "
+                f"{self.identity_slots - 1}): each task numbers its rows from its own slot "
+                "of the values reserved when the write was planned"
+            )
+        return {
+            name: slot_cursor(
+                self.plan_id,
+                int(task_index),
+                name,
+                IdentityBlock(first, step, count).slot(int(task_index), self.identity_slots),
+            )
+            for name, first, step, count in self.identity_blocks
+        }
 
     def commit(
         self,
@@ -388,6 +432,11 @@ class WritePlan:
                         commit_metadata=self.commit_metadata,
                         **({"version": pinned} if pinned is not None else {}),
                         **({"table_identity": self.table_identity} if self.table_identity else {}),
+                        **(
+                            {"domain_metadata": self.domain_metadata}
+                            if self.domain_metadata
+                            else {}
+                        ),
                     ),
                     table,
                 )
