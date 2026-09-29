@@ -1301,6 +1301,19 @@ class SqlEngine:
         table is a full scan billed to the warehouse -- and slow enough to hit
         the statement timeout.
         """
+        sql, binder, op = self._select(table, columns, predicate, version, timestamp, limit)
+        return self._query(op, sql, binder)
+
+    @staticmethod
+    def _select(
+        table: ResolvedTable,
+        columns: list[str] | None,
+        predicate: str | None,
+        version: int | None,
+        timestamp: str | None,
+        limit: int | None = None,
+    ) -> tuple[str, ParameterBinder, Operation]:
+        """The SELECT a read of `table` runs: (statement, its parameters, the operation)."""
         if version is not None and timestamp is not None:
             # One of them was silently ignored before.
             raise InvalidArgumentError("pass version or timestamp, not both")
@@ -1316,7 +1329,92 @@ class SqlEngine:
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         op = Operation.TIME_TRAVEL if version is not None or timestamp else Operation.SCAN
-        return self._query(op, sql, binder)
+        return sql, binder, op
+
+    #: Threads fetching result links on the driver when a plan carries them all.
+    link_fetch_threads = 8
+
+    def plan_scan_chunks(
+        self,
+        table: ResolvedTable,
+        *,
+        columns: list[str] | None = None,
+        predicate: str | None = None,
+        version: int | None = None,
+        timestamp: str | None = None,
+        prefetch_links: bool = True,
+    ) -> Any:
+        """Run the table's read once and plan its result as chunk splits.
+
+        The warehouse computes the whole result before any of it is read, and
+        serves it in chunks behind presigned links (`warehouse_scan`). With
+        `prefetch_links`, every chunk's link is fetched now, on the driver, so
+        workers need no way to ask for one; links live about 15 minutes.
+        """
+        from ..warehouse_scan import ChunkLink, WarehouseScanPlan, WarehouseSplit, _DriverLinks
+        from .sql_backend import _schema_from_manifest
+
+        backend: Any = self._statement_backend()
+        if not callable(getattr(backend, "execute_chunked", None)):
+            raise UnreachableTableError(
+                "plan a distributed read through the warehouse",
+                "this statement backend cannot describe a result chunk by chunk",
+            )
+        sql, binder, op = self._select(table, columns, predicate, version, timestamp)
+        self._notify(op)
+        try:
+            result = backend.execute_chunked(sql, binder.parameters)
+        except SqlStatementError as exc:
+            denied = permission_error(exc)
+            if denied is None:
+                raise
+            raise denied from exc
+        manifest = result.manifest
+        expected = getattr(manifest, "total_row_count", None)
+        if isinstance(expected, int) and sum(c.row_count for c in result.chunks) != expected:
+            raise SqlStatementError(
+                f"the warehouse's result chunks add up to "
+                f"{sum(c.row_count for c in result.chunks)} rows, not the {expected} it reported",
+                statement_id=result.statement_id,
+                state="SUCCEEDED",
+            )
+        links = {i: [ChunkLink.of(link) for link in ls] for i, ls in result.links.items()}
+        fetcher = _DriverLinks(backend, result.statement_id)
+        missing = [c.index for c in result.chunks if c.index not in links]
+        if prefetch_links and missing:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=max(1, int(self.link_fetch_threads))) as pool:
+                for index, fetched in zip(missing, pool.map(fetcher.links, missing), strict=True):
+                    links[index] = fetched
+        import pyarrow as pa
+
+        schema = _schema_from_manifest(manifest)
+        qualifiers = []
+        for column in getattr(getattr(manifest, "schema", None), "columns", None) or []:
+            text = " ".join(str(getattr(column, "type_text", None) or "").upper().split())
+            if text.startswith("INTERVAL "):
+                qualifiers.append((str(column.name), text[len("INTERVAL ") :]))
+        return WarehouseScanPlan(
+            splits=tuple(
+                WarehouseSplit(
+                    statement_id=result.statement_id,
+                    chunk_index=c.index,
+                    row_count=c.row_count,
+                    size=c.byte_count,
+                    links=tuple(links.get(c.index, ())),
+                )
+                for c in result.chunks
+            ),
+            schema_ipc=schema.serialize().to_pybytes() if isinstance(schema, pa.Schema) else b"",
+            statement_id=result.statement_id,
+            columns=tuple(columns) if columns is not None else None,
+            predicate=predicate,
+            snapshot_version=version,
+            interval_qualifiers=tuple(qualifiers),
+            warehouse=self._warehouse_label,
+            driver_links=fetcher,
+        )
 
     def history(self, table: ResolvedTable, *, limit: int | None = None) -> list[dict[str, Any]]:
         if limit is not None:

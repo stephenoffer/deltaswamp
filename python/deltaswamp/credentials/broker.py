@@ -59,10 +59,21 @@ class CredentialBroker:
         """`table`'s credential provider, picklable *with* its catalog secrets.
 
         For registering with a broker in another process (an actor); a
-        provider pickles no literal secret by default.
+        provider pickles no literal secret by default. Given a warehouse plan
+        (`Table.plan_scan` of a table only the warehouse can read), the
+        fetcher of its result links instead.
         """
         from .databricks import shipping
 
+        if getattr(table, "is_warehouse_plan", False):
+            from ..warehouse_scan import StatementLinks
+
+            catalog = getattr(table, "catalog", None)
+            if catalog is None:
+                raise CredentialError(
+                    "this warehouse plan has no catalog to fetch its result links through"
+                )
+            return StatementLinks(shipping(catalog), table.statement_id)
         provider = _provider_of(table)
         if provider is None:
             raise CredentialError("this table has no credential provider: nothing to broker")
@@ -71,8 +82,20 @@ class CredentialBroker:
     def add(self, table: Any) -> str:
         """Serve `table`'s credentials (a Table, a ResolvedTable or a provider).
 
-        Returns the key workers ask by: the UC table id.
+        Returns the key workers ask by: the UC table id. Given a warehouse
+        plan, or the `portable()` fetcher of one, serves its result links
+        under ``sql-statement:<statement id>`` instead.
         """
+        from ..warehouse_scan import STATEMENT_KEY_PREFIX
+
+        fetcher = getattr(table, "driver_links", None) or (
+            table if callable(getattr(table, "links", None)) else None
+        )
+        if fetcher is not None and getattr(fetcher, "statement_id", None):
+            statement_key = STATEMENT_KEY_PREFIX + str(fetcher.statement_id)
+            with self._lock:
+                self._providers[statement_key] = fetcher
+            return statement_key
         provider = _provider_of(table)
         key = getattr(provider, "table_id", None)
         if provider is None or not key:
@@ -92,6 +115,16 @@ class CredentialBroker:
             raise CredentialError(
                 f"this credential broker serves no table {table_id!r}; add() it on the driver"
             )
+        from ..warehouse_scan import STATEMENT_KEY_PREFIX
+
+        if str(table_id).startswith(STATEMENT_KEY_PREFIX):
+            # A warehouse plan's result links: operation is "chunk:<index>".
+            kind, _, index = str(operation).partition(":")
+            if kind != "chunk" or not index.isdigit():
+                raise CredentialError(
+                    f"a statement's links are asked for as 'chunk:<index>', not {operation!r}"
+                )
+            return {"links": [link.as_dict() for link in provider.links(int(index))]}
         credentials: Credentials = provider.credentials(Operation(str(operation).upper()))
         return credentials._state()
 

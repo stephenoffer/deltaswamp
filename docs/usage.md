@@ -1090,11 +1090,32 @@ replays the log: a task costs its files, not the table's history, and a
 catalog-managed read keeps working after the catalog publishes and removes the
 staged commits it was planned from.
 
-Where no engine can plan a distributed read -- a table with a row filter or
-column mask, which only the warehouse can read; a Delta Sharing table --
-`to_ray_dataset()` raises rather than reading the whole table on the driver.
-`to_ray_dataset(allow_driver_read=True)` does that read, and refuses it once
-it passes `driver_read_max_bytes` (1 GiB by default).
+A table only the warehouse can read -- one with a row filter or column mask,
+a view, a materialized view -- is read in parallel through the warehouse when
+the SQL fallback is on. `plan_scan()` runs the query once, with the
+projection, predicate and time travel in the SQL, and returns a
+`WarehouseScanPlan` whose splits are the result's chunks; `partitions(n)` and
+`read(splits)` work as on a `ScanPlan`, and so does `to_ray_dataset()`. A
+worker fetches each chunk from its presigned link, with only the headers the
+link carries, over https to a public host. Links live about 15 minutes. By
+default the plan carries every chunk's link, fetched on the driver, so the
+job must start reading within that window; to refresh them, plan with
+`credential_source=` reaching a `CredentialBroker` the plan was added to
+(`broker.add(plan)`, or `broker.add(CredentialBroker.portable(plan))` for a
+broker in an actor), or with `ship_catalog_auth=True`. A result larger than
+the warehouse serves as links (100 GiB) is refused at planning.
+
+```python
+conn = ds.connect(allow_sql_fallback=True, warehouse_id="abc123")
+plan = conn.table("main.sec.orders_eu_only").plan_scan(columns=["id", "amount"])
+part = plan.read(plan.partitions(16)[i])  # on a worker: chunk i's rows, filter applied
+```
+
+Where no engine can plan a distributed read -- a governed table with the
+fallback off, a Delta Sharing table -- `to_ray_dataset()` raises rather than
+reading the whole table on the driver. `to_ray_dataset(allow_driver_read=True)`
+does that read, and refuses it once it passes `driver_read_max_bytes` (1 GiB
+by default).
 
 The change feed is planned the same way. `plan_changes(start, end)` pins the
 end, sizes each commit from the log and cuts the range into runs of whole
@@ -1470,8 +1491,9 @@ reached.
   SET values cannot be bounded, count as holding such values: they go to the
   kernel, and are refused where it cannot serve them (a MERGE into a table
   without deletion vectors, `writer_properties=`).
-- Distributed planning is kernel-only. For a table only another engine can
-  read, `to_ray_dataset()` raises unless `allow_driver_read=True`.
+- Distributed planning is the kernel's, or the warehouse's by result chunk for
+  a table only it can read (with the fallback on). For a table only another
+  engine can read, `to_ray_dataset()` raises unless `allow_driver_read=True`.
 - A MERGE with `merge_schema=True` whose SET or INSERT assigns a column the
   source does not have (closing an SCD2 row) is refused on delta-rs, which
   fails it, and needs the SQL fallback; the kernel MERGE does not evolve the

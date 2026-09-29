@@ -58,9 +58,9 @@ Several values in one cell are a routing chain, tried in order.
 | Detail / protocol / properties | all | kernel, delta-rs, warehouse | |
 | File listing with stats | Spark, delta-rs, kernel | delta-rs, kernel | `Table.files()` |
 | Deletion vectors on read | all | kernel, delta-rs | applied before any reordering |
-| Views, MVs, metric views, row-filtered tables | DBR | warehouse | vending refuses them; only the warehouse can evaluate them |
+| Views, MVs, metric views, row-filtered tables | DBR | warehouse | vending refuses them; only the warehouse can evaluate them. `plan_scan()` / `to_ray_dataset()` read them in parallel: the query runs once and each result chunk is a split a worker fetches by its presigned link |
 | Shallow clones | DBR, Spark | warehouse | absolute paths into the source defeat credential scoping |
-| Distributed scan | Spark, kernel | kernel | `plan_scan()` / `to_ray_dataset()`; per-file splits pinned to a version, each carrying the kernel's scan row, so workers read with no log listing or replay and no catalog call. See [Ray Data](ray-data.md) |
+| Distributed scan | Spark, kernel | kernel, warehouse | `plan_scan()` / `to_ray_dataset()`; per-file splits pinned to a version, each carrying the kernel's scan row, so workers read with no log listing or replay and no catalog call. Tables only the warehouse can read are split by result chunk instead. See [Ray Data](ray-data.md) |
 | Distributed change feed | Spark | kernel | `plan_changes()`: runs of whole commits per split; refused on catalog-managed tables |
 | Incremental / streaming read | DBR, Spark | native over CDF | `Table.changes()` follows the change feed version by version; `changes(..., include_snapshot=True)` first yields the table at the start version as inserts |
 | Incremental read without CDF (rows added since a version) | kernel | kernel | `Table.added_since(version)` reads the files the kernel's incremental scan lists as added; refused when the range removed files, unless `only_appends=True` |

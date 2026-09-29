@@ -78,6 +78,12 @@ First release.
     cached by the catalog's answer. `plan_changes()` plans the change feed as
     runs of whole commits. `to_ray_dataset()` no longer reads the whole table
     on the driver unless `allow_driver_read=True`.
+  - Tables only the warehouse can read (row filters, column masks, views,
+    materialized views) are read in parallel too, with the SQL fallback on:
+    `plan_scan()` runs the query once and plans its result chunks, which
+    workers fetch by their presigned links (https, public hosts only).
+    Expired links are refreshed through `credential_source=` (a
+    `CredentialBroker` the plan was added to) or `ship_catalog_auth=True`.
   - Distributed commits are idempotent: the driver reads only the commits
     since the write for the job's files and returns a landed version instead
     of committing twice. `WritePlan.abort()` deletes a job's files, and

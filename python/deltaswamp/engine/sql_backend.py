@@ -27,6 +27,8 @@ from .._util import enum_value
 from ..errors import DeltaSwampError, PreflightError
 
 __all__ = [
+    "ChunkInfo",
+    "ChunkedResult",
     "ParameterBinder",
     "SdkStatementBackend",
     "SqlParameter",
@@ -292,6 +294,26 @@ class StatementBackend(Protocol):
 Opener = Callable[[urllib.request.Request, float], Any]
 
 
+@dataclass(frozen=True)
+class ChunkInfo:
+    """One result chunk, as the manifest describes it."""
+
+    index: int
+    row_count: int
+    byte_count: int
+
+
+@dataclass(frozen=True)
+class ChunkedResult:
+    """A finished statement's result, described chunk by chunk (`execute_chunked`)."""
+
+    statement_id: str
+    manifest: Any
+    chunks: list[ChunkInfo]
+    #: Links the statement's response already carried, by chunk index.
+    links: dict[int, list[Any]]
+
+
 def _default_opener(request: urllib.request.Request, timeout: float) -> Any:
     return urllib.request.urlopen(request, timeout=timeout)
 
@@ -346,6 +368,87 @@ class SdkStatementBackend:
         *,
         fetch: bool = True,
     ) -> Any:
+        response, statement_id = self._finished(statement, parameters)
+        if not fetch:
+            return None
+        return self._arrow(response, statement_id)
+
+    def execute_chunked(
+        self, statement: str, parameters: Sequence[SqlParameter] = ()
+    ) -> ChunkedResult:
+        """Run `statement` and describe its result chunks without downloading them.
+
+        For a distributed read: each chunk becomes a split a worker fetches by
+        its presigned link. A truncated result is refused, as `execute`
+        refuses it: the warehouse caps what it serves as external links
+        (100 GiB), and a plan of part of the result would silently drop rows.
+        """
+        response, statement_id = self._finished(statement, parameters)
+        manifest = getattr(response, "manifest", None)
+        if not statement_id:
+            raise SqlStatementError(
+                "the warehouse returned no statement_id, so its result chunks cannot be "
+                "fetched by index",
+                state="SUCCEEDED",
+            )
+        if getattr(manifest, "truncated", None):
+            raise SqlStatementError(
+                "the result is larger than the warehouse serves as external links (100 GiB) "
+                "and was truncated; narrow the read with columns= or predicate=",
+                statement_id=statement_id,
+                state="SUCCEEDED",
+            )
+        chunks: list[ChunkInfo] = []
+        for info in getattr(manifest, "chunks", None) or []:
+            index = getattr(info, "chunk_index", None)
+            if index is None:
+                continue
+            chunks.append(
+                ChunkInfo(
+                    index=int(index),
+                    row_count=int(getattr(info, "row_count", None) or 0),
+                    byte_count=int(getattr(info, "byte_count", None) or 0),
+                )
+            )
+        total = getattr(manifest, "total_chunk_count", None)
+        if isinstance(total, int) and total > len(chunks):
+            # The manifest lists every chunk when it is complete; one that
+            # does not would plan a read missing rows.
+            raise SqlStatementError(
+                f"the warehouse described {len(chunks)} of {total} result chunks; refusing a "
+                "plan that would miss rows",
+                statement_id=statement_id,
+                state="SUCCEEDED",
+            )
+        first = getattr(response, "result", None)
+        links: dict[int, list[Any]] = {}
+        for link in getattr(first, "external_links", None) or []:
+            index = getattr(link, "chunk_index", None)
+            if index is not None:
+                links.setdefault(int(index), []).append(link)
+        return ChunkedResult(
+            statement_id=str(statement_id),
+            manifest=manifest,
+            chunks=sorted(chunks, key=lambda c: c.index),
+            links=links,
+        )
+
+    def chunk_links(self, statement_id: str, chunk_index: int) -> list[Any]:
+        """Fresh presigned links for one result chunk (they live about 15 minutes)."""
+        try:
+            chunk = self._client.statement_execution.get_statement_result_chunk_n(
+                statement_id, chunk_index
+            )
+        except DeltaSwampError:
+            raise
+        except Exception as exc:
+            raise sdk_error(exc, f"warehouse {self._warehouse_id}") from exc
+        return list(getattr(chunk, "external_links", None) or [])
+
+    def _finished(
+        self, statement: str, parameters: Sequence[SqlParameter]
+    ) -> tuple[Any, str | None]:
+        """Run `statement` to a terminal state: (the succeeded response, its id)."""
         from databricks.sdk.service.sql import (
             Disposition,
             ExecuteStatementRequestOnWaitTimeout,
@@ -388,9 +491,7 @@ class SdkStatementBackend:
             if isinstance(exc, Exception) and not isinstance(exc, DeltaSwampError):
                 raise sdk_error(exc, f"warehouse {self._warehouse_id}") from exc
             raise
-        if not fetch:
-            return None
-        return self._arrow(response, statement_id)
+        return response, getattr(response, "statement_id", None) or statement_id
 
     # ------------------------------------------------------------- polling
 

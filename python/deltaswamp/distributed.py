@@ -1469,8 +1469,13 @@ def _datasource_base() -> type:
 def DeltaSwampDatasource(plan: ScanPlan) -> Any:
     """A Ray Data `Datasource` over a scan plan.
 
-    Built lazily so importing this module does not import Ray.
+    Built lazily so importing this module does not import Ray. A warehouse
+    plan (a table only the warehouse can read) gets its own datasource.
     """
+    if getattr(plan, "is_warehouse_plan", False):
+        from .warehouse_scan import WarehouseDatasource
+
+        return WarehouseDatasource(cast(Any, plan))
     from ray.data import ReadTask
     from ray.data.block import BlockMetadata
 

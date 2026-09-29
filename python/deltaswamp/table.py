@@ -2303,7 +2303,15 @@ class Table:
         )
         # Asked before routing: learning the schema routes a read of its own.
         intervals = self._interval_plan()
-        engine = self._route(request)
+        try:
+            engine = self._route(request)
+        except UnreachableTableError:
+            warehouse = self._warehouse_plan(
+                columns, predicate, version, timestamp, ship_catalog_auth, credential_source
+            )
+            if warehouse is None:
+                raise
+            return warehouse
         splits = engine.plan_scan(
             self._resolved,
             columns=columns,
@@ -2332,6 +2340,59 @@ class Table:
             credential_source=credential_source,
             variant_paths=tuple(sorted(self._variant_paths())),
             interval_paths=intervals,
+        )
+
+    def _warehouse_plan(
+        self,
+        columns: list[str] | None,
+        predicate: str | None,
+        version: int | None,
+        timestamp: Any,
+        ship_catalog_auth: bool,
+        credential_source: Any,
+    ) -> Any:
+        """A distributed read through the warehouse, or None where it would not serve.
+
+        Only for a table whose ordinary read the warehouse serves -- one with
+        a row filter or column mask, a view, a materialized view -- and so
+        only with the SQL fallback on. The query runs once, now; its result
+        chunks are the splits (`warehouse_scan`).
+        """
+        from .engine.sql import SqlEngine
+
+        request = self._request(
+            Operation.SCAN,
+            {
+                "columns": columns,
+                "predicate": predicate,
+                "version": version,
+                "timestamp": timestamp,
+            },
+        )
+        try:
+            engine = self._route(request)
+        except UnreachableTableError:
+            return None
+        if not isinstance(engine, SqlEngine):
+            return None
+        catalog = self._connection._catalog_for(self._resolved.ref)
+        refreshes = bool(ship_catalog_auth) or credential_source is not None
+        plan = engine.plan_scan_chunks(
+            self._resolved,
+            columns=columns,
+            predicate=predicate,
+            version=version,
+            timestamp=timestamp,
+            prefetch_links=not refreshes,
+        )
+        shipped = None
+        if ship_catalog_auth:
+            from .credentials.databricks import shipping
+            from .warehouse_scan import StatementLinks
+
+            shipped = StatementLinks(shipping(catalog), plan.statement_id)
+        return dataclasses.replace(
+            plan, credential_source=credential_source, shipped_links=shipped, catalog=catalog
         )
 
     #: About how many bytes of changed data files one `plan_changes` split reads.
@@ -2534,6 +2595,17 @@ class Table:
                     "to Ray yourself",
                 ) from exc
             plan = None
+        if getattr(plan, "is_warehouse_plan", False):
+            # A table only the warehouse can read: its result chunks are read
+            # in parallel. An empty result still has the query's columns.
+            from .warehouse_scan import WarehouseDatasource
+
+            if not plan.splits:
+                return ray_data.from_arrow(plan.read())
+            dataset = ray_data.read_datasource(
+                WarehouseDatasource(plan), override_num_blocks=override_num_blocks
+            )
+            return dataset.limit(limit) if limit is not None else dataset
         # With no files to read there are no read tasks, and Ray builds a
         # dataset with no schema at all; the driver read of nothing keeps the
         # columns.
