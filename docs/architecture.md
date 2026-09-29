@@ -311,9 +311,18 @@ commit that would add and remove one path is refused.
 
 A write that creates its table (`Connection.plan_write`) writes a template
 version 0 under `_deltaswamp_pending/<plan>/` in the table root, outside the
-log, so no reader sees a table. Workers resolve the table from it; the commit
-writes version 0 put-if-absent and then the data, and undoes version 0 if the
-data never lands.
+log, so no reader sees a table. Workers resolve the table from it. For a path
+or external table the commit is an ordinary data transaction on the template
+snapshot, written *as* version 0 by `commit::VersionZeroCommitter`: the
+template's protocol, metaData and domains with the transaction's commitInfo,
+adds and row-tracking domain (each add's `defaultRowCommitVersion` 0), in one
+put-if-absent. The kernel derives row ids, in-commit timestamps and physical
+names from the template the workers wrote against; it numbers the commit 1,
+which the committer reports back while writing `0.json`, and the post-commit
+snapshot is not used. A conflict on version 0 is settled by its metaData id:
+this plan's (an earlier attempt landed) or another writer's. A managed table
+writes version 0 to its staging location at planning -- the catalog vends that
+location's credential only then -- and commits the data after registering it.
 
 ## Extension points
 

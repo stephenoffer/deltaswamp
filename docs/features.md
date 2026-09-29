@@ -99,7 +99,7 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 | CREATE (path / external) | all | delta-rs, kernel | kernel for properties delta-rs rejects and for liquid clustering |
 | CREATE managed (catalog-managed) | DBR, UC API | kernel + UC API | staging-table flow; see [Unity Catalog](#unity-catalog) |
 | Register an existing external table | DBR, UC API | SDK | writes nothing unless the log exists |
-| CREATE by a distributed write | DBR, Spark | kernel + UC API | `Connection.plan_write(name, schema=...)`: the table appears at commit with its data, and a failed job leaves none. See [Ray Data](ray-data.md) |
+| CREATE by a distributed write | DBR, Spark | kernel + UC API | `Connection.plan_write(name, schema=...)`: the table appears at commit with its data, and a failed job leaves none. Path and external tables in one commit (version 0 holds the files); managed tables stage version 0 at planning. See [Ray Data](ray-data.md) |
 | ADD COLUMNS | all | delta-rs, native, warehouse | native for tables delta-rs cannot write |
 | RENAME / DROP COLUMN | DBR, Spark | native, warehouse | metadata-only under column mapping |
 | Enable column mapping | DBR, Spark | native | none -> name only; existing names become physical names |
@@ -114,7 +114,7 @@ the commit fail and triggers a recompute; it is never silently overwritten.
 | CLUSTER BY AUTO | DBR | warehouse | predictive optimization chooses keys |
 | Primary / foreign keys | UC | SDK | informational constraints |
 | Row filters, column masks | UC | warehouse | |
-| Identity, generated, default columns | DBR, Spark | kernel, delta-rs | the kernel computes and checks them on every append and on workers of a distributed write (DuckDB for expressions; unevaluable ones refused at planning). A distributed write reserves identity values at planning, one slot per task. DML on such tables stays with delta-rs or the warehouse |
+| Identity, generated, default columns | DBR, Spark | kernel, delta-rs | identity and literal-default columns are created locally (version 0 composed with the feature; identity start/step/allowExplicitInsert typed as Spark reads them), generated columns by delta-rs. The kernel computes and checks them on every append and on workers of a distributed write (DuckDB for expressions; unevaluable ones refused at planning). A distributed write reserves identity values at planning, one slot per task; generated values follow Spark (the high-water mark rounded to start + k * step). DML on such tables stays with delta-rs or the warehouse |
 
 ## Table features
 
