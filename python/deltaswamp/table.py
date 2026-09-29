@@ -4077,7 +4077,7 @@ class Table:
             "delta-rs can read",
         )
 
-    def delete(self, predicate: str | None = None, **kwargs: Any) -> dict[str, Any]:
+    def delete(self, predicate: str | None = None, **kwargs: Any) -> _results.OperationResult:
         """DELETE rows matching a SQL predicate (every row when None)."""
         self._check_writable("delete", pinned=True)
         _check_options("delete", kwargs, _DML_OPTIONS)
@@ -4102,7 +4102,7 @@ class Table:
         new_values: dict[str, Any] | None = None,
         predicate: str | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> _results.OperationResult:
         """UPDATE. `updates` maps columns to SQL expressions; `new_values` to
         plain Python values, which need no quoting."""
         self._check_writable("update", pinned=True)

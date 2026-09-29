@@ -106,7 +106,7 @@ def _constraint_still_binds(volume: Any, ref: str, before: list[int]) -> None:
 def test_a_constrained_kernel_checkpoint_reads_on_databricks(
     volume: Any, conn: Any, tmp_path: Any, policy: str
 ) -> None:
-    path = _constrained(conn, tmp_path, **{"delta.checkpointPolicy": policy})
+    path = _constrained(conn, tmp_path, appends=3, **{"delta.checkpointPolicy": policy})
     t = conn.open_table(path)
     assert t.can("checkpoint").engine is Engine.KERNEL
     t.checkpoint()

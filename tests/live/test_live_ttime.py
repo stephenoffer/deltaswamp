@@ -107,9 +107,10 @@ def _local_answers(t: Any, stamp: int) -> dict[str, Any]:
             return "refused" if "after the latest" not in str(exc) else "after"
 
     when = at(stamp)
-    feed = lambda **kw: sorted(  # noqa: E731
-        set(t.cdf(**kw).read_all().column("_commit_version").to_pylist())
-    )
+
+    def feed(**kw: Any) -> list[int]:
+        return sorted(set(t.cdf(**kw).read_all().column("_commit_version").to_pylist()))
+
     return {
         "read": attempt(lambda: t.to_arrow(timestamp=when).num_rows),
         "start": attempt(lambda: feed(starting_timestamp=when)),

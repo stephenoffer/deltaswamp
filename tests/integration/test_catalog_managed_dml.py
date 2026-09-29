@@ -43,7 +43,8 @@ def _router() -> Any:
 
 @pytest.fixture
 def uc(tmp_path: pathlib.Path) -> Iterator[StrictUnityCatalog]:
-    with StrictUnityCatalog(staging_root=tmp_path / "managed") as server:
+    server = StrictUnityCatalog(staging_root=tmp_path / "managed")
+    with server:
         yield server
 
 
