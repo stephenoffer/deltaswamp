@@ -1205,10 +1205,28 @@ class KernelEngine:
         # which a log listing cannot see.
         cacheable = log_tail is None and table.max_catalog_version is None and timestamp is None
         reuse = cacheable and not (write if fresh is None else fresh)
+        # A catalog-managed table is cached by the catalog's own answer
+        # instead: the same table id, tail and ratified version always build
+        # the same snapshot, so nothing needs revalidating. Every read task
+        # and every `WritePlan.write()` resolved (and replayed) it again.
+        by_tail = (
+            not cacheable
+            and timestamp is None
+            and table.table_id is not None
+            and table.max_catalog_version is not None
+        )
 
         def resolve() -> Any:
             options = self._options(table, write=write)
             key = (location, version, _store_fingerprint(options), table.table_id)
+            if by_tail:
+                key = (*key, table.max_catalog_version, tuple(log_tail or ()))
+                if not (write if fresh is None else fresh):
+                    with self._snapshots_lock:
+                        cached = self._snapshots.get(key)
+                        if cached is not None:
+                            self._snapshots.move_to_end(key)
+                            return cached
             if reuse:
                 with self._snapshots_lock:
                     cached = self._snapshots.get(key)
@@ -1232,6 +1250,8 @@ class KernelEngine:
             )
             if cacheable:
                 self._remember(key, snapshot)
+            elif by_tail:
+                self._keep(key, snapshot)
             return snapshot
 
         try:
@@ -1310,6 +1330,9 @@ class KernelEngine:
             with self._snapshots_lock:
                 self._snapshots.pop(key, None)
             return
+        self._keep(key, snapshot)
+
+    def _keep(self, key: tuple[Any, ...], snapshot: Any) -> None:
         with self._snapshots_lock:
             self._snapshots[key] = snapshot
             self._snapshots.move_to_end(key)

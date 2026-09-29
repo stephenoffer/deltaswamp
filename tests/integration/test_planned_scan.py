@@ -180,3 +180,59 @@ class TestCatalogManaged:
                 worker.engine.snapshot(worker.table, version=worker.version)
             # ...and the planned read never asks it to.
             assert sorted(worker.read().column("id").to_pylist()) == [0, 1, 2]
+
+
+class _CountingSnapshot:
+    """`_native.Snapshot`, counting resolves (the class itself cannot be patched)."""
+
+    resolves = 0
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+
+    def resolve(self, *args: Any, **kwargs: Any) -> Any:
+        type(self).resolves += 1
+        return self._real.resolve(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def catalog_table(tmp_path: Any) -> Any:
+    pytest.importorskip("deltalake")
+    from deltaswamp.catalog.ossuc import OSSUnityCatalog
+
+    from tests.fake_uc import FakeUnityCatalog
+
+    with FakeUnityCatalog(staging_root=tmp_path / "m") as uc:
+        catalog = OSSUnityCatalog(uc.url)
+        catalog.create_catalog("main")
+        catalog.create_schema("main", "s")
+        conn = ds.connect(catalog=catalog)
+        conn.create_table("main.s.t", pa.schema([("id", pa.int64())]))
+        conn.table("main.s.t").append(pa.table({"id": [0]}))
+        yield conn
+
+
+class TestCatalogManagedSnapshotsAreReused:
+    def test_repeated_writes_of_one_plan_resolve_once(
+        self, catalog_table: Any, monkeypatch: Any
+    ) -> None:
+        import deltaswamp._native as native
+
+        counting = _CountingSnapshot(native.Snapshot)
+        monkeypatch.setattr(native, "Snapshot", counting)
+        plan = catalog_table.table("main.s.t").plan_write()
+        before = type(counting).resolves
+        fragments = [plan.write(pa.table({"id": [i]})) for i in range(1, 5)]
+        assert type(counting).resolves - before <= 1
+        plan.commit(fragments)
+        got = catalog_table.table("main.s.t").to_arrow()
+        assert sorted(got.column("id").to_pylist()) == [0, 1, 2, 3, 4]
+
+    def test_a_new_commit_is_a_new_snapshot(self, catalog_table: Any) -> None:
+        table = catalog_table.table("main.s.t")
+        assert table.to_arrow().num_rows == 1
+        table.append(pa.table({"id": [1]}))
+        assert catalog_table.table("main.s.t").to_arrow().num_rows == 2
