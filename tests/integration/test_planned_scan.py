@@ -236,3 +236,39 @@ class TestCatalogManagedSnapshotsAreReused:
         assert table.to_arrow().num_rows == 1
         table.append(pa.table({"id": [1]}))
         assert catalog_table.table("main.s.t").to_arrow().num_rows == 2
+
+
+class TestRayNeverReadsOnTheDriverUnasked:
+    """A table no engine can plan used to be read whole on the driver, silently."""
+
+    @pytest.fixture
+    def unplannable(self, mapped: Any, monkeypatch: Any) -> Any:
+        from deltaswamp.errors import UnreachableTableError
+
+        def refuse(**_: Any) -> Any:
+            raise UnreachableTableError(
+                "scan", "sql: does not support distributed_scan (the table has a row filter)"
+            )
+
+        monkeypatch.setattr(mapped, "plan_scan", refuse)
+        return mapped
+
+    def test_is_refused_by_default_with_the_reason(self, unplannable: Any) -> None:
+        pytest.importorskip("ray.data")
+        from deltaswamp.errors import UnreachableTableError
+
+        with pytest.raises(UnreachableTableError, match="row filter") as info:
+            unplannable.to_ray_dataset()
+        assert "allow_driver_read=True" in str(info.value)
+
+    def test_reads_on_the_driver_when_asked(self, unplannable: Any) -> None:
+        pytest.importorskip("ray.data")
+        dataset = unplannable.to_ray_dataset(allow_driver_read=True)
+        assert dataset.count() == unplannable.to_arrow().num_rows
+
+    def test_a_driver_read_past_the_bound_is_refused(self, unplannable: Any) -> None:
+        pytest.importorskip("ray.data")
+        from deltaswamp.errors import EngineLimitError
+
+        with pytest.raises(EngineLimitError, match="driver_read_max_bytes"):
+            unplannable.to_ray_dataset(allow_driver_read=True, driver_read_max_bytes=16)

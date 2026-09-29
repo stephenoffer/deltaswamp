@@ -19,7 +19,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from . import _results
 from ._request import METHOD_OPERATIONS, NO_DATA, Request, derive, refusal
@@ -2161,12 +2161,28 @@ class Table:
             interval_paths=intervals,
         )
 
-    def to_ray_dataset(self, *, override_num_blocks: int | None = None, **kwargs: Any) -> Any:
+    #: What `to_ray_dataset(allow_driver_read=True)` reads on the driver at
+    #: most before refusing, in Arrow bytes.
+    driver_read_max_bytes: ClassVar[int] = 1 << 30
+
+    def to_ray_dataset(
+        self,
+        *,
+        override_num_blocks: int | None = None,
+        allow_driver_read: bool = False,
+        driver_read_max_bytes: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """A Ray Dataset, read in parallel by Ray workers.
 
         The scan is planned on the driver and each read task reads a
         byte-balanced group of files. Where no engine can plan a distributed
-        read, the table is read on the driver instead.
+        read (a table only the SQL warehouse can read, such as one with a row
+        filter; a Delta Sharing table), this raises: reading it on the driver
+        instead puts the whole table in one process's memory. Pass
+        ``allow_driver_read=True`` to do that anyway; the read is refused once
+        it passes ``driver_read_max_bytes`` (default
+        `Table.driver_read_max_bytes`, 1 GiB) rather than running out of memory.
         """
         ray_data = _require("ray.data", "ray")
         from .distributed import DeltaSwampDatasource
@@ -2175,24 +2191,58 @@ class Table:
         # it to plan_scan(), which does not take one.
         limit = kwargs.pop("limit", None)
         _check_count(limit, "limit")
-        if self.can(Operation.SCAN).engine is not None:
-            try:
-                plan = self.plan_scan(**kwargs)
-            except UnreachableTableError:
-                plan = None
-            # With no files to read there are no read tasks, and Ray builds a
-            # dataset with no schema at all; the driver read keeps the columns.
-            if plan is not None and plan.splits:
-                dataset = ray_data.read_datasource(
-                    DeltaSwampDatasource(plan), override_num_blocks=override_num_blocks
-                )
-                return dataset.limit(limit) if limit is not None else dataset
+        bound = (
+            self.driver_read_max_bytes if driver_read_max_bytes is None else driver_read_max_bytes
+        )
+        _check_count(bound, "driver_read_max_bytes")
+        try:
+            plan = self.plan_scan(**kwargs)
+        except UnreachableTableError as exc:
+            if not allow_driver_read:
+                raise UnreachableTableError(
+                    "read the table as a Ray Dataset",
+                    f"no engine can plan a distributed read of it ({exc.reason})",
+                    "pass allow_driver_read=True to read it on the driver instead (refused past "
+                    "driver_read_max_bytes), or read it with to_arrow() and hand the result "
+                    "to Ray yourself",
+                ) from exc
+            plan = None
+        # With no files to read there are no read tasks, and Ray builds a
+        # dataset with no schema at all; the driver read of nothing keeps the
+        # columns.
+        if plan is not None and plan.splits:
+            dataset = ray_data.read_datasource(
+                DeltaSwampDatasource(plan), override_num_blocks=override_num_blocks
+            )
+            return dataset.limit(limit) if limit is not None else dataset
         if limit is not None:
             kwargs["limit"] = limit
-        table = self.to_arrow(**kwargs)
+        table = self._bounded_read(bound if plan is None else None, **kwargs)
         if limit is not None:
             table = table.slice(0, limit)
         return ray_data.from_arrow(table)
+
+    def _bounded_read(self, max_bytes: int | None, **kwargs: Any) -> Any:
+        """`to_arrow(**kwargs)`, refused once it holds more than `max_bytes`."""
+        if max_bytes is None:
+            return self.to_arrow(**kwargs)
+        import pyarrow as pa
+
+        reader = pa.RecordBatchReader.from_stream(self.scan(**kwargs))
+        batches, held = [], 0
+        for batch in reader:
+            held += batch.nbytes
+            if held > max_bytes:
+                reader.close()
+                raise EngineLimitError(
+                    "read the table as a Ray Dataset on the driver",
+                    f"it holds more than driver_read_max_bytes ({max_bytes} bytes) and no "
+                    "engine can read it in parallel",
+                    "narrow the read with columns= or predicate=, raise driver_read_max_bytes, "
+                    "or read a table Ray workers can plan",
+                )
+            batches.append(batch)
+        return pa.Table.from_batches(batches, schema=reader.schema)
 
     def to_daft(self, **kwargs: Any) -> Any:
         """A Daft DataFrame, read eagerly: pass `columns=` and `predicate=` to narrow it."""

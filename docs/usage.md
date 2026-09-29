@@ -1054,6 +1054,18 @@ so workers re-vend on their own -- at the cost of the catalog token travelling
 in every task payload. `to_ray_dataset()` is built on `plan_scan`, and
 catalog-managed tables work too: the commit goes through the catalog's committer.
 
+A read task touches only its own files. Each split carries its file's scan row
+and the plan the table's protocol and metadata, so a worker neither lists nor
+replays the log: a task costs its files, not the table's history, and a
+catalog-managed read keeps working after the catalog publishes and removes the
+staged commits it was planned from.
+
+Where no engine can plan a distributed read -- a table with a row filter or
+column mask, which only the warehouse can read; a Delta Sharing table --
+`to_ray_dataset()` raises rather than reading the whole table on the driver.
+`to_ray_dataset(allow_driver_read=True)` does that read, and refuses it once
+it passes `driver_read_max_bytes` (1 GiB by default).
+
 Concurrency follows what the mode means. An **append** commits against the table
 as it is then, so a writer that arrived while the job ran is not a conflict --
 both sets of rows survive. An **overwrite** removes what it finds, so committing
