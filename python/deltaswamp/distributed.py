@@ -15,6 +15,10 @@ fragments, and the driver commits every fragment in one transaction.
 
 from __future__ import annotations
 
+import os
+import threading
+import time
+import uuid
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
@@ -47,6 +51,19 @@ class ScanPlan:
     #: Where its interval columns are, by kind (`engine.intervals`): read as
     #: `Table` reads them, a duration or text, where the engines give integers.
     interval_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = ()
+    #: Where workers get a fresh storage credential when the shipped one
+    #: nears expiry: a picklable ``source(table_id, operation)`` reaching a
+    #: driver-side `credentials.CredentialBroker`. None: they cannot.
+    credential_source: Any = None
+
+    @property
+    def credential_expires_at(self) -> float | None:
+        """When the storage credential workers get expires (epoch seconds), if known.
+
+        Workers refresh it when the plan has a `credential_source` or ships
+        catalog auth; otherwise a job running past this fails on its workers.
+        """
+        return _credential_expiry(self.table, write=False)
 
     @property
     def version(self) -> int | None:
@@ -56,7 +73,7 @@ class ScanPlan:
         # What crosses a process boundary: see `_for_workers`.
         fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
         if not self.ship_catalog_auth:
-            fields["table"] = _for_workers(self.table, write=False)
+            fields["table"] = _for_workers(self.table, write=False, source=self.credential_source)
         else:
             fields["table"] = _shipping_table(self.table)
         return (_rebuild, (type(self), fields))
@@ -178,6 +195,13 @@ class WritePlan:
     #: The top-level columns with a literal DEFAULT, as Arrow fields: a batch
     #: that leaves one out gets the default, as `Table.append` fills it.
     default_fields: tuple[Any, ...] = ()
+    #: See `ScanPlan.credential_source`.
+    credential_source: Any = None
+
+    @property
+    def credential_expires_at(self) -> float | None:
+        """When the storage credential workers write with expires, if known."""
+        return _credential_expiry(self.table, write=True)
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
@@ -198,7 +222,7 @@ class WritePlan:
         # its own copy, with full catalog access, for the commit.
         fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
         if not self.ship_catalog_auth:
-            fields["table"] = _for_workers(self.table, write=True)
+            fields["table"] = _for_workers(self.table, write=True, source=self.credential_source)
             fields["catalog"] = None
         else:
             from .credentials.databricks import shipping
@@ -974,14 +998,29 @@ class ShippedCredentials:
         credentials: Any,
         table_id: str | None,
         workspace_url: str | None = None,
+        source: Any = None,
+        identity: str | None = None,
     ) -> None:
         self._credentials = credentials
         self._table_id = table_id
         self._workspace_url = workspace_url
+        #: `credential_source` of the plan: asked for a fresh credential.
+        self._source = source
+        #: The driver provider's identity: every task of a plan (and every
+        #: plan of one principal and table) shares a slot and a cache entry.
+        self._identity = identity or f"shipped-{uuid.uuid4().hex}"
 
     @property
     def table_id(self) -> str | None:
         return self._table_id
+
+    @property
+    def refreshable(self) -> bool:
+        """Whether a fresh credential can be had here (a credential source)."""
+        return self._source is not None
+
+    def credential_identity(self) -> str:
+        return f"shipped-{self._identity}"
 
     @property
     def expires_at(self) -> float | None:
@@ -998,6 +1037,8 @@ class ShippedCredentials:
                 "this plan carries a read-only storage credential and cannot write; "
                 "plan the write with plan_write() on the driver"
             )
+        if self._source is not None:
+            self._credentials = _sourced(self, Operation(str(wanted).upper()))
         if self._credentials.expires_within(SHIPPED_CREDENTIAL_MARGIN_SECONDS):
             import time
 
@@ -1007,7 +1048,8 @@ class ShippedCredentials:
                 + ("has expired" if left <= 0 else f"expires in {left:.0f}s")
                 + ", and a worker cannot re-vend it: plans carry no catalog credentials. "
                 "Re-plan on the driver (plan_scan()/plan_write() again), or plan with "
-                "ship_catalog_auth=True so workers can refresh it themselves"
+                "credential_source= (a driver-side CredentialBroker) or "
+                "ship_catalog_auth=True so workers can refresh it"
             )
         return self._credentials
 
@@ -1042,6 +1084,63 @@ class ShippedCredentials:
             self._credentials = Credentials._from_state(carried)
 
 
+#: Credentials a credential source served in this process, and when it was
+#: last asked, by (identity, operation): every task of a plan in one worker
+#: shares one answer, so a job asks once per refresh per process.
+_SOURCED: dict[tuple[str, str], tuple[Any, float]] = {}
+_SOURCED_LOCK = threading.Lock()
+
+#: A credential source is not asked again sooner than this, unless the
+#: credential has expired: one it answers with a short-lived credential
+#: would otherwise be asked on every request.
+SOURCE_MIN_INTERVAL_SECONDS = 30.0
+
+
+def _sourced(shipped: ShippedCredentials, operation: Any) -> Any:
+    """The freshest credential for `shipped`: its own, this process's, or the source's."""
+    from .credentials import Credentials
+    from .credentials.base import DEFAULT_REFRESH_MARGIN_SECONDS
+    from .errors import CredentialError
+
+    key = (shipped.credential_identity(), str(operation.value))
+    current = shipped._credentials
+    with _SOURCED_LOCK:
+        known, asked = _SOURCED.get(key, (None, 0.0))
+        if known is not None and (known.expires_at or 0) > (current.expires_at or 0):
+            current = known
+        now = time.time()
+        if not current.expires_within(DEFAULT_REFRESH_MARGIN_SECONDS) or (
+            not current.is_expired and now - asked < SOURCE_MIN_INTERVAL_SECONDS
+        ):
+            return current
+        # Asked under the lock: the other tasks in this process wait for the
+        # one answer rather than each asking the driver.
+        _SOURCED[key] = (current, now)
+        try:
+            answer = shipped._source(shipped.table_id, operation.value)
+        except Exception as exc:
+            if not current.is_expired:
+                return current  # asked again after the interval
+            raise CredentialError(
+                f"the plan's credential source could not vend a fresh credential: {exc}"
+            ) from exc
+        served = answer if isinstance(answer, Credentials) else Credentials._from_state(answer)
+        _SOURCED[key] = (served, now)
+        return served
+
+
+def _credential_expiry(table: Any, *, write: bool) -> float | None:
+    """When the credential a plan ships for `table` expires (vends it on the driver)."""
+    from .credentials import Operation
+
+    provider = getattr(table, "credential_provider", None)
+    if provider is None:
+        return None
+    return getattr(
+        provider.credentials(Operation.READ_WRITE if write else Operation.READ), "expires_at", None
+    )
+
+
 def _shipping_table(table: Any) -> Any:
     """`table` with a provider that pickles its catalog secrets: ship_catalog_auth=True.
 
@@ -1056,7 +1155,7 @@ def _shipping_table(table: Any) -> Any:
     return replace(table, credential_provider=shipping(provider))
 
 
-def _for_workers(table: Any, *, write: bool) -> Any:
+def _for_workers(table: Any, *, write: bool, source: Any = None) -> Any:
     """`table` as a worker should receive it: no catalog credentials.
 
     The provider is replaced by the storage credential it vends now, on the
@@ -1074,7 +1173,19 @@ def _for_workers(table: Any, *, write: bool) -> Any:
         auth = getattr(provider, "workspace_auth", None)
         if callable(auth):
             workspace_url = auth()[0]
-    shipped = ShippedCredentials(credentials, getattr(provider, "table_id", None), workspace_url)
+    # The same for every pickle of this provider, so a plan's tasks share one
+    # slot, cache entry and refresh in each worker process.
+    identity = f"object-{id(provider):x}-{os.getpid()}"
+    get_identity = getattr(provider, "credential_identity", None)
+    if callable(get_identity):
+        identity = get_identity()
+    shipped = ShippedCredentials(
+        credentials,
+        getattr(provider, "table_id", None),
+        workspace_url,
+        source=source,
+        identity=identity,
+    )
     return replace(table, credential_provider=shipped)
 
 

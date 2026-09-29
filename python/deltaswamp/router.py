@@ -1361,7 +1361,12 @@ class Router:
                 ok=False,
                 reason=(
                     "Unity Catalog reports no external-engine write support for this table "
-                    "(HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT absent)"
+                    "(HAS_DIRECT_EXTERNAL_ENGINE_WRITE_SUPPORT absent; Databricks refuses its "
+                    "write credentials with EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE). A managed "
+                    "table takes writes from outside Databricks only with catalog commits "
+                    "enabled (catalog-managed); otherwise write to an external table, or "
+                    "through a SQL warehouse, which is a driver-side write and not a "
+                    "distributed one"
                 ),
                 remedy=self._fallback_remedy(table),
             )

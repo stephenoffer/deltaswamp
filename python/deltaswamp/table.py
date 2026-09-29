@@ -19,7 +19,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from . import _results
 from ._request import METHOD_OPERATIONS, NO_DATA, Request, derive, refusal
@@ -2019,14 +2019,23 @@ class Table:
         commit_metadata: dict[str, Any] | None = None,
         ship_catalog_auth: bool = False,
         supplies_defaults: bool = False,
+        credential_source: Any = None,
     ) -> Any:
         """Plan a distributed write, refusing now if the table will not accept it.
 
         A pickled plan carries the table's short-lived storage credential and
-        no catalog credentials, so a worker whose credential expires must be
-        given a fresh plan. ``ship_catalog_auth=True`` ships the catalog's
-        credential provider (and so its token) instead, letting workers
-        re-vend on their own.
+        no catalog credentials. ``credential_source=`` -- a picklable
+        ``source(table_id, operation)`` reaching a driver-side
+        `deltaswamp.credentials.CredentialBroker` -- lets workers refresh it
+        without catalog credentials; ``ship_catalog_auth=True`` ships the
+        catalog's credential provider (and so its token) instead. Either way
+        a worker's object store picks the refreshed credential up mid-write.
+        With neither, `plan.credential_expires_at` says when workers stop.
+
+        The write credential is vended here, on the driver: a table Unity
+        Catalog will not vend write credentials for (a managed table without
+        catalog commits: EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE) is refused now,
+        not when the plan is shipped or on a worker.
 
         Returns a picklable `WritePlan`. Ship it to workers, call
         `plan.write(batch)` there, send the fragments back, and commit them all
@@ -2077,6 +2086,7 @@ class Table:
             )
         engine = self._route(request)
         default_fields = self._planned_defaults(supplies_defaults)
+        self._vend_for_plan(write=True, source=credential_source, shipped=ship_catalog_auth)
         identity = None
         if isinstance(engine, KernelEngine) and self.version is not None:
             # Read from storage, not the cache: this is the identity every
@@ -2096,6 +2106,7 @@ class Table:
             txn=txn,
             commit_metadata=commit_metadata,
             ship_catalog_auth=bool(ship_catalog_auth),
+            credential_source=credential_source,
             catalog=(
                 self._connection._catalog_for(self._resolved.ref)
                 if self._resolved.is_catalog_managed and self._resolved.ref.kind is RefKind.CATALOG
@@ -2133,6 +2144,43 @@ class Table:
             )
         return tuple(literal)
 
+    #: Warn at planning when the credential workers get has less life than
+    #: this and nothing can refresh it: a job running longer fails on them.
+    plan_expiry_warning_seconds: ClassVar[float] = 1800.0
+
+    def _vend_for_plan(self, *, write: bool, source: Any, shipped: bool) -> None:
+        """Vend the credential a plan's workers get, now, on the driver.
+
+        A refusal (no write credentials for this table) surfaces at planning
+        instead of when the plan is first pickled or on a worker. And a plan
+        whose workers cannot refresh says when they will stop.
+        """
+        from .credentials import Operation as CredentialOperation
+        from .errors import CredentialExpiryWarning
+
+        provider = getattr(self._resolved, "credential_provider", None)
+        if provider is None:
+            return
+        credentials = provider.credentials(
+            CredentialOperation.READ_WRITE if write else CredentialOperation.READ
+        )
+        expires_at = getattr(credentials, "expires_at", None)
+        if source is not None or shipped or expires_at is None:
+            return
+        import time
+        import warnings
+
+        left = expires_at - time.time()
+        if left < self.plan_expiry_warning_seconds:
+            warnings.warn(
+                f"workers of this plan get a storage credential that expires in "
+                f"{max(0.0, left):.0f}s and cannot refresh it: a job running longer fails "
+                "on its workers. Plan with credential_source= (a driver-side "
+                "deltaswamp.credentials.CredentialBroker) or ship_catalog_auth=True.",
+                CredentialExpiryWarning,
+                stacklevel=3,
+            )
+
     def plan_scan(
         self,
         *,
@@ -2141,11 +2189,13 @@ class Table:
         version: int | None = None,
         timestamp: Any = None,
         ship_catalog_auth: bool = False,
+        credential_source: Any = None,
     ) -> Any:
         """Plan a distributed read: a picklable `ScanPlan` of per-file splits.
 
         As with `plan_write`, a pickled plan carries a short-lived storage
-        credential and no catalog credentials unless ``ship_catalog_auth=True``.
+        credential and no catalog credentials unless ``ship_catalog_auth=True``;
+        ``credential_source=`` lets workers refresh it from the driver.
 
         Ship the plan (or parts of it, via `plan.partitions(n)`) to workers and
         call `plan.read(splits)` there. Each worker re-resolves the same
@@ -2182,6 +2232,7 @@ class Table:
         # An empty snapshot yields no splits to carry its version, and reading
         # the plan then resolved the latest one, with its (possibly evolved)
         # schema. Pin it on the plan itself.
+        self._vend_for_plan(write=False, source=credential_source, shipped=ship_catalog_auth)
         planned = splits[0].commit_version if splits else version
         if planned is None and callable(getattr(engine, "snapshot", None)):
             try:
@@ -2196,6 +2247,7 @@ class Table:
             predicate=predicate,
             snapshot_version=planned,
             ship_catalog_auth=bool(ship_catalog_auth),
+            credential_source=credential_source,
             variant_paths=tuple(sorted(self._variant_paths())),
             interval_paths=intervals,
         )

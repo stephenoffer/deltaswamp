@@ -1162,6 +1162,7 @@ What no rule recognises arrives as `EngineError`.
 | `PropertyNotSupportedError` | a property the chosen engine cannot handle |
 | `EngineLimitError` | an `UnreachableTableError`: the engine serving a read hit a limit of its own once it read the log, so the next capable engine is tried first |
 | `CredentialError` | vending or refresh failed |
+| `ExternalWriteNotAllowedError` | Unity Catalog vends no write credentials for the table (`EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE`: a managed table without catalog commits); raised by `plan_write`, before any worker runs |
 | `PreflightError` | a workspace prerequisite is not satisfied |
 | `CommitConflictError` | another writer took that version first |
 | `CommitRefusedError` | an `EngineError`: the engine refused a commit for a reason other than a lost race (a remove on an append-only table, a failure writing the commit file); retrying the same commit meets the same refusal |

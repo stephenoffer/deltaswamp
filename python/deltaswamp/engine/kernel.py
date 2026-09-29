@@ -337,6 +337,16 @@ def _store_fingerprint(options: dict[str, str]) -> str:
     """
     import hashlib
 
+    from .._storage import _CREDENTIAL_KEYS
+    from ..credentials.refresh import SLOT_KEY
+
+    if SLOT_KEY in options:
+        # The slot names the principal and table the credential is vended
+        # for, and the store reads the credential from it on every request:
+        # keyed on the secret itself, every refresh (and every task's own
+        # vend) missed the cache and replayed the log again.
+        secret = frozenset().union(*_CREDENTIAL_KEYS.values())
+        options = {k: v for k, v in options.items() if str(k).lower() not in secret}
     canonical = json.dumps(sorted((str(k).lower(), str(v)) for k, v in options.items()))
     return hashlib.blake2b(canonical.encode(), key=_FINGERPRINT_KEY, digest_size=16).hexdigest()
 
@@ -4177,18 +4187,31 @@ class KernelEngine:
         # vended aws_region), and object_store then chose between them in
         # HashMap order.
         vended = None
+        credentials = None
+        op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
         if table.credential_provider is not None:
-            op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
             credentials = table.credential_provider.credentials(op)
-            self._warn_if_short_lived(credentials)
             vended = credentials.as_storage_options()
-        return store_options(engine_options(self._base_options, vended, table.location))
+        options = store_options(engine_options(self._base_options, vended, table.location))
+        if credentials is not None:
+            # The store reads its credential from a slot kept fresh by the
+            # refresher (credentials.refresh), so a snapshot, read or write
+            # outlives the credential it was built with.
+            from ..credentials.refresh import SLOT_KEY, slot_options
+
+            options = slot_options(table.credential_provider, op, credentials, options)
+            refreshable = getattr(table.credential_provider, "refreshable", True)
+            if SLOT_KEY not in options or not refreshable:
+                self._warn_if_short_lived(credentials)
+        return options
 
     def _warn_if_short_lived(self, credentials: Any) -> None:
         """Say so when the credential may not outlive the read it is about to serve.
 
-        The object store is built once per snapshot and holds this credential
-        for the whole scan, so there is no refresh to rescue a long read.
+        Only for a credential no slot refreshes (an extension without slots):
+        the object store is then built once per snapshot and holds this
+        credential for the whole scan, so there is no refresh to rescue a
+        long read.
         """
         remaining = getattr(credentials, "expires_at", None)
         if remaining is None or not credentials.expires_within(self.expiry_warning_seconds):
@@ -4203,8 +4226,9 @@ class KernelEngine:
             f"the vended credential for this table expires in {left:.0f}s, and it is "
             "held for the whole scan: the object store is built once per snapshot, so "
             "a read that runs longer fails partway through with a 403 from storage. "
-            "Split the read with plan_scan()/to_ray_dataset(), where each worker vends "
-            "its own, or re-open the table to mint a fresh one.",
+            "Split the read with plan_scan()/to_ray_dataset() and credential_source= "
+            "(a driver-side CredentialBroker) or ship_catalog_auth=True, so workers "
+            "refresh it, or re-open the table to mint a fresh one.",
             CredentialExpiryWarning,
             stacklevel=4,
         )

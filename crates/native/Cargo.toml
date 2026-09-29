@@ -41,6 +41,8 @@ humantime = "2"
 # issues its storage requests concurrently and compares decoded keys.
 futures = "0.3"
 percent-encoding = "2"
+# Already in the tree through object_store; its CredentialProvider trait.
+async-trait = "0.1"
 thiserror.workspace = true
 tracing.workspace = true
 

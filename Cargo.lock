@@ -699,6 +699,7 @@ name = "deltaswamp-native"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "delta-kernel-unity-catalog",
  "delta_kernel",

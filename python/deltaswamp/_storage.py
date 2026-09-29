@@ -380,7 +380,13 @@ def engine_options(
 ) -> dict[str, str]:
     """What an engine hands its object store for `location`."""
     options = merge_options(base, vended, location)
-    options.update(environment_options(location, options))
+    environment = environment_options(location, options)
+    if vended and any(str(k).lower() in _CREDENTIAL_KEYS["s3"] for k in vended):
+        # Vended keys belong to the catalog's storage: an AWS_ENDPOINT_URL
+        # exported for some other store sent them there instead.
+        for key in ("aws_endpoint", "aws_virtual_hosted_style_request"):
+            environment.pop(key, None)
+    options.update(environment)
     pin_s3_endpoint(options, location, vended=bool(vended))
     return options
 
@@ -680,3 +686,64 @@ def write_refusal(
     except InvalidArgumentError:
         return None  # the operation itself reports the conflicting keys
     return commit_refusal(location, options)
+
+
+# ---------------------------------------------------------- S3 bucket regions
+
+#: Buckets' regions as S3 reported them, per process.
+_BUCKET_REGIONS: dict[str, str | None] = {}
+_BUCKET_REGIONS_LOCK = threading.Lock()
+
+#: Set to 0 to never ask S3 where a bucket is (air-gapped hosts, tests).
+BUCKET_REGION_PROBE_ENV = "DELTASWAMP_S3_REGION_PROBE"
+
+#: Where the region is asked: S3's global endpoint answers for every bucket.
+S3_REGION_ENDPOINT = "https://s3.amazonaws.com"
+
+
+def s3_bucket_region(location: str | None, *, timeout: float = 3.0) -> str | None:
+    """The AWS region of the bucket `location` is in, or None if S3 will not say.
+
+    Unity Catalog vends S3 keys without a region, and the catalog's region is
+    the *metastore's*: an external table in a bucket elsewhere got the wrong
+    one, and every request failed with a redirect that names no region
+    object_store can follow. S3 answers an anonymous ``HEAD`` of any bucket
+    with its region in ``x-amz-bucket-region`` (even when it refuses access),
+    so one request per bucket per process settles it.
+    """
+    import os
+
+    if os.environ.get(BUCKET_REGION_PROBE_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    parsed = urlparse(location or "")
+    if parsed.scheme.lower() not in ("s3", "s3a", "s3n") or not parsed.netloc:
+        return None
+    bucket = parsed.netloc.split("@")[-1]
+    with _BUCKET_REGIONS_LOCK:
+        if bucket in _BUCKET_REGIONS:
+            return _BUCKET_REGIONS[bucket]
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    region: str | None = None
+    request = urllib.request.Request(
+        f"{S3_REGION_ENDPOINT}/{urllib.parse.quote(bucket, safe='')}", method="HEAD"
+    )
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            region = response.headers.get("x-amz-bucket-region")
+    except urllib.error.HTTPError as exc:
+        region = exc.headers.get("x-amz-bucket-region") if exc.headers else None
+    except Exception:
+        return None  # unreachable: not remembered, asked again next time
+    region = region.strip() if region else None
+    with _BUCKET_REGIONS_LOCK:
+        _BUCKET_REGIONS[bucket] = region or None
+    return region or None

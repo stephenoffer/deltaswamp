@@ -33,11 +33,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use delta_kernel::object_store::aws::AwsCredentialProvider;
+use delta_kernel::object_store::azure::AzureCredentialProvider;
 use delta_kernel::object_store::client::StaticCredentialProvider;
-use delta_kernel::object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
+use delta_kernel::object_store::gcp::{
+    GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder,
+};
 use delta_kernel::object_store::{parse_url_opts, BackoffConfig, DynObjectStore, RetryConfig};
 use url::Url;
 
+use crate::credential_slot::{self, SlotProvider, SLOT_KEY};
 use crate::error::{NativeError, Result};
 
 /// Option keys accepted for a GCS OAuth bearer token, most specific first.
@@ -45,7 +50,7 @@ use crate::error::{NativeError, Result};
 /// `gcp_oauth_token` is the name Unity Catalog uses in its credential response,
 /// so accepting it verbatim means callers can pass the vended block through
 /// without renaming fields.
-const GCS_BEARER_KEYS: &[&str] = &["google_bearer_token", "gcp_oauth_token", "bearer_token"];
+pub const GCS_BEARER_KEYS: &[&str] = &["google_bearer_token", "gcp_oauth_token", "bearer_token"];
 
 /// Keys that must never be forwarded to `parse_url_opts`, because object_store
 /// would misinterpret them.
@@ -304,35 +309,67 @@ pub fn retry_config(options: &HashMap<String, String>) -> Result<Option<RetryCon
     Ok(Some(config))
 }
 
-/// `parse_url_opts`, with a retry policy: object_store's URL parser takes no
-/// retry settings, so the builder for the URL's cloud is built here, with the
-/// same key handling (unknown keys are ignored, as there).
-fn build_with_retry(
+/// A refreshing credential provider for the store's cloud (`credential_slot`).
+enum Refreshing {
+    Aws(AwsCredentialProvider),
+    Azure(AzureCredentialProvider),
+}
+
+/// `options` without the keys (case-insensitively) in `keys`.
+fn without(options: &HashMap<String, String>, keys: &[&str]) -> HashMap<String, String> {
+    options
+        .iter()
+        .filter(|(k, _)| !keys.iter().any(|key| k.eq_ignore_ascii_case(key)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// `parse_url_opts`, with a retry policy and a refreshing credential:
+/// object_store's URL parser takes neither, so the builder for the URL's
+/// cloud is built here, with the same key handling (unknown keys are
+/// ignored, as there).
+fn build_with(
     url: &Url,
     options: &HashMap<String, String>,
-    retry: RetryConfig,
+    retry: Option<RetryConfig>,
+    refreshing: Option<Refreshing>,
 ) -> Result<Arc<DynObjectStore>> {
     use delta_kernel::object_store::aws::AmazonS3Builder;
     use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
 
     macro_rules! build {
-        ($builder:ty) => {{
-            let builder = options.iter().fold(
+        ($builder:ty, $credentials:expr) => {{
+            let mut builder = options.iter().fold(
                 <$builder>::new().with_url(url.to_string()),
                 |builder, (key, value)| match key.to_ascii_lowercase().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
                 },
             );
-            Ok(Arc::new(builder.with_retry(retry).build()?) as Arc<DynObjectStore>)
+            if let Some(retry) = retry {
+                builder = builder.with_retry(retry);
+            }
+            if let Some(credentials) = $credentials {
+                builder = builder.with_credentials(credentials);
+            }
+            Ok(Arc::new(builder.build()?) as Arc<DynObjectStore>)
         }};
     }
+    let aws = match &refreshing {
+        Some(Refreshing::Aws(p)) => Some(p.clone()),
+        _ => None,
+    };
+    let azure = match &refreshing {
+        Some(Refreshing::Azure(p)) => Some(p.clone()),
+        _ => None,
+    };
     match url.scheme() {
-        "s3" | "s3a" => build!(AmazonS3Builder),
-        "gs" | "gcs" => build!(GoogleCloudStorageBuilder),
-        "abfs" | "abfss" | "az" | "adl" | "azure" => build!(MicrosoftAzureBuilder),
+        "s3" | "s3a" => build!(AmazonS3Builder, aws),
+        "gs" | "gcs" => build!(GoogleCloudStorageBuilder, None::<GcpCredentialProvider>),
+        "abfs" | "abfss" | "az" | "adl" | "azure" => build!(MicrosoftAzureBuilder, azure),
         _ => {
-            // Local files and memory make no network requests to retry.
+            // Local files and memory make no network requests to retry, and
+            // take no credential.
             let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
             let (store, _path) = parse_url_opts(url, pairs)?;
             Ok(Arc::from(store))
@@ -340,13 +377,38 @@ fn build_with_retry(
     }
 }
 
+fn is_s3(url: &Url) -> bool {
+    matches!(url.scheme(), "s3" | "s3a")
+}
+
 /// Build an object store for `url`, honoring vended credentials.
+///
+/// With a credential slot named in the options (`credential_slot::SLOT_KEY`)
+/// and a vended credential for the URL's cloud, the store reads its
+/// credential from the slot on every request, so it outlives the one it was
+/// built with.
 pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
+    let slot = option_value(options, &[SLOT_KEY]).map(str::to_string);
+    let stripped;
+    let options = if slot.is_some() {
+        stripped = without(options, &[SLOT_KEY]);
+        &stripped
+    } else {
+        options
+    };
     let retry = retry_config(options)?;
     if is_azure(url) {
         let (target, options) = azure_target(url, options)?;
-        if let Some(retry) = retry {
-            return build_with_retry(&target, &options, retry);
+        if let Some(slot) = &slot {
+            if let Some(credential) = credential_slot::azure(&options) {
+                let provider: AzureCredentialProvider =
+                    Arc::new(SlotProvider::new(slot, credential, credential_slot::azure));
+                let options = without(&options, credential_slot::AZURE_KEYS);
+                return build_with(&target, &options, retry, Some(Refreshing::Azure(provider)));
+            }
+        }
+        if retry.is_some() {
+            return build_with(&target, &options, retry, None);
         }
         let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
         let (store, _path) = parse_url_opts(&target, pairs)?;
@@ -355,12 +417,23 @@ pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<D
 
     if is_gcs(url) {
         if let Some(token) = gcs_bearer_token(options) {
-            return build_gcs_with_bearer(url, options, token, retry);
+            return build_gcs_with_bearer(url, options, token, retry, slot.as_deref());
         }
     }
 
-    if let Some(retry) = retry {
-        return build_with_retry(url, options, retry);
+    if is_s3(url) {
+        if let Some(slot) = &slot {
+            if let Some(credential) = credential_slot::aws(options) {
+                let provider: AwsCredentialProvider =
+                    Arc::new(SlotProvider::new(slot, credential, credential_slot::aws));
+                let options = without(options, credential_slot::AWS_KEYS);
+                return build_with(url, &options, retry, Some(Refreshing::Aws(provider)));
+            }
+        }
+    }
+
+    if retry.is_some() {
+        return build_with(url, options, retry, None);
     }
     let pairs = options.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     let (store, _path) = parse_url_opts(url, pairs)?;
@@ -414,6 +487,7 @@ fn build_gcs_with_bearer(
     options: &HashMap<String, String>,
     token: &str,
     retry: Option<RetryConfig>,
+    slot: Option<&str>,
 ) -> Result<Arc<DynObjectStore>> {
     let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_str());
     if let Some(retry) = retry {
@@ -432,9 +506,13 @@ fn build_gcs_with_bearer(
         }
     }
 
-    let provider = Arc::new(StaticCredentialProvider::new(GcpCredential {
+    let credential = GcpCredential {
         bearer: token.to_string(),
-    }));
+    };
+    let provider: GcpCredentialProvider = match slot {
+        Some(slot) => Arc::new(SlotProvider::new(slot, credential, credential_slot::gcp)),
+        None => Arc::new(StaticCredentialProvider::new(credential)),
+    };
     let store = builder.with_credentials(provider).build()?;
     Ok(Arc::new(store))
 }
@@ -735,6 +813,106 @@ mod tests {
             request.contains("authorization: bearer ya29.secret"),
             "request did not carry the bearer token:\n{request}"
         );
+    }
+
+    /// A server that answers `n` requests with 404 and returns each one's
+    /// lower-cased text.
+    fn recording_server(n: usize) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            (0..n)
+                .map(|_| {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf = vec![0u8; 8192];
+                    let read = sock.read(&mut buf).unwrap();
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    );
+                    String::from_utf8_lossy(&buf[..read]).to_lowercase()
+                })
+                .collect()
+        });
+        (port, server)
+    }
+
+    /// One store, two requests, a refresh published between them: the second
+    /// request carries the new credential. Before slots, a store held the
+    /// credential it was built with until it was dropped.
+    #[test]
+    fn a_store_with_a_slot_sends_the_refreshed_credential() {
+        use delta_kernel::object_store::{path::Path, ObjectStoreExt};
+
+        let far = || {
+            Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64()
+                    + 3600.0,
+            )
+        };
+        let slot = format!("test-{}", uuid::Uuid::new_v4());
+        crate::credential_slot::set(&slot, opts(&[("google_bearer_token", "ya29.first")]), far());
+        let (port, server) = recording_server(2);
+        let base = format!("http://127.0.0.1:{port}");
+        let o = opts(&[
+            ("google_bearer_token", "ya29.first"),
+            ("google_base_url", base.as_str()),
+            ("allow_http", "true"),
+            ("max_retries", "0"),
+            (SLOT_KEY, slot.as_str()),
+        ]);
+        let store = build_store(&Url::parse("gs://bucket/table/").unwrap(), &o).unwrap();
+        let head = || {
+            let _ = crate::runtime::block_on(async {
+                store.head(&Path::from("table/_delta_log/x.json")).await
+            });
+        };
+        head();
+        crate::credential_slot::set(
+            &slot,
+            opts(&[("google_bearer_token", "ya29.second")]),
+            far(),
+        );
+        head();
+        let requests = server.join().unwrap();
+        crate::credential_slot::remove(&slot);
+        assert!(requests[0].contains("bearer ya29.first"), "{}", requests[0]);
+        assert!(
+            requests[1].contains("bearer ya29.second"),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[test]
+    fn s3_and_azure_stores_build_with_a_slot() {
+        let slot = format!("test-{}", uuid::Uuid::new_v4());
+        let s3 = opts(&[
+            ("aws_access_key_id", "k"),
+            ("aws_secret_access_key", "s"),
+            ("aws_region", "us-west-2"),
+            (SLOT_KEY, slot.as_str()),
+        ]);
+        build_store(&Url::parse("s3://b/t").unwrap(), &s3).unwrap();
+        let azure = opts(&[
+            ("azure_storage_sas_key", "sv=1&sig=x"),
+            (SLOT_KEY, slot.as_str()),
+        ]);
+        build_store(
+            &Url::parse("abfss://c@acct.dfs.core.windows.net/t").unwrap(),
+            &azure,
+        )
+        .unwrap();
+        // A slot on a local path is ignored, not an error.
+        build_store(
+            &Url::parse("file:///tmp/t").unwrap(),
+            &opts(&[(SLOT_KEY, "x")]),
+        )
+        .unwrap();
     }
 
     #[test]

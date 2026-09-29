@@ -12,6 +12,9 @@ import pytest
 # the arguments belongs in the engine's supports() or in the request's needs,
 # where can() sees it and routing moves on. See deltaswamp._request.
 os.environ.setdefault("DELTASWAMP_STRICT_ROUTING", "1")
+# Vended S3 credentials ask S3 for their bucket's region; the suite's buckets
+# are made up, and a test that wants the probe turns it on itself.
+os.environ.setdefault("DELTASWAMP_S3_REGION_PROBE", "0")
 
 #: Tests whose call is refused inside an engine as UnreachableTableError, with
 #: the router willing to send the same request to another engine. Each is a
