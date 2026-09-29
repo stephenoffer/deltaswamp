@@ -22,13 +22,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      # A virtualenv, activated for every later step: the runner's Python is
+      # externally managed (PEP 668), so `uv pip install --system` is refused.
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-      - run: uv python install 3.11
+          python-version: "3.11"
+          activate-environment: true
       # Pinned so an upstream release cannot break CI. Keep in step with
       # .pre-commit-config.yaml.
-      - run: uv pip install --system pytest 'mypy==2.3.1' 'ruff==0.14.2'
+      - run: uv pip install pytest 'mypy==2.3.1' 'ruff==0.14.2'
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
@@ -47,10 +50,14 @@ jobs:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
-      - run: uv python install ${{ matrix.python }}
-      - run: uv pip install --system --python ${{ matrix.python }} pytest
-      - run: uv run --python ${{ matrix.python }} pytest tests/unit -q
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+          activate-environment: true
+      - run: uv pip install pytest
+      # `python -m pytest`, not `uv run`: uv run would build and install the
+      # project, Rust extension included, which these tests do not need.
+      - run: python -m pytest tests/unit -q
 
   rust:
     name: rust ${{ matrix.os }}
@@ -77,15 +84,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v6
-      - run: uv python install 3.11
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+          activate-environment: true
       - name: Build and install the wheel
-        # Installing the real artifact exercises packaging as well, and works
-        # without a virtualenv (which `maturin develop` requires).
+        # Installing the real artifact exercises packaging as well.
         run: |
-          uv pip install --system maturin pytest pyarrow polars
-          maturin build --out dist --locked
-          uv pip install --system --find-links dist deltaswamp
+          uv pip install maturin pytest
+          maturin build --release --out dist --locked
+          # Every optional engine, so no test skips for want of a dependency.
+          uv pip install --find-links dist "deltaswamp[all]"
       - name: Packaging is intact
         # A build can succeed while the distribution is wrong: a missing
         # subpackage, absent entry-point metadata, a stub that did not ship.
@@ -117,19 +126,23 @@ jobs:
         # Live Databricks tests are marked and skipped: they need a workspace and
         # a token. Everything else runs, including the catalog-managed path,
         # which is covered by tests/fake_uc.py rather than a real catalog.
-        run: pytest -q -m "not databricks"
+        # pyproject's pythonpath puts the source tree first, which has no
+        # compiled extension here; clearing it tests the installed wheel.
+        run: pytest -o pythonpath= -q -m "not databricks"
 
   sdist:
     name: sdist builds from source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
-      - run: uv python install 3.11
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+          activate-environment: true
       - name: Build the sdist and compile the wheel from it
         # Catches a source distribution missing a file the build needs.
         run: |
-          uv pip install --system maturin
+          uv pip install maturin
           maturin sdist --out dist
-          uv pip install --system --no-binary deltaswamp dist/*.tar.gz
+          uv pip install --no-binary deltaswamp dist/*.tar.gz
           python -c "import deltaswamp; deltaswamp.check_native(); print('sdist OK')"

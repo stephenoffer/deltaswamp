@@ -49,8 +49,10 @@ RESTORE, FSCK, CONVERT or manifest generation, and its log compaction is a stub.
 for the tables delta-rs cannot write.)
 
 So the kernel is the default reader and delta-rs the default for DML and
-maintenance. Two rows break the pattern: for `checkConstraints` and
-`generatedColumns`, delta-rs is the more capable engine.
+maintenance on the tables it can write. For `checkConstraints`,
+`generatedColumns` and `invariants` both engines write -- the kernel evaluates
+them in DuckDB, on the workers of a distributed write -- but DML on tables
+with generated columns stays with delta-rs.
 
 ## Resolution happens in two stages
 
@@ -140,16 +142,27 @@ per-table, carries its own `expiration_time`, and must be re-vended. Databricks
 publishes no TTL, so nothing here assumes an hour. Mixing the two up is how a
 job dies after about an hour while authentication still looks fine.
 
-Re-vending happens between operations. The kernel builds its object store once
-per snapshot, so a single scan that streams past its credential's lifetime
-fails. Refreshing inside Rust needs an `object_store::CredentialProvider` that
-calls back into Python, which is not built. Until then, a scan that starts with
-less than `KernelEngine.expiry_warning_seconds` of credential life raises
-`CredentialExpiryWarning`. `plan_scan()` and `to_ray_dataset()` split the read,
-but by default a plan carries one storage credential vended on the driver, and
-a worker refuses it within a minute of its expiry. With
-`ship_catalog_auth=True` the plan carries the credential provider instead, and
-each worker vends its own credential for its own slice.
+The kernel's object store does not hold a credential; it holds a *slot*
+(`crates/native/src/credential_slot.rs`). Each AWS, Azure (SAS or bearer) and
+GCS request reads the slot, and Python publishes a fresh credential into it
+from its own thread ahead of expiry (`credentials/refresh.py`). The store never
+calls back into Python, so it cannot deadlock on the GIL; a request that finds
+its credential within ten seconds of expiry waits up to thirty for a fresher
+one. Stores built before a refresh see it, so a single long scan or write
+outlives any one credential. The snapshot cache keys on the slot, not the
+secret, so a refresh does not replay the log.
+
+A distributed plan carries the storage credential vended on the driver, never
+the catalog's. Workers refresh it in one of two ways. With a
+`credential_source` the plan carries a picklable callable that reaches a
+`CredentialBroker` on the driver or in an actor, which vends by table id; with
+`ship_catalog_auth=True` it carries the catalog's own provider, secrets
+included. Either way the providers unpickled in one process are shared, keyed
+by a digest of host, principal and table, so N tasks in a worker vend once and
+share one `WorkspaceClient`. With neither, a worker refuses its credential
+within a minute of expiry, and planning warns (`CredentialExpiryWarning`) when
+less than half an hour is left. delta-rs cannot read a slot: a delta-rs
+operation takes the credential current when it starts.
 
 Providers are picklable and credentials are not: `Credentials` raises
 `TypeError` when pickled, and only a plan's `ShippedCredentials` carries one on
@@ -255,11 +268,19 @@ the deleted rows from the old and new vectors.
 
 ## Distributed reads and writes
 
-A scan plan is a list of per-file splits pinned to one snapshot version. A
-worker re-resolves that version and reads its files through a file-restricted
-kernel scan, which applies deletion vectors, column mapping and partition values
-exactly as a full scan does. Only the kernel engine plans; other engines read
-on the driver.
+A scan plan is a list of per-file splits pinned to one snapshot version. Each
+split carries its file's scan row (the kernel's own description of the file,
+without statistics), and the plan carries one shared planned snapshot: version,
+protocol and metadata. A worker builds the snapshot from that with no log I/O
+(`Snapshot.planned`) and hands the scan rows to the kernel's
+`scan_metadata_from`, which applies deletion vectors, column mapping and
+partition values exactly as a full scan does. A read task therefore costs its
+files, not the table's history, and a catalog-managed read survives the
+catalog publishing and removing the staged commits it was planned from. Only
+the kernel engine plans; `to_ray_dataset()` refuses a driver-side read unless
+asked. A change-feed plan (`plan_changes`) cuts a version range into runs of
+whole commits, since a deletion-vector update pairs a remove and an add in one
+commit.
 
 Writes run the same way in reverse. Workers write Parquet and return add-action
 metadata, which the driver commits in one transaction at a single version. The
@@ -270,7 +291,29 @@ tracking. Re-deriving it here would drift from `Transaction::add_files_schema`.
 `plan_write` decides on the driver whether the commit can succeed, before any
 worker runs. It reads the full protocol: a legacy `minWriterVersion` implies
 features it never names, and a check that reads only the named list would
-accept writes it cannot perform.
+accept writes it cannot perform. It also vends the write credential, so a
+catalog's refusal to vend one surfaces there. Values the table computes are
+computed on the workers (`engine/values.py`): defaults, generated columns and
+invariants per batch, identity values from a block the plan reserved in a
+metadata-only commit, one slot per task, so the job's own commit changes no
+metadata and can rebase.
+
+The commit is idempotent. Each fragment records the version it was written
+at, and before every attempt the driver reads the commits since then --
+including a catalog-managed table's ratified tail -- for the job's paths
+(`crates/native/src/landed.rs`). Found: the landed version is returned. Found
+in part: refused. Not readable: nothing is committed. So a driver may commit
+the same fragments again after a timeout. A failure that certainly committed
+nothing deletes the job's files (`WritePlan.abort`); an ambiguous one keeps
+them. Overwrite removes are streamed from the scan with their statistics
+dropped, though delta-kernel-rs 0.28 still holds them until the commit, and a
+commit that would add and remove one path is refused.
+
+A write that creates its table (`Connection.plan_write`) writes a template
+version 0 under `_deltaswamp_pending/<plan>/` in the table root, outside the
+log, so no reader sees a table. Workers resolve the table from it; the commit
+writes version 0 put-if-absent and then the data, and undoes version 0 if the
+data never lands.
 
 ## Extension points
 
@@ -315,7 +358,6 @@ from the registry one. Mixing them yields two kernels and two incompatible
   would need them; DELETE through deletion vectors does not.
 - The change feed of a catalog-managed table. The kernel's `TableChanges`
   lists the log itself and would miss unpublished commits.
-- Credential refresh inside a single long read.
 - Databricks server-side behavior: predictive optimization, auto compaction,
   row-level concurrency, UniForm metadata generation. The
   [feature map](features.md) shows how each is reached.

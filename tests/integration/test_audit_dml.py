@@ -89,20 +89,35 @@ def _ids(n: int = 3) -> Any:
 class TestChangeFeedMergeWithConditionalInsert:
     SOURCE = pa.table({"id": pa.array([5, 6, 7], pa.int64()), "s": ["abc", "b", "ab"]})
 
-    def test_deltars_still_writes_null_rows(self, tmp_path: Any) -> None:
-        """Probe: when this fails, delta-rs is fixed and the refusal can go."""
+    def test_the_refusal_matches_what_delta_rs_does(self, tmp_path: Any) -> None:
+        """Probe: the refusal is on exactly while the installed delta-rs writes
+        the all-NULL rows (deltalake 1.6.5 does, 1.6.6 does not)."""
+        from deltaswamp.engine.deltars import _null_rows_on_feed_merge
+
         path = str(tmp_path / "t")
         deltalake.write_deltalake(path, _ids(2), configuration=CDF)
         deltalake.DeltaTable(path).merge(
             self.SOURCE, "t.id = s.id", source_alias="s", target_alias="t"
         ).when_not_matched_insert_all(predicate="s.s LIKE 'a%'").execute()
         ids = deltalake.DeltaTable(path).to_pyarrow_table().column("id").to_pylist()
-        assert None in ids, (
-            "delta-rs no longer writes an all-NULL row per rejected source row on a CDF "
-            "table; _CheckedMerger.execute can stop refusing conditional NOT MATCHED clauses"
-        )
+        assert (None in ids) is _null_rows_on_feed_merge(), ids
+
+    def test_served_where_delta_rs_is_fixed(self, conn: Any, tmp_path: Any) -> None:
+        from deltaswamp.engine.deltars import _null_rows_on_feed_merge
+
+        if _null_rows_on_feed_merge():
+            pytest.skip("the installed delta-rs writes the all-NULL rows")
+        path = _table(conn, tmp_path, _ids(2), CDF)
+        conn.open_table(path).merge(
+            self.SOURCE, "t.id = s.id", source_alias="s", target_alias="t"
+        ).when_not_matched_insert_all(predicate="s.s LIKE 'a%'").execute()
+        assert sorted(r[0] for r in _rows(conn, path, "id")) == [1, 2, 5, 7]
 
     def test_refused_before_anything_is_written(self, conn: Any, tmp_path: Any) -> None:
+        from deltaswamp.engine.deltars import _null_rows_on_feed_merge
+
+        if not _null_rows_on_feed_merge():
+            pytest.skip("the installed delta-rs no longer writes the all-NULL rows")
         path = _table(conn, tmp_path, _ids(2), CDF)
         t = conn.open_table(path)
         assert t.can(Operation.MERGE).engine is Engine.DELTARS

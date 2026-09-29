@@ -1301,7 +1301,8 @@ def c_identity(ctx: Context, b: Builder, rel: str, uri: str) -> list[str]:
     ref = dref(uri)
     sel = ", ".join(_FLAT)
     ctx.warehouse.run(
-        f"INSERT INTO {ref} ({sel}) SELECT id + 20000, s, d, ts, dec, i FROM {ref} WHERE id % 10 = 3"
+        f"INSERT INTO {ref} ({sel}) "
+        f"SELECT id + 20000, s, d, ts, dec, i FROM {ref} WHERE id % 10 = 3"
     )
     n, dn, dd, nulls = (
         int(x)

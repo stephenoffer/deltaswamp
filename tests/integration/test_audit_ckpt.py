@@ -177,7 +177,7 @@ def test_a_constrained_kernel_only_table_checkpoints(
 ) -> None:
     """The reported gap: UnreachableTableError, on classic and v2 checkpoints."""
     monkeypatch.setenv("DELTASWAMP_STRICT_ROUTING", "1")
-    path = _constrained(conn, tmp_path, **{"delta.checkpointPolicy": policy})
+    path = _constrained(conn, tmp_path, appends=3, **{"delta.checkpointPolicy": policy})
     t = conn.open_table(path)
     verdict = t.can("checkpoint")
     assert verdict.ok and verdict.engine is Engine.KERNEL, verdict
@@ -198,7 +198,7 @@ def test_a_constrained_kernel_only_table_checkpoints(
 def test_the_checkpoint_alone_reads_as_the_table(conn: Any, tmp_path: Any, policy: str) -> None:
     """A copy with every commit below the checkpoint deleted: the kernel and
     delta-rs load it from the checkpoint, and the constraint still binds."""
-    path = _constrained(conn, tmp_path, **{"delta.checkpointPolicy": policy})
+    path = _constrained(conn, tmp_path, appends=3, **{"delta.checkpointPolicy": policy})
     conn.open_table(path).checkpoint()
     copy = str(tmp_path / "copy")
     shutil.copytree(path, copy)

@@ -60,7 +60,9 @@ def _age(path: str, versions: range, days: float) -> None:
             os.utime(f, (stamp, stamp))
 
 
-def _table(conn: Any, tmp_path: Any, commits: int, checkpoints: tuple[int, ...] = (), **kw: Any):
+def _table(
+    conn: Any, tmp_path: Any, commits: int, checkpoints: tuple[int, ...] = (), **kw: Any
+) -> str:
     """A table of `commits` versions (0 is the create), checkpointed at `checkpoints`."""
     path = str(tmp_path / "t")
     conn.create_table(path, _rows(0).schema, **kw)

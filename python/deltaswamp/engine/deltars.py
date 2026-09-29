@@ -12,6 +12,7 @@ re-opening is the only way to pick up a re-vended credential.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import math
 import os
@@ -81,6 +82,22 @@ _CM_SCHEMA_EVOLUTION = (
     "the table uses column mapping, and delta-rs cannot change the schema of a "
     "column-mapped table during a write"
 )
+
+
+@functools.cache
+def _null_rows_on_feed_merge() -> bool:
+    """Whether the installed delta-rs writes an all-NULL row for each source row
+    a conditional WHEN NOT MATCHED clause rejects, on a change-data-feed table.
+
+    deltalake 1.6.5 does; 1.6.6 does not.
+    """
+    try:
+        from importlib.metadata import version
+
+        installed = tuple(int(part) for part in re.findall(r"\d+", version("deltalake"))[:3])
+    except Exception:
+        return True
+    return installed < (1, 6, 6)
 
 
 def _column_mapped(table: ResolvedTable) -> bool:
@@ -183,7 +200,7 @@ class DeltaRsEngine:
             return _CM_SCHEMA_EVOLUTION
         if "early_datetimes" in needs:
             return _FOOTERLESS_EARLY_VALUES
-        if "conditional_insert_with_feed" in needs:
+        if "conditional_insert_with_feed" in needs and _null_rows_on_feed_merge():
             # The MERGE builder's own refusal at execute(), stated up front.
             return (
                 "the table has the change data feed enabled, and delta-rs 1.6.5 inserts an "
@@ -3255,7 +3272,7 @@ class _CheckedMerger:
                 "allow_sql_fallback=True) to run it on Databricks",
             )
         not_matched = [conditional for kind, conditional in self._clauses if kind == "not_matched"]
-        if self._change_feed and not_matched and not_matched[-1]:
+        if self._change_feed and not_matched and not_matched[-1] and _null_rows_on_feed_merge():
             # delta-rs 1.6.5 writes an all-NULL row into the table for every
             # source row that matches no target row and no NOT MATCHED
             # clause's condition, when the change data feed is on (and counts

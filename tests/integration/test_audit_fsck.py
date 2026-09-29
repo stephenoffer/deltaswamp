@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import Any
+from typing import Any, cast
 from urllib.parse import unquote
 
 import pytest
@@ -88,7 +88,7 @@ def test_missing_files_are_removed(conn: Any, tmp_path: Any, kw: dict[str, Any])
 
 
 def test_a_healthy_table_commits_nothing(conn: Any, tmp_path: Any) -> None:
-    path = _table(conn, tmp_path, KERNEL_ONLY[0].values[0])
+    path = _table(conn, tmp_path, cast(dict[str, Any], KERNEL_ONLY[0].values[0]))
     version = conn.open_table(path).version
     assert conn.open_table(path).repair() == {"dry_run": False, "files_removed": []}
     assert conn.open_table(path).version == version

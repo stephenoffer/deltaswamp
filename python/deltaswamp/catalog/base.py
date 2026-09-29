@@ -267,7 +267,7 @@ class ResolvedTable:
         """
         if not self.is_catalog_managed or self.commit_tail is None:
             return None
-        fresh = self.commit_tail(self)
+        fresh: ResolvedTable = self.commit_tail(self)
         if self.table_id and fresh.table_id and self.table_id != fresh.table_id:
             from ..errors import CorruptTableError
 

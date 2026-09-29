@@ -142,7 +142,7 @@ def test_add_constraint_rechecks_rows_a_concurrent_writer_added(
 
     path, t = _build(conn, tmp_path, "ict")
     real = KernelEngine._state
-    raced = []
+    raced: list[Any] = []
 
     def state(self: Any, table: Any) -> Any:
         out = real(self, table)

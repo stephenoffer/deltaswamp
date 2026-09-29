@@ -42,7 +42,7 @@ jobs:
           import deltaswamp as ds
           ds.check_native()
           from deltaswamp.catalog.registry import available_catalogs
-          assert set(available_catalogs()) == {'databricks','filesystem','glue','hive','unity'}
+          assert set(available_catalogs()) == {'databricks','filesystem','glue','hive','sharing','unity'}
           print('wheel OK', ds.__version__)
           "
       - uses: actions/upload-artifact@v4

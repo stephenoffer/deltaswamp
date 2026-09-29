@@ -331,7 +331,13 @@ class TestWrapper:
 
 def test_a_conditional_last_insert_on_a_feed_table_is_refused_by_can(feed: Any) -> None:
     """r5rg M11: can("merge") named delta-rs, whose execute() then refused."""
+    from deltaswamp.engine.deltars import _null_rows_on_feed_merge
+
     conditional = [("when_not_matched_insert_all", "source.id > 1")]
+    if not _null_rows_on_feed_merge():
+        # delta-rs 1.6.6 serves it correctly: can() and the call agree on ok.
+        assert feed.can("merge", clauses=conditional).ok
+        return
     cap = feed.can("merge", clauses=conditional)
     assert not cap.ok and "conditional WHEN NOT MATCHED" in cap.reason
     assert feed.can("merge", clauses=["when_not_matched_insert_all"]).ok

@@ -260,6 +260,8 @@ class TestCommitSafety:
         )
 
     def test_can_agrees_with_the_refusal(self) -> None:
+        # Without the extension every kernel verdict is "not installed" instead.
+        pytest.importorskip("deltaswamp._native")
         from deltaswamp.engine.kernel import KernelEngine
 
         table = ResolvedTable(

@@ -127,7 +127,7 @@ def test_native_stub_lists_every_feature_the_build_reports() -> None:
 def test_usage_errors_table_names_every_public_error() -> None:
     import pathlib
 
-    usage = (pathlib.Path(ds.__file__).parents[2] / "docs" / "usage.md").read_text()
+    usage = (pathlib.Path(__file__).parents[2] / "docs" / "usage.md").read_text()
     for name in ds.__all__:
         obj = getattr(ds, name)
         if (

@@ -1335,6 +1335,8 @@ class KernelEngine:
             # The binding takes an unsigned version and raised OverflowError.
             raise UnreachableTableError(f"read version {version}", "versions start at 0")
 
+        # Checked above; `_latest_tail` swaps only the commit tail.
+        location: str = table.location
         if timestamp is None and (version is None or version > (table.max_catalog_version or -1)):
             # The latest version is the newest the catalog has said it is, and
             # a version past the tail the caller holds (one this engine just
@@ -1347,7 +1349,6 @@ class KernelEngine:
             for entry in table.log_tail
         ] or None
 
-        location: str = table.location
         # Only a path-based read by version (or latest) is cached: a
         # catalog-managed table's latest version is the catalog's to say,
         # which a log listing cannot see.
@@ -1458,7 +1459,7 @@ class KernelEngine:
                 # not; that escaped as a bare ValueError. Tell the two apart.
                 try:
                     Snapshot.resolve(
-                        table.location,
+                        location,
                         options=self._options(table, write=write),
                         log_tail=log_tail,
                         max_catalog_version=table.max_catalog_version,

@@ -37,9 +37,11 @@ reads tables delta-rs refuses (catalog-managed, type widening,
 block delta-rs, such as in-commit timestamps and liquid clustering. delta-rs
 has MERGE, OPTIMIZE, VACUUM and RESTORE, and the kernel has none of them.
 
-So deltaswamp routes each operation to the engine that can serve it. The
-kernel reads, delta-rs writes and maintains, and a Databricks SQL warehouse
-covers what neither can, but only if you opt in.
+So deltaswamp routes each operation to the engine that can serve it, and
+builds what neither has on top of the kernel: deletion-vector DML, MERGE,
+compaction, VACUUM and RESTORE for the tables delta-rs cannot write, including
+catalog-managed ones. A Databricks SQL warehouse covers the rest, but only if
+you opt in.
 
 ## It tells you before it fails
 
@@ -72,6 +74,30 @@ changes latency and cost by orders of magnitude.
 - Distributed reads and writes for Ray and other engines, plus hand-offs to
   DuckDB, Polars and Daft and cross-catalog SQL via `conn.sql(...)`.
 
+## Distributed reads and writes
+
+The plans a Ray Data `read_delta` or `write_delta` runs on, with no Spark and
+no JVM:
+
+```python
+plan = t.plan_scan(columns=["id"])            # driver
+part = plan.read(plan.partitions(64)[i])      # worker: no log replay, no catalog
+
+plan = t.plan_write(mode="append")            # driver: refuses now, not after the job
+fragment = plan.write(block, task_index=i)    # worker: durable, uncommitted files
+plan.commit(fragments)                        # driver: one commit, rebased and retried
+plan.abort(fragments)                         # or delete the job's files
+```
+
+A refusal comes from `plan_write`, before any worker runs. A commit that
+fails for certain deletes the job's files, and one whose outcome is unknown
+can be retried safely. Workers refresh vended credentials inside a running
+task. Catalog-managed tables, row tracking, in-commit timestamps, identity
+and generated columns, and `checkpointProtection` all work through these
+plans, and `conn.plan_write(name, schema=...)` creates the table at commit.
+[Ray Data](docs/ray-data.md) maps every scenario that fails with `deltalake`
+alone to what solves it here.
+
 The [feature map](docs/features.md) shows how each Databricks and open-source
 Delta feature is reached, and names the blocker for the few that aren't.
 
@@ -86,7 +112,9 @@ pip install 'deltaswamp[pyarrow,polars,sql]'   # extras as needed
 
 Alpha. Every feature is tested against real on-disk tables, a fake Unity
 Catalog server that speaks the real `/delta/v1` protocol, and a Delta Sharing
-server. A live Databricks suite runs with a personal access token.
+server. A live Databricks suite runs with a personal access token: it checks
+deltaswamp against tables Databricks wrote, and has a SQL warehouse read,
+query and write on top of every table shape deltaswamp writes.
 
 DELETE, UPDATE and MERGE write deletion vectors, as Databricks does, on every
 table that enables them, catalog-managed and row-tracked tables included. The
@@ -98,6 +126,7 @@ table that enables them, catalog-managed and row-tracked tables included. The
 - [Architecture](docs/architecture.md): how it works and why
 - [Conformance](docs/conformance.md): which engine serves which feature and operation
 - [Feature map](docs/features.md): every Databricks and open-source feature, and how it is reached
+- [Ray Data](docs/ray-data.md): the distributed read and write plans, scenario by scenario
 - [Testing](docs/testing.md) and [Contributing](CONTRIBUTING.md)
 
 ## License
