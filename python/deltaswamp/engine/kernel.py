@@ -678,11 +678,22 @@ class KernelEngine:
     #: history_manager resolves a timestamp to the latest recreatable version,
     #: honoring in-commit timestamps.
     supports_timestamp_travel = True
-    #: DELETE/UPDATE/replaceWhere evaluate their SQL here, and only the
-    #: predicate grammar (comparisons, IN, BETWEEN, LIKE, IS NULL, AND/OR/NOT
-    #: over columns and literals; SET values a literal or a column). Arithmetic
-    #: and function calls go to an engine that evaluates SQL.
+    #: DELETE/UPDATE/replaceWhere evaluate their SQL here: the predicate
+    #: grammar (comparisons, IN, BETWEEN, LIKE, IS NULL, AND/OR/NOT over
+    #: columns and literals; SET values a literal or a column) natively, and
+    #: SQL beyond it -- arithmetic, function calls, CASE, nested fields -- with
+    #: DuckDB in Spark's dialect where the request found DuckDB binds it
+    #: (``duckdb_sql``; see `supports_dml_sql_expressions`). Reads and other
+    #: operations take only the grammar.
     supports_sql_expressions = False
+
+    @property
+    def supports_dml_sql_expressions(self) -> bool:
+        """DELETE/UPDATE/replaceWhere SQL beyond the grammar, evaluated by DuckDB."""
+        return (
+            importlib.util.find_spec("duckdb") is not None
+            and importlib.util.find_spec("pyarrow") is not None
+        )
 
     #: DELETE/UPDATE/MERGE from a handle pinned to a past version: read there,
     #: committed at the latest through the conflict check a lost race gets
@@ -2277,15 +2288,12 @@ class KernelEngine:
             def replace(current: Any, keep: Any) -> Any:
                 import pyarrow.compute as pc
 
-                from .. import predicate as sqlpred
-
                 kept = current.filter(keep)
                 new = _conform(incoming, kept.schema)
                 # replaceWhere: every new row must satisfy the predicate, as
                 # Databricks (replaceWhere.constraintCheck) and delta-rs enforce.
                 # Accepting others writes rows outside the range being replaced.
-                node = _canonical_node(sqlpred.parse(predicate), new.schema)
-                ok = pc.fill_null(_evaluate(new, sqlpred.to_arrow(node, new.schema)), False)
+                ok = _satisfied(new, predicate)
                 bad = new.num_rows - int(pc.sum(ok).as_py() or 0)
                 if bad:
                     # The request's data, not the table: the type delta-rs raises
@@ -2543,12 +2551,17 @@ class KernelEngine:
             )
 
         snapshot = self.snapshot(table, write=True)
+        duck = _duck_predicate(predicate)
         attempt = 0
         while True:
             current = pa.table(snapshot.scan())
             node = None
             if predicate is None:
                 matched = pa.array([True] * current.num_rows, pa.bool_())
+            elif duck is not None:
+                # Beyond the grammar: DuckDB decides, in Spark's dialect. No
+                # node, so a rebase counts every file as read.
+                matched = _duck_mask(duck, current, predicate)
             else:
                 node = _canonical_node(sqlpred.parse(predicate), current.schema)
                 expr = sqlpred.to_arrow(node, current.schema)
@@ -2631,8 +2644,13 @@ class KernelEngine:
             emptied = self._delete_every_file(table, snapshot, txn, commit_metadata, engine_info)
             if emptied is not None:
                 return emptied
-        node = _canonical_node(sqlpred.parse(predicate), schema) if predicate is not None else None
-        if transform is None:
+        # A predicate beyond the grammar is evaluated by DuckDB over every row
+        # (it gives the kernel nothing to skip files by).
+        duck = _duck_predicate(predicate)
+        node = None
+        if predicate is not None and duck is None:
+            node = _canonical_node(sqlpred.parse(predicate), schema)
+        if transform is None and duck is None:
             # Only what the predicate reads: a DELETE never needs the rest.
             wanted = sorted({path[0] for path in sqlpred.columns_of(node)}) if node else []
             columns: list[str] | None = _with_data_column(snapshot, wanted)
@@ -2647,21 +2665,34 @@ class KernelEngine:
         if node is not None:
             stream = sqlpred.filter_stream(stream, node)
         reader = pa.RecordBatchReader.from_stream(stream)
+        row_filter = (
+            _dml_row_filter(duck, reader.schema, str(predicate)) if duck is not None else None
+        )
 
         positions = [_FILE_COLUMN, _ROW_INDEX_COLUMN]
         matched_batches = []
         deletion_batches = []
-        for batch in reader:
-            if batch.num_rows == 0:
-                continue
-            deletion_batches.append(
-                pa.record_batch(
-                    [batch.column(_FILE_COLUMN), batch.column(_ROW_INDEX_COLUMN)],
-                    names=["path", "row_index"],
+        try:
+            for batch in reader:
+                if row_filter is not None and batch.num_rows:
+                    batch = row_filter(batch)
+                if batch.num_rows == 0:
+                    continue
+                deletion_batches.append(
+                    pa.record_batch(
+                        [batch.column(_FILE_COLUMN), batch.column(_ROW_INDEX_COLUMN)],
+                        names=["path", "row_index"],
+                    )
                 )
-            )
-            if transform is not None:
-                matched_batches.append(batch.drop_columns(positions))
+                if transform is not None:
+                    matched_batches.append(batch.drop_columns(positions))
+        except sqlpred.PredicateError as exc:
+            if row_filter is None:
+                raise
+            raise _dml_data_error(f"the predicate {predicate!r}", exc) from exc
+        finally:
+            if row_filter is not None:
+                row_filter.close()
         touched = sum(b.num_rows for b in deletion_batches)
 
         data = None
@@ -2670,8 +2701,8 @@ class KernelEngine:
         elif replacement is not None:
             data_schema = pa.schema([f for f in schema])
             data = _conform(replacement, data_schema)
-            if node is not None:
-                ok = pc.fill_null(_evaluate(data, sqlpred.to_arrow(node, data.schema)), False)
+            if predicate is not None:
+                ok = _satisfied(data, predicate)
                 bad = data.num_rows - int(pc.sum(ok).as_py() or 0)
                 if bad:
                     # The request's data, not the table: the type delta-rs raises
@@ -3710,19 +3741,29 @@ class KernelEngine:
         read_version: int | None = None,
         **unsupported: Any,
     ) -> dict[str, Any]:
-        """UPDATE by rewriting the table. Assignments are plain values.
+        """UPDATE, as deletion vectors or by rewriting files.
 
-        `updates` (SQL expressions) are accepted only when each is a literal or
-        a column reference, since nothing here evaluates arbitrary SQL.
+        `new_values` are plain values. An `updates` value (SQL) that is a
+        literal or a top-level column is applied here; any other SQL
+        (`n + 1`, `upper(s)`, `CASE ...`, `st.x`) is evaluated by DuckDB in
+        Spark's dialect over the matched rows only, each reading the row as it
+        was, and stored into the column as Spark's store assignment does.
         """
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        from .kernel_merge import store_cast
+        from .duckfilter import beyond_grammar
+        from .kernel_merge import _cast_to, store_cast
 
         _refuse_options("update", unsupported)
         assignments: dict[str, Any] = dict(new_values or {})
+        #: Column -> its SET value as DuckDB text, for SQL beyond the grammar.
+        computed: dict[str, str] = {}
         for column, expression in (updates or {}).items():
+            if beyond_grammar(expression, False):
+                computed[column] = _duck_text(expression)
+                assignments[column] = computed[column]
+                continue
             value = sqlpred.parse_value(expression)
             assignments[column] = value
         if not assignments:
@@ -3730,11 +3771,33 @@ class KernelEngine:
         from .._variant import log_variant_columns, string_variant, variant_column
 
         variants: frozenset[str] = frozenset()
-        if any(
-            isinstance(v.value if isinstance(v, sqlpred.Literal) else v, str)
-            for v in assignments.values()
+        if (
+            computed
+            or any(
+                isinstance(v.value if isinstance(v, sqlpred.Literal) else v, str)
+                for v in assignments.values()
+            )
         ) and table.features & {"variantType", "variantType-preview"}:
             variants = log_variant_columns(getattr(self.snapshot(table), "metadata_json", dict)())
+
+        def evaluate(current: Any) -> Any:
+            """The computed SET values over `current` (the matched rows), by DuckDB."""
+            from .duckfilter import Projection
+
+            names = {column: f"__deltaswamp_set_{i}" for i, column in enumerate(computed)}
+            try:
+                projection = Projection(
+                    {names[c]: text for c, text in computed.items()}, current.schema
+                )
+            except sqlpred.PredicateError as exc:
+                raise _dml_sql_limit("update on the kernel", exc) from exc
+            try:
+                values = projection(current)
+            except sqlpred.PredicateError as exc:
+                raise _dml_data_error("the UPDATE", exc) from exc
+            finally:
+                projection.close()
+            return {c: values.column(names[c]) for c in computed}
 
         def column_index(schema: Any, name: str, what: str) -> int:
             # Delta column names are case-insensitive.
@@ -3745,10 +3808,19 @@ class KernelEngine:
 
         def assign(current: Any, keep: Any) -> Any:
             out = current
+            values = evaluate(current) if computed and current.num_rows else {}
             for column, value in assignments.items():
                 index = column_index(out.schema, column, f"update {column}")
                 field = out.schema.field(index)
-                if isinstance(value, sqlpred.Column):
+                if column in computed:
+                    source = (
+                        _cast_to(
+                            pa.table({field.name: values[column]}), pa.schema([field]), variants
+                        ).column(0)
+                        if column in values
+                        else pa.nulls(out.num_rows, field.type)
+                    )
+                elif isinstance(value, sqlpred.Column):
                     # SQL reads every right-hand side from the row as it was:
                     # `SET a = b, b = a` swaps. Reading `out` chained them.
                     if len(value.path) != 1:
@@ -3800,8 +3872,18 @@ class KernelEngine:
                 self.need_refusal(frozenset({"pinned_read"}), table) or "",
             )
         else:
+
+            def rewrite(current: Any, keep: Any) -> Any:
+                if not computed:
+                    return assign(current, keep)
+                # SQL is evaluated over the matched rows only, as Spark does:
+                # `10 / n` must not fail on a row the predicate leaves alone.
+                matched = current.filter(pc.invert(keep))
+                none = pa.nulls(matched.num_rows, pa.bool_()).fill_null(False)
+                return pa.concat_tables([current.filter(keep), assign(matched, none)])
+
             result = self._rewrite(
-                table, predicate, assign, operation="UPDATE", commit_metadata=commit_metadata
+                table, predicate, rewrite, operation="UPDATE", commit_metadata=commit_metadata
             )
         return {"num_updated_rows": result["num_affected_rows"], "version": result["version"]}
 
@@ -6625,3 +6707,75 @@ def _refuse_options(what: str, options: dict[str, Any]) -> None:
             f"{what} with {', '.join(given)}",
             "the kernel rewrite path does not implement these options",
         )
+
+
+# ------------------------------------------------------ DML SQL beyond the grammar
+
+
+def _duck_text(text: str) -> str:
+    """Spark SQL `text` respelled for DuckDB, refused when it is not one row expression.
+
+    Raises `EngineLimitError` for SQL the dialect cannot translate faithfully;
+    routing (``spark_sql``) keeps such text off the kernel already.
+    """
+    from . import sharing
+    from .dialect import to_duckdb
+
+    duck = to_duckdb(text)
+    sharing._screen_expression(duck)
+    return duck
+
+
+def _duck_predicate(predicate: str | None) -> str | None:
+    """A DML predicate as DuckDB text when the kernel's grammar does not read it, else None."""
+    from .duckfilter import beyond_grammar
+
+    if predicate is None or not beyond_grammar(predicate, True):
+        return None
+    return _duck_text(predicate)
+
+
+def _dml_sql_limit(what: str, exc: Exception) -> EngineLimitError:
+    """DuckDB could not bind DML SQL: nothing is written, so another engine may serve it."""
+    return EngineLimitError(
+        what,
+        f"DuckDB, which evaluates the kernel's DML SQL beyond its grammar, cannot bind it: {exc}",
+        "delta-rs or the SQL warehouse (allow_sql_fallback=True) evaluate other SQL; "
+        "or rewrite the expression",
+    )
+
+
+def _dml_row_filter(duck: str, schema: Any, predicate: str) -> Any:
+    from .duckfilter import RowFilter
+
+    try:
+        return RowFilter(duck, schema, spark=True)
+    except sqlpred.PredicateError as exc:
+        raise _dml_sql_limit(f"evaluate the predicate {predicate!r} on the kernel", exc) from exc
+
+
+def _dml_data_error(what: str, exc: Exception) -> InvalidArgumentError:
+    """SQL that bound and then failed on the rows -- an overflow, a division by zero."""
+    return InvalidArgumentError(f"{what} failed evaluating its SQL on the rows: {exc}")
+
+
+def _duck_mask(duck: str, table: Any, predicate: str) -> Any:
+    """Where `predicate` (as DuckDB text `duck`) is TRUE over `table`'s rows."""
+    row_filter = _dml_row_filter(duck, table.schema, predicate)
+    try:
+        return row_filter.mask(table)
+    except sqlpred.PredicateError as exc:
+        raise _dml_data_error(f"the predicate {predicate!r}", exc) from exc
+    finally:
+        row_filter.close()
+
+
+def _satisfied(data: Any, predicate: str) -> Any:
+    """Where replaceWhere's `predicate` is TRUE for each row of the new `data`."""
+    import pyarrow.compute as pc
+
+    duck = _duck_predicate(predicate)
+    if duck is not None:
+        return _duck_mask(duck, data, predicate)
+    node = _canonical_node(sqlpred.parse(predicate), data.schema)
+    return pc.fill_null(_evaluate(data, sqlpred.to_arrow(node, data.schema)), False)

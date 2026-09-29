@@ -306,7 +306,7 @@ def _write(
     ):
         op = Operation.REPLACE_WHERE
     if op is Operation.REPLACE_WHERE:
-        needs |= table._expression_needs(get("predicate"))
+        needs |= _dml_expression_needs(table, get("predicate"))
         needs |= table._interval_needs(get("predicate"))
     if data is not NO_DATA:
         needs |= table._data_needs(data, get("partition_by"))
@@ -475,10 +475,26 @@ def _commit_options(table: Table, shape: dict[str, Any]) -> set[str]:
     )
 
 
+def _dml_expression_needs(
+    table: Table, predicate: Any, updates: dict[str, Any] | None = None
+) -> set[str]:
+    """`Table._expression_needs`, and whether the kernel's DuckDB evaluates the SQL.
+
+    SQL beyond the kernel's grammar that the dialect translates faithfully
+    (no ``spark_sql``) is served by the kernel as well when DuckDB binds it
+    over the table (``duckdb_sql``), so a table only the kernel writes takes
+    `n + 1` or `lower(s) = 'a'` without a warehouse.
+    """
+    needs = set(table._expression_needs(predicate, updates))
+    if "sql_expressions" in needs and "spark_sql" not in needs:
+        needs |= table._duckdb_needs(predicate, updates)
+    return needs
+
+
 def _delete(
     table: Table, op: Operation, shape: dict[str, Any], data: Any
 ) -> tuple[Operation, set[str]]:
-    return Operation.DELETE, set(table._expression_needs(shape.get("predicate"))) | (
+    return Operation.DELETE, set(_dml_expression_needs(table, shape.get("predicate"))) | (
         _commit_options(table, shape)
         | table._char_needs(shape.get("predicate"))
         | table._interval_needs(shape.get("predicate"))
@@ -495,7 +511,7 @@ def _update(
     spelled = (
         {k: defaults.get(k, v) for k, v in updates.items()} if isinstance(updates, dict) else None
     )
-    needs |= table._expression_needs(shape.get("predicate"), spelled)
+    needs |= _dml_expression_needs(table, shape.get("predicate"), spelled)
     needs |= table._char_needs(shape.get("predicate"))
     needs |= _assignment_needs(table, [(spelled or {}, True), (new_values, False)])
     needs |= table._interval_needs(

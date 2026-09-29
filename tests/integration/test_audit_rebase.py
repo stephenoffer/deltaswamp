@@ -15,7 +15,6 @@ from typing import Any, ClassVar
 
 import pytest
 from deltaswamp.capability import Operation
-from deltaswamp.errors import UnreachableTableError
 
 from tests.integration.test_audit_read import (
     JULIAN_TS,
@@ -122,18 +121,20 @@ def _ts(conn: Any, path: str, column: str = "ts") -> list[int | None]:
 class TestRewritesKeepTheCalendar:
     """delta-rs rewrote legacy files from their raw Julian values: 0001-01-01 became 0000-12-30."""
 
-    def test_delta_rs_is_refused_and_can_agrees(self, conn: Any, tmp_path: Any) -> None:
+    def test_delta_rs_is_refused_and_the_kernel_computes(self, conn: Any, tmp_path: Any) -> None:
+        # delta-rs is refused the rewrite; the kernel evaluates `rid + 10`
+        # itself (DuckDB, Spark's dialect) and writes the dates it read.
         path = _spark_table(tmp_path / "t")
         t = conn.open_table(path)
         verdict = t.can("update", updates={"rid": "rid + 10"})
-        assert not verdict.ok
-        assert "legacy hybrid calendar" in verdict.reason, verdict
-        assert verdict.engine is not ds.Engine.DELTARS
-        with pytest.raises(UnreachableTableError, match="legacy hybrid calendar"):
-            t.update({"rid": "rid + 10"}, predicate="rid = 2")
-        # Nothing was rewritten.
-        assert [d for _, d in _rows(conn, path)] == EXPECTED_DATES
-        assert _raw_days(path) == [-719164, -171489, 19723]  # the Julian day numbers
+        assert verdict.engine is ds.Engine.KERNEL, verdict
+        assert t.update({"rid": "rid + 10"}, predicate="rid = 2").engine == "kernel"
+        assert _rows(conn, path) == [
+            (1, dt.date(1, 1, 1)),
+            (3, dt.date(2024, 1, 1)),
+            (12, dt.date(1500, 6, 15)),
+        ]
+        assert sorted(_raw_days(path)) == sorted(_days(*EXPECTED_DATES))
 
     def test_kernel_merge_keeps_the_values(self, conn: Any, tmp_path: Any) -> None:
         # delta-rs is refused this MERGE; the kernel's copy-on-write one

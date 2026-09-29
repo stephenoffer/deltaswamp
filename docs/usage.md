@@ -232,8 +232,9 @@ included. On the kernel path one parse of the predicate both skips files by
 their statistics and filters the rows exactly. The predicate language is the boolean subset of Spark SQL:
 comparisons, `AND`/`OR`/`NOT`, `IN`, `BETWEEN`, `LIKE`, `IS [NOT] NULL`, `<=>`,
 nested columns (`addr.zip`) and typed literals (`DATE '2026-01-01'`).
-Arithmetic and function calls are refused with a message; delta-rs and the
-warehouse accept full SQL.
+A read predicate with arithmetic or function calls goes to delta-rs or the
+warehouse, which accept full SQL (DELETE, UPDATE and replaceWhere on the
+kernel evaluate it with DuckDB; see below).
 
 Literals mean what they mean in Spark, whichever engine serves the call.
 Adjacent string literals concatenate, so `'it''s'` is `its` (write `'it\'s'`
@@ -595,11 +596,19 @@ no `numRecords` statistic (every file in a Databricks checkpoint, which keeps
 statistics only as `stats_parsed`) takes a vector too; its row count is read
 from the Parquet footer.
 
-On this path the kernel evaluates DELETE, UPDATE and replaceWhere SQL itself,
-and reads comparisons, `IN`, `BETWEEN`, `LIKE`, `IS NULL` and `AND`/`OR`/`NOT`
-over columns and literals; a SET value is a literal or a column. A predicate or
-SET value beyond that (`id % 3 = 0`, `lower(s) = 'a'`, `x + 1`) goes to delta-rs
-as copy-on-write, or to the warehouse, and `t.can("update", updates=...,
+On this path the kernel evaluates DELETE, UPDATE and replaceWhere SQL itself.
+It reads comparisons, `IN`, `BETWEEN`, `LIKE`, `IS NULL` and `AND`/`OR`/`NOT`
+over columns and literals natively, and a SET value that is a literal or a
+column. A predicate or SET value beyond that (`id % 3 = 0`, `lower(s) = 'a'`,
+`x + 1`, `CASE ...`, `st.x`) is translated as described in [Spark SQL on the
+direct engines](#spark-sql-on-the-direct-engines) and evaluated by DuckDB
+(`pip install 'deltaswamp[duckdb]'`): SET values over the matched rows only,
+each reading the row as it was. Integer overflow, division by zero and a
+malformed CAST raise `InvalidArgumentError` before anything is written, as the
+same UPDATE fails on Databricks. Such a predicate gives the kernel nothing to
+skip files by, so every file is read. SQL the dialect cannot translate
+faithfully, or that DuckDB does not bind (`try_divide`), goes to delta-rs as
+copy-on-write, or to the warehouse, and `t.can("update", updates=...,
 predicate=...)` says which.
 
 A MERGE evaluates its clauses with DuckDB (`pip install 'deltaswamp[duckdb]'`),
@@ -622,9 +631,8 @@ Without deletion vectors, delta-rs serves DML as copy-on-write, rewriting the
 Parquet files that hold matching rows. On a table only the kernel can write,
 `delete`, `update` and predicate overwrites then fall back to rewriting the
 whole table in one commit, bounded by `KernelEngine.rewrite_max_bytes` (1 GiB
-by default) and refused on row-tracked tables; on this path `update` takes
-plain values, or SQL that is a literal or a column name, and MERGE needs the
-warehouse. On a table with the change data feed enabled, the kernel serves only
+by default; a row-tracked table gets a rewrite of the touched files instead),
+with the same SQL as on the deletion-vector path. On a table with the change data feed enabled, the kernel serves only
 DELETE, because UPDATE and MERGE need CDC files it cannot write. delta-rs
 1.6.5 inserts an all-NULL row for each source row a conditional
 `when_not_matched_insert` rejects on such a table, so that MERGE is refused
@@ -636,7 +644,8 @@ MATCHED clause unconditional, filtering the source first, to keep it local.
 Predicates, SET values and MERGE clauses are Spark SQL, which the warehouse
 runs as written. SQL the predicate grammar covers is evaluated exactly on every
 engine; anything else (functions, arithmetic) is evaluated by DataFusion
-(delta-rs) or DuckDB (the kernel MERGE, the Delta Sharing filter), whose
+(delta-rs) or DuckDB (the kernel's DELETE, UPDATE, replaceWhere and MERGE,
+the Delta Sharing filter), whose
 dialects read some Spark SQL differently or not at all. It is translated first
 (`deltaswamp.engine.dialect`), so each engine computes what the warehouse
 does:
@@ -654,8 +663,11 @@ does:
   `regexp_replace` replaces every match; `^` is XOR;
 - `RLIKE`/`REGEXP`, `<=>`, `nvl`, `nvl2`, `if`, `pmod`, `1.5D`, `7L`, `1.5BD`
   and LIKE's default `\` escape work on both;
+- in DuckDB an integer literal is an INT, or a BIGINT past INT's range, as in
+  Spark: a TINYINT `b` of 127 gives 127 for `b + 1 - 1` (DuckDB narrowed the
+  literal to TINYINT and overflowed);
 - where DuckDB filters a read (a table delta-rs misreads, a Delta Sharing
-  filter), a FLOAT compares with a decimal literal as DOUBLE (`f = 0.1` is
+  filter) or evaluates the kernel's DELETE, UPDATE or replaceWhere, a FLOAT compares with a decimal literal as DOUBLE (`f = 0.1` is
   false for the FLOAT 0.1, as on Spark), and BIGINT arithmetic that overflows
   raises, as ANSI Spark's does, rather than being folded away. Such a filter
   is one expression over the row: a subquery (`SELECT`, `VALUES`, `PIVOT`,

@@ -472,6 +472,9 @@ _ROUTER_HINTS: frozenset[str] = frozenset(
         "conditional_insert_with_feed",
         # Only delta-rs cannot serve it (`DeltaRsEngine.need_refusal`).
         "early_datetimes",
+        # DML SQL beyond the kernel's grammar that DuckDB, in Spark's
+        # dialect, binds over the table's schema (`_kernel_evaluates_sql`).
+        "duckdb_sql",
     }
 )
 #: What a need means, where its name alone does not say.
@@ -546,6 +549,35 @@ _CALENDAR_BOUND: frozenset[Operation] = _FILE_REWRITES | _DATA_READS
 _DV_DML: frozenset[Operation] = frozenset(
     {Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE, Operation.MERGE}
 )
+
+
+#: DML whose SQL (predicate, SET values) the kernel evaluates with DuckDB
+#: when its own grammar does not read it.
+_DUCKDB_DML: frozenset[Operation] = frozenset(
+    {Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE}
+)
+
+
+def _kernel_evaluates_sql(
+    kind: EngineKind, operation: Operation, needs: frozenset[str], engine: object
+) -> bool:
+    """Whether the kernel evaluates this DML's SQL beyond its grammar itself.
+
+    A DELETE, UPDATE or replaceWhere predicate, or a SET value, that the
+    kernel's grammar does not read (`n + 1`, `lower(s) = 'a'`) is respelled
+    in Spark's dialect and evaluated by DuckDB over the rows the kernel reads,
+    as the kernel MERGE evaluates its clauses. ``duckdb_sql`` says the request
+    checked that DuckDB binds every such text over the table's schema; text
+    the dialect cannot translate faithfully carries ``spark_sql`` instead,
+    and goes to the warehouse.
+    """
+    return (
+        kind is EngineKind.KERNEL
+        and operation in _DUCKDB_DML
+        and "duckdb_sql" in needs
+        and "spark_sql" not in needs
+        and bool(getattr(engine, "supports_dml_sql_expressions", False))
+    )
 
 
 def _preference(
@@ -808,8 +840,9 @@ class Router:
                 for need in needs - _ROUTER_HINTS
                 if not getattr(engine, f"supports_{need}", False)
             )
-            if missing == ["sql_expressions"] and self._kernel_filters_sql(
-                kind, operation, table, needs, engine, shape
+            if missing == ["sql_expressions"] and (
+                self._kernel_filters_sql(kind, operation, table, needs, engine, shape)
+                or _kernel_evaluates_sql(kind, operation, needs, engine)
             ):
                 missing = []
             if missing:

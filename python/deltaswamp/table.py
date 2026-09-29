@@ -3194,6 +3194,33 @@ class Table:
             raise
         return frozenset()
 
+    def _duckdb_needs(
+        self, predicate: str | None, updates: dict[str, Any] | None = None
+    ) -> frozenset[str]:
+        """``duckdb_sql`` when DuckDB evaluates the DML SQL the kernel's grammar does not.
+
+        The kernel evaluates a DELETE/UPDATE/replaceWhere predicate, or a SET
+        value, beyond its grammar with DuckDB in Spark's dialect -- when the
+        dialect translates it faithfully and DuckDB binds it over the table's
+        schema. Decided here, from the text and the schema, so routing knows
+        before the call whether the kernel serves it (see
+        `router._kernel_evaluates_sql`).
+        """
+        from .engine.duckfilter import beyond_grammar, evaluable
+
+        texts: list[tuple[str, bool]] = []
+        if isinstance(predicate, str) and beyond_grammar(predicate, True):
+            texts.append((predicate, True))
+        if isinstance(updates, dict):
+            texts += [(v, False) for v in updates.values() if beyond_grammar(v, False)]
+        if not texts:
+            return frozenset()
+        try:
+            schema = self.schema()
+        except (ImportError, DeltaSwampError):
+            return frozenset()
+        return frozenset({"duckdb_sql"}) if evaluable(texts, schema) else frozenset()
+
     def _update_needs(self, targets: Any, literal: bool) -> frozenset[str]:
         """`_data_needs` for UPDATE's SET list.
 

@@ -272,19 +272,24 @@ class TestDeletionVectorDmlBeyondTheKernelGrammar:
         )
         return _table(conn, tmp_path, data, DV)
 
-    def test_arithmetic_delete_goes_to_deltars(self, conn: Any, tmp_path: Any) -> None:
+    def test_arithmetic_delete_stays_on_the_kernel(self, conn: Any, tmp_path: Any) -> None:
+        # Evaluated by DuckDB in Spark's dialect, written as deletion vectors.
         path = self._path(conn, tmp_path)
         t = conn.open_table(path)
         assert t.can(Operation.DELETE).engine is Engine.KERNEL
-        assert t.can(Operation.DELETE, predicate="id % 2 = 0").engine is Engine.DELTARS
+        assert t.can(Operation.DELETE, predicate="id % 2 = 0").engine is Engine.KERNEL
         assert t.delete("id % 2 = 0")["num_deleted_rows"] == 2
         assert _rows(conn, path, "id") == [(1,), (3,)]
+        assert any("deletionVector" in a.get("add", {}) for a in _last_commit(path))
 
     def test_functions_in_update(self, conn: Any, tmp_path: Any) -> None:
         path = self._path(conn, tmp_path)
         t = conn.open_table(path)
-        assert t.can(Operation.UPDATE, updates={"x": "x + 1"}).engine is Engine.DELTARS
-        t.update({"x": "x + 1", "status": "upper(status)"}, predicate="lower(status) = 'b'")
+        assert t.can(Operation.UPDATE, updates={"x": "x + 1"}).engine is Engine.KERNEL
+        result = t.update(
+            {"x": "x + 1", "status": "upper(status)"}, predicate="lower(status) = 'b'"
+        )
+        assert result.engine == "kernel"
         assert _rows(conn, path, "id", "x", "status") == [
             (1, 10, "a"),
             (2, 21, "B"),
@@ -298,7 +303,7 @@ class TestDeletionVectorDmlBeyondTheKernelGrammar:
             {"id": pa.array([2], pa.int64()), "x": pa.array([99], pa.int64()), "status": ["n"]}
         )
         t = conn.open_table(path)
-        assert t.can(Operation.OVERWRITE, predicate="id % 2 = 0").engine is Engine.DELTARS
+        assert t.can(Operation.OVERWRITE, predicate="id % 2 = 0").engine is Engine.KERNEL
         t.overwrite(new, predicate="id % 2 = 0")
         assert _rows(conn, path, "id", "x") == [(1, 10), (2, 99), (3, 30)]
 

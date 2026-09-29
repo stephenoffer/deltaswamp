@@ -43,6 +43,22 @@ First release.
   `baseRowId` and `defaultRowCommitVersion`, as do deletion-vector re-adds; a
   deletion-vector DELETE that empties a file now removes it rather than leaving
   a full vector. CLONE of a row-tracked table stays refused, with the reason.
+- Kernel DELETE, UPDATE and replaceWhere evaluate SQL beyond the kernel's
+  predicate grammar (arithmetic, function calls, CASE, casts, nested fields)
+  with DuckDB in Spark's dialect, as the kernel MERGE does, on deletion-vector,
+  copy-on-write and row-tracked tables alike: `t.update({"n": "n + 1"})` on an
+  in-commit-timestamp table no longer needs a SQL warehouse. SET values are
+  evaluated over the matched rows only, each reading the row as it was, and
+  stored as Spark's store assignment does; integer overflow, division and
+  remainder by zero, and malformed casts raise as they do on Databricks (ANSI
+  mode). Routing decides from the text and the schema: SQL the dialect cannot
+  translate faithfully (`split`, a 0-based subscript, `hash`) or that DuckDB
+  does not bind (`try_divide`) still goes to delta-rs or the warehouse, and
+  `can()` names the engine the call uses. On a table with deletion vectors
+  such DML now stays on the kernel rather than moving to delta-rs.
+- An integer literal in Spark SQL evaluated by DuckDB is typed as Spark types
+  it (INT, or BIGINT past INT): `b + 1 - 1` on a TINYINT 127 is 127, where
+  DuckDB narrowed the literal and overflowed TINYINT.
 - Metadata-only ALTER commits for what delta-rs cannot do: column rename and
   drop under column mapping, type widening, SET NOT NULL, clustering keys and
   unset properties.

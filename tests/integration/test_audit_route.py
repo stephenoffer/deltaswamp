@@ -93,7 +93,7 @@ class TestChangeFeedRouting:
 
 
 def test_update_from_a_nested_field_on_a_dv_table(conn: Any, tmp_path: Any) -> None:
-    """M2: the kernel's UPDATE reads top-level columns only; strict routing is on here."""
+    """M2: the kernel's UPDATE reads a nested field through DuckDB; strict routing is on here."""
     path = str(tmp_path / "dv")
     st = pa.array([{"x": i, "y": str(i)} for i in range(3)])
     conn.create_table(
@@ -104,7 +104,7 @@ def test_update_from_a_nested_field_on_a_dv_table(conn: Any, tmp_path: Any) -> N
     t = conn.open_table(path)
     t.append(pa.table({"id": [0, 1, 2], "v": [9, 9, 9], "st": st}))
     assert t.can("update", updates={"v": "1"}).engine is Engine.KERNEL
-    assert t.can("update", updates={"v": "st.x"}).engine is Engine.DELTARS
+    assert t.can("update", updates={"v": "st.x"}).engine is Engine.KERNEL
     t.update({"v": "st.x"})
     assert sorted(t.to_arrow().column("v").to_pylist()) == [0, 1, 2]
 
