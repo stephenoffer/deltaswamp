@@ -7,11 +7,15 @@ what the plan carries. See docs/ray-data.md.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import os
 import pickle
 import subprocess
 import sys
 import textwrap
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -159,3 +163,69 @@ class TestPlannedWrite:
         fragment = plan.write(pa.table({"id": [11], "city": ["kyiv"]}))
         plan.abort([fragment])
         assert live_connection.table(name).to_arrow().num_rows == 3
+
+
+class TestGovernedRead:
+    """A table only the warehouse can read: its result chunks are the splits."""
+
+    @pytest.fixture
+    def governed(self, live_config: Any, scratch_sql: Any) -> Iterator[tuple[str, str]]:
+        """The scratch table behind a row filter (id <> 2) and a column mask on city."""
+        name, run = scratch_sql
+        suffix = uuid.uuid4().hex[:8]
+        keep = f"{live_config.prefix}.dsw_keep_{suffix}"
+        hide = f"{live_config.prefix}.dsw_hide_{suffix}"
+        view = f"{live_config.prefix}.dsw_view_{suffix}"
+        run(f"CREATE FUNCTION {keep}(id BIGINT) RETURN id <> 2")
+        run(f"CREATE FUNCTION {hide}(city STRING) RETURN concat('masked-', length(city))")
+        try:
+            run(f"ALTER TABLE {name} SET ROW FILTER {keep} ON (id)")
+            run(f"ALTER TABLE {name} ALTER COLUMN city SET MASK {hide}")
+            run(f"CREATE VIEW {view} AS SELECT id, city FROM {name} WHERE id > 1")
+            yield name, view
+        finally:
+            for statement in (
+                f"DROP VIEW IF EXISTS {view}",
+                f"ALTER TABLE {name} DROP ROW FILTER",
+                f"ALTER TABLE {name} ALTER COLUMN city DROP MASK",
+                f"DROP FUNCTION IF EXISTS {keep}",
+                f"DROP FUNCTION IF EXISTS {hide}",
+            ):
+                with contextlib.suppress(Exception):
+                    run(statement)
+
+    @staticmethod
+    def _rows(rows: list[dict[str, Any]]) -> list[tuple[int, str]]:
+        return sorted((int(r["id"]), str(r["city"])) for r in rows)
+
+    def test_a_worker_reads_the_filtered_and_masked_result(
+        self, live_connection: Any, governed: Any, tmp_path: Path
+    ) -> None:
+        name, _view = governed
+        table = live_connection.table(name)
+        plan = table.plan_scan()
+        assert getattr(plan, "is_warehouse_plan", False), plan
+        expected = self._rows(table.to_arrow().to_pylist())
+        assert expected == [(1, "masked-4"), (3, "masked-5")]
+        assert self._rows(_read_in_a_worker(tmp_path, plan, plan.partitions(4))) == expected
+
+    def test_projection_and_predicate_run_in_the_query(
+        self, live_connection: Any, governed: Any, tmp_path: Path
+    ) -> None:
+        name, _view = governed
+        plan = live_connection.table(name).plan_scan(columns=["id"], predicate="id >= 3")
+        assert _read_in_a_worker(tmp_path, plan, plan.partitions(2)) == [{"id": 3}]
+
+    def test_a_view_is_read_by_a_worker_with_shipped_auth(
+        self, live_connection: Any, governed: Any, tmp_path: Path
+    ) -> None:
+        _name, view = governed
+        plan = live_connection.table(view).plan_scan(ship_catalog_auth=True)
+        assert plan.shipped_links is not None
+        # Links as a worker finds them after the ones planned have expired:
+        # none. It asks the warehouse for fresh ones with the shipped auth.
+        stale = dataclasses.replace(
+            plan, splits=tuple(dataclasses.replace(s, links=()) for s in plan.splits)
+        )
+        rows = _read_in_a_worker(tmp_path, stale, stale.partitions(2))
+        assert self._rows(rows) == [(3, "masked-5")]
