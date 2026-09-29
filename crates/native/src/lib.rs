@@ -10,6 +10,7 @@ mod checksum;
 mod commit;
 mod commit_time;
 mod confine;
+mod credential_slot;
 mod dml;
 mod error;
 mod files;
@@ -28,6 +29,8 @@ mod vacuum;
 mod writer;
 
 pub use error::{NativeError, Result};
+
+use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
@@ -132,7 +135,24 @@ pub const FEATURES: &[&str] = &[
     // monotonic before in-commit timestamps), which every timestamp lookup
     // resolves against.
     "commit_timestamps",
+    // `set_credential_slot`/`remove_credential_slot`: stores built with a
+    // slot's key read their vended credential from it on every request, so
+    // a refresh published from Python reaches stores already built.
+    "credential_slots",
 ];
+
+/// Publish a freshly vended credential (as storage options) in slot `slot`.
+#[pyfunction]
+#[pyo3(signature = (slot, options, expires_at = None))]
+fn set_credential_slot(slot: &str, options: HashMap<String, String>, expires_at: Option<f64>) {
+    credential_slot::set(slot, options, expires_at);
+}
+
+/// Forget slot `slot`; stores built from it keep the credential they last saw.
+#[pyfunction]
+fn remove_credential_slot(slot: &str) {
+    credential_slot::remove(slot);
+}
 
 #[pyfunction]
 fn kernel_version() -> &'static str {
@@ -192,6 +212,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(functions::validate_retry_options, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_create_table_request, m)?)?;
     m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
+    m.add_function(wrap_pyfunction!(set_credential_slot, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_credential_slot, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_version, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_is_multithreaded, m)?)?;

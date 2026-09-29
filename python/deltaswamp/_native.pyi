@@ -18,8 +18,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "compaction", "commit_info_patch", "streaming_compaction", "retry_options", "vacuum",
 "restore", "row_tracking_compaction", "add_tags", "write_checksum", "incremental_files",
 "path_clone", "row_tracking_dml", "check_constraints", "schema_evolution", "log_cleanup",
-"symlink_manifest", "fsck", "value_constrained_checkpoint", "commit_timestamps". Gate on
-this list, not `hasattr`, so a stale build refuses cleanly.
+"symlink_manifest", "fsck", "value_constrained_checkpoint", "commit_timestamps",
+"credential_slots". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -162,6 +162,14 @@ def validate_retry_options(options: dict[str, str]) -> None:
 
     Raises InvalidInputError. Keys are read as delta-rs reads them.
     """
+
+def set_credential_slot(
+    slot: str, options: dict[str, str], expires_at: float | None = None
+) -> None:
+    """Publish a freshly vended credential in `slot`, for stores built with its key."""
+
+def remove_credential_slot(slot: str) -> None:
+    """Forget `slot`; stores built from it keep the credential they last saw."""
 
 def probe_put_if_absent(table_root: str, options: dict[str, str] | None = None) -> bool:
     """Whether the store under `table_root` honours put-if-absent.
