@@ -15,6 +15,7 @@ mod dml;
 mod error;
 mod files;
 mod functions;
+mod geo;
 mod landed;
 mod logclean;
 mod manifest;
@@ -167,6 +168,12 @@ pub const FEATURES: &[&str] = &[
     // created by a distributed write, resolved by workers from a template
     // version 0 before it exists, and undone if its data never lands.
     "deferred_create",
+    // Reads and writes of `geospatial` tables: geo columns as WKB binary,
+    // written with Parquet's GEOMETRY/GEOGRAPHY logical types (`geo`).
+    "geospatial",
+    // Writes to IcebergCompatV1/V2 tables, partition values materialized in
+    // every data file as the features require (`restate::ICEBERG_COMPAT`).
+    "iceberg_compat_writes",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.

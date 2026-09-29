@@ -49,6 +49,9 @@ pub struct PySnapshot {
     /// Built by `planned` from a driver's protocol and metadata, with no log
     /// behind it: it reads only the files a plan hands it (`scan_rows=`).
     planned: bool,
+    /// The table's own `metaData`, where `inner` holds the kernel's view of
+    /// it with geo columns as binary (`crate::geo`); None when they agree.
+    logged_metadata: Option<Arc<delta_kernel::actions::Metadata>>,
 }
 
 /// A strong identity for the commit file `snapshot` ends at, or None.
@@ -232,6 +235,17 @@ impl PySnapshot {
         })?)
     }
 
+    /// `snapshot` as this binding hands it on: the kernel's view of it (see
+    /// `crate::geo`), with the table's own metadata where that differs.
+    fn viewed(
+        snapshot: SnapshotRef,
+    ) -> Result<(SnapshotRef, Option<Arc<delta_kernel::actions::Metadata>>)> {
+        let logged = snapshot.table_configuration().metadata().clone();
+        let view = crate::geo::view(snapshot.clone())?;
+        let logged = (!Arc::ptr_eq(&view, &snapshot)).then(|| Arc::new(logged));
+        Ok((view, logged))
+    }
+
     /// Build a snapshot of a table that exists only as a template version 0
     /// (see `pending`): the template is the whole log tail.
     fn build_template(
@@ -369,7 +383,7 @@ impl PySnapshot {
 
         // Log resolution does real I/O, so release the GIL for it.
         type Resolved = (SnapshotRef, SharedEngine, Option<String>);
-        let (inner, engine, identity) = py.detach(|| -> Result<Resolved> {
+        let (resolved, engine, identity) = py.detach(|| -> Result<Resolved> {
             let object_store = store::build_store(&url, &options)?;
             let engine = commit::new_engine(object_store.clone());
             let tail = log_tail.as_deref();
@@ -389,12 +403,14 @@ impl PySnapshot {
             };
             Ok((snapshot, engine, identity))
         })?;
+        let (inner, logged_metadata) = Self::viewed(resolved)?;
 
         Ok(Self {
             inner,
             engine,
             identity,
             planned: false,
+            logged_metadata,
         })
     }
 
@@ -456,11 +472,13 @@ impl PySnapshot {
             let segment = LogSegment::try_new(files, log_root, Some(version), None)?;
             Ok((Arc::new(Snapshot::new(segment, config)?), engine))
         })?;
+        let (inner, logged_metadata) = Self::viewed(inner)?;
         Ok(Self {
             inner,
             engine,
             identity: None,
             planned: true,
+            logged_metadata,
         })
     }
 
@@ -499,8 +517,9 @@ impl PySnapshot {
         let url = self.inner.table_root().clone();
         let options = options.unwrap_or_default();
         let existing = self.inner.clone();
+        let viewed = self.logged_metadata.is_some();
         type Refreshed = (SnapshotRef, SharedEngine, Option<String>);
-        let (inner, engine, identity) = py.detach(|| -> Result<Refreshed> {
+        let (refreshed, engine, identity) = py.detach(|| -> Result<Refreshed> {
             let object_store = store::build_store(&url, &options)?;
             let engine = commit::new_engine(object_store.clone());
             let pinned = (!latest).then(|| existing.version());
@@ -515,6 +534,13 @@ impl PySnapshot {
             }
             if !latest {
                 return Ok((existing, engine, Some(recorded)));
+            }
+            if viewed {
+                // Brought forward from the kernel's view, an unchanged table
+                // would keep the view as its metadata: read the log afresh.
+                let snapshot = Self::build(&engine, &url, None, None, None)?;
+                let identity = commit_identity(object_store.as_ref(), &snapshot);
+                return Ok((snapshot, engine, identity));
             }
             let snapshot = match runtime::block_on(async {
                 Snapshot::builder_from(existing.clone()).build(engine.as_ref() as &dyn Engine)
@@ -531,11 +557,18 @@ impl PySnapshot {
             };
             Ok((snapshot, engine, identity))
         })?;
+        // The pinned snapshot reused as it is keeps its logged metadata.
+        let (inner, logged_metadata) = if Arc::ptr_eq(&refreshed, &self.inner) {
+            (refreshed, self.logged_metadata.clone())
+        } else {
+            Self::viewed(refreshed)?
+        };
         Ok(Self {
             inner,
             engine,
             identity,
             planned: false,
+            logged_metadata,
         })
     }
 
@@ -1032,7 +1065,11 @@ impl PySnapshot {
 
     /// The current `metaData` action, as Delta-protocol JSON.
     fn metadata_json(&self) -> PyResult<String> {
-        serde_json::to_string(self.inner.table_configuration().metadata())
+        let metadata = match &self.logged_metadata {
+            Some(logged) => logged.as_ref(),
+            None => self.inner.table_configuration().metadata(),
+        };
+        serde_json::to_string(metadata)
             .map_err(|e| NativeError::Invalid(format!("could not serialize metadata: {e}")).into())
     }
 

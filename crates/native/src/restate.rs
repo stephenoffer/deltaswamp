@@ -19,6 +19,10 @@
 //!   [`Checked`]), all of which the kernel refuses to write.
 //! * A write to a table carrying `checkpointProtection`, which kernel 0.28 does
 //!   not know and so refuses (see [`HISTORY_ONLY`]).
+//! * A write to an IcebergCompatV1/V2 table, which kernel 0.28 refuses though
+//!   it writes V3, whose rules include every V2 rule (see [`ICEBERG_COMPAT`]).
+//! * A write to a `geospatial` table, whose geo columns the kernel sees as
+//!   binary (`crate::geo`) and which it refuses to write.
 //!
 //! All start the transaction on a restated snapshot: the same log segment and
 //! version, with the evolved metadata and protocol, and with the features the
@@ -132,6 +136,49 @@ impl Restatement {
 /// binds, refuses it itself (`crate::logclean`).
 pub(crate) const HISTORY_ONLY: &[&str] = &["checkpointProtection"];
 
+/// IcebergCompatV1 and V2, which kernel 0.28 refuses to write.
+///
+/// Their writer rules (PROTOCOL.md, "Writer Requirements for
+/// IcebergCompatV1/V2"), and where each is kept:
+///
+/// * column mapping in `name` or `id` mode, and no deletion vectors: the
+///   table's own state, which the features require of the table and the
+///   caller checks before writing (a deletion-vector DML is never chosen
+///   where the vectors are off);
+/// * partition values materialized in every data file: the checked protocol
+///   lists `materializePartitionColumns` in their place, so the kernel's
+///   physical write schema holds them (V1 wants them after the data columns,
+///   which the caller checks);
+/// * `numRecords` in every add's stats: the kernel's statistics always carry
+///   it;
+/// * timestamps as INT64, and Parquet field ids for array elements and map
+///   keys and values: arrow-rs writes INT64 microseconds, and the kernel's
+///   physical schema carries `delta.columnMapping.nested.ids` as field ids;
+/// * the type allow-list, no differently-named partition spec on replace, and
+///   Iceberg-compatible type changes: the schema the table already has, which
+///   the caller refuses to change in a write.
+pub(crate) const ICEBERG_COMPAT: &[&str] = &["icebergCompatV1", "icebergCompatV2"];
+
+/// Whether a restated snapshot of a table with `protocol` sets anything aside
+/// even when the write restates nothing.
+fn always_restated(protocol: &Protocol) -> bool {
+    lists_any(protocol, HISTORY_ONLY)
+        || lists_any(protocol, ICEBERG_COMPAT)
+        || lists_any(protocol, &[crate::geo::FEATURE])
+}
+
+/// Whether `metadata` turns on IcebergCompatV1 or V2.
+fn iceberg_compat_enabled(metadata: &Metadata) -> bool {
+    ["delta.enableIcebergCompatV1", "delta.enableIcebergCompatV2"]
+        .iter()
+        .any(|key| {
+            metadata
+                .configuration()
+                .get(*key)
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        })
+}
+
 /// Whether `protocol` lists any of `features` among its writer features.
 fn lists_any(protocol: &Protocol, features: &[&str]) -> bool {
     protocol.writer_features().is_some_and(|listed| {
@@ -167,7 +214,18 @@ pub(crate) fn legacy_writer_features(version: i32) -> Vec<&'static str> {
 ///
 /// A legacy writer version becomes the same features listed explicitly
 /// (writer version 7), the only form in which some can be left out.
+#[cfg(test)]
 fn without_features(protocol: &Protocol, set_aside: &[&str]) -> Result<Option<Protocol>> {
+    without_features_adding(protocol, set_aside, &[])
+}
+
+/// [`without_features`], with `added` listed among the writer features kept
+/// when anything is set aside.
+fn without_features_adding(
+    protocol: &Protocol,
+    set_aside: &[&str],
+    added: &[&str],
+) -> Result<Option<Protocol>> {
     let writer = protocol.min_writer_version();
     let listed: Vec<String> = match protocol.writer_features() {
         Some(features) => features.iter().map(|f| f.to_string()).collect(),
@@ -183,13 +241,24 @@ fn without_features(protocol: &Protocol, set_aside: &[&str]) -> Result<Option<Pr
     if !listed.iter().any(|f| set_aside.contains(&f.as_str())) {
         return Ok(None);
     }
-    let kept: Vec<&String> = listed
+    let mut kept: Vec<String> = listed
         .iter()
         .filter(|f| !set_aside.contains(&f.as_str()))
+        .cloned()
         .collect();
-    let reader_features: Option<Vec<String>> = protocol
-        .reader_features()
-        .map(|features| features.iter().map(|f| f.to_string()).collect());
+    for feature in added {
+        if !kept.iter().any(|f| f == feature) {
+            kept.push((*feature).to_string());
+        }
+    }
+    // A reader-writer feature set aside (geospatial) leaves both lists.
+    let reader_features: Option<Vec<String>> = protocol.reader_features().map(|features| {
+        features
+            .iter()
+            .map(|f| f.to_string())
+            .filter(|f| !set_aside.contains(&f.as_str()))
+            .collect()
+    });
     let restated = serde_json::from_value(serde_json::json!({
         "minReaderVersion": protocol.min_reader_version(),
         "minWriterVersion": 7,
@@ -219,9 +288,39 @@ pub(crate) fn restated_snapshot(
 
     let config = snapshot.table_configuration();
     let protocol = protocol.unwrap_or_else(|| config.protocol().clone());
-    // Every restated snapshot sets these aside: no commit is bound by them.
-    let set_aside: Vec<&str> = set_aside.iter().chain(HISTORY_ONLY).copied().collect();
-    let checked = without_features(&protocol, &set_aside)?;
+    let effective = metadata.as_ref().unwrap_or_else(|| config.metadata());
+    // Every restated snapshot sets these aside: no commit is bound by them,
+    // or the caller keeps their rules (see ICEBERG_COMPAT and crate::geo).
+    let mut set_aside: Vec<&str> = set_aside
+        .iter()
+        .chain(HISTORY_ONLY)
+        .chain(ICEBERG_COMPAT)
+        .copied()
+        .collect();
+    if crate::geo::schema_has_geo(effective.schema_string()) {
+        return Err(NativeError::Invalid(
+            "a geospatial table can be written only through its binary view; this write's \
+             schema carries a geometry or geography type"
+                .to_string(),
+        ));
+    }
+    if lists_any(&protocol, &[crate::geo::FEATURE]) {
+        if crate::geo::has_unmarked(config.metadata().schema_string()) {
+            return Err(NativeError::Invalid(
+                "the table holds geometry or geography values inside an array or map, \
+                 which no data file written here can type as geospatial"
+                    .to_string(),
+            ));
+        }
+        set_aside.push(crate::geo::FEATURE);
+    }
+    let materialize: &[&str] =
+        if lists_any(&protocol, ICEBERG_COMPAT) && iceberg_compat_enabled(effective) {
+            &["materializePartitionColumns"]
+        } else {
+            &[]
+        };
+    let checked = without_features_adding(&protocol, &set_aside, materialize)?;
     if metadata.is_none() && checked.is_none() && &protocol == config.protocol() {
         return Ok(snapshot.clone());
     }
@@ -368,8 +467,7 @@ pub(crate) fn writing_snapshot(
     use delta_kernel::actions::{LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA};
     use delta_kernel::IntoEngineData;
 
-    if restatement.is_empty() && !lists_any(snapshot.table_configuration().protocol(), HISTORY_ONLY)
-    {
+    if restatement.is_empty() && !always_restated(snapshot.table_configuration().protocol()) {
         return Ok(snapshot.clone());
     }
     let parse = |what: &str, text: &str| -> Result<serde_json::Value> {
@@ -671,5 +769,82 @@ mod tests {
             ["generatedColumns", "identityColumns", "invariants"]
         );
         assert!(Checked::from_args(false, Some(vec!["nope".into()])).is_err());
+    }
+
+    /// A snapshot of an in-memory table whose version 0 is `protocol` and
+    /// `metadata` (log JSON).
+    fn memory_snapshot(protocol: &str, metadata: &str) -> SnapshotRef {
+        use delta_kernel::object_store::memory::InMemory;
+        use delta_kernel::object_store::path::Path;
+        use delta_kernel::object_store::ObjectStoreExt;
+        use delta_kernel::snapshot::Snapshot;
+
+        let body = [
+            r#"{"commitInfo":{"timestamp":1,"operation":"CREATE TABLE"}}"#,
+            protocol,
+            metadata,
+        ]
+        .join("\n");
+        let store = Arc::new(InMemory::new());
+        let key = Path::from(format!("t/_delta_log/{:020}.json", 0));
+        crate::runtime::block_on(store.put(&key, body.into())).unwrap();
+        let engine = crate::commit::new_engine(store);
+        Snapshot::builder_for("memory:///t/")
+            .build(engine.as_ref())
+            .unwrap()
+    }
+
+    fn writer_features(snapshot: &SnapshotRef) -> Vec<String> {
+        snapshot
+            .table_configuration()
+            .protocol()
+            .writer_features()
+            .map(|f| f.iter().map(|x| x.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn iceberg_compat_is_written_with_partition_values_materialized() {
+        let snapshot = memory_snapshot(
+            r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":7,"writerFeatures":["columnMapping","icebergCompatV2"]}}"#,
+            r#"{"metaData":{"id":"5b3c0a1e-0000-4000-8000-000000000003","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"c1\"}},{\"name\":\"p\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"c2\"}}]}","partitionColumns":["p"],"configuration":{"delta.enableIcebergCompatV2":"true","delta.columnMapping.mode":"name"},"createdTime":1}}"#,
+        );
+        let restated = restated_snapshot(&snapshot, &[], None, None).unwrap();
+        let features = writer_features(&restated);
+        assert!(
+            !features.iter().any(|f| f == "icebergCompatV2"),
+            "{features:?}"
+        );
+        assert!(
+            features.iter().any(|f| f == "materializePartitionColumns"),
+            "{features:?}"
+        );
+        // The table's own protocol is untouched, and the kernel writes the restated one.
+        assert!(writer_features(&snapshot)
+            .iter()
+            .any(|f| f == "icebergCompatV2"));
+        use delta_kernel::table_features::Operation;
+        assert!(restated
+            .table_configuration()
+            .ensure_operation_supported(Operation::Write)
+            .is_ok());
+    }
+
+    #[test]
+    fn geospatial_is_set_aside_on_the_binary_view_only() {
+        let snapshot = memory_snapshot(
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["geospatial"],"writerFeatures":["geospatial"]}}"#,
+            r#"{"metaData":{"id":"5b3c0a1e-0000-4000-8000-000000000004","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"g\",\"type\":\"geometry(OGC:CRS84)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1}}"#,
+        );
+        // The table as logged carries a geo type: never written from.
+        assert!(restated_snapshot(&snapshot, &[], None, None).is_err());
+        let view = crate::geo::view(snapshot).unwrap();
+        let restated = restated_snapshot(&view, &[], None, None).unwrap();
+        assert!(!writer_features(&restated).iter().any(|f| f == "geospatial"));
+        use delta_kernel::table_features::Operation;
+        assert!(restated
+            .table_configuration()
+            .ensure_operation_supported(Operation::Write)
+            .is_ok());
     }
 }
