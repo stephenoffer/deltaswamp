@@ -300,6 +300,14 @@ def test_variant_merge_null_element(interop: Runner, case_id: str, key: str) -> 
     assert len(merged[0]["av"]) == 3 and merged[0]["av"][1] is None
 
 
+@pytest.mark.parametrize(("case_id", "key"), _params(*sorted({k for c in CASES for k in c.checks})))
+def test_case_checks(interop: Runner, case_id: str, key: str) -> None:
+    """What a case checks beyond the common pipeline (identity values unique
+    across writers, domains kept, generated values right, ...)."""
+    problems: list[str] = evidence(interop, case_id, key)
+    assert not problems, "\n".join(problems)
+
+
 def test_selection_is_known() -> None:
     """A typo in DELTASWAMP_TEST_INTEROP_SHAPES should not pass as an empty run."""
     wanted = {s.strip() for s in os.environ.get("DELTASWAMP_TEST_INTEROP_SHAPES", "").split(",")}
