@@ -720,7 +720,7 @@ These are refused with the reason, because they need more than a metadata
 commit:
 
 - enabling row tracking on an existing table (needs a backfill)
-- UniForm / Iceberg compatibility (needs Iceberg metadata generated)
+- turning on UniForm / Iceberg compatibility (needs Iceberg metadata generated)
 - changing column mapping other than none -> name
 - a catalog-managed table's metadata, which the catalog refuses from external
   writers after version 0
@@ -970,8 +970,27 @@ catalog's Iceberg REST endpoint with PyIceberg: reads, time travel by snapshot
 id or timestamp, history, appends, and overwrites by predicate (for Databricks
 managed Iceberg, appends only; see below). UniForm Delta
 tables can also be read as Iceberg, but the Delta path remains the default for
-them. External writes to UniForm tables are refused, because they would leave
-the Iceberg metadata stale; `t.sync_iceberg()` regenerates it on Databricks.
+them. Data written here to a UniForm table follows the IcebergCompat rules
+(partition values in every file, Parquet field ids, no deletion vectors), but
+only Databricks generates the Iceberg metadata, so the connection says what to
+do about it:
+
+```python
+conn = ds.connect(allow_sql_fallback=True, uniform_writes="sync")  # regenerate after each commit
+conn = ds.connect(uniform_writes="stale")  # write; Iceberg readers lag until a sync
+conn.table("main.sales.orders").sync_iceberg()  # MSCK REPAIR TABLE ... SYNC METADATA
+```
+
+Without `uniform_writes` such writes are refused. With "stale" each commit
+warns (`DeltaSwampWarning`) and VACUUM is refused, since it could delete files
+the stale Iceberg snapshot still reads. Delta readers see every commit either
+way. Schema changes to an IcebergCompat table stay with Databricks.
+
+Geometry and geography columns (`geospatial` tables) read as WKB `binary`,
+each column's field metadata naming its type (`deltaswamp.geospatial.type`),
+and take WKB on write: appends, overwrites, distributed writes, DML and
+compaction. The files type them GEOMETRY / GEOGRAPHY in Parquet, as Databricks
+writes them.
 
 Databricks managed Iceberg (`CREATE TABLE ... USING ICEBERG`) is a special
 case: Unity Catalog reports it as Delta, with a catalog-managed Delta log
@@ -1158,8 +1177,9 @@ exists. Enabling change data feed alone puts a table at version 4.
 Change data feed, column mapping, row tracking, in-commit timestamps, deletion
 vectors, type widening, liquid clustering, `checkpointProtection`, CHECK
 constraints, generated and identity columns, invariants and literal defaults
-all write. UniForm (IcebergCompat V1/V2) and geospatial columns are refused
-when the write is planned. DELETE, UPDATE, MERGE and maintenance run on the
+all write, and so do IcebergCompatV1/V2 tables (UniForm ones as
+`uniform_writes` allows; see "Iceberg") and geometry and geography columns
+(WKB). Schema changes to those tables are refused when the write is planned. DELETE, UPDATE, MERGE and maintenance run on the
 driver.
 
 ### When a job fails

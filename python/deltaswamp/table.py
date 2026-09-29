@@ -2134,6 +2134,7 @@ class Table:
             interval_paths=self._interval_plan(),
             table_identity=identity,
             default_fields=default_fields,
+            after_commit=self._after_commit,
             identity_blocks=blocks or (),
             domain_metadata=dict(domain_metadata) if domain_metadata else None,
             identity_slots=slots,
@@ -3748,6 +3749,7 @@ class Table:
             version = raw.get("version")
         engine = outcome.get("engine")
         totals = None if version is None else self._commit_totals(engine, version)
+        self._after_commit(engine)
         return _results.write(raw, engine, totals)
 
     def _commit_totals(self, kind: Any, version: int) -> dict[str, Any] | None:
@@ -4093,6 +4095,7 @@ class Table:
 
         result = self._pinned_write(lambda: self._backfilled(run))
         self._invalidate()
+        self._after_commit(served[-1] if served else None)
         return _results.dml(result, served[-1] if served else None)
 
     def update(
@@ -4149,6 +4152,7 @@ class Table:
             )
         )
         self._invalidate()
+        self._after_commit(getattr(engine, "kind", None))
         return _results.dml(result, getattr(engine, "kind", None))
 
     def _update_defaults(self, updates: Any) -> tuple[dict[str, str], frozenset[str]]:
@@ -4345,7 +4349,12 @@ class Table:
         builder, kind = build(frozenset())
         # A consumed stream cannot be offered to a second engine.
         rebuild = None if _consumable(source) else build
-        return _InvalidatingMerger(builder, self._invalidate, rebuild, kind, clauses_routed)
+
+        def committed() -> None:
+            self._invalidate()
+            self._after_commit(kind)
+
+        return _InvalidatingMerger(builder, committed, rebuild, kind, clauses_routed)
 
     # ------------------------------------------------------------ maintenance
 
@@ -4385,6 +4394,7 @@ class Table:
             self._resolved, zorder_by=zorder_by, full=full, predicate=predicate, **kwargs
         )
         self._invalidate()
+        self._after_commit(getattr(engine, "kind", None))
         return _results.optimize(result, getattr(engine, "kind", None))
 
     def z_order(self, columns: list[str] | str, **kwargs: Any) -> dict[str, Any]:
@@ -4399,6 +4409,7 @@ class Table:
         engine = self._route(self._request(Operation.ZORDER, {"zorder_by": columns, **kwargs}))
         result = engine.zorder(self._resolved, columns, **kwargs)
         self._invalidate()
+        self._after_commit(getattr(engine, "kind", None))
         return _results.optimize(result, getattr(engine, "kind", None))
 
     def _check_optimize_args(self, kwargs: dict[str, Any]) -> None:
@@ -4504,6 +4515,8 @@ class Table:
             self._resolved, retention_hours=retention_hours, dry_run=dry_run, lite=lite, **kwargs
         )
         self._invalidate()
+        if not dry_run:
+            self._after_commit(getattr(engine, "kind", None))
         return result
 
     def restore(self, target: Any, **kwargs: Any) -> dict[str, Any]:
@@ -4548,6 +4561,7 @@ class Table:
                 )
         result = engine.restore(self._resolved, target, **kwargs)
         self._invalidate()
+        self._after_commit(getattr(engine, "kind", None))
         return _results.restore(result, getattr(engine, "kind", None))
 
     def _timestamp_kernel(self) -> Any:
@@ -4983,6 +4997,33 @@ class Table:
         return self._route(request).analyze(
             self._resolved, columns=columns, delta_statistics=delta_statistics
         )
+
+    def _after_commit(self, kind: Any) -> None:
+        """Keep a UniForm table's Iceberg metadata with a commit a direct engine made.
+
+        As `ds.connect(uniform_writes=)` says: "sync" regenerates it through the
+        warehouse now, "stale" warns that Iceberg readers still read the last
+        regenerated version. A commit Databricks made (the SQL fallback)
+        regenerates it itself.
+        """
+        from .capability import uniform_enabled
+
+        served = getattr(kind, "value", kind)
+        if served in (None, EngineKind.SQL.value) or not uniform_enabled(self._resolved):
+            return
+        mode = self._connection.router.uniform_writes
+        if mode == "sync":
+            self.sync_iceberg()
+        elif mode == "stale":
+            from .errors import DeltaSwampWarning
+
+            warnings.warn(
+                f"{self._resolved.ref}: committed to Delta; Iceberg readers of this UniForm "
+                "table still read the last regenerated version until Databricks next writes "
+                "it or Table.sync_iceberg() runs",
+                DeltaSwampWarning,
+                stacklevel=3,
+            )
 
     def sync_iceberg(self) -> Any:
         """Regenerate UniForm Iceberg metadata (MSCK REPAIR TABLE ... SYNC METADATA).

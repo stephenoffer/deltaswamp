@@ -58,15 +58,20 @@ def test_timestamp_without_timezone_alias_is_known() -> None:
     assert t.unknown_features == frozenset()
 
 
-@pytest.mark.parametrize(
-    "feature", [TableFeature.GEOSPATIAL, TableFeature.ADAPTIVE_METADATA_PREVIEW]
-)
-def test_dev_gated_kernel_features_are_not_claimed_readable(feature: TableFeature) -> None:
-    """The native crate does not enable geo-type-in-dev / adaptive-metadata-in-dev,
-    so the compiled kernel refuses to scan these ReaderWriter features."""
-    row = FEATURE_SUPPORT[feature]
+def test_dev_gated_kernel_features_are_not_claimed_readable() -> None:
+    """The native crate does not enable adaptive-metadata-in-dev, so the compiled
+    kernel refuses to scan this ReaderWriter feature."""
+    row = FEATURE_SUPPORT[TableFeature.ADAPTIVE_METADATA_PREVIEW]
     assert row.kernel_read is Support.NO
     assert row.kernel_write is Support.NO
+
+
+def test_geospatial_is_read_and_written_as_binary() -> None:
+    """geo-type-in-dev parses the types; the binding views them as WKB binary
+    (crate::geo), which the kernel's engine reads and writes."""
+    row = FEATURE_SUPPORT[TableFeature.GEOSPATIAL]
+    assert row.kernel_read is Support.YES
+    assert row.kernel_write is Support.PARTIAL
 
 
 def test_variant_shredding_depends_on_variant_type() -> None:

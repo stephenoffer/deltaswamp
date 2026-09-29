@@ -102,6 +102,19 @@ First release.
   - On catalog-managed tables, DML rebases over concurrent appends by
     re-reading the catalog's tail, and OPTIMIZE, Z-ORDER, RESTORE and VACUUM
     (`allow_catalog_managed=True`) commit through the catalog.
+- Writes to IcebergCompatV1/V2 tables through the kernel, which 0.28 refuses:
+  partition values materialized in every data file, Parquet field ids for
+  nested elements, `numRecords` in every add, copy-on-write DML; schema
+  changes stay with Databricks. UniForm tables are written as
+  `ds.connect(uniform_writes=)` says: "sync" regenerates the Iceberg metadata
+  through the warehouse after each commit (`MSCK REPAIR TABLE ... SYNC
+  METADATA`, which Databricks documents for writes by clients that do not
+  generate it), "stale" leaves Iceberg readers on the last converted version
+  and warns; unset, they are refused as before.
+- Geometry and geography columns (`geospatial` tables): read as WKB binary,
+  written as WKB typed GEOMETRY / GEOGRAPHY in Parquet, as Databricks writes
+  them, with no min/max statistics for them. Not inside arrays or maps; no
+  change data feed or schema changes on such tables.
 - Hand-offs to DuckDB, Polars and Daft, and cross-catalog SQL through
   `Connection.sql`.
 

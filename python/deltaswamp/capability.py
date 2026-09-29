@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 __all__ = [
     "ENGINE_METHODS",
@@ -345,8 +346,31 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
             "row-tracked table is delta-rs-unwritable",
             "delta-rs#3249",
         ),
-        _row(TableFeature.ICEBERG_COMPAT_V1, _W, _Y, _N, _Y, _N, "", "delta-rs#3249"),
-        _row(TableFeature.ICEBERG_COMPAT_V2, _W, _Y, _N, _Y, _N, "", "delta-rs#3249"),
+        _row(
+            TableFeature.ICEBERG_COMPAT_V1,
+            _W,
+            _Y,
+            _P,
+            _Y,
+            _N,
+            "kernel 0.28 refuses it; the kernel path here writes it with partition values "
+            "materialized after the data columns, numRecords in every add and no "
+            "deletion vectors, and refuses schema changes Iceberg V1 cannot follow",
+            "delta-rs#3249",
+        ),
+        _row(
+            TableFeature.ICEBERG_COMPAT_V2,
+            _W,
+            _Y,
+            _P,
+            _Y,
+            _N,
+            "kernel 0.28 refuses it though it writes V3, whose rules include V2's; the "
+            "kernel path here writes it with partition values materialized, field ids for "
+            "nested elements, numRecords in every add and no deletion vectors, and refuses "
+            "schema changes Iceberg V2 cannot follow",
+            "delta-rs#3249",
+        ),
         _row(
             TableFeature.ICEBERG_WRITER_COMPAT_V1,
             _W,
@@ -503,14 +527,15 @@ FEATURE_SUPPORT: dict[TableFeature, FeatureSupport] = dict(
         _row(
             TableFeature.GEOSPATIAL,
             _RW,
+            _Y,
+            _P,
             _N,
             _N,
-            _N,
-            _N,
-            "kernel gates reads behind geo-type-in-dev, which this build does not "
-            "enable, fails on the geometry(...) schema type, and "
-            "errors on writes regardless. One feature covers both geometry and "
-            "geography.",
+            "kernel 0.28 parses geometry(...) and geography(...) (geo-type-in-dev) but its "
+            "engine converts neither to Arrow and it refuses writes. Here geo columns "
+            "read and write as WKB binary; data files type them GEOMETRY / GEOGRAPHY in "
+            "Parquet and carry no min/max for them. Not inside arrays or maps, no "
+            "change data feed, no schema changes. One feature covers both types.",
         ),
         # --- no kernel variant at all
         _row(
@@ -1027,11 +1052,15 @@ COLUMN_MAPPING_REQUIRED: frozenset[Operation] = frozenset(
     {Operation.RENAME_COLUMN, Operation.DROP_COLUMN}
 )
 
-#: Data commits that leave a UniForm table's Iceberg metadata behind. Only
-#: Databricks regenerates it (after its own commits, or MSCK REPAIR ... SYNC
-#: METADATA), so delta-rs refuses these on an Iceberg-enabled table and the
-#: kernel refuses its metadata changes -- but a kernel APPEND went through and
-#: the Iceberg view silently went stale.
+#: Commits that leave a UniForm table's Iceberg metadata behind. Only
+#: Databricks regenerates it: after its own commits, and on MSCK REPAIR TABLE
+#: ... SYNC METADATA, which Databricks documents for exactly this case ("a
+#: client that doesn't support UniForm Iceberg metadata generation writes to
+#: the Delta Lake table"). A direct engine serves them only as
+#: `ds.connect(uniform_writes=...)` says: "sync" runs that statement through
+#: the warehouse after each commit, "stale" leaves Iceberg readers on the last
+#: converted version until someone does. VACUUM is here too: it deletes files
+#: the Delta log removed, which a stale Iceberg snapshot may still read.
 UNIFORM_STALE_WRITES: frozenset[Operation] = frozenset(
     {
         Operation.APPEND,
@@ -1041,8 +1070,22 @@ UNIFORM_STALE_WRITES: frozenset[Operation] = frozenset(
         Operation.UPDATE,
         Operation.MERGE,
         Operation.MERGE_SCHEMA,
+        Operation.OPTIMIZE,
+        Operation.ZORDER,
+        Operation.RESTORE,
+        Operation.VACUUM,
     }
 )
+
+#: What `ds.connect(uniform_writes=)` takes.
+UNIFORM_WRITE_MODES: frozenset[str] = frozenset({"sync", "stale"})
+
+
+def uniform_enabled(table: Any) -> bool:
+    """Whether Databricks generates Iceberg metadata for `table` (UniForm)."""
+    properties = getattr(table, "properties", None) or {}
+    return "iceberg" in str(properties.get("delta.universalFormat.enabledFormats", "")).lower()
+
 
 #: Operations the kernel serves by writing to the log without a data commit.
 #: Its checkpoint writer still runs the write-protocol check, so it refuses the
