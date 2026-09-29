@@ -16,6 +16,7 @@ import threading
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from dataclasses import replace as _replace
 from typing import Any, ClassVar
 
 from .. import predicate as sqlpred
@@ -710,10 +711,10 @@ class KernelEngine:
                 "can be conflict-checked from a past version (a rewrite replaces files the "
                 "commits since may have changed)"
             )
-        if table.is_catalog_managed:
+        if table.is_catalog_managed and table.commit_tail is None:
             return (
-                "the table is catalog-managed, and a commit that lost to the catalog's "
-                "later versions is not rebased here"
+                "the table is catalog-managed and was not resolved through its catalog here, "
+                "so a commit that lost to the catalog's later versions cannot be rebased"
             )
         return None
 
@@ -741,6 +742,55 @@ class KernelEngine:
 
     def __init__(self, *, storage_options: dict[str, str] | None = None) -> None:
         self._base_options = dict(storage_options or {})
+
+    #: The newest catalog commit tail read for each catalog-managed table, by
+    #: (location, table id); see `_latest_tail`. Per process, as snapshots
+    #: are: a tail is the catalog's word on the table, whoever asked for it.
+    _tails: ClassVar[OrderedDict[tuple[Any, ...], ResolvedTable]] = OrderedDict()
+    _tails_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    #: Catalog-managed tables whose re-read commit tail is kept.
+    tail_cache_size = 64
+
+    def _latest_tail(self, table: ResolvedTable) -> ResolvedTable:
+        """`table` with the newest commit tail this engine has read for it.
+
+        A commit that lost a race to the catalog's next version re-reads the
+        tail (`_refresh_tail`) and is rebased over the winners; every snapshot
+        of the latest version after that -- the rebase's own, a compaction
+        planned again, the next attempt of an append -- must see them too,
+        though the caller still holds the table as it was resolved. Catalog
+        versions only grow, so the newer of the two tails is the right one.
+        """
+        if not table.is_catalog_managed:
+            return table
+        with self._tails_lock:
+            known = self._tails.get((table.location, table.table_id))
+        if known is None or (known.max_catalog_version or -1) <= (table.max_catalog_version or -1):
+            return table
+        return _replace(
+            table, log_tail=known.log_tail, max_catalog_version=known.max_catalog_version
+        )
+
+    def _refresh_tail(self, table: ResolvedTable) -> ResolvedTable | None:
+        """Re-read `table`'s commit tail from its catalog; None when it cannot be.
+
+        Remembered for `_latest_tail`, so later snapshots of the table's latest
+        version include the commits the catalog has ratified since.
+        """
+        fresh = table.with_fresh_commit_tail()
+        if fresh is None:
+            return None
+        key = (table.location, table.table_id)
+        with self._tails_lock:
+            self._tails[key] = fresh
+            self._tails.move_to_end(key)
+            while len(self._tails) > self.tail_cache_size:
+                self._tails.popitem(last=False)
+        return fresh
+
+    def _can_refresh_tail(self, table: ResolvedTable) -> bool:
+        return table.is_catalog_managed and table.commit_tail is not None
 
     # ----------------------------------------------------------- capabilities
 
@@ -1192,6 +1242,11 @@ class KernelEngine:
             # The binding takes an unsigned version and raised OverflowError.
             raise UnreachableTableError(f"read version {version}", "versions start at 0")
 
+        if timestamp is None and (version is None or version > (table.max_catalog_version or -1)):
+            # The latest version is the newest the catalog has said it is, and
+            # a version past the tail the caller holds (one this engine just
+            # committed) is in the newer tail.
+            table = self._latest_tail(table)
         # `log_tail` and `max_catalog_version` are what make a catalog-managed
         # table readable; both are meaningless (and omitted) otherwise.
         log_tail = [
@@ -1831,17 +1886,26 @@ class KernelEngine:
 
         # A blind append commutes with any concurrent commit, so losing the race
         # means re-staging it on the new snapshot -- which delta-rs does too.
-        # Only re-readable data can be re-staged, an overwrite must surface the
-        # conflict, and a catalog-managed table's tail cannot be refreshed here.
+        # Only re-readable data can be re-staged, and an overwrite must surface
+        # the conflict. A catalog-managed table is re-staged over the tail its
+        # catalog is asked for again (`_refresh_tail`).
         if retries is not None and not hasattr(data, "to_reader") and not overwrite:
             import pyarrow as pa
 
             data = pa.table(_as_record_batch_reader(data))
-        replayable = hasattr(data, "to_reader") and not overwrite and not table.is_catalog_managed
+        replayable = (
+            hasattr(data, "to_reader")
+            and not overwrite
+            and (not table.is_catalog_managed or self._can_refresh_tail(table))
+        )
         attempts = 1 + max(0, self.append_commit_retries if retries is None else int(retries))
         attempts = attempts if replayable else 1
         with translating(EngineKind.KERNEL, "commit"):
             for attempt in range(attempts):
+                if attempt and table.is_catalog_managed and self._refresh_tail(table) is None:
+                    raise UnreachableTableError(
+                        "append", "the catalog's commit tail could not be read again"
+                    )
                 snapshot = self.snapshot(table, write=True)
                 if txn is not None and hasattr(snapshot, "app_id_version"):
                     # The caller's txn check read an older snapshot: a writer that
@@ -2315,6 +2379,35 @@ class KernelEngine:
     #: take on. The rewrite holds the table in memory, so past this size the
     #: warehouse, or delta-rs on a table it can open, is the right tool.
     rewrite_max_bytes = 1 << 30
+    #: The most live data-file bytes a MERGE reads as candidate target rows,
+    #: or a copy-on-write DELETE/UPDATE/MERGE reads back from the files it
+    #: touches. Both are held in memory, so past this the operation is refused
+    #: before anything is read or written, rather than running out of memory.
+    dml_max_bytes = 4 << 30
+
+    def _refuse_oversized_read(self, what: str, snapshot: Any, **files: Any) -> None:
+        """Raise EngineLimitError when the files `what` would hold exceed `dml_max_bytes`.
+
+        `files` selects them as `snapshot.files` does (`predicate=`), or
+        names them (`paths=`).
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        paths = files.pop("paths", None)
+        listed = pa.table(snapshot.files(**files)).select(["path", "size"])
+        if paths is not None:
+            listed = listed.filter(pc.is_in(listed.column("path"), value_set=pa.array(paths)))
+        size = int(pc.sum(listed.column("size")).as_py() or 0)
+        if size > self.dml_max_bytes:
+            raise EngineLimitError(
+                what,
+                f"it would read {size:,} bytes of data files into memory, above the "
+                f"{self.dml_max_bytes:,}-byte limit",
+                "narrow the predicate (or the MERGE source's keys), run it on a table with "
+                "deletion vectors enabled, use ds.connect(..., allow_sql_fallback=True), or "
+                "raise KernelEngine.dml_max_bytes",
+            )
 
     def _merge_refusal(self, table: ResolvedTable) -> Capability | None:
         """Why the kernel cannot MERGE into `table`, or None if it can.
@@ -2382,11 +2475,17 @@ class KernelEngine:
     def _file_rewrite_path(self, table: ResolvedTable) -> bool:
         """Whether DELETE/UPDATE/replaceWhere rewrite only the files they touch.
 
-        That is how a row-tracked table without deletion vectors is served:
-        a whole-table rewrite would give every row a fresh id. Elsewhere the
-        whole-table rewrite (`_rewrite`) still serves those tables.
+        Every table without deletion vectors is served so: a whole-table
+        rewrite would give a row-tracked table's rows fresh ids, and holds
+        and rewrites the whole of any other table for one matching row. The
+        whole-table rewrite (`_rewrite`) remains for builds without the
+        native DML.
         """
-        return not self._dv_path(table) and _row_tracking_dml(table)
+        if self._dv_path(table):
+            return False
+        if "rowTracking" in table.effective_writer_features:
+            return _row_tracking_dml(table)
+        return _native_has("deletion_vector_dml")
 
     def _rewrite_refusal(
         self, operation: Operation, table: ResolvedTable, *, by_dv: bool = False
@@ -2882,6 +2981,7 @@ class KernelEngine:
         import pyarrow.compute as pc
 
         paths = sorted(set(deletions.column("path").to_pylist()))
+        self._refuse_oversized_read("copy-on-write rewrite on the kernel", snapshot, paths=paths)
         tracked = _row_tracking_enabled(table) and "rowTracking" in table.effective_writer_features
         extra = {"row_tracking": True} if tracked else {}
         read = pa.table(snapshot.scan(files=paths, row_positions=True, **extra))
@@ -2958,8 +3058,9 @@ class KernelEngine:
         """
         import pyarrow as pa
 
-        if table.is_catalog_managed:
-            # As for appends: a catalog commit is not re-staged here.
+        if table.is_catalog_managed and self._refresh_tail(table) is None:
+            # No way to ask the catalog what won (a table unpickled on a
+            # worker): surfacing the conflict is the safe answer.
             return None
         if txn is not None and self._txn_won_race(read, table, txn):
             return None
@@ -3106,12 +3207,6 @@ class KernelEngine:
     def _compaction_table_refusal(self, table: ResolvedTable) -> tuple[str, str | None] | None:
         if not _native_has(*_COMPACTION_NATIVE):
             return "the native extension has no streaming kernel compaction", None
-        if table.is_catalog_managed:
-            return (
-                "a catalog-managed table's commits are ratified by Unity Catalog, and the "
-                "kernel's compaction commits to storage directly",
-                SQL_FALLBACK_REMEDY,
-            )
         if table.is_shallow_clone:
             return "a shallow clone's data files belong to its source table", None
         if table.properties.get("delta.enableVariantShredding", "").lower() == "true":
@@ -3666,6 +3761,9 @@ class KernelEngine:
                 empty.to_reader(),
                 data=recorded(data),
                 whole_files=removing,
+                # A catalog-managed table's compaction is ratified by its
+                # catalog like any other commit.
+                uc=self._uc_commit_config(table),
                 engine_info=_engine_info(),
                 operation="OPTIMIZE",
                 commit_metadata={k: str(v) for k, v in (commit_metadata or {}).items()} or None,
@@ -3674,6 +3772,10 @@ class KernelEngine:
                 # As Spark records an OPTIMIZE; Databricks' history showed {}.
                 **_commit_info(blind=False, **parameters, auto="false"),
             )
+        if table.is_catalog_managed and int(version) != int(snapshot.version):
+            # The next step plans from the table as it is now, which the
+            # caller's tail does not yet include.
+            self._refresh_tail(table)
         if checkpoint and int(version) != int(snapshot.version):
             self._maybe_checkpoint(table, int(version), snapshot)
         return int(version)
@@ -4294,10 +4396,10 @@ class KernelEngine:
         Both decide which data files the table references, and a feature
         nothing here knows could reference files some other way.
         """
-        if table.is_catalog_managed:
+        if table.is_catalog_managed and not _native_has("commit_actions"):
             return (
-                "the table is catalog-managed: Unity Catalog owns its files and ratifies "
-                "every commit, and it refuses file changes from external engines"
+                "the table is catalog-managed, and this build of the native extension "
+                "cannot commit its file changes through the catalog"
             )
         if table.is_shallow_clone:
             return (
@@ -4339,6 +4441,24 @@ class KernelEngine:
                 ok=False,
                 reason="the kernel VACUUM does not implement keep_versions",
             )
+        if (
+            table.is_catalog_managed
+            and not shape.get("dry_run", True)
+            and not shape.get("allow_catalog_managed")
+        ):
+            # The plan reads the ratified tail, so it is right; whether the
+            # catalog lets an external credential delete its table's files is
+            # the catalog's policy, which only the caller can vouch for.
+            return Capability(
+                Operation.VACUUM,
+                ok=False,
+                reason="the table is catalog-managed, and Unity Catalog decides whether an "
+                "external engine may delete its files: a dry run lists them, and "
+                "allow_catalog_managed=True deletes them",
+                remedy="vacuum(..., allow_catalog_managed=True) deletes them with the vended "
+                "credential and commits VACUUM START/END through the catalog; or "
+                "ds.connect(..., allow_sql_fallback=True) runs VACUUM on Databricks",
+            )
         return Capability(Operation.VACUUM, ok=True, engine=self.kind)
 
     #: The retention Delta applies when a table sets none (one week).
@@ -4379,6 +4499,7 @@ class KernelEngine:
         kwargs.pop("max_commit_retries", None)
         kwargs.pop("post_commithook_properties", None)
         kwargs.pop("keep_versions", None)
+        kwargs.pop("allow_catalog_managed", None)  # judged by the capability above
         if kwargs:
             raise InvalidArgumentError(f"vacuum got unexpected option(s) {sorted(kwargs)}")
         _enter_native("vacuum the table")
@@ -4716,6 +4837,10 @@ class KernelEngine:
         """Commit a version holding only commitInfo, as VACUUM START/END are."""
         from deltaswamp import _native
 
+        if table.is_catalog_managed:
+            return self._commit_actions(
+                table, [], operation, parameters, commit_metadata, what=operation
+            )
         last_error: Exception | None = None
         for _ in range(self.metadata_commit_attempts):
             _, state = self._state(table)
@@ -4745,6 +4870,60 @@ class KernelEngine:
             f"cannot commit {operation}: another writer committed first on each of "
             f"{self.metadata_commit_attempts} attempts ({last_error}); retry when the table "
             "is less busy",
+        )
+
+    def _commit_actions(
+        self,
+        table: ResolvedTable,
+        actions: list[str],
+        operation: str,
+        parameters: dict[str, str],
+        commit_metadata: dict[str, Any],
+        *,
+        what: str,
+        recompute: Any = None,
+    ) -> int:
+        """Commit raw file actions on a catalog-managed table, through its catalog.
+
+        The kernel transaction writes the commitInfo (with its in-commit
+        timestamp) and the catalog ratifies the version. A version another
+        writer took first is retried on the tail the catalog reports then:
+        `recompute(snapshot)` gives the actions again for the new snapshot
+        (None: the same ones stand).
+        """
+        from deltaswamp import _native
+
+        last_error: Exception | None = None
+        for attempt in range(self.metadata_commit_attempts):
+            if attempt and self._refresh_tail(table) is None:
+                break
+            snapshot = self.snapshot(table, write=True)
+            if recompute is not None:
+                actions = recompute(snapshot)
+            try:
+                with translating(EngineKind.KERNEL, "commit"):
+                    version = int(
+                        snapshot.commit_actions(
+                            actions,
+                            uc=self._uc_commit_config(table),
+                            engine_info=_engine_info(),
+                            operation=operation,
+                            operation_parameters=parameters,
+                            commit_metadata={k: str(v) for k, v in commit_metadata.items()} or None,
+                        )
+                    )
+            except (CommitConflictError, _native.CommitConflictError) as exc:
+                last_error = exc
+                commit_backoff(attempt)
+                continue
+            # A next commit here (VACUUM END after START) builds on this one,
+            # which the tail the caller holds does not include.
+            self._refresh_tail(table)
+            return version
+        raise CommitConflictError(
+            conflict_version(str(last_error)),
+            f"cannot commit {what}: another writer committed first on each attempt "
+            f"({last_error}); retry when the table is less busy",
         )
 
     # --------------------------------------------------------------- restore
@@ -4806,9 +4985,15 @@ class KernelEngine:
             _restored_protocol_check(
                 json.loads(current.protocol_json()), json.loads(past.protocol_json()), target
             )
-            _restored_metadata(
+            restored = _restored_metadata(
                 json.loads(current.metadata_json()), json.loads(past.metadata_json()), target
             )
+            if restored is not None and table.is_catalog_managed:
+                raise UnreachableTableError(
+                    f"restore version {target}",
+                    _CATALOG_METADATA_RESTORE,
+                    SQL_FALLBACK_REMEDY,
+                )
         except UnreachableTableError as exc:
             if exc.operation.startswith("restore version"):
                 return exc
@@ -4884,6 +5069,23 @@ class KernelEngine:
                     ignore_missing_files,
                     int(time.time() * 1000),
                 )
+            if table.is_catalog_managed:
+
+                def plan() -> tuple[dict[str, Any], dict[str, int]]:
+                    current, state = self._state(table)
+                    past = self.snapshot(table, version=target)
+                    with translating(EngineKind.KERNEL, "restore"):
+                        return self._restore_change(
+                            table,
+                            current,
+                            past,
+                            state,
+                            target,
+                            ignore_missing_files,
+                            int(time.time() * 1000),
+                        )
+
+                return self._restore_through_the_catalog(table, plan, metadata, target)
             actions = build_actions(state, change.pop("change"), engine_info=_engine_info())
             info = json.loads(actions[0])
             info["commitInfo"].update({k: str(v) for k, v in metadata.items()})
@@ -4917,6 +5119,57 @@ class KernelEngine:
             f"{self.metadata_commit_attempts} attempts ({last_error}); retry when the table "
             "is less busy",
         )
+
+    def _restore_through_the_catalog(
+        self,
+        table: ResolvedTable,
+        plan: Any,
+        metadata: dict[str, Any],
+        target: int,
+    ) -> dict[str, Any]:
+        """Commit a catalog-managed table's restore: its file actions, through the catalog.
+
+        `plan()` computes the restore against the table as it is now, again
+        after a lost race: a restore to a version means that version's files,
+        whatever was committed since. The catalog refuses a metaData or
+        protocol change after version 0, so a restore to a version whose
+        metadata differs is refused, before anything is committed.
+        """
+        metrics: dict[str, int] = {}
+
+        def files(_snapshot: Any = None) -> list[str]:
+            change, measured = plan()
+            restored = change["change"]
+            if (
+                getattr(restored, "metadata", None) is not None
+                or getattr(restored, "protocol", None) is not None
+            ):
+                raise UnreachableTableError(
+                    f"restore version {target}", _CATALOG_METADATA_RESTORE, SQL_FALLBACK_REMEDY
+                )
+            metrics.clear()
+            metrics.update(measured)
+            # The row-tracking high-water mark, which must not go back.
+            actions = [*change["files"], *restored.domains]
+            return [json.dumps(a, separators=(",", ":")) for a in actions]
+
+        if not files():
+            return {"numRemovedFile": 0, "numRestoredFile": 0}
+        version = self._commit_actions(
+            table,
+            [],
+            "RESTORE",
+            {"version": str(target)},
+            metadata,
+            what="the restore",
+            recompute=files,
+        )
+        return {
+            "numRemovedFile": metrics["numRemovedFiles"],
+            "numRestoredFile": metrics["numRestoredFiles"],
+            "version": version,
+            "operationMetrics": metrics,
+        }
 
     def _restore_change(
         self,
@@ -5397,6 +5650,13 @@ def _restored_protocol_check(now: dict[str, Any], then: dict[str, Any], version:
             + "), and a restore keeps the current protocol",
             SQL_FALLBACK_REMEDY,
         )
+
+
+_CATALOG_METADATA_RESTORE = (
+    "the table is catalog-managed, and that version's schema, properties or description "
+    "differ from the current ones; Unity Catalog refuses a metadata change after the "
+    "table's creation, so only its files could be restored"
+)
 
 
 def _restored_metadata(
@@ -5884,6 +6144,9 @@ def _compaction_feature_refusal(
             blockers.append(f"{name} (unrecognized writer feature)")
             continue
         if feature in _COMPACTION_NEUTRAL:
+            continue
+        if feature in (TableFeature.CATALOG_MANAGED, TableFeature.CATALOG_OWNED_PREVIEW):
+            # Committed through the catalog, as every write to such a table is.
             continue
         if feature is TableFeature.ROW_TRACKING:
             if "domainMetadata" not in set(writer_features):

@@ -4157,7 +4157,12 @@ class Table:
         refused = refusal(self, request)
         if refused is not None:
             raise UnreachableTableError("vacuum", refused.reason or "", refused.remedy)
-        result = self._route(request).vacuum(
+        engine = self._route(request)
+        if getattr(engine, "kind", None) is not EngineKind.KERNEL:
+            # A catalog-managed table's opt-in to deleting files directly;
+            # meaningless to an engine that asks the catalog's own compute.
+            kwargs.pop("allow_catalog_managed", None)
+        result = engine.vacuum(
             self._resolved, retention_hours=retention_hours, dry_run=dry_run, lite=lite, **kwargs
         )
         self._invalidate()
@@ -5144,7 +5149,11 @@ _OPTIMIZE_OPTIONS = _COMMIT_OPTIONS | {
     "sort_by",
     "min_cube_size",
 }
-_VACUUM_OPTIONS = _COMMIT_OPTIONS | {"enforce_retention_duration", "keep_versions"}
+_VACUUM_OPTIONS = _COMMIT_OPTIONS | {
+    "enforce_retention_duration",
+    "keep_versions",
+    "allow_catalog_managed",
+}
 _RESTORE_OPTIONS = _COMMIT_OPTIONS | {"ignore_missing_files", "protocol_downgrade_allowed"}
 _MERGE_OPTIONS = _COMMIT_OPTIONS | {
     "source_alias",
