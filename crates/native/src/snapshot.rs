@@ -323,6 +323,47 @@ impl PySnapshot {
     }
 }
 
+/// A deletion vector descriptor from its log JSON (`storageType`,
+/// `pathOrInlineDv`, `offset`, `sizeInBytes`, `cardinality`).
+fn dv_descriptor_from_json(
+    text: &str,
+) -> Result<delta_kernel::actions::deletion_vector::DeletionVectorDescriptor> {
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorStorageType,
+    };
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| NativeError::Invalid(format!("bad deletion vector descriptor: {e}")))?;
+    let field = |name: &str| value.get(name).filter(|v| !v.is_null());
+    let bad =
+        |what: &str| NativeError::Invalid(format!("deletion vector descriptor {what}: {text}"));
+    let kind: DeletionVectorStorageType = field("storageType")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| bad("without storageType"))?
+        .parse()?;
+    let path = field("pathOrInlineDv")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| bad("without pathOrInlineDv"))?;
+    let offset = field("offset")
+        .map(|v| v.as_i64().ok_or_else(|| bad("with a non-integer offset")))
+        .transpose()?
+        .map(|o| i32::try_from(o).map_err(|_| bad("with an offset out of range")))
+        .transpose()?;
+    let size = field("sizeInBytes")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| bad("without sizeInBytes"))?;
+    let size = i32::try_from(size).map_err(|_| bad("with sizeInBytes out of range"))?;
+    let cardinality = field("cardinality")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| bad("without cardinality"))?;
+    Ok(DeletionVectorDescriptor::try_new(
+        kind,
+        path,
+        offset,
+        size,
+        cardinality,
+    )?)
+}
+
 #[pymethods]
 impl PySnapshot {
     /// Resolve a snapshot, optionally pinned to a catalog-supplied tail.
@@ -664,10 +705,10 @@ impl PySnapshot {
         row_tracking: bool,
         scan_rows: Option<Vec<String>>,
     ) -> PyResult<PyRecordBatchReader> {
-        if scan_rows.is_some() && (row_positions || file_groups.is_some() || row_tracking) {
+        if scan_rows.is_some() && (row_ids || file_groups.is_some() || row_tracking) {
             return Err(NativeError::Invalid(
-                "scan_rows=... reads planned files only; it takes no row_positions, \
-                 file_groups or row_tracking"
+                "scan_rows=... reads planned files only; it takes no row_ids, file_groups \
+                 or row_tracking"
                     .to_string(),
             )
             .into());
@@ -764,6 +805,17 @@ impl PySnapshot {
                 crate::rebase::reading_engine(&self.engine, self.inner.table_root()),
                 self.inner.table_root(),
             );
+            if let (true, Some(rows)) = (row_positions, &scan_rows) {
+                // Rows a scan row's deletion vector removed are not returned;
+                // the survivors keep their physical indexes (a change feed
+                // tells a deletion vector's old rows from its new ones so).
+                return KernelBatchReader::try_new_planned_positional(
+                    &scan,
+                    engine,
+                    &crate::scan::PlannedFiles(rows.clone()),
+                    files,
+                );
+            }
             if row_positions {
                 let paths = files.map(|f| f.into_iter().collect());
                 return KernelBatchReader::try_new_positional(
@@ -1074,7 +1126,8 @@ impl PySnapshot {
     }
 
     /// The raw commit files `_delta_log/<v>.json` for `after < v <= self.version`,
-    /// as `(version, text)` pairs in ascending order.
+    /// as `(version, text)` pairs in ascending order (`after=-1` starts at
+    /// version 0).
     ///
     /// What a DML that lost a commit race needs to apply Delta's conflict
     /// rules: whether each winning commit was a blind append, and which files
@@ -1089,19 +1142,27 @@ impl PySnapshot {
     fn commit_log(
         &self,
         py: Python<'_>,
-        after: u64,
+        after: i64,
         until: Option<u64>,
     ) -> PyResult<Vec<(u64, String)>> {
         if self.planned {
             return Err(self.planned_refusal("read its commits"));
         }
+        if after < -1 {
+            return Err(NativeError::Invalid(format!(
+                "commit_log(after={after}): after is a version, or -1 for the whole log"
+            ))
+            .into());
+        }
         let end = until.map_or(self.inner.version(), |u| u.min(self.inner.version()));
         let root = self.inner.table_root().clone();
         let texts = py.detach(|| -> Result<Vec<(u64, String)>> {
-            if after >= end {
+            // Non-negative from here: -1 + 1 is version 0.
+            let first = (after + 1) as u64;
+            if first > end {
                 return Ok(Vec::new());
             }
-            let versions: Vec<u64> = ((after + 1)..=end).collect();
+            let versions: Vec<u64> = (first..=end).collect();
             let listed: std::collections::HashMap<u64, url::Url> = self
                 .inner
                 .log_segment()
@@ -1134,6 +1195,74 @@ impl PySnapshot {
                 .collect()
         })?;
         Ok(texts)
+    }
+
+    /// The row indexes a deletion vector marks deleted, ascending.
+    ///
+    /// `descriptor` is the vector as a log action carries it (`storageType`,
+    /// `pathOrInlineDv`, `offset`, `sizeInBytes`, `cardinality`). What a
+    /// change feed tells a file's newly deleted rows from its surviving ones
+    /// by, when a commit replaces the file's vector. Read with the table's
+    /// credentials and confined to its root.
+    fn deletion_vector_rows(&self, py: Python<'_>, descriptor: &str) -> PyResult<Vec<u64>> {
+        let root = self.inner.table_root().clone();
+        let rows = py.detach(|| -> Result<Vec<u64>> {
+            let descriptor = dv_descriptor_from_json(descriptor)?;
+            let engine = crate::confine::confined(self.engine.clone(), &root);
+            Ok(descriptor.row_indexes(engine.storage_handler(), &root)?)
+        })?;
+        Ok(rows)
+    }
+
+    /// One top-level column of the Parquet file at `path`, read as stored.
+    ///
+    /// `path` is as a log action names it (relative to the table root,
+    /// URL-encoded, or absolute). What a change feed reads a CDC file's
+    /// `_change_type` with, beside the table columns the scan reads from the
+    /// same file in the same order. A column the file lacks reads as nulls.
+    fn file_column(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        column: &str,
+        size: u64,
+    ) -> PyResult<PyTable> {
+        use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+        use delta_kernel::engine::arrow_data::EngineDataArrowExt;
+        use delta_kernel::schema::{DataType, StructField, StructType};
+
+        let root = self.inner.table_root().clone();
+        let (batches, schema) = py.detach(|| -> Result<(Vec<arrow::array::RecordBatch>, _)> {
+            // As kernel resolves a log path: a URL, else URL-encoded relative
+            // to the root. The confined engine refuses one outside the root.
+            let url = match Url::parse(path) {
+                Ok(url) => url,
+                Err(_) => root.join(path)?,
+            };
+            let engine = crate::confine::confined(self.engine.clone(), &root);
+            let schema = Arc::new(StructType::try_new([StructField::nullable(
+                column,
+                DataType::STRING,
+            )])?);
+            let meta = delta_kernel::FileMeta::new(url, 0, size);
+            let mut batches = Vec::new();
+            for data in
+                engine
+                    .parquet_handler()
+                    .read_parquet_files(&[meta], schema.clone(), None)?
+            {
+                batches.push(data?.try_into_record_batch()?);
+            }
+            let arrow_schema: arrow::datatypes::Schema = schema.as_ref().try_into_arrow()?;
+            // The batches as read may carry field metadata the declared
+            // schema lacks; the table is built on what was read.
+            let arrow_schema = batches
+                .first()
+                .map(|b| b.schema().as_ref().clone())
+                .unwrap_or(arrow_schema);
+            Ok((batches, Arc::new(arrow_schema)))
+        })?;
+        PyTable::try_new(batches, schema)
     }
 
     /// Write `_delta_log/<version>.crc` for this snapshot, best effort.
@@ -1501,6 +1630,12 @@ impl PySnapshot {
     /// commits nothing and returns this snapshot's version. `add_tags` are
     /// written as the `tags` of every add the commit makes (a Z-order's
     /// `ZCUBE_*` tags).
+    ///
+    /// `changes`, on a table with the change data feed, is the commit's change
+    /// rows -- the table's columns plus `_change_type` (`insert`, `delete`,
+    /// `update_preimage`, `update_postimage`) -- written as CDC files under
+    /// `_change_data/` and committed as `cdc` actions beside the rest, which
+    /// change-feed readers then take instead of the commit's adds and removes.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         deletions,
@@ -1517,6 +1652,7 @@ impl PySnapshot {
         add_tags = None,
         constraints_checked = false,
         values_checked = None,
+        changes = None,
     ))]
     fn commit_dml(
         &self,
@@ -1535,11 +1671,13 @@ impl PySnapshot {
         add_tags: Option<HashMap<String, String>>,
         constraints_checked: bool,
         values_checked: Option<Vec<String>>,
+        changes: Option<PyRecordBatchReader>,
     ) -> PyResult<(u64, u64, usize, usize)> {
         let constraints_checked =
             crate::restate::Checked::from_args(constraints_checked, values_checked)?;
         let deletions = deletions.into_reader()?;
         let data = data.map(|d| d.into_reader()).transpose()?;
+        let changes = changes.map(|c| c.into_reader()).transpose()?;
         let outcome = py.detach(|| -> Result<dml::DmlOutcome> {
             let deletions: std::result::Result<Vec<_>, _> = deletions.collect();
             let deletions = dml::deletions_from_batches(&deletions.map_err(NativeError::from)?)?;
@@ -1554,6 +1692,13 @@ impl PySnapshot {
                     dml::DmlData::Batches(batches.map_err(NativeError::from)?)
                 }
                 None => dml::DmlData::Batches(Vec::new()),
+            };
+            let changes = match changes {
+                Some(reader) => {
+                    let batches: std::result::Result<Vec<_>, _> = reader.collect();
+                    batches.map_err(NativeError::from)?
+                }
+                None => Vec::new(),
             };
             dml::commit_dml(
                 self.inner.clone(),
@@ -1574,6 +1719,7 @@ impl PySnapshot {
                     add_tags,
                     ..Default::default()
                 },
+                changes,
             )
         })?;
         Ok((

@@ -20,8 +20,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
 "commit_timestamps", "credential_slots", "planned_scan", "values_checked",
-"checkpoint_protection", "domain_metadata", "deferred_create". Gate on this list, not
-`hasattr`, so a stale build refuses cleanly.
+"checkpoint_protection", "domain_metadata", "deferred_create", "change_files",
+"log_change_feed". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -561,8 +561,26 @@ class Snapshot:
         """The raw commit files after version `after` up to this one, ascending.
 
         `(version, text)`, each text the newline-delimited actions of that
-        commit. Published commits only. `until` stops at that version instead
-        (never past this one), to read a long range in chunks.
+        commit; `after=-1` starts at version 0. A commit the snapshot's log
+        segment holds is read from the file it names -- on a catalog-managed
+        table, the ratified but unpublished staged commit. `until` stops at
+        that version instead (never past this one), to read a long range in
+        chunks.
+        """
+
+    def deletion_vector_rows(self, descriptor: str) -> list[int]:
+        """The row indexes a deletion vector marks deleted, ascending.
+
+        `descriptor` is the vector's log JSON (`storageType`,
+        `pathOrInlineDv`, `offset`, `sizeInBytes`, `cardinality`); read with
+        the table's credentials, confined to its root.
+        """
+
+    def file_column(self, path: str, column: str, size: int) -> Any:
+        """One top-level column of the Parquet file at `path`, as stored.
+
+        An Arrow table; a CDC file's `_change_type`, beside the table columns
+        a scan reads from the same file in the same order.
         """
 
     def write_checksum(self, always: bool = False) -> bool:
@@ -755,8 +773,16 @@ class Snapshot:
         blind_append: bool | None = None,
         add_tags: dict[str, str] | None = None,
         constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
+        changes: Any | None = None,
     ) -> tuple[int, int, int, int]:
         """Commit row-level DML as deletion vectors, in one transaction.
+
+        `changes`, on a table with the change data feed, is an Arrow stream of
+        the commit's change rows -- the table's columns plus `_change_type` --
+        written as CDC files under `_change_data/` and committed as `cdc`
+        actions, which change-feed readers take instead of the adds and
+        removes.
 
         `whole_files` are removed outright; `data_change=False` commits the
         whole thing as a compaction (OPTIMIZE), the same rows in new files:

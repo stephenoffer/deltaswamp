@@ -237,6 +237,32 @@ pub(crate) fn restated_snapshot(
     )?))
 }
 
+/// `snapshot` with the change data feed off in the metadata the kernel checks
+/// a commit against, for a commit that writes its own change files.
+///
+/// Kernel 0.28 refuses a data-changing commit that both adds and removes (or
+/// replaces deletion vectors) on a change-feed table, because it cannot write
+/// the CDC files such a commit needs (`crate::change_files` writes them). The
+/// metadata restated here is never written: the table keeps its property, and
+/// the commit carries its `cdc` actions beside the kernel's.
+pub(crate) fn change_files_snapshot(snapshot: &SnapshotRef) -> Result<SnapshotRef> {
+    let current = snapshot.table_configuration().metadata();
+    let mut value = serde_json::to_value(current)
+        .map_err(|e| NativeError::Invalid(format!("cannot restate the metadata: {e}")))?;
+    let Some(configuration) = value
+        .get_mut("configuration")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(snapshot.clone());
+    };
+    if configuration.remove("delta.enableChangeDataFeed").is_none() {
+        return Ok(snapshot.clone());
+    }
+    let metadata: Metadata = serde_json::from_value(value)
+        .map_err(|e| NativeError::Invalid(format!("cannot restate the metadata: {e}")))?;
+    restated_snapshot(snapshot, &[], Some(metadata), None)
+}
+
 /// Features that constrain only the values a commit writes.
 ///
 /// A compaction writes back exactly the values it read (`dataChange=false`),
