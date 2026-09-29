@@ -180,6 +180,7 @@ def connect(
             warehouse_id=warehouse_id,
             staging_volume=staging_volume,
         )
+        engines[EngineKind.SQL]._ship_secrets = bool(ship_credentials)  # type: ignore[attr-defined]
 
     if default_catalog is None:
         # A metastore has two levels: `db.table` on an hms:// or glue://

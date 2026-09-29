@@ -824,3 +824,44 @@ class TestCreateManaged:
             eng.create_managed(
                 "main.s.t", pa.schema([("id", pa.int64())]), partition_by=["id"], cluster_by=["id"]
             )
+
+
+class TestPicklingCarriesNoSecret:
+    """A pickled engine, Connection or Table re-derives auth where it lands."""
+
+    SECRET = "dapiNEVERSHIPPED0123"
+
+    def test_an_engine_pickles_without_its_token(self) -> None:
+        import pickle
+
+        from deltaswamp.engine.sql import SqlEngine
+
+        engine = SqlEngine(host="https://example.cloud.databricks.com", token=self.SECRET)
+        assert self.SECRET.encode() not in pickle.dumps(engine)
+
+    def test_a_connection_with_the_fallback_pickles_without_the_token(self) -> None:
+        import pickle
+
+        import deltaswamp as ds
+
+        conn = ds.connect(
+            host="https://example.cloud.databricks.com",
+            token=self.SECRET,
+            allow_sql_fallback=True,
+            warehouse_id="abc123",
+        )
+        assert self.SECRET.encode() not in pickle.dumps(conn)
+
+    def test_ship_credentials_ships_it(self) -> None:
+        import pickle
+
+        import deltaswamp as ds
+
+        conn = ds.connect(
+            host="https://example.cloud.databricks.com",
+            token=self.SECRET,
+            allow_sql_fallback=True,
+            warehouse_id="abc123",
+            ship_credentials=True,
+        )
+        assert self.SECRET.encode() in pickle.dumps(conn)

@@ -882,6 +882,9 @@ class SqlEngine:
         self._profile = profile
         self._host = host
         self._token = token
+        #: Pickle `_token` and secret config fields too
+        #: (``connect(ship_credentials=True)``).
+        self._ship_secrets = False
         self._config = config
         self._warn_on_use = warn_on_use
         self._staging_volume = _check_volume(staging_volume)
@@ -915,6 +918,15 @@ class SqlEngine:
 
             state["_config"] = None
             state["_config_kwargs"] = _config_attributes(config)
+        if not state.get("_ship_secrets"):
+            # As the catalog and its credential providers do: a copy
+            # re-derives auth from its own environment, and a pickled
+            # Connection or Table never carries a PAT or client secret.
+            from ..credentials.databricks import without_secrets
+
+            state["_token"] = None
+            if state.get("_config_kwargs"):
+                state["_config_kwargs"] = without_secrets(state["_config_kwargs"])
         return state
 
     # ----------------------------------------------------------- capabilities
