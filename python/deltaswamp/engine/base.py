@@ -21,6 +21,7 @@ __all__ = [
     "AddFile",
     "DeletionVectorDescriptor",
     "Engine",
+    "PlannedSnapshot",
     "ScanSplit",
     "TranslatingStream",
     "missing_file_error",
@@ -87,6 +88,20 @@ class DeletionVectorDescriptor:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannedSnapshot:
+    """The protocol and metadata a scan was planned against.
+
+    Every split of one plan refers to the same instance, so pickling a group
+    of splits carries it once. A worker builds the snapshot from it without
+    reading the log.
+    """
+
+    version: int
+    protocol_json: str
+    metadata_json: str
+
+
+@dataclass(frozen=True, slots=True)
 class ScanSplit:
     """One unit of scan work. Must be serializable to a worker.
 
@@ -103,6 +118,11 @@ class ScanSplit:
     # The commit version this file was observed at. Pass-through fields must be
     # decoded against *their own* commit's protocol, not the target snapshot's.
     commit_version: int | None = None
+    # The file as the kernel's scan metadata describes it (JSON, statistics
+    # left out), and the snapshot it was planned from. With both, a worker
+    # reads the file without listing or replaying the log.
+    scan_row: str | None = None
+    planned: PlannedSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)

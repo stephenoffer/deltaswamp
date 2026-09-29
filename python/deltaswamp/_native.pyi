@@ -19,8 +19,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "restore", "commit_actions", "row_tracking_compaction", "add_tags", "write_checksum",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
-"commit_timestamps", "credential_slots". Gate on this list, not `hasattr`, so a stale build
-refuses cleanly.
+"commit_timestamps", "credential_slots", "planned_scan". Gate on this list, not `hasattr`, so a
+stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -280,6 +280,22 @@ class Snapshot:
         oldest retained checkpoint).
         """
 
+    @staticmethod
+    def planned(
+        table_root: str,
+        version: int,
+        protocol_json: str,
+        metadata_json: str,
+        options: dict[str, str] | None = None,
+    ) -> Snapshot:
+        """A snapshot at `version` built from a plan's protocol and metadata.
+
+        Reads no log: a worker scans planned files through it with
+        `scan(files=..., scan_rows=...)`, the rows `files(scan_rows=True)`
+        listed on the driver. Anything else that needs the log (`files()`, a
+        scan without `scan_rows`) is refused. Requires "planned_scan".
+        """
+
     def refresh(self, options: dict[str, str] | None = None, latest: bool = True) -> Snapshot:
         """This snapshot revalidated against storage and brought up to date.
 
@@ -323,6 +339,7 @@ class Snapshot:
         row_ids: bool = False,
         file_groups: list[int] | None = None,
         row_tracking: bool = False,
+        scan_rows: list[str] | None = None,
     ) -> Any:
         """Read the table as an Arrow stream, with deletion vectors applied.
 
@@ -370,9 +387,16 @@ class Snapshot:
         not in this snapshot are ignored; `[]` yields an empty stream with the
         same schema. So scans over a partition of `files()` union to the full
         scan -- the building block for distributed reads.
+
+        `scan_rows` (requires "planned_scan"; with `files`, not with
+        `row_positions`, `file_groups` or `row_tracking`) reads the files
+        those scan rows describe without replaying the log: the rows are the
+        `scan_row` column of `files(scan_rows=True)`.
         """
 
-    def files(self, predicate: str | None = None, tags: bool = False) -> Any:
+    def files(
+        self, predicate: str | None = None, tags: bool = False, scan_rows: bool = False
+    ) -> Any:
         """One row per live data file, as an Arrow table (arro3 Table).
 
         Columns: `path` (string, as stored in the log: usually relative to the
@@ -385,6 +409,9 @@ class Snapshot:
         `num_records` (int64 from stats, nullable; counts rows *before* the
         deletion vector). `predicate` skips files exactly as in `scan`.
         `tags=True` appends `tags`: each add's tags as a JSON object (nullable).
+        `scan_rows=True` (requires "planned_scan") appends `scan_row`: each
+        file's kernel scan row as JSON, statistics left out, for
+        `scan(scan_rows=...)` on a worker.
         """
 
     def add_actions(self) -> list[str]:
@@ -496,11 +523,12 @@ class Snapshot:
         `delta.setTransactionRetentionDuration` read as None.
         """
 
-    def commit_log(self, after: int) -> list[tuple[int, str]]:
+    def commit_log(self, after: int, until: int | None = None) -> list[tuple[int, str]]:
         """The raw commit files after version `after` up to this one, ascending.
 
         `(version, text)`, each text the newline-delimited actions of that
-        commit. Published commits only.
+        commit. Published commits only. `until` stops at that version instead
+        (never past this one), to read a long range in chunks.
         """
 
     def write_checksum(self, always: bool = False) -> bool:

@@ -2252,12 +2252,182 @@ class Table:
             interval_paths=intervals,
         )
 
-    def to_ray_dataset(self, *, override_num_blocks: int | None = None, **kwargs: Any) -> Any:
+    #: About how many bytes of changed data files one `plan_changes` split reads.
+    changes_split_bytes: ClassVar[int] = 256 << 20
+
+    #: Commits `plan_changes` reads from the log at a time while sizing splits.
+    _CHANGES_LOG_CHUNK = 1000
+
+    def plan_changes(
+        self,
+        starting_version: int,
+        ending_version: int | None = None,
+        *,
+        columns: list[str] | None = None,
+        predicate: str | None = None,
+        split_bytes: int | None = None,
+        ship_catalog_auth: bool = False,
+    ) -> Any:
+        """Plan a distributed change-feed read: a picklable `ChangesPlan`.
+
+        The range (both ends inclusive; the end defaults to the latest
+        version, and is pinned now) is split into runs of whole commits of
+        about `split_bytes` of changed data each (default
+        `Table.changes_split_bytes`). Workers read their runs with
+        `plan.read(splits)`; `plan.partitions(n)` groups them. Rows are those
+        `cdf()` returns, with `_change_type`, `_commit_version` and
+        `_commit_timestamp`.
+
+        Refused here, before any worker runs: a catalog-managed table (the
+        kernel reads the feed from the log alone, which lacks the commits the
+        catalog has not published), a range the feed was off for, and a range
+        across a schema change (plan each side separately).
+        """
+        from .distributed import ChangesPlan, ChangesSplit
+
+        what = "plan a distributed read of the change data feed"
+        _check_version(starting_version, "starting_version")
+        if starting_version is None:
+            raise InvalidArgumentError("plan_changes() needs a starting_version")
+        _check_version(ending_version, "ending_version")
+        if ending_version is not None and ending_version < starting_version:
+            raise InvalidArgumentError(
+                f"ending_version {ending_version} is before starting_version {starting_version}"
+            )
+        columns = _columns_arg(columns)
+        _check_predicate(predicate, what)
+        size = self.changes_split_bytes if split_bytes is None else split_bytes
+        _check_count(size, "split_bytes")
+        if self._resolved.is_catalog_managed:
+            raise UnreachableTableError(
+                what,
+                "the kernel reads a change feed from the log alone and takes no catalog commit "
+                "tail, so workers would miss the commits the catalog has not published",
+                "read it on the driver with cdf() and ds.connect(..., allow_sql_fallback=True), "
+                "which reads it with table_changes()",
+            )
+        engine = self._cdf_engine()
+        from .engine.kernel import _native_has
+
+        if not isinstance(engine, KernelEngine) or not _native_has("planned_scan"):
+            raise UnreachableTableError(
+                what,
+                f"this table's change feed is read by {engine.kind.value}, which has no "
+                "distributed read"
+                if not isinstance(engine, KernelEngine)
+                else "the installed native extension predates distributed change feeds",
+                "read it on the driver with cdf()",
+            )
+        end = int(engine.snapshot(self._resolved, version=ending_version).version)
+        if starting_version > end:
+            raise InvalidArgumentError(
+                f"starting_version {starting_version} is after the table's last version ({end})"
+            )
+        segments = self._feed_segments(starting_version, end)
+        if segments is not None and len(segments) > 1:
+            changed = segments[1][0]
+            raise UnreachableTableError(
+                what,
+                f"the table's schema changed at version {changed}, within the range, and a "
+                "worker reads a change feed under one schema",
+                f"plan commits {starting_version}..{changed - 1} and {changed}..{end} separately",
+            )
+        engine_columns = None
+        if columns is not None:
+            # As cdf() asks: the change metadata always comes, so each run is
+            # told apart by version.
+            engine_columns = [*columns, *(c for c in _CDF_META if c not in columns)]
+        # Everything a worker would fail on, settled here once: the feed off
+        # at either end, an unknown column, a predicate the schema cannot
+        # evaluate. Opening the feed reads no data.
+        self._cdf_read(
+            _given(
+                {
+                    "starting_version": starting_version,
+                    "ending_version": end,
+                    "columns": engine_columns,
+                    "predicate": predicate,
+                }
+            ),
+            starting_version,
+            end,
+        )
+        weights = self._commit_weights(engine, starting_version, end)
+        splits: list[ChangesSplit] = []
+        low, held = starting_version, 0
+        for version in range(starting_version, end + 1):
+            held += weights.get(version, size)
+            if held >= size or version == end:
+                splits.append(ChangesSplit(start=low, end=version, size=held))
+                low, held = version + 1, 0
+        return ChangesPlan(
+            engine=engine,
+            table=self._resolved,
+            splits=tuple(splits),
+            columns=tuple(engine_columns) if engine_columns is not None else None,
+            predicate=predicate,
+            ship_catalog_auth=bool(ship_catalog_auth),
+            interval_paths=self._interval_plan(),
+        )
+
+    def _commit_weights(self, engine: Any, start: int, end: int) -> dict[int, int]:
+        """Bytes of data files each commit in `start..end` changes, read from the log.
+
+        A commit with change files reads those; any other reads its added and
+        removed files. A `metaData` action that leaves the feed off is refused
+        here, naming its version, rather than on the worker that reaches it.
+        Version 0 has no weight here (it counts as a split of its own).
+        """
+        snapshot = engine.snapshot(self._resolved, version=end)
+        weights: dict[int, int] = {}
+        after = max(start - 1, 0)
+        while after < end:
+            until = min(after + self._CHANGES_LOG_CHUNK, end)
+            for version, text in snapshot.commit_log(after, until=until):
+                if version < start:
+                    continue
+                changed = changes = 0
+                for line in text.splitlines():
+                    if not line.strip():
+                        continue
+                    action = json.loads(line)
+                    if "cdc" in action:
+                        changes += int(action["cdc"].get("size") or 0)
+                    elif "add" in action or "remove" in action:
+                        file = action.get("add") or action.get("remove") or {}
+                        if file.get("dataChange", True):
+                            changed += int(file.get("size") or 0)
+                    elif "metaData" in action:
+                        config = action["metaData"].get("configuration") or {}
+                        enabled = str(config.get("delta.enableChangeDataFeed", "false"))
+                        if enabled.lower() != "true":
+                            raise _feed_gap_error(version)
+                weights[version] = changes or changed
+            after = until
+        return weights
+
+    #: What `to_ray_dataset(allow_driver_read=True)` reads on the driver at
+    #: most before refusing, in Arrow bytes.
+    driver_read_max_bytes: ClassVar[int] = 1 << 30
+
+    def to_ray_dataset(
+        self,
+        *,
+        override_num_blocks: int | None = None,
+        allow_driver_read: bool = False,
+        driver_read_max_bytes: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """A Ray Dataset, read in parallel by Ray workers.
 
         The scan is planned on the driver and each read task reads a
         byte-balanced group of files. Where no engine can plan a distributed
-        read, the table is read on the driver instead.
+        read (a table only the SQL warehouse can read, such as one with a row
+        filter; a Delta Sharing table), this raises: reading it on the driver
+        instead puts the whole table in one process's memory. Pass
+        ``allow_driver_read=True`` to do that anyway; the read is refused once
+        it passes ``driver_read_max_bytes`` (default
+        `Table.driver_read_max_bytes`, 1 GiB) rather than running out of memory.
         """
         ray_data = _require("ray.data", "ray")
         from .distributed import DeltaSwampDatasource
@@ -2266,24 +2436,58 @@ class Table:
         # it to plan_scan(), which does not take one.
         limit = kwargs.pop("limit", None)
         _check_count(limit, "limit")
-        if self.can(Operation.SCAN).engine is not None:
-            try:
-                plan = self.plan_scan(**kwargs)
-            except UnreachableTableError:
-                plan = None
-            # With no files to read there are no read tasks, and Ray builds a
-            # dataset with no schema at all; the driver read keeps the columns.
-            if plan is not None and plan.splits:
-                dataset = ray_data.read_datasource(
-                    DeltaSwampDatasource(plan), override_num_blocks=override_num_blocks
-                )
-                return dataset.limit(limit) if limit is not None else dataset
+        bound = (
+            self.driver_read_max_bytes if driver_read_max_bytes is None else driver_read_max_bytes
+        )
+        _check_count(bound, "driver_read_max_bytes")
+        try:
+            plan = self.plan_scan(**kwargs)
+        except UnreachableTableError as exc:
+            if not allow_driver_read:
+                raise UnreachableTableError(
+                    "read the table as a Ray Dataset",
+                    f"no engine can plan a distributed read of it ({exc.reason})",
+                    "pass allow_driver_read=True to read it on the driver instead (refused past "
+                    "driver_read_max_bytes), or read it with to_arrow() and hand the result "
+                    "to Ray yourself",
+                ) from exc
+            plan = None
+        # With no files to read there are no read tasks, and Ray builds a
+        # dataset with no schema at all; the driver read of nothing keeps the
+        # columns.
+        if plan is not None and plan.splits:
+            dataset = ray_data.read_datasource(
+                DeltaSwampDatasource(plan), override_num_blocks=override_num_blocks
+            )
+            return dataset.limit(limit) if limit is not None else dataset
         if limit is not None:
             kwargs["limit"] = limit
-        table = self.to_arrow(**kwargs)
+        table = self._bounded_read(bound if plan is None else None, **kwargs)
         if limit is not None:
             table = table.slice(0, limit)
         return ray_data.from_arrow(table)
+
+    def _bounded_read(self, max_bytes: int | None, **kwargs: Any) -> Any:
+        """`to_arrow(**kwargs)`, refused once it holds more than `max_bytes`."""
+        if max_bytes is None:
+            return self.to_arrow(**kwargs)
+        import pyarrow as pa
+
+        reader = pa.RecordBatchReader.from_stream(self.scan(**kwargs))
+        batches, held = [], 0
+        for batch in reader:
+            held += batch.nbytes
+            if held > max_bytes:
+                reader.close()
+                raise EngineLimitError(
+                    "read the table as a Ray Dataset on the driver",
+                    f"it holds more than driver_read_max_bytes ({max_bytes} bytes) and no "
+                    "engine can read it in parallel",
+                    "narrow the read with columns= or predicate=, raise driver_read_max_bytes, "
+                    "or read a table Ray workers can plan",
+                )
+            batches.append(batch)
+        return pa.Table.from_batches(batches, schema=reader.schema)
 
     def to_daft(self, **kwargs: Any) -> Any:
         """A Daft DataFrame, read eagerly: pass `columns=` and `predicate=` to narrow it."""

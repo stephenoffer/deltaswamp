@@ -147,6 +147,9 @@ pub const FEATURES: &[&str] = &[
     // slot's key read their vended credential from it on every request, so
     // a refresh published from Python reaches stores already built.
     "credential_slots",
+    // `files(scan_rows=True)`, `Snapshot.planned` and `scan(scan_rows=)`: a
+    // worker reads planned files with no log listing or replay.
+    "planned_scan",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.
