@@ -223,7 +223,13 @@ def test_describe_detail(interop: Runner, case_id: str, key: str) -> None:
 
 # --------------------------------------------------------------- change feed
 
-_CDF = ("cdf-full", "cdf-window", "cdf-before-add-column", "cdf-databricks-writes")
+_CDF = (
+    "cdf-full",
+    "cdf-window",
+    "cdf-before-add-column",
+    "cdf-kernel-dml",
+    "cdf-databricks-writes",
+)
 
 
 @pytest.mark.parametrize(("case_id", "key"), _params(*_CDF))

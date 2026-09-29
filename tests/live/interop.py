@@ -2427,7 +2427,9 @@ def check_keys(case: Case) -> list[str]:
     if case.cdf:
         keys += ["cdf-full", "cdf-window", "cdf-databricks-writes"]
         if case.adds_column:
-            keys.append("cdf-before-add-column")
+            # full_history cases: the kernel's own UPDATE/DELETE/MERGE, with
+            # the CDC files it writes, read back through table_changes().
+            keys += ["cdf-before-add-column", "cdf-kernel-dml"]
     keys += list(DATABRICKS_KEYS)
     if case.variant:
         keys.append("variant-merge-null-element")
@@ -2548,13 +2550,33 @@ def _cdf_items(
 def _change_feed(
     res: CaseResult, ctx: Context, case: Case, b: Builder, pre: Path, uri: str, latest: int
 ) -> None:
-    keys = ["cdf-full", "cdf-window"] + (["cdf-before-add-column"] if case.adds_column else [])
+    keys = ["cdf-full", "cdf-window"] + (
+        ["cdf-before-add-column", "cdf-kernel-dml"] if case.adds_column else []
+    )
     with res.gather(*keys):
         first = next(v for v in range(latest + 1) if _cdf_on(pre, v))
         ranges = {"cdf-full": (first, latest), "cdf-window": (max(first, latest - 3), latest)}
         if case.adds_column:
             end = b.marks["add_column"] - 1
             ranges["cdf-before-add-column"] = (first, end)
+            # Exactly the commits of the kernel's UPDATE, DELETE and MERGE:
+            # their CDC files (update pre/post images, deletes, inserts) must
+            # read on Databricks as deltaswamp reads them.
+            kernel_dml = [
+                s
+                for s in b.steps
+                if s.name in ("update_kernel", "delete_kernel", "merge_kernel")
+                and s.outcome == "ok"
+                and s.before is not None
+                and s.after is not None
+                and s.after > s.before
+            ]
+            if not kernel_dml:
+                raise AssertionError("the kernel committed none of its UPDATE, DELETE, MERGE")
+            ranges["cdf-kernel-dml"] = (
+                min(int(s.before) + 1 for s in kernel_dml if s.before is not None),
+                max(int(s.after) for s in kernel_dml if s.after is not None),
+            )
         res.evidence.update(compare_many(ctx, case, _cdf_items(ctx, case, pre, uri, ranges, res)))
 
 

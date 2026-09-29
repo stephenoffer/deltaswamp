@@ -375,8 +375,9 @@ schema instead, and so does `cdf()`. A `columns=` projection is left as asked.
 
 The kernel serves CDF first, and delta-rs what the kernel cannot (a read past
 the table's last version, a predicate outside the kernel's grammar). A
-catalog-managed table's feed needs the warehouse, since the kernel's change
-feed cannot take the catalog's commit tail. Guards fire before any read.
+catalog-managed table's feed is read from its commits, the ones the catalog
+has ratified but not published included, since the kernel's change feed cannot
+take the catalog's commit tail. Guards fire before any read.
 A table without `delta.enableChangeDataFeed` is refused, because enabling it is
 not retroactive. A table whose `delta.deletedFileRetentionDuration` is shorter
 than its `delta.logRetentionDuration` is refused too, because files could be
@@ -633,8 +634,10 @@ Parquet files that hold matching rows. On a table only the kernel can write,
 only the files that hold matching rows, keeping row ids on row-tracked tables,
 with the same SQL as on the deletion-vector path, and refuses a rewrite that
 would read more than `KernelEngine.dml_max_bytes` (4 GiB). On a table with the
-change data feed enabled, the kernel serves only DELETE, because UPDATE and
-MERGE need CDC files it cannot write. deltalake 1.6.5 inserts an all-NULL row
+change data feed enabled, UPDATE, MERGE, replaceWhere and copy-on-write DELETE
+write CDC files under `_change_data/` in the same commit, as Spark's do, so
+the feed reports `update_preimage` and `update_postimage` rows. deltalake
+1.6.5 inserts an all-NULL row
 for each source row a conditional `when_not_matched_insert` rejects on such a
 table, so with that version the MERGE is refused there (and goes to the
 warehouse when the fallback is on); make the last NOT MATCHED clause
@@ -1141,8 +1144,10 @@ end, sizes each commit from the log and cuts the range into runs of whole
 commits of about `split_bytes` of changed data (256 MiB by default); a commit
 is never split, since a deletion-vector update pairs a remove with an add in
 one commit. `plan.read(splits)` on a worker returns what `cdf()` returns for
-those commits. A catalog-managed table, a range the feed was off for and a
-range across a schema change are refused at planning.
+those commits. A range the feed was off for and a range across a schema
+change are refused at planning. A catalog-managed table's plan carries the
+catalog's commit tail, so workers read the unpublished commits from their
+staged files without calling the catalog.
 
 ```python
 plan = t.plan_changes(120, columns=["id", "amount"])
@@ -1504,9 +1509,7 @@ reached.
 - DML on a kernel-only table without deletion vectors rewrites the files it
   touches, and MERGE reads its source and candidate files into memory; both
   are refused past `KernelEngine.dml_max_bytes` (4 GiB) rather than running
-  out of memory. UPDATE and MERGE on a change-data-feed table need the
-  warehouse, since the kernel cannot write CDC files.
-- The change feed of a catalog-managed table needs the warehouse.
+  out of memory.
 - delta-rs reads pre-1582 dates and timestamps from Spark's legacy-calendar
   files unrebased (2-10 days off); the kernel rebases them. Ancient timestamps
   in such files written in a non-UTC session zone need the warehouse.

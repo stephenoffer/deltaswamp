@@ -2442,10 +2442,11 @@ class Table:
         `cdf()` returns, with `_change_type`, `_commit_version` and
         `_commit_timestamp`.
 
-        Refused here, before any worker runs: a catalog-managed table (the
-        kernel reads the feed from the log alone, which lacks the commits the
-        catalog has not published), a range the feed was off for, and a range
-        across a schema change (plan each side separately).
+        Refused here, before any worker runs: a range the feed was off for,
+        and a range across a schema change (plan each side separately). A
+        catalog-managed table's plan carries the catalog's commit tail, so
+        workers read the commits the catalog has not published from their
+        staged files, with no catalog call.
         """
         from .distributed import ChangesPlan, ChangesSplit
 
@@ -2462,14 +2463,6 @@ class Table:
         _check_predicate(predicate, what)
         size = self.changes_split_bytes if split_bytes is None else split_bytes
         _check_count(size, "split_bytes")
-        if self._resolved.is_catalog_managed:
-            raise UnreachableTableError(
-                what,
-                "the kernel reads a change feed from the log alone and takes no catalog commit "
-                "tail, so workers would miss the commits the catalog has not published",
-                "read it on the driver with cdf() and ds.connect(..., allow_sql_fallback=True), "
-                "which reads it with table_changes()",
-            )
         engine = self._cdf_engine()
         from .engine.kernel import _native_has
 

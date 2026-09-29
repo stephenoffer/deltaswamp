@@ -264,6 +264,31 @@ impl KernelBatchReader {
         Self::from_parts(scan.logical_schema().as_ref(), iter)
     }
 
+    /// [`Self::try_new_planned`] with every row tagged by its file and
+    /// physical row index, as [`Self::try_new_positional`] tags them.
+    pub fn try_new_planned_positional(
+        scan: &Scan,
+        engine: Arc<dyn Engine>,
+        planned: &PlannedFiles,
+        paths: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let metadata = scan_metadata_source(scan, engine.as_ref(), Some(planned))?;
+        let iter = RestrictedScan::with_metadata(scan, engine, metadata, paths, true, false, None)?;
+        let mut reader = Self::from_parts(scan.logical_schema().as_ref(), iter)?;
+        let mut fields: Vec<arrow::datatypes::FieldRef> =
+            reader.schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            FILE_PATH_COLUMN,
+            arrow::datatypes::DataType::Utf8,
+            false,
+        )));
+        reader.schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            reader.schema.metadata().clone(),
+        ));
+        Ok(reader)
+    }
+
     /// Read only the data files whose log path (as stored in the `add`
     /// action, i.e. as `files()` reports it) is in `paths`.
     ///

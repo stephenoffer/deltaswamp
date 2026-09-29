@@ -28,7 +28,13 @@ def _kernel_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(kernel, "_native_has", lambda *names: True)
 
 
-def test_catalog_managed_cdf_is_refused_in_supports() -> None:
+def test_catalog_managed_cdf_is_refused_without_the_log_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build that cannot read the feed from the catalog's commits refuses it."""
+    from deltaswamp.engine import kernel
+
+    monkeypatch.setattr(kernel, "_native_has", lambda *f: "log_change_feed" not in f)
     table = resolved_table(
         data_source_format="DELTA",
         reader_features=frozenset({"catalogManaged"}),

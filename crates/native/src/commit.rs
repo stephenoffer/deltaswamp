@@ -838,18 +838,7 @@ pub fn commit_actions(
     }
     let extra = ExtraActions::default();
     if !lines.is_empty() {
-        let strings = arrow::array::StringArray::from(lines);
-        let batch = arrow::array::RecordBatch::try_new(
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("json", arrow::datatypes::DataType::Utf8, false),
-            ])),
-            vec![Arc::new(strings)],
-        )?;
-        let parsed = delta_kernel::Engine::json_handler(engine.as_ref()).parse_json(
-            Box::new(ArrowEngineData::new(batch)),
-            delta_kernel::actions::get_commit_schema().clone(),
-        )?;
-        extra.push(FilteredEngineData::with_all_rows_selected(parsed));
+        extra.push(parse_actions(&engine, &lines)?);
     }
     let info = CommitInfoPatch {
         operation_parameters,
@@ -871,6 +860,22 @@ pub fn commit_actions(
         info,
     )?;
     finish_commit_as(transaction, &engine, false)
+}
+
+/// Log-JSON action lines as the kernel's commit data, for [`ExtraActions`].
+pub(crate) fn parse_actions(engine: &SharedEngine, lines: &[&str]) -> Result<FilteredEngineData> {
+    let strings = arrow::array::StringArray::from(lines.to_vec());
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("json", arrow::datatypes::DataType::Utf8, false),
+        ])),
+        vec![Arc::new(strings)],
+    )?;
+    let parsed = delta_kernel::Engine::json_handler(engine.as_ref()).parse_json(
+        Box::new(ArrowEngineData::new(batch)),
+        delta_kernel::actions::get_commit_schema().clone(),
+    )?;
+    Ok(FilteredEngineData::with_all_rows_selected(parsed))
 }
 
 /// What a failed put-if-absent of commit `version` means.

@@ -189,6 +189,7 @@ pub fn commit_dml(
     data_change: bool,
     constraints_checked: crate::restate::Checked,
     info: commit::CommitInfoPatch,
+    changes: Vec<RecordBatch>,
 ) -> Result<DmlOutcome> {
     let deletions: HashMap<String, RoaringTreemap> = deletions
         .into_iter()
@@ -361,7 +362,7 @@ pub fn commit_dml(
         }
         DmlData::Stream(stream) => (Vec::new(), Some(stream)),
     };
-    if touched.is_empty() && batches.is_empty() {
+    if touched.is_empty() && batches.is_empty() && changes.iter().all(|b| b.num_rows() == 0) {
         // Nothing to change: no commit, as Spark writes none for a no-op DELETE.
         return Ok(DmlOutcome {
             version: snapshot.version(),
@@ -467,7 +468,16 @@ pub fn commit_dml(
         };
         crate::restate::writing_snapshot(&snapshot, &engine, &checked, &info)?
     };
+    // A commit that writes its change files: kernel's refusal of an add and a
+    // remove together on a change-feed table is set aside (`crate::change_files`).
+    let writes_changes = changes.iter().any(|b| b.num_rows() > 0);
+    let committing = if writes_changes {
+        crate::restate::change_files_snapshot(&committing)?
+    } else {
+        committing
+    };
     let restated = !Arc::ptr_eq(&committing, &snapshot);
+    let extras = info.extra_actions.clone();
     let mut transaction = commit::begin_transaction(
         committing,
         &engine,
@@ -555,6 +565,34 @@ pub fn commit_dml(
         None => None,
     };
     let mut written = Vec::new();
+    // The change files first: a failure there leaves only files in
+    // `written`, which are taken back out here.
+    let staged_changes = if writes_changes {
+        crate::change_files::write_change_files(
+            &snapshot,
+            &engine,
+            &transaction,
+            changes,
+            codec,
+            &mut written,
+        )
+        .and_then(|actions| {
+            let lines: Vec<&str> = actions.iter().map(String::as_str).collect();
+            if !lines.is_empty() {
+                extras.push(commit::parse_actions(&engine, &lines)?);
+            }
+            Ok(())
+        })
+    } else {
+        Ok(())
+    };
+    if let Err(err) = staged_changes {
+        let _ = commit::remove_written(&engine, &table_root, &written);
+        if let Some(relative) = dv_relative {
+            let _ = commit::remove_written(&engine, &table_root, &[relative]);
+        }
+        return Err(err);
+    }
     let staged = match stream {
         Some(stream) => commit::stage_stream(
             &mut transaction,

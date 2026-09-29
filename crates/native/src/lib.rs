@@ -5,6 +5,7 @@
 //! extension to coexist in one process with the `deltalake` wheel, which links
 //! its own (forked) build of the kernel.
 
+mod change_files;
 mod changes;
 mod checksum;
 mod commit;
@@ -101,6 +102,13 @@ pub const FEATURES: &[&str] = &[
     // hand, and `scan(row_tracking=True)` rows written back with their ids
     // and commit versions in the materialized columns.
     "row_tracking_compaction",
+    // `commit_dml(changes=)`: an UPDATE, MERGE or copy-on-write DELETE on a
+    // change-feed table writes its CDC files and `cdc` actions.
+    "change_files",
+    // `commit_log(after=-1)`, `scan(scan_rows=, row_positions=True)`,
+    // `deletion_vector_rows` and `file_column`: a change feed read from the
+    // log, for catalog-managed tables the kernel's TableChanges cannot open.
+    "log_change_feed",
     // `commit_dml(add_tags=)`: tags on every add (a Z-order's ZCUBE_* tags),
     // and files() lists each file's tags.
     "add_tags",

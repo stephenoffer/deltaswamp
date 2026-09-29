@@ -170,8 +170,18 @@ class TestChangeFeed:
 
 
 class TestSupports:
-    def test_cdf_on_catalog_managed_is_refused_up_front(self, cdf_table: str) -> None:
+    def test_cdf_on_catalog_managed_is_refused_without_the_log_reader(
+        self, cdf_table: str, monkeypatch: Any
+    ) -> None:
+        from deltaswamp.engine import kernel
+
         table = resolved(cdf_table, writer_features=frozenset({"catalogManaged"}))
+        # Served from the catalog's commits by a build that reads them.
+        assert KernelEngine().supports(Operation.CDF, table).ok
+        real = kernel._native_has
+        monkeypatch.setattr(
+            kernel, "_native_has", lambda *f: "log_change_feed" not in f and real(*f)
+        )
         verdict = KernelEngine().supports(Operation.CDF, table)
         assert not verdict.ok
         assert "catalog" in verdict.reason
@@ -233,7 +243,11 @@ class TestSupports:
         assert DeltaTable(path).protocol().min_writer_version == 6
 
     @pytest.mark.parametrize("op", [Operation.DELETE, Operation.UPDATE, Operation.REPLACE_WHERE])
-    def test_cdf_enabled_refuses_removing_writes(self, tmp_path: Any, op: Operation) -> None:
+    def test_cdf_enabled_removing_writes_need_change_files(
+        self, tmp_path: Any, op: Operation, monkeypatch: Any
+    ) -> None:
+        from deltaswamp.engine import kernel
+
         path = kernel_table(
             str(tmp_path / "t"),
             pa.schema([("id", pa.int64())]),
@@ -241,6 +255,10 @@ class TestSupports:
         )
         engine = KernelEngine()
         assert engine.supports(Operation.APPEND, resolved(path)).ok
+        # A build that writes CDC files serves them (see test_change_files.py).
+        assert engine.supports(op, resolved(path)).ok
+        real = kernel._native_has
+        monkeypatch.setattr(kernel, "_native_has", lambda *f: "change_files" not in f and real(*f))
         verdict = engine.supports(op, resolved(path))
         assert not verdict.ok
         assert "change data feed" in verdict.reason

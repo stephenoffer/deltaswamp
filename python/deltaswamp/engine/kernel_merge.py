@@ -270,7 +270,7 @@ class KernelMerger:
             raise InvalidArgumentError(f"the MERGE failed evaluating its clauses: {exc}") from exc
         finally:
             con.close()
-        deletions, data, metrics = result
+        deletions, data, metrics, changes = result
 
         if deletions.num_rows == 0 and (data is None or data.num_rows == 0):
             return {**metrics, "version": int(snapshot.version)}
@@ -280,6 +280,7 @@ class KernelMerger:
             deletions,
             data,
             operation="MERGE",
+            changes=changes,
             # The rows read are the ones this bounds, so only files it keeps
             # can hold a row a concurrent MERGE added that this one must see.
             read_predicate=skipping,
@@ -408,7 +409,14 @@ class KernelMerger:
 
     def _evaluate(
         self, con: Any, schema: Any, target: Any, row_ids: bool
-    ) -> tuple[Any, Any, dict[str, Any]]:
+    ) -> tuple[Any, Any, dict[str, Any], Any]:
+        """The MERGE's deletions, written rows and metrics, and its change rows.
+
+        The change rows (None unless the table has the change data feed) are
+        what the commit's CDC files hold: each updated target row before
+        (`update_preimage`) and after (`update_postimage`), each deleted one
+        (`delete`), each inserted source row (`insert`).
+        """
         import pyarrow as pa
 
         t, s = _quote(self._target_alias), _quote(self._source_alias)
@@ -454,6 +462,11 @@ class KernelMerger:
         deletions: list[Any] = []
         deleted: list[Any] = []
         outputs: list[Any] = []
+        # Change rows, by kind: target positions for the rows read from the
+        # target, the computed rows for the ones written.
+        updated_at: list[Any] = []
+        postimages: list[Any] = []
+        inserts: list[Any] = []
         counts = {"updated": 0, "deleted": 0, "inserted": 0}
 
         def applies(kind_clauses: list[Any], index: int) -> str:
@@ -486,6 +499,8 @@ class KernelMerger:
                 part = _fetch(con, f"SELECT {positions}{carried}, {select} {sql_from}")
                 deletions.append(part.select([_POS_FILE, _POS_INDEX]))
                 outputs.append(part.drop_columns([_POS_FILE, _POS_INDEX]))
+                updated_at.append(part.select([_POS_FILE, _POS_INDEX]))
+                postimages.append(part.drop_columns([_POS_FILE, _POS_INDEX]))
                 counts["updated"] += part.num_rows
 
         not_matched = clauses["not_matched"]
@@ -501,6 +516,7 @@ class KernelMerger:
             if row_ids:
                 part = part.append_column(_ROW_ID, pa.nulls(part.num_rows, pa.int64()))
             outputs.append(part)
+            inserts.append(part)
             counts["inserted"] += part.num_rows
 
         positions_schema = pa.schema([(_POS_FILE, pa.string()), (_POS_INDEX, pa.int64())])
@@ -532,7 +548,12 @@ class KernelMerger:
             "num_deleted_rows": counts["deleted"],
             "num_inserted_rows": counts["inserted"],
         }
-        return deletion_table, data, metrics
+        changes = None
+        if _change_feed_on(self._table):
+            changes = _merge_changes(
+                schema, target, updated_at, deleted, postimages, inserts, self._variants
+            )
+        return deletion_table, data, metrics, changes
 
     def _target_column(self, key: Any, columns: list[str]) -> str:
         text = str(key)
@@ -634,6 +655,69 @@ def _one_statement(con: Any, sql: str) -> Any:
             "the MERGE clause text does not stay inside one expression; refused"
         )
     return con.execute(sql)
+
+
+def _change_feed_on(table: Any) -> bool:
+    enabled = table.properties.get("delta.enableChangeDataFeed", "false")
+    return str(enabled).lower() == "true"
+
+
+def _merge_changes(
+    schema: Any,
+    target: Any,
+    updated_at: list[Any],
+    deleted_at: list[Any],
+    postimages: list[Any],
+    inserts: list[Any],
+    variants: frozenset[str],
+) -> Any:
+    """A MERGE's change rows: the table's columns plus `_change_type`."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    out_schema = pa.schema([*schema, pa.field("_change_type", pa.string())])
+    files = pc.unique(target.column(_FILE).cast(pa.string()))
+
+    def keys(file_column: Any, index_column: Any) -> Any:
+        ids = pc.cast(pc.index_in(pc.cast(file_column, pa.string()), value_set=files), pa.int64())
+        return pc.add(pc.shift_left(ids, 40), pc.cast(index_column, pa.int64()))
+
+    target_keys = keys(target.column(_FILE), target.column(_INDEX))
+
+    def kind(rows: Any, name: str) -> Any:
+        parts = rows if isinstance(rows, list) else [rows]
+        cast = [
+            _cast_to(p.select([f.name for f in schema]), pa.schema(schema), variants) for p in parts
+        ]
+        rows = pa.concat_tables(cast)
+        return rows.append_column(
+            pa.field("_change_type", pa.string()), pa.array([name] * rows.num_rows, pa.string())
+        )
+
+    def at(positions: list[Any]) -> Any:
+        joined = pa.concat_tables(
+            [
+                p.rename_columns(["f", "i"]).cast(
+                    pa.schema([("f", pa.string()), ("i", pa.int64())])
+                )
+                for p in positions
+            ]
+        )
+        wanted = pc.unique(keys(joined.column("f"), joined.column("i")))
+        return target.filter(pc.is_in(target_keys, value_set=wanted))
+
+    parts = []
+    if updated_at:
+        parts.append(kind(at(updated_at), "update_preimage"))
+        parts.append(kind(postimages, "update_postimage"))
+    if deleted_at:
+        parts.append(kind(at(deleted_at), "delete"))
+    if inserts:
+        parts.append(kind(inserts, "insert"))
+    parts = [p for p in parts if p.num_rows]
+    if not parts:
+        return None
+    return pa.concat_tables([p.cast(out_schema) for p in parts])
 
 
 def _row_tracking_enabled(table: Any) -> bool:

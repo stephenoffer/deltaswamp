@@ -90,10 +90,11 @@ class TestTheUnionIsTheFeed:
 
 
 class TestRefusedAtPlanning:
-    def test_a_catalog_managed_table(self, tmp_path: Any) -> None:
+    def test_a_catalog_managed_table_is_planned(self, tmp_path: Any) -> None:
+        """No longer refused: workers read the catalog's commits from the tail
+        the plan carries (see test_log_change_feed.py)."""
         pytest.importorskip("deltalake")
         from deltaswamp.catalog.ossuc import OSSUnityCatalog
-        from deltaswamp.errors import UnreachableTableError
 
         from tests.fake_uc import FakeUnityCatalog
 
@@ -107,8 +108,10 @@ class TestRefusedAtPlanning:
                 pa.schema([("id", pa.int64())]),
                 properties={"delta.enableChangeDataFeed": "true"},
             )
-            with pytest.raises(UnreachableTableError, match="catalog commit tail"):
-                conn.table("main.s.t").plan_changes(0)
+            conn.table("main.s.t").append(pa.table({"id": pa.array([1, 2], pa.int64())}))
+            plan = conn.table("main.s.t").plan_changes(0)
+            rows = pa.concat_tables([pa.table(plan.read(g)) for g in plan.partitions(2) if g])
+            assert sorted(rows.column("id").to_pylist()) == [1, 2]
 
     def test_the_feed_off_within_the_range(self, feed: Any) -> None:
         from deltaswamp.errors import UnreachableTableError

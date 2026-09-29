@@ -21,7 +21,6 @@ from deltaswamp.capability import Engine, Operation
 from deltaswamp.errors import (
     InvalidArgumentError,
     MissingDataFileError,
-    UnreachableTableError,
 )
 
 pa = pytest.importorskip("pyarrow")
@@ -113,7 +112,9 @@ class TestChangeFeedMergeWithConditionalInsert:
         ).when_not_matched_insert_all(predicate="s.s LIKE 'a%'").execute()
         assert sorted(r[0] for r in _rows(conn, path, "id")) == [1, 2, 5, 7]
 
-    def test_refused_before_anything_is_written(self, conn: Any, tmp_path: Any) -> None:
+    def test_the_kernel_serves_it_where_delta_rs_would_not(self, conn: Any, tmp_path: Any) -> None:
+        """Where delta-rs writes the all-NULL rows, the MERGE goes to the kernel,
+        which writes it with its CDC files; no row is lost or invented."""
         from deltaswamp.engine.deltars import _null_rows_on_feed_merge
 
         if not _null_rows_on_feed_merge():
@@ -121,16 +122,19 @@ class TestChangeFeedMergeWithConditionalInsert:
         path = _table(conn, tmp_path, _ids(2), CDF)
         t = conn.open_table(path)
         assert t.can(Operation.MERGE).engine is Engine.DELTARS
-        assert not t.can(
+        conditional = t.can(
             Operation.MERGE, clauses=[("when_not_matched_insert_all", "s.s LIKE 'a%'")]
-        ).ok
-        # Refused by the router as the clauses arrive, as can() refuses it.
-        with pytest.raises(UnreachableTableError, match="all-NULL row"):
-            t.merge(
-                self.SOURCE, "t.id = s.id", source_alias="s", target_alias="t"
-            ).when_not_matched_insert_all(predicate="s.s LIKE 'a%'").execute()
-        assert _rows(conn, path, "id") == [(1,), (2,)]
-        assert conn.open_table(path).version == 1
+        )
+        assert conditional.ok and conditional.engine is Engine.KERNEL
+        t.merge(
+            self.SOURCE, "t.id = s.id", source_alias="s", target_alias="t"
+        ).when_not_matched_insert_all(predicate="s.s LIKE 'a%'").execute()
+        assert _rows(conn, path, "id") == [(1,), (2,), (5,), (7,)]
+        feed = pa.table(conn.open_table(path).cdf(starting_version=2))
+        assert sorted((r["_change_type"], r["id"]) for r in feed.to_pylist()) == [
+            ("insert", 5),
+            ("insert", 7),
+        ]
 
     def test_an_unconditional_last_clause_is_still_served(self, conn: Any, tmp_path: Any) -> None:
         path = _table(conn, tmp_path, _ids(2), CDF)
