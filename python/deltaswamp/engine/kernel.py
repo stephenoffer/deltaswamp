@@ -1351,7 +1351,12 @@ class KernelEngine:
         # Only a path-based read by version (or latest) is cached: a
         # catalog-managed table's latest version is the catalog's to say,
         # which a log listing cannot see.
-        cacheable = log_tail is None and table.max_catalog_version is None and timestamp is None
+        cacheable = (
+            log_tail is None
+            and table.max_catalog_version is None
+            and timestamp is None
+            and table.pending_commit is None
+        )
         reuse = cacheable and not (write if fresh is None else fresh)
         # A catalog-managed table is cached by the catalog's own answer
         # instead: the same table id, tail and ratified version always build
@@ -1362,6 +1367,10 @@ class KernelEngine:
             and timestamp is None
             and table.table_id is not None
             and table.max_catalog_version is not None
+        )
+        # A table not created yet: its template version 0 is the whole log.
+        template: dict[str, Any] = (
+            {"template": tuple(table.pending_commit)} if table.pending_commit is not None else {}
         )
 
         def resolve() -> Any:
@@ -1395,6 +1404,7 @@ class KernelEngine:
                 timestamp_ms=timestamp_ms(timestamp) if timestamp is not None else None,
                 # Records the identity a later reuse is revalidated against.
                 identify=cacheable,
+                **template,
             )
             if cacheable:
                 self._remember(key, snapshot)

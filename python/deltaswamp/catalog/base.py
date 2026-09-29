@@ -229,6 +229,10 @@ class ResolvedTable:
     # Catalog-managed state, supplied to SnapshotBuilder.
     log_tail: tuple[LogTailEntry, ...] = ()
     max_catalog_version: int | None = None
+    #: A table a distributed write will create, not there yet: its version 0
+    #: as a template commit, `(url, last_modified_millis, size)`, which the
+    #: kernel resolves in place of the log (see `Connection.plan_write`).
+    pending_commit: tuple[str, int, int] | None = None
 
     credential_provider: CredentialProvider | None = None
 

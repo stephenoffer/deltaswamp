@@ -19,6 +19,7 @@ mod landed;
 mod logclean;
 mod manifest;
 mod partition;
+mod pending;
 mod predicate;
 mod rebase;
 mod restate;
@@ -162,6 +163,10 @@ pub const FEATURES: &[&str] = &[
     // `append(domain_metadata=)` and `commit_files(domain_metadata=)`: user
     // domain metadata set in the same commit as the rows.
     "domain_metadata",
+    // `Snapshot.resolve(template=)` and `rollback_create_table`: a table
+    // created by a distributed write, resolved by workers from a template
+    // version 0 before it exists, and undone if its data never lands.
+    "deferred_create",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.
@@ -229,6 +234,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(functions::table_changes, m)?)?;
     m.add_function(wrap_pyfunction!(functions::feed_versions, m)?)?;
     m.add_function(wrap_pyfunction!(functions::commit_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::rollback_create_table, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::write_create_template, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::delete_create_template, m)?)?;
+    m.add_function(wrap_pyfunction!(pending::create_published, m)?)?;
     m.add_function(wrap_pyfunction!(functions::absolute_deletion_vector, m)?)?;
     m.add_function(wrap_pyfunction!(functions::copy_objects, m)?)?;
     m.add_function(wrap_pyfunction!(functions::probe_put_if_absent, m)?)?;

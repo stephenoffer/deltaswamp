@@ -354,6 +354,11 @@ class WritePlan:
     #: User domain metadata the commit sets beside the rows (domain ->
     #: configuration), checked when the write was planned.
     domain_metadata: dict[str, str] | None = None
+    #: For a write that creates its table (`Connection.plan_write` of a name
+    #: not there yet): what creates it at commit. Driver-only -- never
+    #: pickled -- as workers only write files, resolving the table from its
+    #: template version 0 (`table.pending_commit`).
+    create: Any = None
 
     #: Retries an ordinary append gets when `retries` is not given. Concurrent
     #: jobs really do collide -- four committing at once leaves one winner and
@@ -373,6 +378,8 @@ class WritePlan:
         # What crosses a process boundary: see `_for_workers`. The driver keeps
         # its own copy, with full catalog access, for the commit.
         fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
+        # A worker never commits, so it never creates the table either.
+        fields["create"] = None
         if not self.ship_catalog_auth:
             fields["table"] = _for_workers(self.table, write=True, source=self.credential_source)
             fields["catalog"] = None
@@ -552,6 +559,16 @@ class WritePlan:
             retries = self.default_append_retries if rebases and not self.overwrite else 0
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
             raise InvalidArgumentError(f"retries must be a non-negative int, not {retries!r}")
+        if self.create is not None:
+            result: int = self.create.commit(
+                self,
+                collected,
+                operation=operation,
+                retries=retries,
+                abort_on_failure=abort_on_failure,
+            )
+            return result
+        self._refuse_uncreated("commit these fragments")
         try:
             return self._commit(
                 collected,
@@ -715,6 +732,10 @@ class WritePlan:
         from .errors import UnreachableTableError
 
         collected = _fragments_arg(fragments)
+        if self.create is not None:
+            deleted: int = self.create.abort(self, collected)
+            return deleted
+        self._refuse_uncreated("abort these fragments")
         paths, written_at = _fragment_files(collected)
         if not paths:
             return 0
@@ -745,6 +766,25 @@ class WritePlan:
                 "; ".join(failed[:10]),
             )
         return len(paths) - len(failed)
+
+    def _refuse_uncreated(self, action: str) -> None:
+        """Refuse to commit (or abort) a creating write from a worker's copy of its plan.
+
+        That copy resolves the table from its template, which is not the
+        table's log: a commit from it would write version 1 of a log that has
+        no version 0.
+        """
+        if getattr(self.table, "pending_commit", None) is None:
+            return
+        from .errors import UnreachableTableError
+
+        raise UnreachableTableError(
+            action,
+            "this plan creates its table, and this copy of it (a worker's, unpickled) "
+            "cannot: only the plan Connection.plan_write() returned on the driver creates "
+            "the table and commits into it",
+            "send the fragments back to the driver and call commit() (or abort()) there",
+        )
 
     def _abort_after(self, collected: list[bytes], error: Exception) -> None:
         """`abort` after `error`, which stays the one raised; a failed abort is logged."""

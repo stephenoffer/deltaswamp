@@ -232,6 +232,29 @@ impl PySnapshot {
         })?)
     }
 
+    /// Build a snapshot of a table that exists only as a template version 0
+    /// (see `pending`): the template is the whole log tail.
+    fn build_template(
+        engine: &SharedEngine,
+        url: &Url,
+        version: Option<Version>,
+        template: (String, i64, u64),
+        max_catalog_version: Option<Version>,
+    ) -> Result<SnapshotRef> {
+        let (location, last_modified, size) = template;
+        let tail = crate::pending::template_log_path(url, &location, last_modified, size)?;
+        let mut builder = Snapshot::builder_for(url.as_str()).with_log_tail(vec![tail]);
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+        if let Some(v) = max_catalog_version {
+            builder = builder.with_max_catalog_version(v);
+        }
+        Ok(runtime::block_on(async {
+            builder.build(engine.as_ref() as &dyn Engine)
+        })?)
+    }
+
     /// Resolve the latest recreatable version as of `timestamp_ms`, by commit
     /// times as Delta assigns them (see `commit_time`); a time after the
     /// latest commit is refused.
@@ -315,6 +338,7 @@ impl PySnapshot {
         max_catalog_version = None,
         timestamp_ms = None,
         identify = false,
+        template = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn resolve(
@@ -326,11 +350,19 @@ impl PySnapshot {
         max_catalog_version: Option<u64>,
         timestamp_ms: Option<i64>,
         identify: bool,
+        template: Option<(String, i64, u64)>,
     ) -> PyResult<Self> {
         if version.is_some() && timestamp_ms.is_some() {
             return Err(
                 NativeError::Invalid("pass version or timestamp_ms, not both".to_string()).into(),
             );
+        }
+        if template.is_some() && (log_tail.is_some() || timestamp_ms.is_some() || identify) {
+            // A template is the whole log of a table that does not exist yet.
+            return Err(NativeError::Invalid(
+                "a template snapshot takes no log tail, timestamp or identity".to_string(),
+            )
+            .into());
         }
         let url = Self::table_root_url(table_root)?;
         let options = options.unwrap_or_default();
@@ -341,9 +373,14 @@ impl PySnapshot {
             let object_store = store::build_store(&url, &options)?;
             let engine = commit::new_engine(object_store.clone());
             let tail = log_tail.as_deref();
-            let snapshot = match timestamp_ms {
-                Some(ts) => Self::resolve_as_of(&engine, &url, ts, tail, max_catalog_version)?,
-                None => Self::build(&engine, &url, version, tail, max_catalog_version)?,
+            let snapshot = match (template, timestamp_ms) {
+                (Some(template), _) => {
+                    Self::build_template(&engine, &url, version, template, max_catalog_version)?
+                }
+                (None, Some(ts)) => {
+                    Self::resolve_as_of(&engine, &url, ts, tail, max_catalog_version)?
+                }
+                (None, None) => Self::build(&engine, &url, version, tail, max_catalog_version)?,
             };
             let identity = if identify {
                 commit_identity(object_store.as_ref(), &snapshot)

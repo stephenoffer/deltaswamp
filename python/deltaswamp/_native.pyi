@@ -20,8 +20,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
 "commit_timestamps", "credential_slots", "planned_scan", "values_checked",
-"checkpoint_protection", "domain_metadata". Gate on this list, not `hasattr`, so a stale build
-refuses cleanly.
+"checkpoint_protection", "domain_metadata", "deferred_create". Gate on this list, not
+`hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -197,6 +197,33 @@ def copy_objects(
 ) -> int:
     """Copy `paths` (relative, URL-encoded) from one table root to another; bytes copied."""
 
+def rollback_create_table(
+    table_root: str, metadata_id: str, options: dict[str, str] | None = None
+) -> bool:
+    """Delete `_delta_log/<0>.json` if it is the only version and its metaData id is `metadata_id`.
+
+    Undoes a create whose first data commit failed for certain; returns whether
+    it deleted anything.
+    """
+
+def write_create_template(
+    table_root: str, plan_id: str, actions: list[str], options: dict[str, str] | None = None
+) -> tuple[str, int, int]:
+    """Write `actions` as the template version 0 of a table a distributed write will create.
+
+    Put-if-absent at `<table_root>/_deltaswamp_pending/<plan_id>/_delta_log/`.
+    Returns `(url, last_modified_millis, size)`, what `Snapshot.resolve` takes
+    as `template=`.
+    """
+
+def create_published(table_root: str, options: dict[str, str] | None = None) -> bool:
+    """Whether `_delta_log/<0>.json` is there; raises when storage cannot say."""
+
+def delete_create_template(
+    table_root: str, plan_id: str, options: dict[str, str] | None = None
+) -> bool:
+    """Delete plan `plan_id`'s template; True if it was there."""
+
 def commit_raw(
     table_root: str,
     version: int,
@@ -260,8 +287,14 @@ class Snapshot:
         max_catalog_version: int | None = None,
         timestamp_ms: int | None = None,
         identify: bool = False,
+        template: tuple[str, int, int] | None = None,
     ) -> Snapshot:
         """Resolve a snapshot.
+
+        `template` is `(url, last_modified_millis, size)` of a version-0 commit
+        under `<table_root>/_deltaswamp_pending/<plan>/_delta_log/`: a table a
+        distributed write will create, resolved before it exists. It is the
+        whole log; no `log_tail`, `timestamp_ms` or `identify` with it.
 
         `identify=True` records the strong identity of the commit file the
         snapshot ends at (`commit_identity`), which `refresh` revalidates.

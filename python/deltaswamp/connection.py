@@ -577,6 +577,36 @@ def _local_log_dir(ref: TableRef, name: str) -> str | None:
     return os.path.join(os.path.abspath(location), "_delta_log")
 
 
+def _check_existing_layout(
+    table: Table, name: str, partition_by: list[str] | None, properties: Mapping[str, Any] | None
+) -> None:
+    """Refuse create-time layout or properties for a table that already exists.
+
+    Layout and properties apply when creating; on an existing table they were
+    silently dropped, so the caller believed them applied.
+    """
+    wanted_parts = _names_arg(partition_by, "partition_by")
+    current = table._enrich()
+    if wanted_parts is not None and list(current.partition_columns) != wanted_parts:
+        raise InvalidArgumentError(
+            f"{name} is partitioned by {list(current.partition_columns)}, not "
+            f"{wanted_parts}; partition_by= only applies when the table is created"
+        )
+    changed = {k: v for k, v in (properties or {}).items() if current.properties.get(k) != str(v)}
+    if changed:
+        raise InvalidArgumentError(
+            f"{name} already exists, so properties= would not be applied: "
+            f"{sorted(changed)}; call set_properties() on the table instead"
+        )
+
+
+def _same_location(a: str | None, b: str | None) -> bool:
+    """Whether two storage locations name the same directory (trailing slash aside)."""
+    if a is None or b is None:
+        return False
+    return a.rstrip("/") == b.rstrip("/")
+
+
 def _registered_anyway(catalog: Any, ref: Any, exc: BaseException) -> bool:
     """Whether a failed finalize had in fact registered the table."""
     text = str(exc)
@@ -824,41 +854,15 @@ class Connection:
         The two catalog shapes need a catalog that supports table lifecycle
         (Databricks or open-source Unity Catalog).
         """
-        ref = parse_ref(
-            name, default_catalog=self.default_catalog, default_schema=self.default_schema
-        )
-        schema = _schema_arg(schema)
-        if _schema_names(schema) == []:
-            # Databricks creates a zero-column table; the kernel refuses one
-            # only after the catalog has allocated it.
-            raise InvalidArgumentError("a table needs at least one column")
         if mode not in _CREATE_MODES:
             # Checked for catalog names too, which blamed any unknown mode on
             # "replacing a catalog table".
             raise InvalidArgumentError(
                 f"create mode must be one of {sorted(_CREATE_MODES)}, not {mode!r}"
             )
-        if properties is not None and not isinstance(properties, Mapping):
-            # A list failed with a bare AttributeError, or ValueError from dict().
-            raise InvalidArgumentError(
-                f"properties= maps property names to values, e.g. "
-                f"{{'delta.appendOnly': 'true'}}; got a {type(properties).__name__}"
-            )
-        partition_by = _names_arg(partition_by, "partition_by")
-        cluster_by = _names_arg(cluster_by, "cluster_by")
-        if partition_by and cluster_by:
-            raise InvalidArgumentError(
-                "a table is either partitioned or liquid-clustered, not both"
-            )
-        _check_layout(schema, partition_by, cluster_by)
-        # JSON stats off with no word on struct stats: record Spark's default
-        # (struct on), or this library's checkpoints would keep no stats.
-        properties = with_checkpoint_stats(properties)
-        clash = cdf_name_clash(_schema_names(schema) or (), properties)
-        if clash:
-            # The kernel's create refused this; delta-rs's created the table,
-            # and every DML and change-feed read on it then failed.
-            raise cdf_clash_error(f"create {name}", clash)
+        ref, schema, partition_by, cluster_by, properties = self._create_args(
+            name, schema, partition_by, cluster_by, properties
+        )
         if ref.kind is RefKind.PATH:
             if location is not None:
                 # It was ignored: the table went to `name`, not `location`.
@@ -943,6 +947,46 @@ class Connection:
         return self._create_managed(
             lifecycle, ref, schema, partition_by, cluster_by, properties, comment
         )
+
+    def _create_args(
+        self,
+        name: str,
+        schema: Any,
+        partition_by: list[str] | None,
+        cluster_by: list[str] | None,
+        properties: dict[str, str] | None,
+    ) -> tuple[TableRef, Any, list[str] | None, list[str] | None, dict[str, str] | None]:
+        """`create_table`'s arguments checked and normalized, before anything is created."""
+        ref = parse_ref(
+            name, default_catalog=self.default_catalog, default_schema=self.default_schema
+        )
+        schema = _schema_arg(schema)
+        if _schema_names(schema) == []:
+            # Databricks creates a zero-column table; the kernel refuses one
+            # only after the catalog has allocated it.
+            raise InvalidArgumentError("a table needs at least one column")
+        if properties is not None and not isinstance(properties, Mapping):
+            # A list failed with a bare AttributeError, or ValueError from dict().
+            raise InvalidArgumentError(
+                f"properties= maps property names to values, e.g. "
+                f"{{'delta.appendOnly': 'true'}}; got a {type(properties).__name__}"
+            )
+        partition_by = _names_arg(partition_by, "partition_by")
+        cluster_by = _names_arg(cluster_by, "cluster_by")
+        if partition_by and cluster_by:
+            raise InvalidArgumentError(
+                "a table is either partitioned or liquid-clustered, not both"
+            )
+        _check_layout(schema, partition_by, cluster_by)
+        # JSON stats off with no word on struct stats: record Spark's default
+        # (struct on), or this library's checkpoints would keep no stats.
+        properties = with_checkpoint_stats(properties)
+        clash = cdf_name_clash(_schema_names(schema) or (), properties)
+        if clash:
+            # The kernel's create refused this; delta-rs's created the table,
+            # and every DML and change-feed read on it then failed.
+            raise cdf_clash_error(f"create {name}", clash)
+        return ref, schema, partition_by, cluster_by, properties
 
     def _lifecycle_catalog(self, what: str, ref: TableRef) -> Any:
         from .catalog.base import TableLifecycleCatalog
@@ -1091,8 +1135,7 @@ class Connection:
         """
         import json
 
-        from . import __version__, _native
-        from .engine.metadata import arrow_to_delta_schema, initial_actions
+        from . import _native
 
         try:
             staging = catalog.create_staging_table(ref)
@@ -1122,6 +1165,59 @@ class Connection:
                 comment=comment,
             )
             return self.table(ref.full_name)
+        actions = self._managed_v0(
+            catalog, ref, staging, schema, partition_by, cluster_by, properties, comment
+        )
+        from ._storage import engine_options, store_options
+
+        # The engines' merge rule: a plain dict merge kept alias spellings side
+        # by side, and object_store chose between them at random.
+        options = store_options(
+            engine_options(self.storage_options, staging.storage_options, staging.location)
+        )
+        _native.commit_raw(staging.location, 0, actions, options=options or None)
+        try:
+            body = json.loads(
+                _native.uc_create_table_request(staging.location, ref.table, options=options)
+            )
+            if comment:
+                body["comment"] = comment
+            resolved = catalog.finalize_managed_table(ref, body)
+        except Exception as exc:
+            if _registered_anyway(catalog, ref, exc):
+                # The catalog took the registration and only the read-back
+                # failed. Calling that "not accepted" sent users to retry,
+                # which then failed with "already exists".
+                raise UnreachableTableError(
+                    f"open the managed table {ref} after creating it",
+                    f"the catalog registered it (version 0 is at {staging.location}), but "
+                    f"reading it back failed: {exc}",
+                    f"do not repeat the create; open it with conn.table({str(ref)!r})",
+                ) from exc
+            raise UnreachableTableError(
+                f"finalize the managed table {ref}",
+                f"version 0 was written at {staging.location}, but the catalog did not "
+                f"accept the registration: {exc}",
+                "the staging location is not reclaimed automatically; retry the create, "
+                "which allocates a fresh one",
+            ) from exc
+        return Table(self, resolved)
+
+    def _managed_v0(
+        self,
+        catalog: Any,
+        ref: Any,
+        staging: Any,
+        schema: Any,
+        partition_by: list[str] | None,
+        cluster_by: list[str] | None,
+        properties: dict[str, str] | None,
+        comment: str | None,
+    ) -> list[str]:
+        """Version 0 of a staged managed table: what the catalog requires, then what was asked."""
+        from . import __version__, _native
+        from .engine.metadata import arrow_to_delta_schema, initial_actions
+
         _refuse_local_catalog_location(catalog, staging.location)
         configuration: dict[str, str] = {}
         # What the kernel's own UC create flow writes, then what this catalog
@@ -1163,40 +1259,7 @@ class Connection:
             description=comment,
             engine_info=f"deltaswamp/{__version__}",
         )
-        from ._storage import engine_options, store_options
-
-        # The engines' merge rule: a plain dict merge kept alias spellings side
-        # by side, and object_store chose between them at random.
-        options = store_options(
-            engine_options(self.storage_options, staging.storage_options, staging.location)
-        )
-        _native.commit_raw(staging.location, 0, actions, options=options or None)
-        try:
-            body = json.loads(
-                _native.uc_create_table_request(staging.location, ref.table, options=options)
-            )
-            if comment:
-                body["comment"] = comment
-            resolved = catalog.finalize_managed_table(ref, body)
-        except Exception as exc:
-            if _registered_anyway(catalog, ref, exc):
-                # The catalog took the registration and only the read-back
-                # failed. Calling that "not accepted" sent users to retry,
-                # which then failed with "already exists".
-                raise UnreachableTableError(
-                    f"open the managed table {ref} after creating it",
-                    f"the catalog registered it (version 0 is at {staging.location}), but "
-                    f"reading it back failed: {exc}",
-                    f"do not repeat the create; open it with conn.table({str(ref)!r})",
-                ) from exc
-            raise UnreachableTableError(
-                f"finalize the managed table {ref}",
-                f"version 0 was written at {staging.location}, but the catalog did not "
-                f"accept the registration: {exc}",
-                "the staging location is not reclaimed automatically; retry the create, "
-                "which allocates a fresh one",
-            ) from exc
-        return Table(self, resolved)
+        return list(actions)
 
     def register_table(self, name: str, location: str, *, comment: str | None = None) -> Table:
         """Register an existing Delta table's location under a catalog name.
@@ -1239,14 +1302,25 @@ class Connection:
                     "check the location, or create the table with create_table(location=...)",
                 ) from exc
             raise
-        resolved = catalog.register_table(
-            ref,
-            location,
-            columns_schema_json=metadata["schemaString"],
-            partition_columns=list(metadata.get("partitionColumns") or []),
-            properties=dict(metadata.get("configuration") or {}),
-            comment=comment,
-        )
+        try:
+            resolved = catalog.register_table(
+                ref,
+                location,
+                columns_schema_json=metadata["schemaString"],
+                partition_columns=list(metadata.get("partitionColumns") or []),
+                properties=dict(metadata.get("configuration") or {}),
+                comment=comment,
+            )
+        except DeltaSwampError:
+            # Registered already -- by an earlier call whose answer was lost,
+            # say -- at this very location: that is what was asked for.
+            try:
+                existing = catalog.resolve(ref)
+            except DeltaSwampError:
+                existing = None
+            if existing is None or not _same_location(existing.location, location):
+                raise
+            resolved = existing
         return Table(self, resolved)
 
     def list_catalogs(self) -> list[str]:
@@ -1439,28 +1513,79 @@ class Connection:
     ) -> Table:
         """write_table's append/overwrite into a table that is already there."""
         table = self.table(name)
-        # Layout and properties apply when creating; on an existing table
-        # they were silently dropped, so the caller believed them applied.
-        wanted_parts = _names_arg(partition_by, "partition_by")
-        current = table._enrich()
-        if wanted_parts is not None and list(current.partition_columns) != wanted_parts:
-            raise InvalidArgumentError(
-                f"{name} is partitioned by {list(current.partition_columns)}, not "
-                f"{wanted_parts}; partition_by= only applies when the table is created"
-            )
-        changed = {
-            k: v for k, v in (properties or {}).items() if current.properties.get(k) != str(v)
-        }
-        if changed:
-            raise InvalidArgumentError(
-                f"{name} already exists, so properties= would not be applied: "
-                f"{sorted(changed)}; call set_properties() on the table instead"
-            )
+        _check_existing_layout(table, name, partition_by, properties)
         if mode == "overwrite":
             table.overwrite(data, **write_options)
         else:
             table.append(data, **write_options)
         return table
+
+    def plan_write(
+        self,
+        name: str,
+        *,
+        schema: Any = None,
+        mode: str = "append",
+        location: str | None = None,
+        partition_by: list[str] | None = None,
+        cluster_by: list[str] | None = None,
+        properties: dict[str, str] | None = None,
+        comment: str | None = None,
+        txn: tuple[str, int] | None = None,
+        commit_metadata: dict[str, Any] | None = None,
+        ship_catalog_auth: bool = False,
+        supplies_defaults: bool = False,
+    ) -> Any:
+        """Plan a distributed write to `name`, creating the table at commit if it is not there.
+
+        For a table that exists this is ``conn.table(name).plan_write(...)``
+        after the save mode is applied: ``append`` and ``overwrite`` write into
+        it, ``error`` refuses, and ``ignore`` returns None (nothing to write).
+        partition_by= and properties= must then agree with the table.
+
+        For a table that does not exist, the three shapes of `create_table`
+        apply (a path; a catalog name with `location`, external; a catalog
+        name without, managed), and `schema` is required. Nothing is visible
+        until the commit: workers write under the table's location, resolving
+        it from a template version 0 no reader sees, and `commit()` creates the
+        table and commits the job's files. A managed table is registered by
+        the commit (its staging location is allocated here); an external one
+        is registered after its data is in. When the commit certainly fails,
+        or `abort()` is called, the files are deleted and the create undone:
+        version 0 is removed while it is the only version, and a managed
+        table the commit registered is dropped while it is empty. A managed
+        table's staging allocation cannot be released and stays with the
+        catalog.
+
+        Everything a write into the table would be refused for is refused
+        here, before any worker runs. If another writer creates the table
+        while the job runs, ``error`` and ``overwrite`` fail the commit,
+        ``ignore`` keeps their table, and ``append`` appends the files to it
+        when they fit its layout (never for a managed table, whose files are
+        in this plan's own staging location); files not committed are deleted.
+
+        Returns a `WritePlan` (or None, as above): ship it to workers, call
+        `plan.write(batch)` there, and `plan.commit(fragments)` here.
+        ``ship_catalog_auth=True`` is refused for a catalog table that does not
+        exist yet: there is no table to vend credentials for until the commit.
+        """
+        from ._create import plan_create_write
+
+        return plan_create_write(
+            self,
+            name,
+            schema=schema,
+            mode=mode,
+            location=location,
+            partition_by=partition_by,
+            cluster_by=cluster_by,
+            properties=properties,
+            comment=comment,
+            txn=txn,
+            commit_metadata=commit_metadata,
+            ship_catalog_auth=ship_catalog_auth,
+            supplies_defaults=supplies_defaults,
+        )
 
     def convert_to_delta(self, location: str, **kwargs: Any) -> Table:
         """Convert a directory of Parquet into a Delta table in place."""
