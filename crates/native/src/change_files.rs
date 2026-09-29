@@ -151,7 +151,8 @@ fn write_one(
         context.physical_schema().as_ref(),
     )?;
     let physical = with_column(&physical, CHANGE_TYPE, kinds)?;
-    let buffer = crate::writer::encode(&physical, codec)?;
+    // No geospatial columns: the change data feed is refused on geo tables.
+    let buffer = crate::writer::encode_typed(&physical, codec, None)?;
     let size = u64::try_from(buffer.len())
         .map_err(|_| NativeError::Invalid("a change file too large to size".to_string()))?;
 
