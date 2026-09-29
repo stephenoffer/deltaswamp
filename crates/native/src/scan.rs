@@ -1200,8 +1200,14 @@ mod tests {
 
     #[test]
     fn table_roots_parse_paths_and_refuse_fragments() {
+        // An absolute path is the platform's own: `C:\tmp\my table` on Windows.
+        let abs = |p: &str| std::path::absolute(p).unwrap();
         let url = PySnapshot::table_root_url("/tmp/my table").unwrap();
-        assert_eq!(url.as_str(), "file:///tmp/my%20table/");
+        assert_eq!(
+            Some(url.clone()),
+            url::Url::from_directory_path(abs("/tmp/my table")).ok()
+        );
+        assert!(url.as_str().ends_with("/tmp/my%20table/"), "{url}");
         let url = PySnapshot::table_root_url("rel/t").unwrap();
         assert!(url.path().ends_with("/rel/t/"), "{url}");
         assert!(url.scheme() == "file");
@@ -1213,7 +1219,7 @@ mod tests {
         assert_eq!(url.as_str(), "s3://bucket/t/");
         // A path containing '#' is fine: only a URL reads it as a fragment.
         let url = PySnapshot::table_root_url("/tmp/a#b").unwrap();
-        assert_eq!(url.path(), "/tmp/a%23b/");
+        assert!(url.path().ends_with("/tmp/a%23b/"), "{url}");
         if let Some(home) = std::env::var_os("HOME") {
             let url = PySnapshot::table_root_url("~/t").unwrap();
             let want = url::Url::from_directory_path(std::path::Path::new(&home).join("t"));

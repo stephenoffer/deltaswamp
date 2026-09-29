@@ -242,7 +242,13 @@ mod tests {
     fn lines_are_decoded_paths() {
         let url = Url::parse("s3://bucket/t/g=a%20b/part%2D0.parquet").unwrap();
         assert_eq!(line(&url), "s3://bucket/t/g=a b/part-0.parquet");
-        let url = Url::parse("file:///tmp/t%20t/g=x%252Fy/p.parquet").unwrap();
-        assert_eq!(line(&url), "/tmp/t t/g=x%2Fy/p.parquet");
+        // A local file is written as the platform's own path.
+        let dir = std::path::absolute("/tmp/t t").unwrap();
+        let url = Url::from_directory_path(&dir)
+            .unwrap()
+            .join("g=x%252Fy/p.parquet")
+            .unwrap();
+        let want = dir.join("g=x%2Fy").join("p.parquet");
+        assert_eq!(line(&url), want.to_string_lossy());
     }
 }
