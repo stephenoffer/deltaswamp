@@ -20,8 +20,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
 "commit_timestamps", "credential_slots", "planned_scan", "values_checked",
-"checkpoint_protection", "domain_metadata", "deferred_create". Gate on this list, not
-`hasattr`, so a stale build refuses cleanly.
+"checkpoint_protection", "domain_metadata", "deferred_create", "dml_stream". Gate on this
+list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -755,8 +755,13 @@ class Snapshot:
         blind_append: bool | None = None,
         add_tags: dict[str, str] | None = None,
         constraints_checked: bool = False,
+        values_checked: list[str] | None = None,
+        stream_data: bool = False,
     ) -> tuple[int, int, int, int]:
         """Commit row-level DML as deletion vectors, in one transaction.
+
+        `stream_data` (feature ``dml_stream``): `data` is pulled as its files
+        are written, in files of the usual size, instead of collected first.
 
         `whole_files` are removed outright; `data_change=False` commits the
         whole thing as a compaction (OPTIMIZE), the same rows in new files:

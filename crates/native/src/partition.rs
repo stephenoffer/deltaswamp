@@ -519,7 +519,7 @@ fn conform_array(array: &ArrayRef, target: &DataType, path: &str) -> Result<Arra
 }
 
 /// Arrow memory per written file above which input batches stop merging.
-const COALESCE_TARGET_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const COALESCE_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// Merge consecutive small batches, preserving row order.
 ///

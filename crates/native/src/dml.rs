@@ -145,6 +145,56 @@ pub enum DmlData {
     /// Pulled one batch at a time and written as each arrives: a compaction's
     /// output files, each one batch.
     Stream(Box<dyn Iterator<Item = Result<RecordBatch>> + Send>),
+    /// A DML's rows, pulled as they are written and cut into files of the
+    /// size every write coalesces to: an UPDATE's or MERGE's output (or a
+    /// copy-on-write rewrite's kept rows) far larger than memory.
+    Rows(
+        arrow::datatypes::SchemaRef,
+        Box<dyn Iterator<Item = Result<RecordBatch>> + Send>,
+    ),
+}
+
+/// The rows of `stream` in chunks of about `partition::COALESCE_TARGET_BYTES`,
+/// each conformed to the table (the `carried` row-tracking columns kept):
+/// the files a streamed DML writes are as large as a collected one's.
+fn coalesced_rows(
+    snapshot: SnapshotRef,
+    stream: impl Iterator<Item = Result<RecordBatch>>,
+    carried: Vec<(String, String)>,
+) -> impl Iterator<Item = Result<Vec<RecordBatch>>> {
+    let mut stream = stream.fuse();
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let mut chunk = Vec::new();
+        let mut bytes = 0usize;
+        loop {
+            match stream.next() {
+                Some(Ok(batch)) if batch.num_rows() == 0 => continue,
+                Some(Ok(batch)) => {
+                    bytes += batch.get_array_memory_size();
+                    chunk.push(batch);
+                    if bytes >= crate::partition::COALESCE_TARGET_BYTES {
+                        break;
+                    }
+                }
+                Some(Err(err)) => {
+                    done = true;
+                    return Some(Err(err));
+                }
+                None => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if chunk.is_empty() {
+            return None;
+        }
+        Some(prepare_dml_carrying(&snapshot, chunk, &carried))
+    })
 }
 
 /// `snapshot` as a compaction's transaction sees it: the same log segment,
@@ -348,8 +398,35 @@ pub fn commit_dml(
     }
 
     let deleted_rows: u64 = touched.values().map(|t| t.newly_deleted).sum();
+    let mut rows = None;
     let (batches, stream) = match data {
         DmlData::Batches(batches) => (batches, None),
+        DmlData::Rows(_, _) if !data_change => {
+            return Err(NativeError::Invalid(
+                "a compaction (data_change=False) streams its rows as one batch per file"
+                    .to_string(),
+            ))
+        }
+        DmlData::Rows(schema, mut stream) => {
+            // The first row decides whether there is anything to commit; it
+            // goes back in front of the rest.
+            let mut first = None;
+            for batch in stream.by_ref() {
+                let batch = batch?;
+                if batch.num_rows() > 0 {
+                    first = Some(batch);
+                    break;
+                }
+            }
+            if let Some(first) = first {
+                rows = Some((
+                    schema,
+                    Box::new(std::iter::once(Ok(first)).chain(stream))
+                        as Box<dyn Iterator<Item = Result<RecordBatch>> + Send>,
+                ));
+            }
+            (Vec::new(), None)
+        }
         DmlData::Stream(_) if data_change => {
             return Err(NativeError::Invalid(
                 "only a compaction (data_change=False) streams its rows".to_string(),
@@ -361,7 +438,7 @@ pub fn commit_dml(
         }
         DmlData::Stream(stream) => (Vec::new(), Some(stream)),
     };
-    if touched.is_empty() && batches.is_empty() {
+    if touched.is_empty() && batches.is_empty() && rows.is_none() {
         // Nothing to change: no commit, as Spark writes none for a no-op DELETE.
         return Ok(DmlOutcome {
             version: snapshot.version(),
@@ -376,7 +453,9 @@ pub fn commit_dml(
         .logical_partition_columns()
         .to_vec();
     let table_schema = snapshot.schema();
-    let dml_carried = if data_change {
+    let dml_carried = if let Some((schema, _)) = &rows {
+        dml_carried_columns(&snapshot, &[RecordBatch::new_empty(schema.clone())])?
+    } else if data_change {
         dml_carried_columns(&snapshot, &batches)?
     } else {
         Vec::new()
@@ -555,8 +634,18 @@ pub fn commit_dml(
         None => None,
     };
     let mut written = Vec::new();
-    let staged = match stream {
-        Some(stream) => commit::stage_stream(
+    let staged = match (rows, stream) {
+        (Some((_, rows)), _) => commit::stage_stream(
+            &mut transaction,
+            &engine,
+            &partition_columns,
+            &table_schema,
+            coalesced_rows(snapshot.clone(), rows, dml_carried.clone()),
+            codec,
+            &mut written,
+            &dml_carried,
+        ),
+        (None, Some(stream)) => commit::stage_stream(
             &mut transaction,
             &engine,
             &partition_columns,
@@ -571,7 +660,7 @@ pub fn commit_dml(
             &mut written,
             &carried,
         ),
-        None if dml_carried.is_empty() => commit::stage_batches(
+        (None, None) if dml_carried.is_empty() => commit::stage_batches(
             &mut transaction,
             &engine,
             &partition_columns,
@@ -582,7 +671,7 @@ pub fn commit_dml(
         ),
         // Rows that bring their ids (and commit versions) along: written
         // with them in the materialized columns, as a compaction's are.
-        None => commit::stage_stream(
+        (None, None) => commit::stage_stream(
             &mut transaction,
             &engine,
             &partition_columns,

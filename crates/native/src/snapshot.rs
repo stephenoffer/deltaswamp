@@ -1517,6 +1517,7 @@ impl PySnapshot {
         add_tags = None,
         constraints_checked = false,
         values_checked = None,
+        stream_data = false,
     ))]
     fn commit_dml(
         &self,
@@ -1535,20 +1536,38 @@ impl PySnapshot {
         add_tags: Option<HashMap<String, String>>,
         constraints_checked: bool,
         values_checked: Option<Vec<String>>,
+        stream_data: bool,
     ) -> PyResult<(u64, u64, usize, usize)> {
         let constraints_checked =
             crate::restate::Checked::from_args(constraints_checked, values_checked)?;
         let deletions = deletions.into_reader()?;
         let data = data.map(|d| d.into_reader()).transpose()?;
         let outcome = py.detach(|| -> Result<dml::DmlOutcome> {
-            let deletions: std::result::Result<Vec<_>, _> = deletions.collect();
-            let deletions = dml::deletions_from_batches(&deletions.map_err(NativeError::from)?)?;
+            // Folded batch by batch into the bitmaps: the positions are never
+            // held as Arrow beside them.
+            let mut folded: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+            for batch in deletions {
+                let batch = batch.map_err(NativeError::from)?;
+                for (path, rows) in dml::deletions_from_batches(std::slice::from_ref(&batch))? {
+                    *folded.entry(path).or_default() |= rows;
+                }
+            }
+            let deletions = folded;
             let data = match data {
                 // A compaction's rows are pulled as they are written: its
                 // input can be far larger than memory.
                 Some(reader) if !data_change => dml::DmlData::Stream(Box::new(
                     reader.map(|batch| batch.map_err(NativeError::from)),
                 )),
+                // A DML whose caller streams its rows: pulled as they are
+                // written, in files of the usual size.
+                Some(reader) if stream_data => {
+                    let schema = reader.schema();
+                    dml::DmlData::Rows(
+                        schema,
+                        Box::new(reader.map(|batch| batch.map_err(NativeError::from))),
+                    )
+                }
                 Some(reader) => {
                     let batches: std::result::Result<Vec<_>, _> = reader.collect();
                     dml::DmlData::Batches(batches.map_err(NativeError::from)?)

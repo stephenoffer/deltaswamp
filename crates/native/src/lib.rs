@@ -167,6 +167,9 @@ pub const FEATURES: &[&str] = &[
     // created by a distributed write, resolved by workers from a template
     // version 0 before it exists, and undone if its data never lands.
     "deferred_create",
+    // `commit_dml(stream_data=True)`: a DML's rows pulled as they are
+    // written, in files of the usual size, instead of collected first.
+    "dml_stream",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.
