@@ -309,6 +309,12 @@ def _error_kind(exc: BaseException) -> str | None:
     return None
 
 
+def _external_write_refused(exc: BaseException) -> bool:
+    """Whether a vend failed because the table takes no external writes."""
+    code = str(getattr(exc, "error_code", "") or "").upper()
+    return "EXTERNAL_WRITE_NOT_ALLOWED" in code or "EXTERNAL_WRITE_NOT_ALLOWED" in str(exc).upper()
+
+
 def _config_attributes(config: Any) -> dict[str, Any]:
     """The plain, picklable attributes a `Config` was built from."""
     try:
@@ -372,6 +378,53 @@ def shipping(obj: Any) -> Any:
     copy.__dict__.update(obj.__dict__)
     copy._ship_secrets = True
     return copy
+
+
+#: Keys `credential_identity` digests with a secret of this process's own, so
+#: the identity carries nothing checkable offline against a guessed token.
+_IDENTITY_KEY = os.urandom(32)
+
+#: Providers unpickled in this process, by identity: every read task of a
+#: plan unpickles its own copy, and each vended (and built a client) anew --
+#: N tasks in one worker, N vends of the same credential. Bounded, oldest out.
+_SHARED_PROVIDERS: dict[tuple[type, str, bool], DatabricksCredentialProvider] = {}
+_SHARED_LIMIT = 256
+#: Workspace clients by authentication, shared across tables: N tables were
+#: N OAuth token fetches in every process.
+_SHARED_CLIENTS: dict[str, Any] = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def _auth_digest(parts: Any) -> str:
+    import hashlib
+    import json
+
+    material = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.blake2b(material.encode(), key=_IDENTITY_KEY, digest_size=16).hexdigest()
+
+
+def _shared_provider(
+    cls: type[DatabricksCredentialProvider], state: dict[str, Any], pickled_in: int
+) -> DatabricksCredentialProvider:
+    """Unpickle a provider, reusing this process's copy of the same one.
+
+    Only across processes: a copy made in the process that pickled it (a
+    `copy.deepcopy`, a pickle round trip in tests) is a new object, as copies
+    are expected to be.
+    """
+    provider = cls.__new__(cls)
+    provider.__setstate__(state)
+    if pickled_in == os.getpid():
+        return provider
+    key = (cls, provider.credential_identity(), bool(state.get("_ship_secrets")))
+    with _SHARED_LOCK:
+        existing = _SHARED_PROVIDERS.get(key)
+        if existing is not None:
+            return existing
+        if len(_SHARED_PROVIDERS) >= _SHARED_LIMIT:
+            _SHARED_PROVIDERS.pop(next(iter(_SHARED_PROVIDERS)))
+        _SHARED_PROVIDERS[key] = provider
+    return provider
 
 
 class DatabricksCredentialProvider:
@@ -443,6 +496,7 @@ class DatabricksCredentialProvider:
         state["_vended_at"] = {}
         state["_retry_after"] = {}
         state["_skewed"] = set()
+        state.pop("_identity", None)
         # Locks cannot be pickled; __setstate__ installs fresh ones.
         del state["_lock"]
         state.pop("_vend_locks", None)
@@ -459,6 +513,33 @@ class DatabricksCredentialProvider:
             state["_token"] = None
             state["_config_kwargs"] = without_secrets(state["_config_kwargs"])
         return state
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # See `_shared_provider`: one copy per process on the far side.
+        return (_shared_provider, (type(self), self.__getstate__(), os.getpid()))
+
+    def credential_identity(self) -> str:
+        """Who vends for which table: the same from every copy of this provider.
+
+        A keyed digest of the workspace, the authentication settings (secrets
+        included, so two principals never share a credential) and the table.
+        """
+        cached = self.__dict__.get("_identity")
+        if cached is not None:
+            return str(cached)
+        config = self._explicit_config
+        attributes = _config_attributes(config) if config is not None else {}
+        digest = _auth_digest(
+            [
+                self._host,
+                self._profile,
+                self._token,
+                {**attributes, **self._config_kwargs},
+            ]
+        )
+        identity = f"dbx-{digest}-{self._table_id}"
+        self._identity = identity
+        return identity
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         state.setdefault("_ship_secrets", False)
@@ -491,7 +572,19 @@ class DatabricksCredentialProvider:
             ):
                 if value:
                     kwargs[key] = value
-            self._client = workspace_client(config=self._explicit_config, **kwargs)
+            if self._explicit_config is not None:
+                self._client = workspace_client(config=self._explicit_config, **kwargs)
+            else:
+                # The same authentication gets one client per process, whatever
+                # the table: each client fetched its own OAuth token.
+                key = f"{id(workspace_client):x}-{_auth_digest(kwargs)}"
+                with _SHARED_LOCK:
+                    client = _SHARED_CLIENTS.get(key)
+                if client is None:
+                    client = workspace_client(**kwargs)
+                    with _SHARED_LOCK:
+                        client = _SHARED_CLIENTS.setdefault(key, client)
+                self._client = client
         return self._client
 
     def _margin_for(self, operation: Operation, cached: Credentials) -> float:
@@ -625,6 +718,19 @@ class DatabricksCredentialProvider:
                 table_id=self._table_id, operation=op
             )
         except Exception as exc:
+            if _external_write_refused(exc):
+                from ..errors import ExternalWriteNotAllowedError
+
+                raise ExternalWriteNotAllowedError(
+                    f"Unity Catalog will not vend write credentials for table_id="
+                    f"{self._table_id} (EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE): it is a "
+                    "managed table without catalog commits, and Databricks accepts writes "
+                    "to managed tables from outside Databricks only through catalog "
+                    "commits. Enable catalog commits on the table (catalog-managed), write "
+                    "to an external table instead, or pass allow_sql_fallback=True to write "
+                    "through a SQL warehouse (a driver-side Table.append, not a distributed "
+                    f"write). Underlying error: {sdk_message(exc)}"
+                ) from exc
             kind = _error_kind(exc)
             if kind == "transient":
                 raise CredentialError(
@@ -741,8 +847,17 @@ def credentials_from_response(
         if token := _get(aws, "session_token"):
             secrets["aws_session_token"] = str(token)
         # UC vends keys but never a region, and object_store would assume
-        # us-east-1; any other bucket then fails with an opaque redirect.
-        region = aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        # us-east-1; any other bucket then fails with an opaque redirect. The
+        # catalog's region is its metastore's, which an external table's
+        # bucket need not share, so the bucket's own region comes first.
+        from .._storage import s3_bucket_region
+
+        region = (
+            s3_bucket_region(url)
+            or aws_region
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+        )
         if region:
             secrets["aws_region"] = region
         if access_point := _get(aws, "access_point"):

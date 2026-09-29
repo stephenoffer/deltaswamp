@@ -15,6 +15,7 @@ import dataclasses
 import http.client
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -406,16 +407,31 @@ class OSSUnityCredentialProvider:
         self._token = token
         self._cache: dict[Operation, Credentials] = {}
         self._vended_at: dict[Operation, float] = {}
+        # One vend at a time: threads that found the cache stale together
+        # each vended, one request per thread for the same credential.
+        self._vend_lock = threading.Lock()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["_cache"] = {}
         state["_vended_at"] = {}
+        state.pop("_vend_lock", None)
         return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._vend_lock = threading.Lock()
 
     @property
     def table_id(self) -> str | None:
         return self._table_id
+
+    def credential_identity(self) -> str:
+        """Who vends for which table, the same from every copy (see credentials.refresh)."""
+        from ..credentials.databricks import _auth_digest
+
+        digest = _auth_digest([self._base_url, self._token])
+        return f"ossuc-{digest}-{self._catalog}.{self._schema}.{self._table}"
 
     def workspace_auth(self) -> tuple[str, str]:
         """`(base_url, token)` for the commit API."""
@@ -436,6 +452,16 @@ class OSSUnityCredentialProvider:
         cached = self._cache.get(operation)
         if cached is not None and not cached.expires_within(self._margin(operation, cached)):
             return cached
+        lock = self.__dict__.get("_vend_lock")
+        if lock is None:
+            lock = self._vend_lock = threading.Lock()
+        with lock:
+            cached = self._cache.get(operation)
+            if cached is not None and not cached.expires_within(self._margin(operation, cached)):
+                return cached  # vended by the thread this one waited on
+            return self._vend(operation)
+
+    def _vend(self, operation: Operation) -> Credentials:
         # Percent-encoded: a name with a space, '#', '?' or '/' otherwise
         # built a different URL (or a different table) entirely.
         query = urllib.parse.urlencode({"operation": operation.value})

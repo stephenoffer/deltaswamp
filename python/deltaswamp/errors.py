@@ -295,6 +295,15 @@ class CredentialError(DeltaSwampError):
     """Credential vending or refresh failed."""
 
 
+class ExternalWriteNotAllowedError(CredentialError):
+    """Unity Catalog vends no write credentials for this table.
+
+    Databricks' ``EXTERNAL_WRITE_NOT_ALLOWED_FOR_TABLE``: a managed table
+    accepts writes from outside Databricks only when it uses catalog commits
+    (``catalogManaged``). Raised at planning, before any worker runs.
+    """
+
+
 class PreflightError(DeltaSwampError):
     """A required workspace/metastore prerequisite is not satisfied.
 
