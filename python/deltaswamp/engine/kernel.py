@@ -1218,7 +1218,7 @@ class KernelEngine:
 
         def resolve() -> Any:
             options = self._options(table, write=write)
-            key = (location, version, _store_fingerprint(options), table.table_id)
+            key: tuple[Any, ...] = (location, version, _store_fingerprint(options), table.table_id)
             if by_tail:
                 key = (*key, table.max_catalog_version, tuple(log_tail or ()))
                 if not (write if fresh is None else fresh):
@@ -5391,10 +5391,11 @@ class KernelEngine:
         paths = [s.path for s in splits]
         planned = {getattr(s, "planned", None) for s in splits}
         rows = [getattr(s, "scan_row", None) for s in splits]
+        known = [r for r in rows if r is not None]
         if (
             len(planned) == 1
             and None not in planned
-            and None not in rows
+            and len(known) == len(rows)
             and _native_has("planned_scan")
         ):
             # Planned with each file's scan row: read them with no log
@@ -5402,7 +5403,7 @@ class KernelEngine:
             # catalog has since published and removed.
             state = next(iter(planned))
             snapshot = self._planned_snapshot(table, state)
-            return _planned_read(snapshot, columns, predicate, files=paths, scan_rows=rows)
+            return _planned_read(snapshot, columns, predicate, files=paths, scan_rows=known)
         snapshot = self.snapshot(table, version=version)
         return _planned_read(snapshot, columns, predicate, files=paths)
 

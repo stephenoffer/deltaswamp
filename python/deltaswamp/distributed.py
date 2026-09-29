@@ -22,7 +22,14 @@ from typing import Any, ClassVar, cast
 
 from ._util import commit_backoff
 
-__all__ = ["DeltaSwampDatasource", "ScanPlan", "WritePlan", "balance"]
+__all__ = [
+    "ChangesPlan",
+    "ChangesSplit",
+    "DeltaSwampDatasource",
+    "ScanPlan",
+    "WritePlan",
+    "balance",
+]
 
 
 @dataclass(frozen=True)
@@ -136,6 +143,139 @@ class ScanPlan:
         if isinstance(n, bool) or not isinstance(n, int) or n < 1:
             raise InvalidArgumentError(f"partitions(n) needs a positive int, not {n!r}")
         return balance(self.splits, n)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangesSplit:
+    """One unit of change-feed work: the commits `start..end` (both inclusive).
+
+    A split is a run of whole commits, never part of one: a commit's
+    deletion-vector updates pair a remove with an add of the same file, and
+    only a reader of both sides tells an update from a delete and an insert.
+    `size` is the bytes of data files the commits' changes read, which is
+    what `balance` weighs.
+    """
+
+    start: int
+    end: int
+    size: int
+
+    @property
+    def path(self) -> str:
+        # `balance` breaks size ties by path, so equal splits group the same
+        # way on every run.
+        return f"{self.start:020d}"
+
+
+@dataclass(frozen=True)
+class ChangesPlan:
+    """A distributed change-feed read: runs of commits, read on workers.
+
+    Built by `Table.plan_changes()`, which pins the range's end, refuses a
+    range no worker could read (a catalog-managed table, the feed off within
+    it, a schema change across it) and splits it into runs of commits of about
+    the same bytes. Picklable as `ScanPlan` is, with the same credential rules.
+    """
+
+    engine: Any
+    table: Any
+    splits: tuple[ChangesSplit, ...]
+    columns: tuple[str, ...] | None = None
+    predicate: str | None = None
+    ship_catalog_auth: bool = False
+    interval_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = ()
+
+    @property
+    def starting_version(self) -> int | None:
+        return self.splits[0].start if self.splits else None
+
+    @property
+    def ending_version(self) -> int | None:
+        return self.splits[-1].end if self.splits else None
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(s.size for s in self.splits)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        fields = {f.name: getattr(self, f.name) for f in dataclass_fields(self)}
+        if not self.ship_catalog_auth:
+            fields["table"] = _for_workers(self.table, write=False)
+        else:
+            fields["table"] = _shipping_table(self.table)
+        return (_rebuild, (type(self), fields))
+
+    def read(self, splits: Iterable[ChangesSplit] | None = None) -> Any:
+        """Read some (default: all) of the planned splits as a pyarrow Table."""
+        return self.stream(splits).read_all()
+
+    def stream(self, splits: Iterable[ChangesSplit] | None = None) -> Any:
+        """The change feed of some (default: all) splits, in commit order."""
+        import pyarrow as pa
+
+        from .errors import InvalidArgumentError
+
+        chosen = sorted(self.splits if splits is None else splits, key=lambda s: s.start)
+        stray = [s for s in chosen if s not in self.splits]
+        if stray:
+            raise InvalidArgumentError(
+                f"{len(stray)} split(s) are not part of this plan (e.g. commits "
+                f"{stray[0].start}..{stray[0].end}); read splits only through their own plan"
+            )
+        if not chosen:
+            # No splits asked for: the feed's schema, with no rows.
+            schema = self._split_stream(self.splits[0]).schema
+            return pa.RecordBatchReader.from_batches(schema, iter(()))
+        first = self._split_stream(chosen[0])
+        schema = first.schema
+
+        def batches() -> Iterator[Any]:
+            yield from first
+            for split in chosen[1:]:
+                reader = self._split_stream(split)
+                # One schema across the plan (planning refused a range across
+                # a change); a difference would be a bug, not data to cast.
+                if not reader.schema.equals(schema):
+                    raise InvalidArgumentError(
+                        f"commits {split.start}..{split.end} read with another schema than "
+                        f"commits {chosen[0].start}..{chosen[0].end}"
+                    )
+                yield from reader
+
+        return pa.RecordBatchReader.from_batches(schema, batches())
+
+    def _split_stream(self, split: ChangesSplit) -> Any:
+        import pyarrow as pa
+
+        from .engine.base import translating_stream
+
+        stream = self.engine.cdf(
+            self.table,
+            starting_version=split.start,
+            ending_version=split.end,
+            columns=list(self.columns) if self.columns is not None else None,
+            predicate=self.predicate,
+        )
+        if self.interval_paths:
+            from .engine.intervals import interval_stream
+
+            stream = interval_stream(stream, {g: frozenset(p) for g, p in self.interval_paths})
+        from .table import _cdf_types
+
+        where = getattr(self.table, "location", None) or "the table"
+        stream = translating_stream(
+            _cdf_types(stream),
+            f"the change data feed of {where}, commits {split.start}..{split.end}",
+        )
+        return pa.RecordBatchReader.from_stream(stream)
+
+    def partitions(self, n: int) -> list[tuple[ChangesSplit, ...]]:
+        """The splits in at most `n` byte-balanced groups, each in commit order."""
+        from .errors import InvalidArgumentError
+
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise InvalidArgumentError(f"partitions(n) needs a positive int, not {n!r}")
+        return [tuple(sorted(g, key=lambda s: s.start)) for g in balance(self.splits, n)]
 
 
 @dataclass(frozen=True)

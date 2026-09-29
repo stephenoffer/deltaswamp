@@ -514,11 +514,12 @@ class Snapshot:
         `delta.setTransactionRetentionDuration` read as None.
         """
 
-    def commit_log(self, after: int) -> list[tuple[int, str]]:
+    def commit_log(self, after: int, until: int | None = None) -> list[tuple[int, str]]:
         """The raw commit files after version `after` up to this one, ascending.
 
         `(version, text)`, each text the newline-delimited actions of that
-        commit. Published commits only.
+        commit. Published commits only. `until` stops at that version instead
+        (never past this one), to read a long range in chunks.
         """
 
     def write_checksum(self, always: bool = False) -> bool:

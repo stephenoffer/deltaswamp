@@ -170,7 +170,9 @@ class TestCatalogManaged:
                 conn.table("main.s.t").append(pa.table({"id": [i]}))
             table = conn.table("main.s.t")
             plan = pickle.dumps(table.plan_scan())
-            staged = Path(table.location.removeprefix("file://")) / "_delta_log" / "_staged_commits"
+            assert table.location is not None
+            root = Path(table.location.removeprefix("file://"))
+            staged = root / "_delta_log" / "_staged_commits"
             assert any(staged.iterdir())  # the tail really is staged
             shutil.rmtree(staged)
             KernelEngine._snapshots.clear()

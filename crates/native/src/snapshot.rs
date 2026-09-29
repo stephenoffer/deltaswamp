@@ -1043,8 +1043,20 @@ impl PySnapshot {
     /// rules: whether each winning commit was a blind append, and which files
     /// it added. Published commits only, so a catalog-managed table's
     /// ratified tail is not covered; callers do not rebase those.
-    fn commit_log(&self, py: Python<'_>, after: u64) -> PyResult<Vec<(u64, String)>> {
-        let end = self.inner.version();
+    ///
+    /// `until` stops at that version instead, so a long range is read in
+    /// bounded chunks.
+    #[pyo3(signature = (after, until = None))]
+    fn commit_log(
+        &self,
+        py: Python<'_>,
+        after: u64,
+        until: Option<u64>,
+    ) -> PyResult<Vec<(u64, String)>> {
+        if self.planned {
+            return Err(self.planned_refusal("read its commits"));
+        }
+        let end = until.map_or(self.inner.version(), |u| u.min(self.inner.version()));
         let root = self.inner.table_root().clone();
         let texts = py.detach(|| -> Result<Vec<(u64, String)>> {
             if after >= end {
