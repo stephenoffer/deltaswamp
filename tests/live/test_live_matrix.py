@@ -256,7 +256,6 @@ SHAPES: list[Shape] = [
         "geospatial",
         "CREATE TABLE {t} (id BIGINT, g GEOMETRY(4326))",
         "INSERT INTO {t} VALUES (1, ST_GeomFromText('POINT(1 2)', 4326))",
-        direct_read=False,
     ),
     _shape(
         "catalog_managed",
