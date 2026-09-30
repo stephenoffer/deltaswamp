@@ -305,9 +305,22 @@ including a catalog-managed table's ratified tail -- for the job's paths
 in part: refused. Not readable: nothing is committed. So a driver may commit
 the same fragments again after a timeout. A failure that certainly committed
 nothing deletes the job's files (`WritePlan.abort`); an ambiguous one keeps
-them. Overwrite removes are streamed from the scan with their statistics
-dropped, though delta-kernel-rs 0.28 still holds them until the commit, and a
-commit that would add and remove one path is refused.
+them. An overwrite's removes are built by hand from a log replay the commit
+runs while it writes the log file (delta-kernel-rs 0.28 holds every remove it
+stages), so only the commit file is held; a commit that would add and remove
+one path is refused.
+
+A kernel MERGE whose ON condition equates keys runs in buckets, as Spark
+shuffles one: the source and the candidate target rows are hash-partitioned
+by the keys into local Parquet spill files, and each bucket is evaluated in
+DuckDB on its own. UPDATE transforms matched rows a chunk at a time, a
+copy-on-write rewrite reads its touched files back a few at a time, and the
+native commit pulls the rows as it writes their files (`commit_dml(
+stream_data=True)`).
+
+A store built from a credential slot is wrapped (`auth_retry.rs`): a request
+storage refuses with 401/403 or an expired token asks the slot's publisher
+for a fresh credential, waits for it, and is sent again once.
 
 A write that creates its table (`Connection.plan_write`) writes a template
 version 0 under `_deltaswamp_pending/<plan>/` in the table root, outside the

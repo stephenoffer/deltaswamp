@@ -631,8 +631,13 @@ Without deletion vectors, delta-rs serves DML as copy-on-write, rewriting the
 Parquet files that hold matching rows. On a table only the kernel can write,
 `delete`, `update` and predicate overwrites do the same: the kernel rewrites
 only the files that hold matching rows, keeping row ids on row-tracked tables,
-with the same SQL as on the deletion-vector path, and refuses a rewrite that
-would read more than `KernelEngine.dml_max_bytes` (4 GiB). On a table with the
+with the same SQL as on the deletion-vector path, reading the touched files
+back a few at a time; `KernelEngine.dml_max_bytes` optionally caps what a
+rewrite or a MERGE may read (off by default). A MERGE whose ON condition
+equates keys runs in hash buckets over local spill files
+(`KernelEngine.dml_spill_directory`, the system temp directory by default),
+so neither its source nor its target need fit in memory; its source may be a
+`pyarrow.RecordBatchReader` or dataset. On a table with the
 change data feed enabled, the kernel serves only DELETE, because UPDATE and
 MERGE need CDC files it cannot write. deltalake 1.6.5 inserts an all-NULL row
 for each source row a conditional `when_not_matched_insert` rejects on such a
@@ -1454,11 +1459,12 @@ reached.
   false (short decimal literals are DOUBLEs), and a DOUBLE divided by zero is
   infinity rather than an error; DuckDB upper-cases `ß` to `ẞ`; neither
   raises on INT overflow where Spark's ANSI mode does.
-- DML on a kernel-only table without deletion vectors rewrites the files it
-  touches, and MERGE reads its source and candidate files into memory; both
-  are refused past `KernelEngine.dml_max_bytes` (4 GiB) rather than running
-  out of memory. UPDATE and MERGE on a change-data-feed table need the
-  warehouse, since the kernel cannot write CDC files.
+- A kernel MERGE without a key equality in its ON condition runs in memory.
+  UPDATE and MERGE on a change-data-feed table need the warehouse, since the
+  kernel cannot write CDC files.
+- Operations delta-rs serves hold the credential they start with: deltalake
+  takes no credential provider. One that starts with less than
+  `DeltaRsEngine.expiry_warning_seconds` (600) of credential life warns.
 - The change feed of a catalog-managed table needs the warehouse.
 - delta-rs reads pre-1582 dates and timestamps from Spark's legacy-calendar
   files unrebased (2-10 days off); the kernel rebases them. Ancient timestamps

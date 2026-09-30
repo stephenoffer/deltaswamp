@@ -99,6 +99,15 @@ First release.
     change-data-feed tables.
   - `Connection.plan_write(name, schema=...)` creates the table at commit,
     with its data, and undoes the create when the job fails.
+  - A kernel MERGE larger than memory runs in hash buckets over local spill
+    files (`KernelEngine.dml_spill_directory`, `dml_bucket_bytes`); a source
+    may be a RecordBatchReader or a pyarrow dataset, streamed in. UPDATEs and
+    copy-on-write rewrites stream their rows into the commit.
+    `dml_max_bytes` is an optional cap, off by default.
+  - An overwrite's removes are produced while its commit is written instead
+    of held beforehand.
+  - A request storage refuses (401/403, an expired token) is retried once
+    with a credential re-vended then.
   - On catalog-managed tables, DML rebases over concurrent appends by
     re-reading the catalog's tail, and OPTIMIZE, Z-ORDER, RESTORE and VACUUM
     (`allow_catalog_managed=True`) commit through the catalog.
@@ -553,13 +562,13 @@ See docs/usage.md, "Security notes".
 - A new table created by `Connection.plan_write` is two commits: an empty
   version 0, then the data. A driver that dies between them leaves an empty
   table; a managed table's staging allocation cannot be released.
-- delta-kernel-rs 0.28 holds an overwrite's removes (without statistics) in
-  memory until the commit.
-- A kernel MERGE reads its source and candidate files into memory; past
-  `KernelEngine.dml_max_bytes` (4 GiB) it is refused rather than running out
-  of memory.
-- Operations delta-rs serves take a static credential for their duration: it
-  cannot read the refreshing credential slot.
+- An overwrite's commit file is written in one request, so the driver holds
+  it whole (about 200 bytes per removed file).
+- A kernel MERGE without key equalities in its ON condition runs in memory;
+  one with them runs in buckets over local spill files.
+- Operations delta-rs serves hold the credential they start with (deltalake
+  takes no credential provider); one that starts with less than ten minutes
+  of credential life warns.
 - Tables written through delta-rs keep no min/max statistics for decimal
   columns of more than 15 digits (or structs holding one): delta-rs would log
   them as rounded doubles, which Databricks trusts for data skipping. Files

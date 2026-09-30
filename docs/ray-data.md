@@ -93,12 +93,18 @@ Measured locally (see the commit messages for method):
   `deltaswamp/<version>` is registered, those need
   `allow_sql_fallback=True` on Databricks (a driver-side write). OSS Unity
   Catalog is unaffected.
-- **Overwrite removes** are held by delta-kernel-rs 0.28 until commit
-  (without statistics); fully streaming them needs a kernel change.
-- **Kernel MERGE** reads its source and candidate target files into memory,
-  bounded by `KernelEngine.dml_max_bytes` (refused past it, never OOM).
-- **delta-rs paths** (tables only delta-rs can serve) get static credentials:
-  delta-rs cannot read a credential slot.
+- **An overwrite's commit file** is written in one put-if-absent, so the
+  driver holds it whole (about 200 bytes per removed file). The removes
+  themselves are produced as it is written, not held beforehand.
+- **Kernel MERGE** runs in hash buckets over local spill files when its ON
+  condition equates keys; one without such keys runs in memory. It needs
+  local disk (`KernelEngine.dml_spill_directory`) of about the data it reads.
+- **delta-rs operations** hold the credential they start with: deltalake
+  (through 1.6.6) takes storage options, not a credential provider. Each
+  operation vends afresh as it opens the table, and one that starts with
+  less than `DeltaRsEngine.expiry_warning_seconds` (10 minutes) of
+  credential life warns (`CredentialExpiryWarning`). Kernel operations
+  refresh theirs as they run, and retry once when storage refuses one.
 - **Create is two commits.** A new table's empty version 0 lands just before
   its data (the kernel cannot write a first version with data and one set of
   column-mapping names across workers). A driver that dies between the two
