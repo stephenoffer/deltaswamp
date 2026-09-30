@@ -65,14 +65,22 @@ fn lookup(id: &str) -> Option<Arc<Slot>> {
 
 /// Publish `options` (a vended credential, as storage options) in slot `id`,
 /// creating it on first use.
+#[cfg(test)]
 pub fn set(id: &str, options: HashMap<String, String>, expires_at: Option<f64>) {
+    publish(id, options, expires_at, false);
+}
+
+/// [`set`]; `force`: a new generation even when unchanged, the answer to a
+/// store's [`request_refresh`] that vending gave the same credential again,
+/// so the store retries at once instead of waiting.
+pub fn publish(id: &str, options: HashMap<String, String>, expires_at: Option<f64>, force: bool) {
     let slot = {
         let mut slots = SLOTS.lock().unwrap_or_else(|p| p.into_inner());
         slots.entry(id.to_string()).or_default().clone()
     };
     {
         let mut state = slot.state.write().unwrap_or_else(|p| p.into_inner());
-        if state.options == options && state.expires_at == expires_at {
+        if !force && state.options == options && state.expires_at == expires_at {
             return;
         }
         state.options = options;
@@ -80,6 +88,71 @@ pub fn set(id: &str, options: HashMap<String, String>, expires_at: Option<f64>) 
         state.generation += 1;
     }
     slot.changed.notify_waiters();
+}
+
+/// The generation of slot `id`'s credential, if the slot exists.
+pub fn generation(id: &str) -> Option<u64> {
+    lookup(id).map(|slot| {
+        slot.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
+    })
+}
+
+/// Slots whose stores were refused by storage (a 401 or 403) and want a
+/// fresh credential now, and the condition the refresher waits on.
+static REQUESTS: LazyLock<(
+    Mutex<std::collections::BTreeSet<String>>,
+    std::sync::Condvar,
+)> = LazyLock::new(Default::default);
+
+/// Ask whoever publishes slot `id` for a fresh credential now.
+pub fn request_refresh(id: &str) {
+    let (requests, ready) = &*REQUESTS;
+    requests
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id.to_string());
+    ready.notify_all();
+}
+
+/// The slots asked for a refresh, waiting up to `timeout` for one. Blocks:
+/// the publisher's own thread calls it, without the GIL.
+pub fn wait_requests(timeout: Duration) -> Vec<String> {
+    let (requests, ready) = &*REQUESTS;
+    let mut pending = requests.lock().unwrap_or_else(|p| p.into_inner());
+    if pending.is_empty() {
+        pending = ready
+            .wait_timeout(pending, timeout)
+            .map(|(guard, _)| guard)
+            .unwrap_or_else(|p| p.into_inner().0);
+    }
+    std::mem::take(&mut *pending).into_iter().collect()
+}
+
+/// Whether slot `id` publishes a generation after `since` within `timeout`.
+pub async fn wait_newer(id: &str, since: u64, timeout: Duration) -> bool {
+    let Some(slot) = lookup(id) else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        let notified = slot.changed.notified();
+        let now = slot
+            .state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation;
+        if now > since {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let _ = tokio::time::timeout(left.min(Duration::from_secs(1)), notified).await;
+    }
 }
 
 /// Forget slot `id`. Stores built from it keep the credential they last saw.

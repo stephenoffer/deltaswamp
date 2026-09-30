@@ -19,7 +19,7 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "restore", "commit_actions", "row_tracking_compaction", "add_tags", "write_checksum",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
-"commit_timestamps", "credential_slots", "planned_scan", "values_checked",
+"commit_timestamps", "credential_slots", "credential_retry", "planned_scan", "values_checked",
 "checkpoint_protection", "domain_metadata", "deferred_create", "dml_stream". Gate on this
 list, not `hasattr`, so a stale build refuses cleanly.
 """
@@ -166,9 +166,20 @@ def validate_retry_options(options: dict[str, str]) -> None:
     """
 
 def set_credential_slot(
-    slot: str, options: dict[str, str], expires_at: float | None = None
+    slot: str, options: dict[str, str], expires_at: float | None = None, force: bool = False
 ) -> None:
-    """Publish a freshly vended credential in `slot`, for stores built with its key."""
+    """Publish a freshly vended credential in `slot`, for stores built with its key.
+
+    `force`: a new generation even when unchanged, answering a store that
+    asked for a refresh (feature ``credential_retry``).
+    """
+
+def wait_credential_requests(timeout: float = 5.0) -> list[str]:
+    """Slots whose stores storage refused since the last call, waiting up to
+    `timeout` seconds for one (feature ``credential_retry``)."""
+
+def request_credential_refresh(slot: str) -> None:
+    """Ask `slot`'s publisher for a fresh credential now (for tests)."""
 
 def remove_credential_slot(slot: str) -> None:
     """Forget `slot`; stores built from it keep the credential they last saw."""

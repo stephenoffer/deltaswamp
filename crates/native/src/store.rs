@@ -404,7 +404,9 @@ pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<D
                 let provider: AzureCredentialProvider =
                     Arc::new(SlotProvider::new(slot, credential, credential_slot::azure));
                 let options = without(&options, credential_slot::AZURE_KEYS);
-                return build_with(&target, &options, retry, Some(Refreshing::Azure(provider)));
+                let store =
+                    build_with(&target, &options, retry, Some(Refreshing::Azure(provider)))?;
+                return Ok(retrying(store, slot));
             }
         }
         if retry.is_some() {
@@ -427,7 +429,8 @@ pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<D
                 let provider: AwsCredentialProvider =
                     Arc::new(SlotProvider::new(slot, credential, credential_slot::aws));
                 let options = without(options, credential_slot::AWS_KEYS);
-                return build_with(url, &options, retry, Some(Refreshing::Aws(provider)));
+                let store = build_with(url, &options, retry, Some(Refreshing::Aws(provider)))?;
+                return Ok(retrying(store, slot));
             }
         }
     }
@@ -513,8 +516,17 @@ fn build_gcs_with_bearer(
         Some(slot) => Arc::new(SlotProvider::new(slot, credential, credential_slot::gcp)),
         None => Arc::new(StaticCredentialProvider::new(credential)),
     };
-    let store = builder.with_credentials(provider).build()?;
-    Ok(Arc::new(store))
+    let store: Arc<DynObjectStore> = Arc::new(builder.with_credentials(provider).build()?);
+    Ok(match slot {
+        Some(slot) => retrying(store, slot),
+        None => store,
+    })
+}
+
+/// `store`, asking slot `slot` for a fresh credential once when storage
+/// refuses the one it has (see `crate::auth_retry`).
+fn retrying(store: Arc<DynObjectStore>, slot: &str) -> Arc<DynObjectStore> {
+    Arc::new(crate::auth_retry::AuthRetryStore::new(store, slot))
 }
 
 #[cfg(test)]
@@ -836,6 +848,154 @@ mod tests {
                 .collect()
         });
         (port, server)
+    }
+
+    /// A server that answers with `statuses` in turn and returns each
+    /// request's lower-cased text.
+    fn scripted_server(
+        statuses: &'static [&'static str],
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            statuses
+                .iter()
+                .map(|status| {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf = vec![0u8; 8192];
+                    let read = sock.read(&mut buf).unwrap();
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: 0\r\nlast-modified: \
+                         Tue, 29 Sep 2026 10:00:00 GMT\r\netag: \"1\"\r\n\
+                         connection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(reply.as_bytes());
+                    String::from_utf8_lossy(&buf[..read]).to_lowercase()
+                })
+                .collect()
+        });
+        (port, server)
+    }
+
+    fn far() -> Option<f64> {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+                + 3600.0,
+        )
+    }
+
+    fn gcs_store(port: u16, slot: &str, token: &str) -> Arc<DynObjectStore> {
+        let base = format!("http://127.0.0.1:{port}");
+        let o = opts(&[
+            ("google_bearer_token", token),
+            ("google_base_url", base.as_str()),
+            ("allow_http", "true"),
+            ("max_retries", "0"),
+            (SLOT_KEY, slot),
+        ]);
+        build_store(&Url::parse("gs://bucket/table/").unwrap(), &o).unwrap()
+    }
+
+    /// The Python refresher's part, for one slot: publish `token` when the
+    /// slot's store asks. Requests for other slots (other tests running at
+    /// once) are handed back, since each wait takes every pending request.
+    fn answer(slot: &str, token: &'static str, force: bool) -> std::thread::JoinHandle<()> {
+        let slot = slot.to_string();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                let asked = crate::credential_slot::wait_requests(Duration::from_millis(200));
+                let mine = asked.contains(&slot);
+                for other in asked.into_iter().filter(|s| *s != slot) {
+                    crate::credential_slot::request_refresh(&other);
+                }
+                if mine {
+                    crate::credential_slot::publish(
+                        &slot,
+                        opts(&[("google_bearer_token", token)]),
+                        far(),
+                        force,
+                    );
+                    return;
+                }
+            }
+        })
+    }
+
+    /// A request storage refuses asks the slot's publisher for a fresh
+    /// credential and is sent again once, with it; the caller sees success.
+    #[test]
+    fn a_refused_request_is_retried_once_with_a_fresh_credential() {
+        use delta_kernel::object_store::{path::Path, ObjectStoreExt};
+
+        let slot = format!("test-{}", uuid::Uuid::new_v4());
+        crate::credential_slot::set(&slot, opts(&[("google_bearer_token", "ya29.stale")]), far());
+        let publisher = answer(&slot, "ya29.fresh", false);
+        let (port, server) = scripted_server(&["403 Forbidden", "200 OK"]);
+        let store = gcs_store(port, &slot, "ya29.stale");
+        let head = crate::runtime::block_on(async {
+            store.head(&Path::from("table/_delta_log/x.json")).await
+        });
+        publisher.join().unwrap();
+        let requests = server.join().unwrap();
+        crate::credential_slot::remove(&slot);
+        assert!(head.is_ok(), "{head:?}");
+        assert!(requests[0].contains("bearer ya29.stale"), "{}", requests[0]);
+        assert!(requests[1].contains("bearer ya29.fresh"), "{}", requests[1]);
+    }
+
+    /// A second refusal is the store's own error: retried once, not forever.
+    #[test]
+    fn a_second_refusal_is_the_error() {
+        use delta_kernel::object_store::{path::Path, ObjectStoreExt};
+
+        let slot = format!("test-{}", uuid::Uuid::new_v4());
+        crate::credential_slot::set(&slot, opts(&[("google_bearer_token", "ya29.a")]), far());
+        // Vending gives the same credential: published as new anyway, so
+        // the store retries at once rather than waiting out its timeout.
+        let publisher = answer(&slot, "ya29.a", true);
+        let (port, server) = scripted_server(&["403 Forbidden", "403 Forbidden"]);
+        let store = gcs_store(port, &slot, "ya29.a");
+        let started = std::time::Instant::now();
+        let head = crate::runtime::block_on(async {
+            store.head(&Path::from("table/_delta_log/x.json")).await
+        });
+        publisher.join().unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        crate::credential_slot::remove(&slot);
+        assert!(head.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn refusals_are_told_from_other_errors() {
+        use crate::auth_retry::refused;
+        use delta_kernel::object_store::Error;
+
+        let generic = |text: &str| Error::Generic {
+            store: "S3",
+            source: text.to_string().into(),
+        };
+        assert!(refused(&generic(
+            "ExpiredToken: The provided token has expired"
+        )));
+        assert!(refused(&generic(
+            "Server returned non-2xx status code: 403 Forbidden: AuthenticationFailed"
+        )));
+        assert!(!refused(&generic("connection reset by peer")));
+        assert!(!refused(&Error::NotFound {
+            path: "x".into(),
+            source: "403 Forbidden".into(),
+        }));
     }
 
     /// One store, two requests, a refresh published between them: the second

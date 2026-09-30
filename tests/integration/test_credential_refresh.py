@@ -131,6 +131,34 @@ class TestRefresh:
         t.append(pa.table({"id": [1, 2]}))
         assert t.to_arrow().num_rows == 2
 
+    def test_a_store_refused_by_storage_gets_a_fresh_credential_at_once(self) -> None:
+        """Storage refused the credential before its stated expiry (revoked, a
+        clock apart): the store asks, and the refresher vends again then,
+        not at the hour the credential said it would last."""
+        from deltaswamp import _native
+        from deltaswamp.credentials.refresh import _REFRESHER, SLOT_KEY, slot_options
+
+        if "credential_retry" not in _native.FEATURES:
+            pytest.skip("native build predates the retry")
+
+        class Revoked(RotatingProvider):
+            invalidated = 0
+
+            def invalidate(self) -> None:
+                self.invalidated += 1
+
+        provider = Revoked(lifetime=3600.0)
+        first = provider.credentials()
+        slot = slot_options(provider, Operation.READ, first, first.as_storage_options())[SLOT_KEY]
+        assert _REFRESHER.entries()[slot].options == {"token": "v1"}
+        _native.request_credential_refresh(slot)
+        deadline = time.time() + 10
+        while _REFRESHER.entries()[slot].options == {"token": "v1"}:
+            assert time.time() < deadline, "the refused slot was never re-vended"
+            time.sleep(0.05)
+        assert provider.invalidated == 1
+        assert _REFRESHER.entries()[slot].options == {"token": "v2"}
+
 
 # ------------------------------------------------------------------ sharing
 
