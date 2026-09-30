@@ -387,8 +387,8 @@ class TestMergeBounds:
         skipping = []
         original = kernel_merge.KernelMerger._skipping
 
-        def spy(self: Any, schema: Any) -> Any:
-            out = original(self, schema)
+        def spy(self: Any, schema: Any, *rest: Any) -> Any:
+            out = original(self, schema, *rest)
             skipping.append(out)
             return out
 
@@ -407,8 +407,8 @@ class TestMergeBounds:
         skipping = []
         original = kernel_merge.KernelMerger._skipping
 
-        def spy(self: Any, schema: Any) -> Any:
-            out = original(self, schema)
+        def spy(self: Any, schema: Any, *rest: Any) -> Any:
+            out = original(self, schema, *rest)
             skipping.append(out)
             return out
 

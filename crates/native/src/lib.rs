@@ -5,6 +5,7 @@
 //! extension to coexist in one process with the `deltalake` wheel, which links
 //! its own (forked) build of the kernel.
 
+mod auth_retry;
 mod change_files;
 mod changes;
 mod checksum;
@@ -157,6 +158,10 @@ pub const FEATURES: &[&str] = &[
     // slot's key read their vended credential from it on every request, so
     // a refresh published from Python reaches stores already built.
     "credential_slots",
+    // A store whose request storage refuses (401/403, an expired token) asks
+    // its slot's publisher for a fresh credential and retries once
+    // (`wait_credential_requests`, `set_credential_slot(force=)`).
+    "credential_retry",
     // `files(scan_rows=True)`, `Snapshot.planned` and `scan(scan_rows=)`: a
     // worker reads planned files with no log listing or replay.
     "planned_scan",
@@ -188,13 +193,38 @@ pub const FEATURES: &[&str] = &[
     // `list_directory`: a location's entries through the kernel's own store
     // (its credential, endpoint and slot), before any table exists there.
     "list_directory",
+    // `commit_dml(stream_data=True)`: a DML's rows pulled as they are
+    // written, in files of the usual size, instead of collected first.
+    "dml_stream",
 ];
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.
+/// `force` publishes it as new even when unchanged (see `credential_slot`).
 #[pyfunction]
-#[pyo3(signature = (slot, options, expires_at = None))]
-fn set_credential_slot(slot: &str, options: HashMap<String, String>, expires_at: Option<f64>) {
-    credential_slot::set(slot, options, expires_at);
+#[pyo3(signature = (slot, options, expires_at = None, force = false))]
+fn set_credential_slot(
+    slot: &str,
+    options: HashMap<String, String>,
+    expires_at: Option<f64>,
+    force: bool,
+) {
+    credential_slot::publish(slot, options, expires_at, force);
+}
+
+/// The slots whose stores storage refused (401/403) since the last call,
+/// waiting up to `timeout` seconds for one; the refresher re-vends them.
+#[pyfunction]
+#[pyo3(signature = (timeout = 5.0))]
+fn wait_credential_requests(py: Python<'_>, timeout: f64) -> Vec<String> {
+    let timeout = std::time::Duration::from_secs_f64(timeout.max(0.0));
+    py.detach(|| credential_slot::wait_requests(timeout))
+}
+
+/// Ask slot `slot`'s publisher for a fresh credential now (for tests; the
+/// stores ask on their own when storage refuses theirs).
+#[pyfunction]
+fn request_credential_refresh(slot: &str) {
+    credential_slot::request_refresh(slot);
 }
 
 /// Forget slot `slot`; stores built from it keep the credential they last saw.
@@ -268,6 +298,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(functions::uc_required_properties, m)?)?;
     m.add_function(wrap_pyfunction!(set_credential_slot, m)?)?;
     m.add_function(wrap_pyfunction!(remove_credential_slot, m)?)?;
+    m.add_function(wrap_pyfunction!(wait_credential_requests, m)?)?;
+    m.add_function(wrap_pyfunction!(request_credential_refresh, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_version, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_is_multithreaded, m)?)?;

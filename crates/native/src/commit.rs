@@ -279,10 +279,19 @@ pub fn write(
     // Remove everything the snapshot can see, in this same commit. The rows
     // below are written to fresh file names, so none can be among them.
     let removes = if overwrite {
-        overwrite_removes(&scan_source, &engine, &info, &Default::default())?
+        overwrite_removes(
+            &scan_source,
+            &engine,
+            &info,
+            &Default::default(),
+            &Default::default(),
+        )?
     } else {
         Vec::new()
     };
+    // Removes made by hand are not in kernel's post-commit snapshot, so the
+    // checksum is counted from storage.
+    let restated = restated || overwrite;
     let mut transaction = begin_transaction(
         snapshot,
         &engine,
@@ -972,15 +981,25 @@ pub struct CommitInfoPatch {
     pub create_template: Option<Arc<Vec<String>>>,
 }
 
+/// Actions a commit produces as it is written, rather than holds: an
+/// overwrite's removes of a table with millions of files.
+pub(crate) type DeferredActions =
+    Box<dyn FnOnce() -> Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send> + Send>;
+
 /// Actions a commit writes beside the ones kernel builds, taken by the
-/// committer that writes them (one commit attempt per transaction).
+/// committer that writes them (one commit attempt per transaction): those
+/// held, then those produced as they are written.
 #[derive(Clone, Default)]
-pub struct ExtraActions(Arc<std::sync::Mutex<Vec<FilteredEngineData>>>);
+pub struct ExtraActions(
+    Arc<std::sync::Mutex<Vec<FilteredEngineData>>>,
+    Arc<std::sync::Mutex<Option<DeferredActions>>>,
+);
 
 impl std::fmt::Debug for ExtraActions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let n = self.0.lock().map(|v| v.len()).unwrap_or(0);
-        write!(f, "ExtraActions({n} batches)")
+        let deferred = self.1.lock().map(|d| d.is_some()).unwrap_or(false);
+        write!(f, "ExtraActions({n} batches, deferred: {deferred})")
     }
 }
 
@@ -991,11 +1010,22 @@ impl ExtraActions {
         }
     }
 
+    /// Actions produced only when the commit is written, after the held ones.
+    pub(crate) fn defer(&self, actions: DeferredActions) {
+        if let Ok(mut deferred) = self.1.lock() {
+            *deferred = Some(actions);
+        }
+    }
+
     fn take(&self) -> Vec<FilteredEngineData> {
         self.0
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
             .unwrap_or_default()
+    }
+
+    fn take_deferred(&self) -> Option<DeferredActions> {
+        self.1.lock().ok().and_then(|mut d| d.take())
     }
 }
 
@@ -1216,9 +1246,11 @@ impl Committer for PatchingCommitter {
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
         let info = &self.info;
         let extra = info.extra_actions.take();
+        let deferred = info.extra_actions.take_deferred();
         let patched = actions
             .map(move |item| item.and_then(|data| info.apply(data)))
-            .chain(extra.into_iter().map(Ok));
+            .chain(extra.into_iter().map(Ok))
+            .chain(deferred.into_iter().flat_map(|produce| produce()));
         self.inner
             .commit(engine, Box::new(patched), commit_metadata)
     }
@@ -1550,12 +1582,69 @@ impl RemovesByHand {
 /// removes one path is read differently by every reader (the kernel kept the
 /// file, delta-rs listed it, Spark's replay dropped it), and it only happens
 /// when fragments that already landed are committed again.
+///
+/// Mostly nothing is held at all: the removes are built by hand
+/// ([`RemovesByHand`], the same actions kernel builds) from the log replay
+/// the commit itself runs as it writes the log file ([`ExtraActions::defer`]),
+/// so an overwrite of a table with millions of files holds only the commit
+/// file being written. A refusal found then is left in `failure`, for the
+/// caller to report as itself. Kernel stages them where it refuses removes
+/// on its own (append-only and icebergCompatV3 tables), so it still does.
 fn overwrite_removes(
     snapshot: &SnapshotRef,
     engine: &SharedEngine,
     info: &CommitInfoPatch,
     adds: &std::collections::HashSet<String>,
+    failure: &Arc<std::sync::Mutex<Option<NativeError>>>,
 ) -> Result<Vec<FilteredEngineData>> {
+    use delta_kernel::table_features::TableFeature;
+
+    let append_only = snapshot
+        .metadata_configuration()
+        .get("delta.appendOnly")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let kernel_refuses = append_only
+        || snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::IcebergCompatV3);
+    if !kernel_refuses {
+        let builder = RemovesByHand::new(engine, now_millis(), true)?;
+        let (snapshot, engine) = (snapshot.clone(), engine.clone());
+        let (adds, failure) = (adds.clone(), failure.clone());
+        info.extra_actions.defer(Box::new(move || {
+            let report = move |err: NativeError| {
+                let message = err.to_string();
+                if let Ok(mut slot) = failure.lock() {
+                    slot.get_or_insert(err);
+                }
+                delta_kernel::Error::generic(message)
+            };
+            let replay = snapshot
+                .scan_builder()
+                .build()
+                .and_then(|scan| scan.scan_metadata(engine.as_ref()));
+            match replay {
+                Err(err) => Box::new(std::iter::once(Err(report(NativeError::from(err))))),
+                Ok(metadata) => Box::new(
+                    Transaction::scan_metadata_to_engine_data(metadata).filter_map(move |item| {
+                        let removes = item
+                            .map_err(NativeError::from)
+                            .and_then(|filtered| compact_scan_rows(filtered, &adds))
+                            .and_then(|kept| {
+                                kept.map(|(batch, selected)| builder.of(&batch, selected))
+                                    .transpose()
+                            });
+                        match removes {
+                            Ok(Some(removes)) => Some(Ok(removes)),
+                            Ok(None) => None,
+                            Err(err) => Some(Err(report(err))),
+                        }
+                    }),
+                ),
+            }
+        }));
+        return Ok(Vec::new());
+    }
     let scan = snapshot.clone().scan_builder().build()?;
     let scan_metadata = runtime::block_on(async { scan.scan_metadata(engine.as_ref()) })?;
     // On a change-data-feed table too: kernel 0.28 refuses any data commit
@@ -2038,12 +2127,16 @@ pub fn commit_files(
             decoded.push(batch);
         }
     }
+    let failure = Arc::new(std::sync::Mutex::new(None));
     let removes = if overwrite {
-        overwrite_removes(&scan_source, &engine, &info, &seen)?
+        overwrite_removes(&scan_source, &engine, &info, &seen, &failure)?
     } else {
         Vec::new()
     };
     drop(seen);
+    // Removes made by hand are not in kernel's post-commit snapshot, so the
+    // checksum is counted from storage.
+    let restated = restated || overwrite;
     let mut transaction = begin_transaction(
         snapshot,
         &engine,
@@ -2062,9 +2155,18 @@ pub fn commit_files(
     }
 
     if creating {
+        // Never an overwrite, so no removes and no refusal found producing them.
         return finish_create(transaction, &engine, &table_root);
     }
-    finish_commit_as(transaction, &engine, restated)
+    // A refusal found while the removes were produced (a file both added and
+    // removed) is reported as itself, not as the kernel's wrapping of it.
+    finish_commit_as(transaction, &engine, restated).map_err(|err| {
+        failure
+            .lock()
+            .ok()
+            .and_then(|mut f| f.take())
+            .unwrap_or(err)
+    })
 }
 
 /// Commit a transaction whose [`VersionZeroCommitter`] writes version 0.

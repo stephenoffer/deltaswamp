@@ -19,10 +19,10 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "restore", "commit_actions", "row_tracking_compaction", "add_tags", "write_checksum",
 "incremental_files", "uncommitted_files", "path_clone", "row_tracking_dml", "check_constraints",
 "schema_evolution", "log_cleanup", "symlink_manifest", "fsck", "value_constrained_checkpoint",
-"commit_timestamps", "credential_slots", "planned_scan", "values_checked",
+"commit_timestamps", "credential_slots", "credential_retry", "planned_scan", "values_checked",
 "checkpoint_protection", "domain_metadata", "deferred_create", "create_with_data",
-"geospatial", "iceberg_compat_writes", "change_files", "log_change_feed", "list_directory".
-Gate on this list, not `hasattr`, so a stale build refuses cleanly.
+"geospatial", "iceberg_compat_writes", "change_files", "log_change_feed", "list_directory",
+"dml_stream". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
 """
 
 def kernel_version() -> str:
@@ -167,9 +167,20 @@ def validate_retry_options(options: dict[str, str]) -> None:
     """
 
 def set_credential_slot(
-    slot: str, options: dict[str, str], expires_at: float | None = None
+    slot: str, options: dict[str, str], expires_at: float | None = None, force: bool = False
 ) -> None:
-    """Publish a freshly vended credential in `slot`, for stores built with its key."""
+    """Publish a freshly vended credential in `slot`, for stores built with its key.
+
+    `force`: a new generation even when unchanged, answering a store that
+    asked for a refresh (feature ``credential_retry``).
+    """
+
+def wait_credential_requests(timeout: float = 5.0) -> list[str]:
+    """Slots whose stores storage refused since the last call, waiting up to
+    `timeout` seconds for one (feature ``credential_retry``)."""
+
+def request_credential_refresh(slot: str) -> None:
+    """Ask `slot`'s publisher for a fresh credential now (for tests)."""
 
 def remove_credential_slot(slot: str) -> None:
     """Forget `slot`; stores built from it keep the credential they last saw."""
@@ -790,6 +801,7 @@ class Snapshot:
         constraints_checked: bool = False,
         values_checked: list[str] | None = None,
         changes: Any | None = None,
+        stream_data: bool = False,
     ) -> tuple[int, int, int, int]:
         """Commit row-level DML as deletion vectors, in one transaction.
 
@@ -797,7 +809,10 @@ class Snapshot:
         the commit's change rows -- the table's columns plus `_change_type` --
         written as CDC files under `_change_data/` and committed as `cdc`
         actions, which change-feed readers take instead of the adds and
-        removes.
+        removes. It is pulled as the files are written, never held whole.
+
+        `stream_data` (feature ``dml_stream``): `data` is pulled as its files
+        are written, in files of the usual size, instead of collected first.
 
         `whole_files` are removed outright; `data_change=False` commits the
         whole thing as a compaction (OPTIMIZE), the same rows in new files:

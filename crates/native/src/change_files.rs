@@ -47,7 +47,7 @@ pub fn write_change_files(
     snapshot: &SnapshotRef,
     engine: &SharedEngine,
     transaction: &Transaction,
-    batches: Vec<RecordBatch>,
+    batches: impl IntoIterator<Item = Result<RecordBatch>>,
     codec: Compression,
     written: &mut Vec<String>,
 ) -> Result<Vec<String>> {
@@ -59,6 +59,7 @@ pub fn write_change_files(
     let write_state = transaction.write_state()?;
     let mut actions = Vec::new();
     for batch in batches {
+        let batch = batch?;
         if batch.num_rows() == 0 {
             continue;
         }

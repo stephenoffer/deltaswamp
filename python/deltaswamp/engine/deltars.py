@@ -525,6 +525,13 @@ class DeltaRsEngine:
 
     # --------------------------------------------------------------- internals
 
+    #: Warn when a delta-rs operation starts with less than this much
+    #: credential life. deltalake takes storage options only (no credential
+    #: provider, through 1.6.6), so one operation -- a table open, a MERGE,
+    #: an OPTIMIZE -- holds the credential it starts with; each operation
+    #: vends afresh as it opens the table.
+    expiry_warning_seconds: float = 600.0
+
     def _storage_options(self, table: ResolvedTable, *, write: bool) -> dict[str, str]:
         # One merge rule for every engine (_storage): canonical keys, vended
         # secrets over the caller's, the caller's region/endpoint over a
@@ -532,8 +539,28 @@ class DeltaRsEngine:
         vended = None
         if table.credential_provider is not None:
             op = CredentialOperation.READ_WRITE if write else CredentialOperation.READ
-            vended = table.credential_provider.credentials(op).as_storage_options()
+            credentials = table.credential_provider.credentials(op)
+            self._warn_if_short_lived(credentials)
+            vended = credentials.as_storage_options()
         return store_options(engine_options(self._base_options, vended, table.location))
+
+    def _warn_if_short_lived(self, credentials: Any) -> None:
+        expires_at = getattr(credentials, "expires_at", None)
+        if expires_at is None or not credentials.expires_within(self.expiry_warning_seconds):
+            return
+        import time
+
+        from ..errors import CredentialExpiryWarning
+
+        left = max(0.0, expires_at - time.time())
+        warnings.warn(
+            f"a delta-rs operation starts with a vended credential that expires in "
+            f"{left:.0f}s, and delta-rs holds it for the whole operation (it takes no "
+            "credential provider): one that runs longer fails partway through with a 403 "
+            "from storage. Operations the kernel serves refresh theirs as they run.",
+            CredentialExpiryWarning,
+            stacklevel=5,
+        )
 
     def _store(self, table: ResolvedTable, *, write: bool) -> tuple[str, dict[str, str] | None]:
         """The URI and storage_options delta-rs opens `table` with.

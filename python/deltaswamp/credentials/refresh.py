@@ -83,6 +83,8 @@ class _Refresher:
         self._cond = threading.Condition()
         self._entries: dict[str, _Entry] = {}
         self._thread: threading.Thread | None = None
+        #: Answers stores whose request storage refused (`_listen`).
+        self._listener: threading.Thread | None = None
         self._pid = os.getpid()
 
     def _native(self) -> Any:
@@ -104,9 +106,10 @@ class _Refresher:
         slot = slot_identity(provider, operation)
         with self._cond:
             if self._pid != os.getpid():
-                # A forked child: the parent's thread did not come along.
+                # A forked child: the parent's threads did not come along.
                 self._entries.clear()
                 self._thread = None
+                self._listener = None
                 self._pid = os.getpid()
             entry = self._entries.get(slot)
             if entry is None or entry.live() is None:
@@ -137,8 +140,10 @@ class _Refresher:
         credentials: Credentials,
         options: dict[str, str],
         now: float,
+        force: bool = False,
     ) -> None:
-        self._native().set_credential_slot(slot, dict(options), credentials.expires_at)
+        extra = {"force": True} if force else {}
+        self._native().set_credential_slot(slot, dict(options), credentials.expires_at, **extra)
         entry.options = dict(options)
         entry.expires_at = credentials.expires_at
         entry.published_at = now
@@ -153,12 +158,46 @@ class _Refresher:
         return max(now + 1.0, entry.expires_at - ahead)
 
     def _start(self) -> None:
+        if (self._listener is None or not self._listener.is_alive()) and "credential_retry" in (
+            getattr(self._native(), "FEATURES", ())
+        ):
+            self._listener = threading.Thread(
+                target=self._listen, name="deltaswamp-credential-requests", daemon=True
+            )
+            self._listener.start()
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(
             target=self._run, name="deltaswamp-credential-refresh", daemon=True
         )
         self._thread.start()
+
+    def _listen(self) -> None:
+        """Answer stores whose request storage refused: re-vend now.
+
+        The store waits for the answer (`credential_slot::request_refresh`)
+        and sends the request again once. What is published is always a new
+        generation, even when vending gave the same credential, so the store
+        retries at once instead of waiting out its timeout.
+        """
+        native = self._native()
+        pid = os.getpid()
+        while os.getpid() == pid:
+            try:
+                asked = native.wait_credential_requests(5.0)
+            except Exception:  # pragma: no cover - the extension went away
+                return
+            for slot in asked:
+                with self._cond:
+                    entry = self._entries.get(slot)
+                if entry is None:
+                    continue
+                provider = entry.live()
+                invalidate = getattr(provider, "invalidate", None)
+                if callable(invalidate):
+                    with contextlib.suppress(Exception):
+                        invalidate()
+                self._refresh(slot, entry, force=True)
 
     def _run(self) -> None:
         while True:
@@ -174,12 +213,17 @@ class _Refresher:
             for slot, entry in due:
                 self._refresh(slot, entry)
 
-    def _refresh(self, slot: str, entry: _Entry) -> None:
+    def _refresh(self, slot: str, entry: _Entry, force: bool = False) -> None:
+        """Vend `slot`'s credential again and publish it if it changed.
+
+        `force` (a store asked, `_listen`): published as new in any case, and
+        when vending fails too, so the waiting request is answered at once.
+        """
         from .base import Credentials as _Credentials
 
         now = time.time()
         provider = entry.live()
-        if provider is None or now - entry.last_used > IDLE_SECONDS:
+        if provider is None or (not force and now - entry.last_used > IDLE_SECONDS):
             self._drop(slot)
             return
         try:
@@ -193,10 +237,15 @@ class _Refresher:
             with self._cond:
                 left = (entry.expires_at or now) - now
                 entry.due = now + min(RETRY_SECONDS, max(1.0, left / 4.0))
+                if force:
+                    with contextlib.suppress(Exception):
+                        self._native().set_credential_slot(
+                            slot, dict(entry.options), entry.expires_at, force=True
+                        )
             return
         with self._cond:
-            if options != entry.options:
-                self._publish(slot, entry, fresh, options, now)
+            if options != entry.options or force:
+                self._publish(slot, entry, fresh, options, now, force=force)
             else:
                 # The provider still serves the same one (its own margin is
                 # smaller than ours): ask again shortly.
