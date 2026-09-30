@@ -172,6 +172,8 @@ impl ObjectStore for AuthRetryStore {
                 Some(Err(err)) if refused(&err) && refresh(&slot).await => {
                     inner.list(prefix.as_ref())
                 }
+                // Ended already: polling object_store's listing again panics.
+                None => futures::stream::empty().boxed(),
                 first => futures::stream::iter(first).chain(listing).boxed(),
             }
         })
@@ -193,6 +195,7 @@ impl ObjectStore for AuthRetryStore {
                 Some(Err(err)) if refused(&err) && refresh(&slot).await => {
                     inner.list_with_offset(prefix.as_ref(), &offset)
                 }
+                None => futures::stream::empty().boxed(),
                 first => futures::stream::iter(first).chain(listing).boxed(),
             }
         })
