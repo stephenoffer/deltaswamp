@@ -387,7 +387,27 @@ fn is_s3(url: &Url) -> bool {
 /// and a vended credential for the URL's cloud, the store reads its
 /// credential from the slot on every request, so it outlives the one it was
 /// built with.
+///
+/// Built stores are cached per process (see [`cache`]): building one costs
+/// 100-250 ms (object_store's HTTP clients load the system's root
+/// certificates), and a worker reading many planned files built one per task.
 pub fn build_store(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
+    let Some(key) = cache::key(url, options) else {
+        return build_uncached(url, options);
+    };
+    if let Some(store) = cache::get(&key) {
+        return Ok(store);
+    }
+    let store = build_uncached(url, options)?;
+    cache::put(key, store.clone());
+    Ok(store)
+}
+
+/// Stores this process has built, not counting those the cache served.
+pub static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn build_uncached(url: &Url, options: &HashMap<String, String>) -> Result<Arc<DynObjectStore>> {
+    BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let slot = option_value(options, &[SLOT_KEY]).map(str::to_string);
     let stripped;
     let options = if slot.is_some() {
@@ -511,6 +531,161 @@ pub fn list_directory(url: &Url, options: &HashMap<String, String>) -> Result<Ve
 }
 
 /// Build a GCS store authenticated with a raw OAuth2 bearer token.
+/// The per-process cache of built stores.
+///
+/// A key never holds an option's value, secret or not: it is the store's
+/// scope (scheme, user, host and first path segment, which covers what
+/// object_store binds a store to), the credential slot's name, and a 128-bit
+/// keyed hash of the options (keys random per process). A store that reads
+/// its credential from a slot is keyed without the credential itself, so a
+/// refresh reuses it; one with a static credential is keyed with it, so
+/// another secret never gets its store. A forked child starts empty: the
+/// parent's stores hold connections of a runtime the child does not have
+/// (`crate::runtime`). `DELTASWAMP_STORE_CACHE=0` turns caching off.
+pub(crate) mod cache {
+    use super::*;
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    /// Stores kept per process, least recently used dropped first.
+    pub const CAPACITY: usize = 64;
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub struct Key {
+        scope: String,
+        slot: Option<String>,
+        options: (u64, u64),
+    }
+
+    struct Cache {
+        pid: u32,
+        tick: u64,
+        entries: Vec<(Key, Arc<DynObjectStore>, u64)>,
+    }
+
+    static HASHERS: LazyLock<(RandomState, RandomState)> =
+        LazyLock::new(|| (RandomState::new(), RandomState::new()));
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| {
+        Mutex::new(Cache {
+            pid: std::process::id(),
+            tick: 0,
+            entries: Vec::new(),
+        })
+    });
+
+    fn enabled() -> bool {
+        std::env::var("DELTASWAMP_STORE_CACHE").map_or(true, |v| v.trim() != "0")
+    }
+
+    fn credential_keys(url: &Url) -> &'static [&'static str] {
+        if is_azure(url) {
+            credential_slot::AZURE_KEYS
+        } else if is_gcs(url) {
+            GCS_BEARER_KEYS
+        } else {
+            credential_slot::AWS_KEYS
+        }
+    }
+
+    /// The cache key for building a store at `url` with `options`, or None
+    /// when caching is off.
+    pub fn key(url: &Url, options: &HashMap<String, String>) -> Option<Key> {
+        if !enabled() {
+            return None;
+        }
+        let slot = option_value(options, &[SLOT_KEY]).map(str::to_string);
+        let scope = if url.scheme() == "file" {
+            "file".to_string()
+        } else {
+            let first = url
+                .path_segments()
+                .and_then(|mut s| s.next())
+                .unwrap_or_default();
+            format!(
+                "{}://{}@{}/{}",
+                url.scheme(),
+                url.username(),
+                url.host_str().unwrap_or_default(),
+                first
+            )
+        };
+        let skip: &[&str] = if slot.is_some() {
+            credential_keys(url)
+        } else {
+            &[]
+        };
+        let mut pairs: Vec<(String, &str)> = options
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case(SLOT_KEY))
+            .filter(|(k, _)| !skip.iter().any(|s| k.eq_ignore_ascii_case(s)))
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.as_str()))
+            .collect();
+        pairs.sort();
+        let digest = |state: &RandomState| state.hash_one(&pairs);
+        let (a, b) = &*HASHERS;
+        Some(Key {
+            scope,
+            slot,
+            options: (digest(a), digest(b)),
+        })
+    }
+
+    fn lock() -> MutexGuard<'static, Cache> {
+        let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        let pid = std::process::id();
+        if cache.pid != pid {
+            // Leaked, not dropped: dropping the parent's clients in a child
+            // could touch a runtime with no threads.
+            std::mem::forget(std::mem::take(&mut cache.entries));
+            cache.pid = pid;
+        }
+        cache
+    }
+
+    /// The cached store for `key`. A slot-backed store is used only while its
+    /// slot exists: without it the store would serve the credential it was
+    /// built with, older than the one the caller passes now.
+    pub fn get(key: &Key) -> Option<Arc<DynObjectStore>> {
+        if let Some(slot) = &key.slot {
+            credential_slot::generation(slot)?;
+        }
+        let mut cache = lock();
+        cache.tick += 1;
+        let tick = cache.tick;
+        let entry = cache.entries.iter_mut().find(|(k, _, _)| k == key)?;
+        entry.2 = tick;
+        Some(entry.1.clone())
+    }
+
+    pub fn put(key: Key, store: Arc<DynObjectStore>) {
+        let mut cache = lock();
+        cache.tick += 1;
+        let tick = cache.tick;
+        if let Some(entry) = cache.entries.iter_mut().find(|(k, _, _)| *k == key) {
+            *entry = (key, store, tick);
+            return;
+        }
+        if cache.entries.len() >= CAPACITY {
+            let oldest = cache
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(i, _)| i);
+            if let Some(oldest) = oldest {
+                cache.entries.swap_remove(oldest);
+            }
+        }
+        cache.entries.push((key, store, tick));
+    }
+
+    #[cfg(test)]
+    pub fn len() -> usize {
+        lock().entries.len()
+    }
+}
+
 fn build_gcs_with_bearer(
     url: &Url,
     options: &HashMap<String, String>,
@@ -1128,5 +1303,142 @@ mod tests {
         // No credentials at all: object_store should still construct a store
         // (it resolves credentials lazily from the environment).
         assert!(build_store(&url, &HashMap::new()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn o(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn s3(secret: &str) -> HashMap<String, String> {
+        o(&[
+            ("aws_access_key_id", "AKIA"),
+            ("aws_secret_access_key", secret),
+            ("aws_region", "us-east-1"),
+        ])
+    }
+
+    fn url(u: &str) -> Url {
+        Url::parse(u).unwrap()
+    }
+
+    #[test]
+    fn a_key_holds_no_option_value() {
+        let key = cache::key(&url("s3://b/t/"), &s3("hunter2-secret")).unwrap();
+        assert!(!format!("{key:?}").contains("hunter2-secret"));
+        assert!(!format!("{key:?}").contains("AKIA"));
+    }
+
+    #[test]
+    fn keys_tell_apart_what_makes_a_store_different() {
+        let k = |u: &str, options: &HashMap<String, String>| cache::key(&url(u), options);
+        let base = k("s3://b/t/", &s3("one"));
+        // The same store: another path under the same scope, key order.
+        assert_eq!(base, k("s3://b/t/part=1/", &s3("one")));
+        // Another store: another secret, bucket, first segment, region.
+        assert_ne!(base, k("s3://b/t/", &s3("two")));
+        assert_ne!(base, k("s3://other/t/", &s3("one")));
+        assert_ne!(base, k("s3://b/u/", &s3("one")));
+        let mut region = s3("one");
+        region.insert("aws_region".into(), "eu-west-1".into());
+        assert_ne!(base, k("s3://b/t/", &region));
+        // Azure: the container is the URL's user.
+        let sas = o(&[("azure_storage_sas_key", "sv=1&sig=x")]);
+        assert_ne!(
+            k("abfss://c1@acct.dfs.core.windows.net/t/", &sas),
+            k("abfss://c2@acct.dfs.core.windows.net/t/", &sas)
+        );
+        // A slot-backed store is keyed by its slot, not the credential in it.
+        let slotted = |secret: &str, slot: &str| {
+            let mut options = s3(secret);
+            options.insert(SLOT_KEY.into(), slot.into());
+            k("s3://b/t/", &options)
+        };
+        assert_eq!(slotted("one", "slot-a"), slotted("two", "slot-a"));
+        assert_ne!(slotted("one", "slot-a"), slotted("one", "slot-b"));
+        assert_ne!(slotted("one", "slot-a"), base);
+    }
+
+    #[test]
+    fn the_same_options_reuse_one_store_and_another_secret_does_not() {
+        let at = url("s3://cache-reuse-bucket/t/");
+        let first = build_store(&at, &s3("one")).unwrap();
+        let again = build_store(&at, &s3("one")).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        let other = build_store(&at, &s3("two")).unwrap();
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn a_slot_store_is_reused_across_refreshes_while_its_slot_lives() {
+        let slot = format!("cache-test-{}", uuid::Uuid::new_v4());
+        let at = url("s3://cache-slot-bucket/t/");
+        let with = |secret: &str| {
+            let mut options = s3(secret);
+            options.insert(SLOT_KEY.into(), slot.clone());
+            options
+        };
+        // No slot published: never cached, as the store would serve the
+        // credential it was built with.
+        let a = build_store(&at, &with("one")).unwrap();
+        let b = build_store(&at, &with("one")).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        credential_slot::publish(&slot, s3("one"), None, false);
+        let c = build_store(&at, &with("one")).unwrap();
+        credential_slot::publish(&slot, s3("two"), None, false);
+        let d = build_store(&at, &with("two")).unwrap();
+        assert!(Arc::ptr_eq(&c, &d), "a refresh reuses the slot's store");
+        credential_slot::remove(&slot);
+        let e = build_store(&at, &with("three")).unwrap();
+        assert!(!Arc::ptr_eq(&d, &e), "a gone slot's store is not reused");
+    }
+
+    #[test]
+    fn the_cache_is_bounded() {
+        for i in 0..(cache::CAPACITY + 10) {
+            build_store(&url(&format!("s3://bound-{i}/t/")), &s3("x")).unwrap();
+        }
+        assert!(cache::len() <= cache::CAPACITY);
+    }
+
+    #[test]
+    #[ignore]
+    fn print_store_build_cost() {
+        let cases: Vec<(&str, HashMap<String, String>)> = vec![
+            ("s3://bucket/t/", s3("s")),
+            ("gs://bucket/t/", o(&[("google_bearer_token", "tok")])),
+            (
+                "abfss://c@acct.dfs.core.windows.net/t/",
+                o(&[("azure_storage_sas_key", "sv=1&sig=x")]),
+            ),
+            ("file:///tmp/t/", o(&[])),
+        ];
+        for (u, options) in cases {
+            let at = url(u);
+            let n = 20;
+            let start = Instant::now();
+            for _ in 0..n {
+                build_uncached(&at, &options).unwrap();
+            }
+            let uncached = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            build_store(&at, &options).unwrap();
+            let start = Instant::now();
+            for _ in 0..n {
+                build_store(&at, &options).unwrap();
+            }
+            let cached = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            eprintln!(
+                "{} uncached {uncached:.2} ms, cached {cached:.4} ms",
+                at.scheme()
+            );
+        }
     }
 }

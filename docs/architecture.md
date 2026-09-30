@@ -192,6 +192,16 @@ metadata and domain metadata, the change data feed, appends and overwrites
 through `FileSystemCommitter` or `UCCommitter`, publishing, checkpoints, a
 put-if-absent commit of raw actions, and Unity Catalog's managed-table creation.
 
+Object stores are built once per process and reused (`store::cache`). Building
+one costs 100-250 ms on a cloud, since object_store's HTTP clients load the
+system's root certificates, and an append built eight of them, a DELETE seven
+and every `WritePlan.write()` one. A store is keyed by its scope (scheme,
+container or bucket, first path segment), its credential slot, and a keyed hash
+of its options, never by an option's value. A store that reads a credential
+slot is reused across refreshes while the slot exists, one with a static
+credential only for that credential, and a forked child starts with none. The
+cache holds 64 stores; `DELTASWAMP_STORE_CACHE=0` turns it off.
+
 Five kernel constraints shape the code:
 
 - **Multi-threaded runtime and executor.** `UCCommitter` bridges async catalog

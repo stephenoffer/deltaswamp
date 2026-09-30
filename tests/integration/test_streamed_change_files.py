@@ -180,9 +180,7 @@ def test_a_bucketed_merge_spills_its_changes_and_cleans_up(
     _merge(conn.open_table(path))
     assert spilled == ["Spill"]
     log = pathlib.Path(path) / "_delta_log" / f"{version:020d}.json"
-    cdc = [
-        json.loads(line)["cdc"] for line in log.read_text().splitlines() if '"cdc"' in line
-    ]
+    cdc = [json.loads(line)["cdc"] for line in log.read_text().splitlines() if '"cdc"' in line]
     assert cdc and all(c["path"].startswith("_change_data/") for c in cdc)
     assert not list((tmp_path / "spill").iterdir()), "spill files left behind"
 

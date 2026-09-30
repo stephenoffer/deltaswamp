@@ -196,7 +196,17 @@ pub const FEATURES: &[&str] = &[
     // `commit_dml(stream_data=True)`: a DML's rows pulled as they are
     // written, in files of the usual size, instead of collected first.
     "dml_stream",
+    // Built object stores cached per process (`store::cache`); `store_builds`
+    // counts the stores actually built.
+    "store_cache",
 ];
+
+/// How many object stores this process has built, not counting those the
+/// per-process cache served (a diagnostic, and for tests).
+#[pyfunction]
+fn store_builds() -> u64 {
+    store::BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Publish a freshly vended credential (as storage options) in slot `slot`.
 /// `force` publishes it as new even when unchanged (see `credential_slot`).
@@ -300,6 +310,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(remove_credential_slot, m)?)?;
     m.add_function(wrap_pyfunction!(wait_credential_requests, m)?)?;
     m.add_function(wrap_pyfunction!(request_credential_refresh, m)?)?;
+    m.add_function(wrap_pyfunction!(store_builds, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_version, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_is_multithreaded, m)?)?;

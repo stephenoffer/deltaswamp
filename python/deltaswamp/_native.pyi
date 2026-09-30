@@ -22,7 +22,8 @@ One of: "predicate_skipping", "timestamp_travel", "table_changes", "files",
 "commit_timestamps", "credential_slots", "credential_retry", "planned_scan", "values_checked",
 "checkpoint_protection", "domain_metadata", "deferred_create", "create_with_data",
 "geospatial", "iceberg_compat_writes", "change_files", "log_change_feed", "list_directory",
-"dml_stream". Gate on this list, not `hasattr`, so a stale build refuses cleanly.
+"dml_stream", "store_cache". Gate on this list, not `hasattr`, so a stale build refuses
+cleanly.
 """
 
 def kernel_version() -> str:
@@ -184,6 +185,10 @@ def request_credential_refresh(slot: str) -> None:
 
 def remove_credential_slot(slot: str) -> None:
     """Forget `slot`; stores built from it keep the credential they last saw."""
+
+def store_builds() -> int:
+    """Object stores this process has built, not counting those its cache
+    served (feature ``store_cache``)."""
 
 def list_directory(
     table_root: str, options: dict[str, str] | None = None
