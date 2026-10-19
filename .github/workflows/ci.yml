@@ -21,7 +21,7 @@ jobs:
     name: lint, types, unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -46,7 +46,7 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
       - run: uv python install ${{ matrix.python }}
       - run: uv pip install --system --python ${{ matrix.python }} pytest
@@ -60,7 +60,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # No toolchain action: rust-toolchain.toml is the single source of truth
       # for the version and components, and rustup honours it.
       - uses: Swatinem/rust-cache@v2
@@ -75,7 +75,7 @@ jobs:
     name: native build and integration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
       - run: uv python install 3.11
@@ -123,7 +123,7 @@ jobs:
     name: sdist builds from source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
       - run: uv python install 3.11
       - name: Build the sdist and compile the wheel from it
