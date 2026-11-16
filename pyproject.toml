@@ -15,6 +15,7 @@ keywords = ["delta", "delta-lake", "unity-catalog", "databricks", "lakehouse", "
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -63,6 +64,9 @@ dev = [
 
 [project.urls]
 Repository = "https://github.com/stephenoffer/deltaswamp"
+Documentation = "https://github.com/stephenoffer/deltaswamp/tree/main/docs"
+Issues = "https://github.com/stephenoffer/deltaswamp/issues"
+Changelog = "https://github.com/stephenoffer/deltaswamp/blob/main/CHANGELOG.md"
 
 # Third parties can ship out-of-tree catalogs (deltaswamp-mycatalog) by
 # registering here. Config also accepts a dotted path as an escape hatch.
