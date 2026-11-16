@@ -260,6 +260,7 @@ class TestCommitSafety:
         )
 
     def test_can_agrees_with_the_refusal(self) -> None:
+        pytest.importorskip("deltaswamp._native")
         from deltaswamp.engine.kernel import KernelEngine
 
         table = ResolvedTable(
